@@ -4,6 +4,24 @@
 
 ## The open source dark software factory for expert engineers
 
+*When agents run untamed through boundless night,*
+*And fifty-file diffs blur the weary eye,*
+*A graph defines the process, sharp and right,*
+*Each stage a node beneath the workflow sky.*
+
+*Let one model plan, and one critique the seam,*
+*Route cheap tasks low and trust the frontier high,*
+*Checkpoint each change, let nothing slip the stream,*
+*And human gates shall pause where choices lie.*
+
+*No Python runtime, no Node, no chain to bind,*
+*One Rust binary, lean and swift and free,*
+*The retro writes itself — your runs refined,*
+*Your laptop sleeps while agents work for thee.*
+
+*So define the graph, approve the plan, then ship:*
+*Let Fabro keep the process in its grip.*
+
 AI coding agents are powerful but unpredictable. You either babysit every step or review a 50-file diff you don't trust. Fabro gives you a middle path: define the process as a graph, let agents execute it, and intervene only where it matters. [Why Fabro?](https://docs.fabro.sh/getting-started/why-fabro)
 
 [![Rust](https://github.com/fabro-sh/fabro/actions/workflows/rust.yml/badge.svg)](https://github.com/fabro-sh/fabro/actions/workflows/rust.yml)
