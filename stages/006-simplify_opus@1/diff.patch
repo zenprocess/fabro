@@ -1,0 +1,253 @@
+diff --git a/lib/crates/fabro-api/build.rs b/lib/crates/fabro-api/build.rs
+index b63e2302..0e5de32c 100644
+--- a/lib/crates/fabro-api/build.rs
++++ b/lib/crates/fabro-api/build.rs
+@@ -379,6 +379,16 @@ fn main() {
+         ("PreRunPushOutcome", "fabro_types::PreRunPushOutcome", &[]),
+         ("DirtyStatus", "fabro_types::DirtyStatus", &[]),
+         ("GitContext", "fabro_types::GitContext", &[]),
++        (
++            "RunIntegrationsSettings",
++            "fabro_types::settings::run::RunIntegrationsSettings",
++            &[],
++        ),
++        (
++            "RunIntegrationsGithubSettings",
++            "fabro_types::settings::run::RunIntegrationsGithubSettings",
++            &[],
++        ),
+     ];
+     for (name, path, impls) in replacements {
+         settings.with_replacement(*name, *path, impls.iter().copied());
+diff --git a/lib/crates/fabro-api/tests/run_integrations_round_trip.rs b/lib/crates/fabro-api/tests/run_integrations_round_trip.rs
+deleted file mode 100644
+index 243268f1..00000000
+--- a/lib/crates/fabro-api/tests/run_integrations_round_trip.rs
++++ /dev/null
+@@ -1,64 +0,0 @@
+-//! JSON parity test for `RunIntegrationsGithubSettings`.
+-//!
+-//! Asserts that the API-side generated `RunIntegrationsGithubSettings` and
+-//! the canonical Rust resolved type round-trip through the same JSON shape.
+-//! Covers both the populated and empty-permissions cases.
+-
+-use fabro_api::types::{
+-    RunIntegrationsGithubSettings as ApiRunIntegrationsGithubSettings,
+-    RunIntegrationsSettings as ApiRunIntegrationsSettings,
+-};
+-use fabro_types::settings::run::{RunIntegrationsGithubSettings, RunIntegrationsSettings};
+-use serde_json::json;
+-
+-#[test]
+-fn run_integrations_github_settings_round_trips_with_permissions() {
+-    let json_value = json!({
+-        "permissions": {
+-            "issues": "read",
+-            "contents": "write",
+-        }
+-    });
+-
+-    let api: ApiRunIntegrationsGithubSettings =
+-        serde_json::from_value(json_value.clone()).expect("api type should parse");
+-    let canonical: RunIntegrationsGithubSettings =
+-        serde_json::from_value(json_value.clone()).expect("canonical type should parse");
+-
+-    assert_eq!(serde_json::to_value(&api).unwrap(), json_value);
+-    assert_eq!(serde_json::to_value(&canonical).unwrap(), json_value);
+-}
+-
+-#[test]
+-fn run_integrations_github_settings_round_trips_empty_permissions() {
+-    // Empty map is the resolved form of "no token requested" — must
+-    // serialize as an object, not omitted.
+-    let json_value = json!({ "permissions": {} });
+-
+-    let api: ApiRunIntegrationsGithubSettings =
+-        serde_json::from_value(json_value.clone()).expect("api type should parse empty");
+-    let canonical: RunIntegrationsGithubSettings =
+-        serde_json::from_value(json_value.clone()).expect("canonical type should parse empty");
+-
+-    assert_eq!(serde_json::to_value(&api).unwrap(), json_value);
+-    assert_eq!(serde_json::to_value(&canonical).unwrap(), json_value);
+-}
+-
+-#[test]
+-fn run_integrations_settings_round_trips() {
+-    let json_value = json!({
+-        "github": {
+-            "permissions": {
+-                "issues": "read",
+-            }
+-        }
+-    });
+-
+-    let api: ApiRunIntegrationsSettings =
+-        serde_json::from_value(json_value.clone()).expect("api wrapper should parse");
+-    let canonical: RunIntegrationsSettings =
+-        serde_json::from_value(json_value.clone()).expect("canonical wrapper should parse");
+-
+-    assert_eq!(serde_json::to_value(&api).unwrap(), json_value);
+-    assert_eq!(serde_json::to_value(&canonical).unwrap(), json_value);
+-}
+diff --git a/lib/crates/fabro-cli/src/commands/run/runner.rs b/lib/crates/fabro-cli/src/commands/run/runner.rs
+index f7c9e59e..114ed383 100644
+--- a/lib/crates/fabro-cli/src/commands/run/runner.rs
++++ b/lib/crates/fabro-cli/src/commands/run/runner.rs
+@@ -15,6 +15,7 @@ use fabro_config::{ServerSettingsBuilder, Storage};
+ use fabro_interview::{
+     AnswerSubmission, ControlInterviewer, WorkerControlEnvelope, WorkerControlMessage,
+ };
++use fabro_sandbox::SandboxProvider;
+ use fabro_store::{EventEnvelope, RunProjection, RunProjectionReducer};
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::{RunMode, RunNamespace};
+@@ -588,12 +589,13 @@ fn requires_github_credentials(run: &RunNamespace) -> bool {
+     if run.integrations.github.is_token_requested() {
+         return true;
+     }
+-    run.execution.mode != RunMode::DryRun
+-        && clone_sandbox_requires_github_credentials(&run.sandbox.provider)
+-}
+-
+-fn clone_sandbox_requires_github_credentials(provider: &str) -> bool {
+-    matches!(provider, "docker" | "daytona")
++    if run.execution.mode == RunMode::DryRun {
++        return false;
++    }
++    run.sandbox
++        .provider
++        .parse::<SandboxProvider>()
++        .is_ok_and(|p| p.is_clone_based())
+ }
+ 
+ fn install_signal_handlers(
+@@ -674,13 +676,6 @@ mod tests {
+         Arc::new(fabro_workflow::SteeringHub::new(emitter))
+     }
+ 
+-    #[test]
+-    fn clone_sandbox_credentials_are_required_for_clone_based_providers() {
+-        assert!(super::clone_sandbox_requires_github_credentials("docker"));
+-        assert!(super::clone_sandbox_requires_github_credentials("daytona"));
+-        assert!(!super::clone_sandbox_requires_github_credentials("local"));
+-    }
+-
+     fn test_user_principal(login: &str) -> Principal {
+         Principal::user(
+             IdpIdentity::new("https://github.com", "12345").unwrap(),
+diff --git a/lib/crates/fabro-config/src/layers/combine.rs b/lib/crates/fabro-config/src/layers/combine.rs
+index 58a0f2a0..ce82485a 100644
+--- a/lib/crates/fabro-config/src/layers/combine.rs
++++ b/lib/crates/fabro-config/src/layers/combine.rs
+@@ -102,6 +102,12 @@ impl Combine for Option<HashMap<String, toml::Value>> {
+     }
+ }
+ 
++impl Combine for Option<HashMap<String, InterpString>> {
++    fn combine(self, other: Self) -> Self {
++        self.or(other)
++    }
++}
++
+ macro_rules! impl_combine_self {
+     ($($ty:ty),+ $(,)?) => {
+         $(
+diff --git a/lib/crates/fabro-config/src/layers/run.rs b/lib/crates/fabro-config/src/layers/run.rs
+index b4aaabda..23946d17 100644
+--- a/lib/crates/fabro-config/src/layers/run.rs
++++ b/lib/crates/fabro-config/src/layers/run.rs
+@@ -9,7 +9,6 @@ use fabro_types::settings::run::{
+ use fabro_types::settings::{Duration, InterpString, ModelRef, Size};
+ use serde::{Deserialize, Serialize};
+ 
+-use super::combine::Combine;
+ use super::maps::{MergeMap, ReplaceMap, StickyMap};
+ use super::splice_array::SPLICE_MARKER;
+ 
+@@ -66,32 +65,20 @@ pub struct RunIntegrationsLayer {
+ 
+ /// `[run.integrations.github]` — runtime GitHub token shape.
+ ///
+-/// `Combine` is hand-rolled (not derived) for two reasons:
+-/// 1. `HashMap<String, InterpString>: Combine` is not implemented in this
+-///    crate, so `#[derive(Combine)]` would not even compile.
+-/// 2. The `ReplaceMap` "empty inherits from below" semantics (`maps.rs:76-80`)
+-///    are the wrong fit: we want `Some({})` from a higher layer to be honored
+-///    as an explicit clear (no token requested) rather than fall through to a
+-///    lower layer's permissions.
+-///
+-/// Note: this diverges from sibling map fields like `RunLayer::metadata`
+-/// (`ReplaceMap`), where empty-table-means-inherit. Document the
+-/// difference for workflow authors reading the schema by analogy.
+-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
++/// The `permissions` field is `Option<HashMap<...>>` so a higher layer that
++/// sets `permissions = {}` is honored as an explicit clear (no token
++/// requested) rather than falling through to a lower layer. `Combine` for
++/// `Option<HashMap<...>>` uses `or` semantics (defined in `combine.rs`), so
++/// any `Some(_)` (including `Some({})`) wins over the fallback layer. This
++/// diverges from sibling map fields like `RunLayer::metadata` (`ReplaceMap`),
++/// where an empty table means inherit.
++#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+ #[serde(deny_unknown_fields)]
+ pub struct RunIntegrationsGithubLayer {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub permissions: Option<HashMap<String, InterpString>>,
+ }
+ 
+-impl Combine for RunIntegrationsGithubLayer {
+-    fn combine(self, other: Self) -> Self {
+-        Self {
+-            permissions: self.permissions.or(other.permissions),
+-        }
+-    }
+-}
+-
+ /// The source of a run's goal, either inline literal text or a reference to
+ /// a file on disk.
+ ///
+diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs
+index f08a63c7..fbfa7e63 100644
+--- a/lib/crates/fabro-server/src/server.rs
++++ b/lib/crates/fabro-server/src/server.rs
+@@ -1458,10 +1458,6 @@ fn system_sandbox_provider(
+     )
+ }
+ 
+-fn clone_sandbox_can_use_github_credentials(provider: &str) -> bool {
+-    matches!(provider, "docker" | "daytona")
+-}
+-
+ fn parse_system_duration(raw: &str) -> anyhow::Result<chrono::Duration> {
+     let raw = raw.trim();
+     anyhow::ensure!(!raw.is_empty(), "empty duration string");
+@@ -2853,7 +2849,11 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
+         let run_spec = persisted.run_spec();
+         let settings = &run_spec.settings.run;
+         let clone_can_use_github_credentials = settings.execution.mode != RunMode::DryRun
+-            && clone_sandbox_can_use_github_credentials(&settings.sandbox.provider)
++            && settings
++                .sandbox
++                .provider
++                .parse::<SandboxProvider>()
++                .is_ok_and(|p| p.is_clone_based())
+             && run_spec
+                 .repo_origin_url()
+                 .is_some_and(|origin| !origin.trim().is_empty());
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index de9c20af..d1ca8fd6 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -890,13 +890,6 @@ provider = "invalid-provider"
+     );
+ }
+ 
+-#[test]
+-fn clone_sandbox_credentials_are_available_for_clone_based_providers() {
+-    assert!(clone_sandbox_can_use_github_credentials("docker"));
+-    assert!(clone_sandbox_can_use_github_credentials("daytona"));
+-    assert!(!clone_sandbox_can_use_github_credentials("local"));
+-}
+-
+ #[tokio::test]
+ async fn create_secret_stores_file_secret_and_excludes_it_from_snapshot() {
+     let state = test_app_state();
