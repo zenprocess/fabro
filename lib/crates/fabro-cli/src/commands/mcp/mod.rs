@@ -9,12 +9,12 @@ pub(crate) async fn dispatch(ns: McpNamespace, base_ctx: &CommandContext) -> Res
             fabro_mcp_server::start(server_settings(base_ctx, &args.connection)?).await
         }
         McpCommand::Config(args) => {
-            let json = fabro_mcp_server::config_json(config_settings(&args.connection));
+            let json = fabro_mcp_server::config_json(&config_settings(&args.connection))?;
             print!("{json}");
             Ok(())
         }
         McpCommand::Init(args) => {
-            fabro_mcp_server::init_agent(init_settings(args.agent, &args.connection)?)?;
+            fabro_mcp_server::init_agent(&init_settings(args.agent, &args.connection)?)?;
             Ok(())
         }
     }
