@@ -26,7 +26,7 @@ pub(crate) async fn dispatch(ns: McpNamespace, base_ctx: &CommandContext) -> Res
 fn server_settings(
     base_ctx: &CommandContext,
     connection: &ServerConnectionArgs,
-) -> Result<fabro_mcp_server::McpServerSettings> {
+) -> Result<fabro_mcp_server::FabroMcpServerSettings> {
     let connection_ctx = base_ctx.with_connection(connection)?;
     let server_target = user_config::resolve_nondefault_server_target(
         &connection.target,
@@ -37,7 +37,7 @@ fn server_settings(
             .as_unix_socket_path()
             .map_or_else(|| target.to_string(), |path| path.display().to_string())
     });
-    Ok(fabro_mcp_server::McpServerSettings {
+    Ok(fabro_mcp_server::FabroMcpServerSettings {
         config: config_settings(connection),
         server_target,
         storage_dir: connection_ctx.storage_dir().to_path_buf(),

@@ -8,7 +8,7 @@ pub use config::{config_json, init_agent};
 pub use server::start;
 
 #[derive(Debug, Clone)]
-pub struct McpServerSettings {
+pub struct FabroMcpServerSettings {
     pub config:        McpConfigSettings,
     pub server_target: Option<String>,
     pub storage_dir:   PathBuf,

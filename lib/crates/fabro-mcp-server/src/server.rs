@@ -23,20 +23,20 @@ use tokio::sync::OnceCell;
 use tokio::task::yield_now;
 use tokio::time::sleep;
 
-use crate::{McpServerSettings, run_tools};
+use crate::{FabroMcpServerSettings, run_tools};
 
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub(crate) struct FabroMcpServer {
-    settings:    Arc<McpServerSettings>,
+    settings:    Arc<FabroMcpServerSettings>,
     client:      Arc<OnceCell<Arc<Client>>>,
     cwd:         PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
-pub async fn start(settings: McpServerSettings) -> Result<()> {
+pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {
     let server = FabroMcpServer::new(Arc::new(settings));
     let service = serve_server(server, stdio()).await?;
     service.waiting().await?;
@@ -53,7 +53,7 @@ impl ServerHandler for FabroMcpServer {
 
 #[tool_router(router = tool_router)]
 impl FabroMcpServer {
-    pub(crate) fn new(settings: Arc<McpServerSettings>) -> Self {
+    pub(crate) fn new(settings: Arc<FabroMcpServerSettings>) -> Self {
         let cwd = settings.cwd.clone();
         Self {
             settings,
@@ -186,7 +186,7 @@ impl FabroMcpServer {
     }
 }
 
-async fn client_from_settings(settings: &McpServerSettings) -> Result<Client> {
+async fn client_from_settings(settings: &FabroMcpServerSettings) -> Result<Client> {
     yield_now().await;
     if let Some(server) = settings.server_target.as_ref() {
         return connect_target(server, settings).await;
@@ -194,7 +194,7 @@ async fn client_from_settings(settings: &McpServerSettings) -> Result<Client> {
     connect_local_server(settings).await
 }
 
-async fn connect_target(server: &str, settings: &McpServerSettings) -> Result<Client> {
+async fn connect_target(server: &str, settings: &FabroMcpServerSettings) -> Result<Client> {
     let target: ServerTarget = server.parse()?;
     let auth_store = AuthStore::default();
     let mut credential = resolve_target_credential_with_store(&target, &auth_store)?;
@@ -221,7 +221,7 @@ async fn connect_target(server: &str, settings: &McpServerSettings) -> Result<Cl
         .context("failed to connect Fabro API")
 }
 
-async fn connect_local_server(settings: &McpServerSettings) -> Result<Client> {
+async fn connect_local_server(settings: &FabroMcpServerSettings) -> Result<Client> {
     let bind = ensure_local_server_running(&settings.storage_dir, &settings.config_path).await?;
     match bind {
         Bind::Unix(path) => {
