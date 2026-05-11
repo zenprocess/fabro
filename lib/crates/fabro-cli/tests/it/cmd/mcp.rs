@@ -426,12 +426,33 @@ async fn stdio_server_initializes_and_lists_run_tools() {
         "fabro_run_interact",
         "fabro_run_search",
     ]);
-    for (_, _, schema) in tools {
+    for (name, _, schema) in &tools {
         assert!(
             schema.is_object(),
             "tool should have input schema: {schema}"
         );
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("tool input schema should have properties");
+        for (property, property_schema) in properties {
+            assert!(
+                property_schema.is_object(),
+                "{name}.{property} should use an object JSON Schema, got {property_schema}"
+            );
+        }
     }
+    let interact_schema = tools
+        .iter()
+        .find(|(name, _, _)| name == "fabro_run_interact")
+        .map(|(_, _, schema)| schema)
+        .expect("fabro_run_interact tool should be listed");
+    assert!(
+        interact_schema
+            .pointer("/properties/answer")
+            .is_some_and(serde_json::Value::is_object),
+        "fabro_run_interact.answer should have an object JSON Schema: {interact_schema}"
+    );
     client
         .shutdown()
         .await

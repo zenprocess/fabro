@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use fabro_api::types;
 use fabro_client::Client;
 use fabro_types::RunId;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -30,7 +31,70 @@ pub(crate) struct FabroRunInteractParams {
     pub(crate) message:     Option<String>,
     pub(crate) interrupt:   Option<bool>,
     pub(crate) question_id: Option<String>,
-    pub(crate) answer:      Option<Value>,
+    pub(crate) answer:      Option<AnswerValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct AnswerValue(Value);
+
+impl From<Value> for AnswerValue {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+impl AnswerValue {
+    fn into_inner(self) -> Value {
+        self.0
+    }
+}
+
+impl JsonSchema for AnswerValue {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "AnswerValue".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "description": "Answer payload for a pending Fabro question. Use a boolean for yes/no, a string or {\"text\": \"...\"} for freeform text, {\"option\": \"key\"} for a single choice, or {\"options\": [\"key\"]} for multi-select.",
+            "anyOf": [
+                { "type": "boolean" },
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "option": { "type": "string" }
+                    },
+                    "required": ["option"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "options": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["options"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -116,7 +180,7 @@ impl TryFrom<FabroRunInteractParams> for ValidatedInteractRun {
                 };
                 ValidatedInteractAction::Answer {
                     question_id: question_id.to_string(),
-                    body:        answer_to_submit_request(answer)?,
+                    body:        answer_to_submit_request(answer.into_inner())?,
                 }
             }
         };
@@ -326,7 +390,7 @@ mod tests {
             message:     None,
             interrupt:   None,
             question_id: Some("question-1".to_string()),
-            answer:      Some(json!({ "value": "yes" })),
+            answer:      Some(json!({ "value": "yes" }).into()),
         })
         .unwrap_err();
 
