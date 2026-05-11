@@ -11,6 +11,7 @@ use crate::sandbox::StdioProcessControl;
 use crate::{
     DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, GrepOptions, Sandbox, SandboxEvent,
     SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
+    StdioProcessTermination,
 };
 
 // --- MockSandbox ---
@@ -117,8 +118,8 @@ impl StdioProcessControl for MockStdioProcessControl {
         Ok(())
     }
 
-    async fn wait(&self) -> crate::Result<CommandTermination> {
-        Ok(CommandTermination::Exited)
+    async fn wait(&self) -> crate::Result<StdioProcessTermination> {
+        Ok(StdioProcessTermination::exited(Some(0)))
     }
 }
 

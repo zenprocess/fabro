@@ -85,6 +85,77 @@ fn acp_backend_workflow() {
     );
 }
 
+#[test]
+fn acp_prompt_workflow_uses_acp_backend() {
+    let mut context = test_context!();
+    context.write_home(
+        ".fabro/settings.toml",
+        "[server.auth]\nmethods = [\"dev-token\"]\n",
+    );
+    context.isolated_server();
+    seed_openai_vault(&context.storage_dir);
+    let fake_agent = fixture("fake_acp_agent.py");
+    let workflow = context.temp_dir.join("acp_prompt_backend.fabro");
+    context.write_temp(
+        "acp_prompt_backend.fabro",
+        format!(
+            r#"digraph ACP {{
+  graph [goal="Exercise ACP prompt backend"]
+  start [shape=Mdiamond]
+  prompt [type="prompt", backend="acp", provider="openai", model="fake-acp", project_memory=false, prompt="write hello.txt", acp_command="python3 {}"]
+  exit [shape=Msquare]
+  start -> prompt
+  prompt -> exit
+}}"#,
+            fake_agent.display()
+        ),
+    );
+    init_git_repo(&context.temp_dir);
+
+    context
+        .run_cmd()
+        .args(["--auto-approve", "--sandbox", "local"])
+        .arg(&workflow)
+        .assert()
+        .success();
+
+    let run_dir = find_run_dir(&context);
+    let conclusion = read_conclusion(&run_dir);
+    assert_eq!(conclusion["status"].as_str(), Some("succeeded"));
+
+    let events = run_events(&run_dir);
+    assert!(has_event(&run_dir, "agent.acp.started"));
+    assert!(has_event(&run_dir, "agent.acp.completed"));
+    assert!(
+        !has_event(&run_dir, "agent.session.activated"),
+        "ACP prompt should not activate an API-mode agent session"
+    );
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.event.body {
+            EventBody::StageCompleted(props)
+                if event.event.node_id.as_deref() == Some("prompt") =>
+            {
+                Some(props)
+            }
+            _ => None,
+        })
+        .expect("prompt stage should complete");
+    assert_eq!(completed.response.as_deref(), Some("hello from acp"));
+
+    let state = serde_json::to_value(run_state(&run_dir)).expect("run state should serialize");
+    let stages = state["stages"]
+        .as_object()
+        .expect("run state should contain stages");
+    assert!(
+        stages.values().any(|stage| {
+            stage["provider_used"]["mode"] == "acp"
+                && stage["provider_used"]["provider"] == "openai"
+        }),
+        "run projection should include ACP provider metadata: {stages:?}"
+    );
+}
+
 fn seed_openai_vault(storage_dir: &std::path::Path) {
     let mut vault =
         Vault::load(Storage::new(storage_dir).secrets_path()).expect("test vault should load");

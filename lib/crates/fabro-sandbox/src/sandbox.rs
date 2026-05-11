@@ -754,15 +754,39 @@ impl StdioProcessHandle {
         self.control.terminate().await
     }
 
-    pub async fn wait(&self) -> crate::Result<CommandTermination> {
+    pub async fn wait(&self) -> crate::Result<StdioProcessTermination> {
         self.control.wait().await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdioProcessTermination {
+    pub termination: CommandTermination,
+    pub exit_code:   Option<i32>,
+}
+
+impl StdioProcessTermination {
+    #[must_use]
+    pub fn exited(exit_code: Option<i32>) -> Self {
+        Self {
+            termination: CommandTermination::Exited,
+            exit_code,
+        }
+    }
+
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            termination: CommandTermination::Cancelled,
+            exit_code:   None,
+        }
     }
 }
 
 #[async_trait]
 pub(crate) trait StdioProcessControl: Send + Sync {
     async fn terminate(&self) -> crate::Result<()>;
-    async fn wait(&self) -> crate::Result<CommandTermination>;
+    async fn wait(&self) -> crate::Result<StdioProcessTermination>;
 }
 
 #[derive(Debug, Clone)]

@@ -30,7 +30,7 @@ use crate::sandbox::{StdioProcessControl, optional_timeout, resolve_path};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
-    StdioProcess, StdioProcessHandle, format_lines_numbered, shell_quote,
+    StdioProcess, StdioProcessHandle, StdioProcessTermination, format_lines_numbered, shell_quote,
 };
 
 const WORKING_DIRECTORY: &str = "/workspace";
@@ -882,7 +882,7 @@ struct DockerStdioProcessControl {
     container_id: String,
     exec_id:      String,
     stop_file:    String,
-    termination:  TokioMutex<Option<CommandTermination>>,
+    termination:  TokioMutex<Option<StdioProcessTermination>>,
 }
 
 #[async_trait]
@@ -892,11 +892,11 @@ impl StdioProcessControl for DockerStdioProcessControl {
             return Ok(());
         }
         request_docker_exec_stop_with(&self.docker, &self.container_id, &self.stop_file).await?;
-        *self.termination.lock().await = Some(CommandTermination::Cancelled);
+        *self.termination.lock().await = Some(StdioProcessTermination::cancelled());
         Ok(())
     }
 
-    async fn wait(&self) -> crate::Result<CommandTermination> {
+    async fn wait(&self) -> crate::Result<StdioProcessTermination> {
         if let Some(termination) = *self.termination.lock().await {
             return Ok(termination);
         }
@@ -908,8 +908,10 @@ impl StdioProcessControl for DockerStdioProcessControl {
                 .await
                 .map_err(|e| crate::Error::context("Failed to inspect Docker stdio exec", e))?;
             if inspect.running != Some(true) {
-                *self.termination.lock().await = Some(CommandTermination::Exited);
-                return Ok(CommandTermination::Exited);
+                let exit_code = inspect.exit_code.and_then(|code| i32::try_from(code).ok());
+                let termination = StdioProcessTermination::exited(exit_code);
+                *self.termination.lock().await = Some(termination);
+                return Ok(termination);
             }
             time::sleep(std::time::Duration::from_millis(50)).await;
         }

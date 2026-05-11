@@ -309,7 +309,18 @@ async fn early_exit_returns_protocol_error_with_stderr() {
     .await
     .expect_err("early exit should error");
 
-    assert!(matches!(err, AcpError::Protocol(_)));
+    let AcpError::Protocol(error) = err else {
+        panic!("expected protocol error");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("exit_code=2"),
+        "early exit should include exit code in diagnostic: {message}"
+    );
+    assert!(
+        message.contains("early boom"),
+        "early exit should include stderr tail in diagnostic: {message}"
+    );
 }
 
 async fn run_fake_agent(

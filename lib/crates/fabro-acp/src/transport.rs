@@ -129,8 +129,12 @@ impl ConnectTo<Client> for SandboxAcpTransport {
             termination = handle.wait() => {
                 let termination = termination.map_err(ProtocolError::into_internal_error)?;
                 let stderr = stderr.tail_string().await;
+                let exit_code = termination
+                    .exit_code
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string());
                 Err(internal_error(format!(
-                    "ACP process exited before protocol completed: termination={termination:?}, stderr={stderr}"
+                    "ACP process exited before protocol completed: termination={}, exit_code={exit_code}, stderr={stderr}",
+                    termination.termination,
                 )))
             }
         }

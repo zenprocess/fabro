@@ -16,7 +16,7 @@ use crate::sandbox::{StdioProcessControl, optional_timeout};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
-    StdioProcess, StdioProcessHandle, format_lines_numbered,
+    StdioProcess, StdioProcessHandle, StdioProcessTermination, format_lines_numbered,
 };
 
 pub struct LocalSandbox {
@@ -145,7 +145,7 @@ where
 
 struct LocalStdioProcessControl {
     child:       TokioMutex<Child>,
-    termination: TokioMutex<Option<CommandTermination>>,
+    termination: TokioMutex<Option<StdioProcessTermination>>,
 }
 
 #[async_trait]
@@ -157,22 +157,23 @@ impl StdioProcessControl for LocalStdioProcessControl {
 
         let mut child = self.child.lock().await;
         sigterm_then_kill(&mut child).await;
-        *self.termination.lock().await = Some(CommandTermination::Cancelled);
+        *self.termination.lock().await = Some(StdioProcessTermination::cancelled());
         Ok(())
     }
 
-    async fn wait(&self) -> crate::Result<CommandTermination> {
+    async fn wait(&self) -> crate::Result<StdioProcessTermination> {
         if let Some(termination) = *self.termination.lock().await {
             return Ok(termination);
         }
 
         let mut child = self.child.lock().await;
-        child
+        let status = child
             .wait()
             .await
             .map_err(|e| crate::Error::context("Failed to wait for stdio process", e))?;
-        *self.termination.lock().await = Some(CommandTermination::Exited);
-        Ok(CommandTermination::Exited)
+        let termination = StdioProcessTermination::exited(status.code());
+        *self.termination.lock().await = Some(termination);
+        Ok(termination)
     }
 }
 
