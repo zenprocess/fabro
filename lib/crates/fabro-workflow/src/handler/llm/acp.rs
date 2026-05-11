@@ -337,11 +337,12 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use fabro_agent::{LocalSandbox, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_model::Provider;
+    use fabro_types::EventBody;
     use tokio_util::sync::CancellationToken;
 
     use super::AgentAcpBackend;
@@ -502,6 +503,71 @@ mod tests {
         };
 
         assert!(matches!(err, crate::error::Error::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn acp_started_event_omits_json_command_env_values() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_agent_script())
+            .await
+            .unwrap();
+
+        let raw_command = serde_json::json!({
+            "type": "stdio",
+            "name": "fake",
+            "command": "python3",
+            "args": [script_path.to_string_lossy()],
+            "env": [
+                {"name": "OPENAI_API_KEY", "value": "secret-key"}
+            ],
+        })
+        .to_string();
+        let mut node = Node::new("work");
+        node.attrs.insert(
+            "provider".to_string(),
+            AttrValue::String("openai".to_string()),
+        );
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs
+            .insert("acp_command".to_string(), AttrValue::String(raw_command));
+
+        let backend = AgentAcpBackend::new_from_env("fake-acp".to_string(), Provider::OpenAi);
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        emitter.on_event({
+            let events = Arc::clone(&events);
+            move |event| events.lock().unwrap().push(event.clone())
+        });
+
+        backend
+            .run(
+                &node,
+                "write hello",
+                &Context::new(),
+                None,
+                &emitter,
+                &sandbox,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let command = events
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::AgentAcpStarted(props) => Some(props.command.as_str()),
+                _ => None,
+            })
+            .expect("ACP started event should be emitted");
+        assert!(command.contains("python3"));
+        assert!(command.contains("fake_acp_agent.py"));
+        assert!(!command.contains("OPENAI_API_KEY"));
+        assert!(!command.contains("secret-key"));
     }
 
     fn fake_agent_script() -> &'static str {

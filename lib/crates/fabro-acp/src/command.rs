@@ -37,11 +37,7 @@ impl AcpCommand {
 
     #[must_use]
     pub fn to_shell_command(&self) -> String {
-        std::iter::once(self.program.to_string_lossy().into_owned())
-            .chain(self.args.iter().cloned())
-            .map(|part| fabro_sandbox::shell_quote(&part))
-            .collect::<Vec<_>>()
-            .join(" ")
+        render_command(&self.program, &self.args)
     }
 }
 
@@ -123,16 +119,28 @@ fn parse_acp_command(raw: &str) -> Result<AcpCommand, AcpCommandError> {
         return Err(AcpCommandError::UnsupportedTransport);
     };
 
+    let program = stdio.command;
+    let args = stdio.args;
+    let display = render_command(&program, &args);
+
     Ok(AcpCommand {
-        display: raw.to_string(),
-        program: stdio.command,
-        args:    stdio.args,
-        env:     stdio
+        display,
+        program,
+        args,
+        env: stdio
             .env
             .into_iter()
             .map(|env| (env.name, env.value))
             .collect(),
     })
+}
+
+fn render_command(program: &Path, args: &[String]) -> String {
+    std::iter::once(program.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|part| fabro_sandbox::shell_quote(&part))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn reject_non_stdio_json_transport(raw: &str) -> Result<(), AcpCommandError> {
@@ -226,6 +234,20 @@ mod tests {
         assert_eq!(command.program(), Path::new("python"));
         assert_eq!(command.args(), &["fake agent.py".to_string()]);
         assert_eq!(command.env().get("MODE").map(String::as_str), Some("test"));
+    }
+
+    #[test]
+    fn json_stdio_acp_command_display_omits_env_contents() {
+        let raw = r#"{"type":"stdio","name":"fake","command":"agent","args":["--flag","two words"],"env":[{"name":"OPENAI_API_KEY","value":"secret-key"}]}"#;
+        let command = resolve_acp_command(Provider::OpenAi, Some(raw)).unwrap();
+
+        assert_eq!(
+            command.env().get("OPENAI_API_KEY").map(String::as_str),
+            Some("secret-key")
+        );
+        assert_eq!(command.to_string(), "agent --flag 'two words'");
+        assert!(!command.to_string().contains("secret-key"));
+        assert!(!command.to_string().contains("OPENAI_API_KEY"));
     }
 
     #[test]
