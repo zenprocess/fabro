@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use fabro_client::{AuthEntry, AuthStore, OAuthEntry, StoredSubject};
+use fabro_client::{AuthEntry, AuthStore, DevTokenEntry, OAuthEntry, StoredSubject};
 use fabro_mcp::client::McpClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
@@ -488,7 +488,7 @@ async fn mcp_create_and_search_manage_real_runs_with_cli_auth() {
             "source": "mcp-test"
           },
           "source_directory": "[SOURCE_DIRECTORY]",
-          "repo_origin_url": "[REPO_ORIGIN_URL]",
+          "repo_origin_url": null,
           "goal": "Run tests and report results"
         }
       ],
@@ -756,6 +756,66 @@ async fn mcp_search_refreshes_expired_oauth_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mcp_search_uses_fabro_auth_file_override() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let target_url = format!("{}/api/v1", server.base_url());
+    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
+    let auth_file = context.temp_dir.join("custom-auth.json");
+    AuthStore::new(auth_file.clone())
+        .put(
+            &target,
+            AuthEntry::DevToken(DevTokenEntry {
+                token:        TEST_DEV_TOKEN.to_string(),
+                logged_in_at: Utc::now(),
+            }),
+        )
+        .expect("custom auth store should be seeded");
+    let run_id = unique_run_id();
+    let list_runs = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/runs")
+            .header("authorization", format!("Bearer {TEST_DEV_TOKEN}"))
+            .query_param("include_archived", "true")
+            .query_param("page[limit]", "100")
+            .query_param("page[offset]", "0");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "data": [remote_run_summary_json(
+                    &run_id,
+                    "Simple",
+                    "simple",
+                    "Custom auth file",
+                    &serde_json::json!({ "kind": "submitted" }),
+                    "2026-04-05T12:00:00Z",
+                )],
+                "meta": { "has_more": false }
+            }));
+    });
+    let mut fixture = mcp_stdio_fixture(&context, &["--server", &target_url]);
+    fixture.env.insert(
+        "FABRO_AUTH_FILE".to_string(),
+        auth_file.display().to_string(),
+    );
+    let client = spawn_mcp_client_from_fixture(fixture).await;
+
+    let result = call_tool_json(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({ "run_ids": [run_id], "first": 1 }),
+    )
+    .await;
+
+    assert_eq!(result["runs"][0]["run_id"], run_id);
+    list_runs.assert();
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_search_orders_by_started_timestamp_before_created_timestamp() {
     let context = test_context!();
     let server = MockServer::start();
@@ -908,7 +968,7 @@ async fn mcp_lifecycle_tools_manage_real_run() {
               "source": "mcp-test"
             },
             "source_directory": "[SOURCE_DIRECTORY]",
-            "repo_origin_url": "[REPO_ORIGIN_URL]",
+            "repo_origin_url": null,
             "goal": "Run tests and report results"
           }
         ],
@@ -1834,12 +1894,18 @@ fn mcp_stdio_fixture(context: &fabro_test::TestContext, extra_args: &[&str]) -> 
 
 async fn spawn_mcp_client(context: &fabro_test::TestContext, extra_args: &[&str]) -> McpClient {
     let fixture = mcp_stdio_fixture(context, extra_args);
+    spawn_mcp_client_from_fixture(fixture).await
+}
+
+async fn spawn_mcp_client_from_fixture(fixture: McpStdioFixture) -> McpClient {
     let config = McpServerSettings {
         name:                 "fabro-under-test".to_string(),
         transport:            McpTransport::Stdio {
             command: fixture.command,
             env:     fixture.env,
         },
+        current_dir:          Some(fixture.current_dir),
+        clear_env:            true,
         startup_timeout_secs: 10,
         tool_timeout_secs:    30,
     };

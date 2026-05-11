@@ -53,8 +53,14 @@ impl McpClient {
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
 
+                if config.clear_env {
+                    cmd.env_clear();
+                }
                 if !env.is_empty() {
                     cmd.envs(env);
+                }
+                if let Some(current_dir) = config.current_dir.as_ref() {
+                    cmd.current_dir(current_dir);
                 }
 
                 #[cfg(unix)]

@@ -194,7 +194,7 @@ async fn client_from_settings(settings: &McpServerSettings) -> Result<Client> {
 
 async fn connect_target(server: &str, settings: &McpServerSettings) -> Result<Client> {
     let target: ServerTarget = server.parse()?;
-    let auth_store = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"));
+    let auth_store = AuthStore::default();
     let mut credential = resolve_target_credential_with_store(&target, &auth_store)?;
     if credential.is_none() && target.is_unix_socket() {
         let runtime_token_path = Storage::new(&settings.storage_dir)
@@ -238,7 +238,7 @@ async fn connect_local_server(settings: &McpServerSettings) -> Result<Client> {
         }
         Bind::Tcp(addr) => {
             let target = ServerTarget::http_url(format!("http://{addr}"))?;
-            let auth_store = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"));
+            let auth_store = AuthStore::default();
             let credential = resolve_target_credential_with_store(&target, &auth_store)?;
             let oauth_session = refreshable_oauth(&target, &auth_store, credential.as_ref());
             let mut builder = Client::builder()
