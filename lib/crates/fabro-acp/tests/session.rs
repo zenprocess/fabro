@@ -12,12 +12,22 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+#[allow(
+    unused,
+    unreachable_pub,
+    reason = "integration test imports the shared test fixture source as a private module"
+)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::fake_acp_agent_script;
+
 #[tokio::test]
 async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let script_path = tempdir.path().join("fake_acp_agent.py");
     let record_path = tempdir.path().join("methods.txt");
-    write(&script_path, fake_agent_script())
+    write(&script_path, fake_acp_agent_script())
         .await
         .expect("write fake ACP agent");
 
@@ -338,7 +348,7 @@ async fn run_fake_agent(
     cancel_token: CancellationToken,
 ) -> Result<AcpRunResult, AcpError> {
     let script_path = tempdir.join("fake_acp_agent.py");
-    write(&script_path, fake_agent_script())
+    write(&script_path, fake_acp_agent_script())
         .await
         .expect("write fake ACP agent");
     let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
@@ -381,129 +391,4 @@ async fn process_is_running(pid: &str) -> bool {
         .chars()
         .find(|ch| !ch.is_whitespace())
         .is_none_or(|state| !matches!(state, 'Z' | 'z'))
-}
-
-fn fake_agent_script() -> &'static str {
-    r#"
-import json
-import os
-import signal
-import sys
-import time
-
-methods = []
-session_id = "sess-1"
-
-if os.environ.get("ACP_PID_RECORD"):
-    with open(os.environ["ACP_PID_RECORD"], "w", encoding="utf-8") as record:
-        record.write(str(os.getpid()))
-
-def handle_sigterm(signum, frame):
-    if os.environ.get("ACP_LINGER_TERMINATED"):
-        with open(os.environ["ACP_LINGER_TERMINATED"], "w", encoding="utf-8") as record:
-            record.write("terminated\n")
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, handle_sigterm)
-
-def send(message):
-    print(json.dumps(message), flush=True)
-
-def respond(message, result):
-    send({"jsonrpc": "2.0", "id": message["id"], "result": result})
-
-def record_methods():
-    if os.environ.get("ACP_RECORD"):
-        with open(os.environ["ACP_RECORD"], "w", encoding="utf-8") as record:
-            record.write("\n".join(methods) + "\n")
-
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    methods.append(method)
-
-    if method == "initialize":
-        if os.environ.get("ACP_MODE") == "slow_initialize":
-            time.sleep(60)
-        respond(message, {"protocolVersion": 1, "agentCapabilities": {}})
-    elif method == "session/new":
-        if os.environ.get("ACP_SESSION_NEW_PARAMS"):
-            with open(os.environ["ACP_SESSION_NEW_PARAMS"], "w", encoding="utf-8") as record:
-                record.write(json.dumps(message.get("params", {}), separators=(",", ":")))
-        respond(message, {"sessionId": session_id})
-    elif method == "session/prompt":
-        mode = os.environ.get("ACP_MODE", "normal")
-        if mode == "timeout":
-            time.sleep(60)
-        if mode == "malformed":
-            print("malformed json", file=sys.stderr, flush=True)
-            print("{not-json", flush=True)
-            break
-        if mode == "early_exit":
-            print("early boom", file=sys.stderr, flush=True)
-            sys.exit(2)
-        if mode == "write_file":
-            with open("hello.txt", "w", encoding="utf-8") as file:
-                file.write("hello from sandbox\n")
-        if mode == "cancel":
-            for cancel_line in sys.stdin:
-                cancel_message = json.loads(cancel_line)
-                if cancel_message.get("method") == "session/cancel":
-                    with open(os.environ["ACP_CANCEL_RECORD"], "w", encoding="utf-8") as record:
-                        record.write("session/cancel\n")
-                    respond(message, {"stopReason": "cancelled"})
-                    sys.exit(0)
-        if mode == "permission":
-            send({
-                "jsonrpc": "2.0",
-                "id": "permission-1",
-                "method": "session/request_permission",
-                "params": {
-                    "sessionId": session_id,
-                    "toolCall": {"toolCallId": "tool-1"},
-                    "options": [
-                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
-                        {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
-                        {"optionId": "always", "name": "Allow always", "kind": "allow_always"}
-                    ]
-                }
-            })
-            permission_response = json.loads(sys.stdin.readline())
-            with open(os.environ["ACP_PERMISSION"], "w", encoding="utf-8") as permission:
-                permission.write(json.dumps(permission_response.get("result", {}), separators=(",", ":")))
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "hello "}
-                }
-            }
-        })
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "from acp"}
-                }
-            }
-        })
-        record_methods()
-        respond(message, {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")})
-        if mode == "linger_after_response":
-            while True:
-                time.sleep(1)
-        break
-    else:
-        send({
-            "jsonrpc": "2.0",
-            "id": message.get("id"),
-            "error": {"code": -32601, "message": "method not found"}
-        })
-"#
 }

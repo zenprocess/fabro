@@ -24,11 +24,24 @@ pub fn fake_acp_agent_script() -> &'static str {
     r#"
 import json
 import os
+import signal
 import sys
 import time
 
 methods = []
 session_id = "sess-1"
+
+if os.environ.get("ACP_PID_RECORD"):
+    with open(os.environ["ACP_PID_RECORD"], "w", encoding="utf-8") as record:
+        record.write(str(os.getpid()))
+
+def handle_sigterm(signum, frame):
+    if os.environ.get("ACP_LINGER_TERMINATED"):
+        with open(os.environ["ACP_LINGER_TERMINATED"], "w", encoding="utf-8") as record:
+            record.write("terminated\n")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 def send(message):
     print(json.dumps(message), flush=True)
@@ -47,6 +60,8 @@ for line in sys.stdin:
     methods.append(method)
 
     if method == "initialize":
+        if os.environ.get("ACP_MODE") == "slow_initialize":
+            time.sleep(60)
         respond(message, {"protocolVersion": 1, "agentCapabilities": {}})
     elif method == "session/new":
         if os.environ.get("ACP_SESSION_NEW_PARAMS"):
@@ -110,6 +125,9 @@ for line in sys.stdin:
             })
         record_methods()
         respond(message, {"stopReason": os.environ.get("ACP_STOP_REASON", "end_turn")})
+        if mode == "linger_after_response":
+            while True:
+                time.sleep(1)
         break
     else:
         send({
