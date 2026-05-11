@@ -12,6 +12,8 @@ use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use chrono::{Duration as ChronoDuration, Utc};
+use fabro_client::{AuthEntry, AuthStore, OAuthEntry, StoredSubject};
 use fabro_mcp::client::McpClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
@@ -653,6 +655,100 @@ async fn mcp_search_includes_archived_runs_by_default() {
             .any(|run| run["archived"] == true)
     );
     list_runs.assert();
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_search_refreshes_expired_oauth_token() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let target_url = format!("{}/api/v1", server.base_url());
+    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
+    seed_oauth_auth(
+        &context.home_dir,
+        &target,
+        "expired-access",
+        "refresh-octocat",
+    );
+    let run_id = unique_run_id();
+    let expired_access = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/runs")
+            .header("authorization", "Bearer expired-access");
+        then.status(401)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "errors": [{
+                    "detail": "access token expired",
+                    "code": "access_token_expired"
+                }]
+            }));
+    });
+    let refresh = server.mock(|when, then| {
+        when.method(POST)
+            .path("/auth/cli/refresh")
+            .header("authorization", "Bearer refresh-octocat");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "access_token_expires_at": (Utc::now() + ChronoDuration::minutes(10)).to_rfc3339(),
+                "refresh_token": "fresh-refresh",
+                "refresh_token_expires_at": (Utc::now() + ChronoDuration::days(30)).to_rfc3339(),
+                "subject": {
+                    "idp_issuer": "https://github.com",
+                    "idp_subject": "12345",
+                    "login": "octocat",
+                    "name": "The Octocat",
+                    "email": "octocat@example.com"
+                }
+            }));
+    });
+    let fresh_access = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/runs")
+            .header("authorization", "Bearer fresh-access")
+            .query_param("include_archived", "true")
+            .query_param("page[limit]", "100")
+            .query_param("page[offset]", "0");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "data": [remote_run_summary_json(
+                    &run_id,
+                    "Simple",
+                    "simple",
+                    "OAuth refreshed",
+                    &serde_json::json!({ "kind": "submitted" }),
+                    "2026-04-05T12:00:00Z",
+                )],
+                "meta": { "has_more": false }
+            }));
+    });
+    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
+
+    let result = call_tool_json(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({ "run_ids": [run_id], "first": 1 }),
+    )
+    .await;
+
+    assert_eq!(result["runs"][0]["run_id"], run_id);
+    expired_access.assert();
+    refresh.assert();
+    fresh_access.assert();
+    let stored = AuthStore::new(context.home_dir.join(".fabro/auth.json"))
+        .get(&target)
+        .unwrap()
+        .unwrap();
+    let AuthEntry::OAuth(stored) = stored else {
+        panic!("expected refreshed OAuth entry");
+    };
+    assert_eq!(stored.access_token, "fresh-access");
     client
         .shutdown()
         .await
@@ -1496,6 +1592,7 @@ async fn mcp_events_desc_after_offset_and_limit_page_over_requested_order() {
     .await;
 
     assert_eq!(desc["events"][0]["event_id"], "evt-5");
+    assert_eq!(desc["next_cursor"], 5);
     assert_eq!(paged["events"][0]["event_id"], "evt-3");
     assert_eq!(paged["events"][1]["event_id"], "evt-4");
     assert_eq!(paged["next_cursor"], 5);
@@ -1503,6 +1600,80 @@ async fn mcp_events_desc_after_offset_and_limit_page_over_requested_order() {
     limited_events.assert_calls(0);
     full_events.assert();
     after_events.assert();
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_events_desc_cursor_continues_to_older_events() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let target_url = format!("{}/api/v1", server.base_url());
+    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
+    seed_dev_token_auth(&context.home_dir, &target, TEST_DEV_TOKEN);
+    let run_id = unique_run_id();
+    let resolve = mock_resolved_run(&server, "nightly", &run_id);
+    let events = (1..=5)
+        .map(|sequence| {
+            serde_json::json!({
+                "seq": sequence,
+                "id": format!("evt-{sequence}"),
+                "ts": format!("2026-04-05T12:00:0{sequence}Z"),
+                "run_id": run_id,
+                "event": "run.started",
+                "properties": { "name": format!("event {sequence}") },
+                "actor": null
+            })
+        })
+        .collect::<Vec<_>>();
+    let full_events = server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/api/v1/runs/{run_id}/events"))
+            .query_param_missing("limit")
+            .query_param_missing("since_seq");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "data": events,
+                "meta": { "has_more": false }
+            }));
+    });
+    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
+
+    let first_page = call_tool_json(
+        &client,
+        "fabro_run_events",
+        serde_json::json!({
+            "run_id": "nightly",
+            "action": "list",
+            "direction": "desc",
+            "first": 2
+        }),
+    )
+    .await;
+    let second_page = call_tool_json(
+        &client,
+        "fabro_run_events",
+        serde_json::json!({
+            "run_id": "nightly",
+            "action": "list",
+            "direction": "desc",
+            "after": first_page["next_cursor"],
+            "first": 2
+        }),
+    )
+    .await;
+
+    assert_eq!(first_page["events"][0]["event_id"], "evt-5");
+    assert_eq!(first_page["events"][1]["event_id"], "evt-4");
+    assert_eq!(first_page["next_cursor"], 4);
+    assert_eq!(second_page["events"][0]["event_id"], "evt-3");
+    assert_eq!(second_page["events"][1]["event_id"], "evt-2");
+    assert_eq!(second_page["next_cursor"], 2);
+    resolve.assert_calls(2);
+    full_events.assert_calls(2);
     client
         .shutdown()
         .await
@@ -1743,6 +1914,34 @@ async fn create_mcp_run(client: &McpClient, workflow: PathBuf, start: bool) -> S
         .as_str()
         .expect("create result should include run id")
         .to_string()
+}
+
+fn seed_oauth_auth(
+    home_dir: &Path,
+    target: &fabro_client::ServerTarget,
+    access_token: &str,
+    refresh_token: &str,
+) {
+    let now = Utc::now();
+    AuthStore::new(home_dir.join(".fabro/auth.json"))
+        .put(
+            target,
+            AuthEntry::OAuth(OAuthEntry {
+                access_token:             access_token.to_string(),
+                access_token_expires_at:  now - ChronoDuration::minutes(1),
+                refresh_token:            refresh_token.to_string(),
+                refresh_token_expires_at: now + ChronoDuration::days(30),
+                subject:                  StoredSubject {
+                    idp_issuer:  "https://github.com".to_string(),
+                    idp_subject: "12345".to_string(),
+                    login:       "octocat".to_string(),
+                    name:        "The Octocat".to_string(),
+                    email:       "octocat@example.com".to_string(),
+                },
+                logged_in_at:             now,
+            }),
+        )
+        .unwrap_or_else(|err| panic!("failed to seed OAuth auth: {err}"));
 }
 
 fn normalize_run_search(mut value: serde_json::Value) -> serde_json::Value {

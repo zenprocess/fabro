@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use fabro_client::{
-    AuthEntry, AuthStore, Client, Credential, ServerTarget, TransportConnector,
+    AuthEntry, AuthStore, Client, Credential, OAuthSession, ServerTarget, TransportConnector,
     apply_bearer_token_auth,
 };
 use fabro_config::bind::Bind;
@@ -194,21 +194,24 @@ async fn client_from_settings(settings: &McpServerSettings) -> Result<Client> {
 
 async fn connect_target(server: &str, settings: &McpServerSettings) -> Result<Client> {
     let target: ServerTarget = server.parse()?;
-    let mut credential = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"))
-        .get(&target)?
-        .map(credential_from_auth_entry);
+    let auth_store = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"));
+    let mut credential = resolve_target_credential_with_store(&target, &auth_store)?;
     if credential.is_none() && target.is_unix_socket() {
         let runtime_token_path = Storage::new(&settings.storage_dir)
             .runtime_directory()
             .dev_token_path();
         credential = dev_token::read_dev_token_file(&runtime_token_path).map(Credential::DevToken);
     }
+    let oauth_session = refreshable_oauth(&target, &auth_store, credential.as_ref());
     let mut builder = Client::builder()
         .target(target.clone())
         .transport_connector(target_transport_connector(target))
         .request_timeout(CLIENT_REQUEST_TIMEOUT);
     if let Some(credential) = credential {
         builder = builder.credential(credential);
+    }
+    if let Some(oauth_session) = oauth_session {
+        builder = builder.oauth_session(oauth_session);
     }
     builder
         .connect()
@@ -235,15 +238,18 @@ async fn connect_local_server(settings: &McpServerSettings) -> Result<Client> {
         }
         Bind::Tcp(addr) => {
             let target = ServerTarget::http_url(format!("http://{addr}"))?;
-            let credential = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"))
-                .get(&target)?
-                .map(credential_from_auth_entry);
+            let auth_store = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"));
+            let credential = resolve_target_credential_with_store(&target, &auth_store)?;
+            let oauth_session = refreshable_oauth(&target, &auth_store, credential.as_ref());
             let mut builder = Client::builder()
                 .target(target.clone())
                 .transport_connector(target_transport_connector(target))
                 .request_timeout(CLIENT_REQUEST_TIMEOUT);
             if let Some(credential) = credential {
                 builder = builder.credential(credential);
+            }
+            if let Some(oauth_session) = oauth_session {
+                builder = builder.oauth_session(oauth_session);
             }
             builder.connect().await
         }
@@ -299,11 +305,32 @@ async fn wait_for_runtime_dev_token(path: &Path) -> Result<String> {
     ))
 }
 
-fn credential_from_auth_entry(entry: AuthEntry) -> Credential {
+fn resolve_target_credential_with_store(
+    target: &ServerTarget,
+    store: &AuthStore,
+) -> Result<Option<Credential>> {
+    let Some(entry) = store.get(target)? else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
     match entry {
-        AuthEntry::OAuth(entry) => Credential::OAuth(entry),
-        AuthEntry::DevToken(entry) => Credential::DevToken(entry.token),
+        AuthEntry::DevToken(entry) => Ok(Some(Credential::DevToken(entry.token))),
+        AuthEntry::OAuth(entry)
+            if entry.access_token_expires_at > now || entry.refresh_token_expires_at > now =>
+        {
+            Ok(Some(Credential::OAuth(entry)))
+        }
+        AuthEntry::OAuth(_) => Ok(None),
     }
+}
+
+fn refreshable_oauth(
+    target: &ServerTarget,
+    auth_store: &AuthStore,
+    credential: Option<&Credential>,
+) -> Option<OAuthSession> {
+    matches!(credential, Some(Credential::OAuth(_)))
+        .then(|| OAuthSession::new(target.clone(), auth_store.clone()))
 }
 
 fn target_transport_connector(target: ServerTarget) -> TransportConnector {

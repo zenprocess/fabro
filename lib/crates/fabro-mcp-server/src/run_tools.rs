@@ -11,13 +11,12 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, NaiveDate, Utc};
 use fabro_api::types;
 use fabro_client::Client;
-use fabro_config::{
-    CliLayer, ReplaceMap, RunExecutionLayer, RunGoalLayer, RunLayer, RunModelLayer, RunSandboxLayer,
+use fabro_config::{CliLayer, RunLayer};
+use fabro_manifest::{
+    ManifestBuildInput, RunOverrideInput, build_run_manifest as build_canonical_run_manifest,
+    build_sparse_run_overrides,
 };
-use fabro_manifest::{ManifestBuildInput, build_run_manifest as build_canonical_run_manifest};
 use fabro_server::manifest_validation;
-use fabro_types::settings::InterpString;
-use fabro_types::settings::run::{ApprovalMode, RunMode};
 use fabro_types::{EventEnvelope, Run, RunId, RunStatus};
 use fabro_util::exit::{self, ExitClass};
 use rmcp::model::{CallToolResult, Content};
@@ -596,12 +595,19 @@ pub(crate) async fn run_events(
         .await
         .map_err(|err| ToolError::from_anyhow(&err))?
         .id;
+    let descending = raw.direction.as_deref() == Some("desc");
+    let fetch_after = if descending { None } else { raw.after };
     let mut events = client
-        .list_run_events(&run_id, raw.after, event_fetch_limit(&raw))
+        .list_run_events(&run_id, fetch_after, event_fetch_limit(&raw))
         .await
         .map_err(|err| ToolError::from_anyhow(&err))?;
+    if descending {
+        if let Some(after) = raw.after {
+            events.retain(|event| event.seq < after);
+        }
+    }
     filter_events(&mut events, &raw)?;
-    if raw.direction.as_deref() == Some("desc") {
+    if descending {
         events.reverse();
     }
     let offset = raw.offset.unwrap_or(0);
@@ -616,7 +622,13 @@ pub(crate) async fn run_events(
         .iter()
         .map(|event| run_event_result(event, max_content_length))
         .collect::<ToolResult<Vec<_>>>()?;
-    let next_cursor = page.last().map(|event| event.seq.saturating_add(1));
+    let next_cursor = page.last().map(|event| {
+        if descending {
+            event.seq
+        } else {
+            event.seq.saturating_add(1)
+        }
+    });
 
     Ok(RunEventsResult {
         run_id: run_id.to_string(),
@@ -902,52 +914,16 @@ fn mcp_manifest_args(spec: &CreateRunSpec) -> Option<types::ManifestArgs> {
 }
 
 fn mcp_run_overrides(spec: &CreateRunSpec) -> Option<RunLayer> {
-    let goal = spec
-        .goal
-        .as_ref()
-        .map(|goal| RunGoalLayer::Inline(InterpString::parse(goal)));
-    let model = (spec.model.is_some() || spec.provider.is_some()).then(|| RunModelLayer {
-        provider:  spec.provider.as_deref().map(InterpString::parse),
-        name:      spec.model.as_deref().map(InterpString::parse),
-        fallbacks: Vec::new(),
-    });
-    let sandbox =
-        (spec.sandbox.is_some() || spec.preserve_sandbox.is_some()).then(|| RunSandboxLayer {
-            provider: spec.sandbox.clone(),
-            preserve: spec.preserve_sandbox,
-            ..RunSandboxLayer::default()
-        });
-    let execution =
-        (spec.dry_run.is_some() || spec.auto_approve.is_some()).then(|| RunExecutionLayer {
-            mode:     spec.dry_run.map(|dry_run| {
-                if dry_run {
-                    RunMode::DryRun
-                } else {
-                    RunMode::Normal
-                }
-            }),
-            approval: spec.auto_approve.map(|auto_approve| {
-                if auto_approve {
-                    ApprovalMode::Auto
-                } else {
-                    ApprovalMode::Prompt
-                }
-            }),
-        });
-    let run = RunLayer {
-        goal,
-        metadata: ReplaceMap::from(spec.labels.clone()),
-        model,
-        sandbox,
-        execution,
-        ..RunLayer::default()
-    };
-    (run.goal.is_some()
-        || !run.metadata.is_empty()
-        || run.model.is_some()
-        || run.sandbox.is_some()
-        || run.execution.is_some())
-    .then_some(run)
+    build_sparse_run_overrides(RunOverrideInput {
+        goal:             spec.goal.as_deref(),
+        model:            spec.model.as_deref(),
+        provider:         spec.provider.as_deref(),
+        sandbox:          spec.sandbox.as_deref(),
+        preserve_sandbox: spec.preserve_sandbox,
+        dry_run:          spec.dry_run,
+        auto_approve:     spec.auto_approve,
+        labels:           spec.labels.clone(),
+    })
 }
 
 fn mcp_manifest_args_is_empty(args: &types::ManifestArgs) -> bool {
