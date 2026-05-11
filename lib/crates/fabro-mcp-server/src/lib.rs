@@ -2,18 +2,36 @@ mod config;
 mod run_tools;
 mod server;
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use anyhow::Result;
 pub use config::{config_json, init_agent};
-use fabro_client::ServerTarget;
+use fabro_client::Client;
 pub use server::start;
 
-#[derive(Debug, Clone)]
+pub type FabroClientFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
+
+pub type FabroClientFactory = Arc<dyn Fn() -> FabroClientFuture + Send + Sync>;
+
+#[derive(Clone)]
 pub struct FabroMcpServerSettings {
-    pub server_target: Option<ServerTarget>,
-    pub storage_dir:   PathBuf,
-    pub config_path:   PathBuf,
-    pub cwd:           PathBuf,
+    pub client_factory: FabroClientFactory,
+    pub config_path:    PathBuf,
+    pub cwd:            PathBuf,
+}
+
+impl std::fmt::Debug for FabroMcpServerSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FabroMcpServerSettings")
+            .field("client_factory", &"<factory>")
+            .field("config_path", &self.config_path)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]

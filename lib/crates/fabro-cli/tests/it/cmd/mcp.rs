@@ -622,6 +622,112 @@ async fn mcp_run_tools_use_default_local_server_without_server_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mcp_configured_unix_target_auto_spawns_like_cli() {
+    let mut context = test_context!();
+    let isolated = fabro_test::isolated_storage_dir();
+    let storage_dir = isolated.path().join("storage");
+    let socket_path = isolated.path().join("configured.sock");
+    write_mcp_server_settings(&mut context, &storage_dir, Some(&socket_path));
+    let workflow = context.install_fixture("simple.fabro");
+
+    assert!(!socket_path.exists());
+    let client = spawn_mcp_client(&context, &[]).await;
+    let run_id = create_mcp_run(&client, workflow, false).await;
+    let search = call_tool_json(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({ "run_ids": [run_id], "first": 1 }),
+    )
+    .await;
+
+    assert_eq!(search["runs"][0]["run_id"], run_id);
+    assert!(
+        socket_path.exists(),
+        "configured Unix socket should be auto-spawned"
+    );
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_explicit_unix_target_auto_spawns_like_cli() {
+    let mut context = test_context!();
+    let isolated = fabro_test::isolated_storage_dir();
+    let storage_dir = isolated.path().join("storage");
+    let socket_path = isolated.path().join("explicit.sock");
+    write_mcp_server_settings(&mut context, &storage_dir, None);
+    let workflow = context.install_fixture("simple.fabro");
+    let storage_arg = storage_dir.display().to_string();
+    let socket_arg = socket_path.display().to_string();
+
+    assert!(!socket_path.exists());
+    let client = spawn_mcp_client(&context, &[
+        "--storage-dir",
+        &storage_arg,
+        "--server",
+        &socket_arg,
+    ])
+    .await;
+    let run_id = create_mcp_run(&client, workflow, false).await;
+    let search = call_tool_json(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({ "run_ids": [run_id], "first": 1 }),
+    )
+    .await;
+
+    assert_eq!(search["runs"][0]["run_id"], run_id);
+    assert!(
+        socket_path.exists(),
+        "explicit Unix socket should be auto-spawned"
+    );
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_missing_default_settings_reports_configure_first_error_and_stays_alive() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut env = fabro_test::isolated_env(home.path());
+    env.insert(
+        "FABRO_HOME".to_string(),
+        home.path().join(".fabro").display().to_string(),
+    );
+    let client = spawn_mcp_client_from_fixture(McpStdioFixture {
+        command: vec![
+            env!("CARGO_BIN_EXE_fabro").to_string(),
+            "mcp".to_string(),
+            "start".to_string(),
+        ],
+        env,
+        current_dir: workspace.path().to_path_buf(),
+    })
+    .await;
+
+    let error = call_tool_error_text(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({ "run_ids": ["missing"], "first": 1 }),
+    )
+    .await;
+
+    assert!(
+        error.contains("Cannot reach Fabro server: no settings.toml configured."),
+        "{error}"
+    );
+    assert_eq!(client.list_tools().await.unwrap().len(), 5);
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_search_filters_status_dates_and_paginates() {
     let context = test_context!();
     let harness =
@@ -1973,6 +2079,38 @@ fn mcp_stdio_fixture(context: &fabro_test::TestContext, extra_args: &[&str]) -> 
         env,
         current_dir: context.temp_dir.clone(),
     }
+}
+
+fn write_mcp_server_settings(
+    context: &mut fabro_test::TestContext,
+    storage_dir: &Path,
+    socket_path: Option<&Path>,
+) {
+    context.manage_storage_dir(storage_dir);
+    let cli_target = socket_path.map_or_else(String::new, |path| {
+        format!(
+            r#"
+[cli.target]
+type = "unix"
+path = "{}"
+"#,
+            path.display()
+        )
+    });
+    context.write_home(
+        ".fabro/settings.toml",
+        format!(
+            r#"_version = 1
+
+[server.storage]
+root = "{}"
+
+[server.auth]
+methods = ["dev-token"]
+{cli_target}"#,
+            storage_dir.display()
+        ),
+    );
 }
 
 async fn spawn_mcp_client(context: &fabro_test::TestContext, extra_args: &[&str]) -> McpClient {
