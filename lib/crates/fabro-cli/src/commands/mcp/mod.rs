@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use anyhow::{Context as _, Result};
 
 use crate::args::{McpAgent, McpCommand, McpNamespace, ServerConnectionArgs};
@@ -10,7 +12,7 @@ pub(crate) async fn dispatch(ns: McpNamespace, base_ctx: &CommandContext) -> Res
         }
         McpCommand::Config(args) => {
             let json = fabro_mcp_server::config_json(&config_settings(&args.connection))?;
-            print!("{json}");
+            let _ = write!(base_ctx.printer().stdout_important(), "{json}");
             Ok(())
         }
         McpCommand::Init(args) => {

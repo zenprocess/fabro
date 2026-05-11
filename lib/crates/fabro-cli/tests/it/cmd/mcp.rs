@@ -367,6 +367,10 @@ async fn stdio_server_initializes_and_lists_run_tools() {
             "tool should have input schema: {schema}"
         );
     }
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
 }
 
 #[test]
@@ -417,6 +421,10 @@ async fn stdio_startup_and_list_tools_is_fast() {
     let tools = client.list_tools().await.unwrap();
     assert_eq!(tools.len(), 5);
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -481,6 +489,10 @@ async fn mcp_create_and_search_manage_real_runs_with_cli_auth() {
     }
     "#);
 
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
     harness.shutdown().await;
 }
 
@@ -589,6 +601,10 @@ async fn mcp_lifecycle_tools_manage_real_run() {
     "#
     );
 
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
     harness.shutdown().await;
 }
 
@@ -609,6 +625,10 @@ async fn mcp_gather_rejects_too_many_runs() {
 
     assert!(error.contains("run_ids"), "{error}");
     assert_eq!(client.list_tools().await.unwrap().len(), 5);
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -639,6 +659,10 @@ async fn mcp_gather_returns_timeout_result() {
     assert!(start.elapsed() < std::time::Duration::from_secs(4));
     assert_eq!(gather["runs"][0]["status"], "submitted");
 
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
     harness.shutdown().await;
 }
 
@@ -656,6 +680,10 @@ async fn mcp_interact_error_does_not_stop_server() {
 
     assert!(error.contains("message"), "{error}");
     assert_eq!(client.list_tools().await.unwrap().len(), 5);
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -679,6 +707,10 @@ async fn mcp_tool_auth_error_mentions_login() {
     );
     assert_eq!(client.list_tools().await.unwrap().len(), 5);
 
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
     harness.shutdown().await;
 }
 
