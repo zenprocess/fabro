@@ -9,12 +9,13 @@ This plan is **not** a template for adding automated test coverage — it exists
 Live list of bugs and notable observations surfaced during the sweep. Each entry links back to the scenario where it was found.
 
 ### Bugs / mismatches
-- **I10 — Archived runs not filtered from default search**: `fabro_run_search` with no `archived` filter returns archived runs alongside active ones. Most systems hide archived by default; consider flipping the default.
+None currently open.
 
 ### Rechecked / no longer open
 - **C4 — `inputs` schema/runtime mismatch**: fixed by narrowing MCP input values to scalar JSON (`string`, `boolean`, `integer`, `number`) and rejecting arrays/objects locally with scalar-only errors. Re-tested on 2026-05-11 against `127.0.0.1:32276`; `tools/list` now advertises scalar-only `inputs.additionalProperties`.
 - **C5 — Misleading null-input error message**: fixed. Re-tested on 2026-05-11; null now returns ``input `maybe` cannot be null; use a string, boolean, or number``.
 - **I7 / I9 — Misleading "Run not found." on terminal runs**: fixed on 2026-05-11 in the server API layer. `message`/steer against a durable terminal run that no longer has a live managed engine now returns `409` with `run_not_steerable`; `cancel` returns `409` with `Run is already terminal and cannot be cancelled.` True missing runs still return `404`.
+- **I10 — Archived runs not filtered from default search**: fixed on 2026-05-11 by aligning MCP search with the HTTP API. `fabro_run_search` now hides archived runs when `archived` is omitted, while `archived=true` still searches archived runs explicitly.
 - **I15 / I16 — yes/no answer flow**: re-tested on 2026-05-11 against `fabro server` `0.230.0-nightly.0` at `127.0.0.1:32276`. `answer=true` and `answer=false` both submit successfully for the bundled `interview` workflow's first `yes_no` question. `true` advanced the run to the next `confirmation` question.
 - **I22 — numeric answer local validation**: re-tested on 2026-05-11 against the same server. `answer=42` now returns `unsupported answer value: 42; expected boolean, string, or object` from the MCP layer before reaching the API.
 - **X6 — Cursor/filter ordering**: simplified on 2026-05-11 by applying search filters before sorting and applying the `after` cursor. This prevents unrelated runs outside the filtered result set from trimming the page. Pagination is explicitly not snapshot-isolated; a new matching run inserted before the cursor during traversal appears when the client starts a new search.
@@ -191,7 +192,7 @@ Source: `run_tools/interact.rs:201`
 - [x] **I9** Cancel an already-terminal run → initially returned `Run not found.`. — **FIXED**: durable terminal runs without a live managed engine now return `409` with `Run is already terminal and cannot be cancelled.`; true missing runs remain `404`.
 
 #### `archive` / `unarchive`
-- [x] **I10** Archive terminal run → `archived=true` in summary; visible via `search archived=true`. — **PASS**. **BUT FINDING**: archived runs are **not** filtered out of default search (no archive filter applied unless explicitly requested).
+- [x] **I10** Archive terminal run → `archived=true` in summary; visible via `search archived=true`. — **FIXED**: default search now hides archived runs to match `/api/v1/runs`; `archived=true` still surfaces archived runs explicitly.
 - [x] **I11** Unarchive → reverses (`archived=false`). — **PASS**.
 - [x] **I12** Archive an active run → `run <id> must be terminal (succeeded, failed, or dead) to archive; current status is starting`. — **PASS** (excellent error).
 

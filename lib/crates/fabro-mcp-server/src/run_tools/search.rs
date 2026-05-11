@@ -123,9 +123,8 @@ fn filter_sort_and_page_runs(
                 .any(|status| *status == run.lifecycle.status.kind())
         });
     }
-    if let Some(archived) = raw.archived {
-        runs.retain(|run| run.lifecycle.archived == archived);
-    }
+    let archived = raw.archived.unwrap_or(false);
+    runs.retain(|run| run.lifecycle.archived == archived);
     if let Some(created_after) = raw.created_after.as_deref() {
         let cutoff = common::parse_datetime_filter("created_after", created_after)?;
         runs.retain(|run| run.timestamps.created_at >= cutoff);
@@ -222,7 +221,41 @@ mod tests {
         assert_eq!(ids, vec![matching_newer.id, matching_older.id]);
     }
 
+    #[test]
+    fn omitted_archived_filter_hides_archived_runs_by_default() {
+        let active = run("01KRBZW5C00000000000000001", "keep", 30);
+        let archived = archived_run("01KRBZW4DW0000000000000002", "keep", 20);
+
+        let result = filter_sort_and_page_runs(
+            vec![archived.clone(), active.clone()],
+            &FabroRunSearchParams {
+                run_ids:        None,
+                workflow:       None,
+                labels:         None,
+                status:         None,
+                archived:       None,
+                created_after:  None,
+                created_before: None,
+                first:          Some(10),
+                after:          None,
+            },
+            None,
+        )
+        .expect("filtering should succeed");
+
+        let ids = result.runs.iter().map(|run| run.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![active.id]);
+    }
+
     fn run(id: &str, group: &str, seconds: u32) -> Run {
+        run_with_archived(id, group, seconds, false)
+    }
+
+    fn archived_run(id: &str, group: &str, seconds: u32) -> Run {
+        run_with_archived(id, group, seconds, true)
+    }
+
+    fn run_with_archived(id: &str, group: &str, seconds: u32, archived: bool) -> Run {
         let created_at = Utc.with_ymd_and_hms(2026, 5, 11, 12, 0, seconds).unwrap();
         Run {
             id:               id.parse().expect("test run id should parse"),
@@ -238,12 +271,12 @@ mod tests {
             origin:           RunOrigin::default(),
             labels:           HashMap::from([("group".to_string(), group.to_string())]),
             lifecycle:        RunLifecycle {
-                status:          RunStatus::Submitted,
+                status: RunStatus::Submitted,
                 pending_control: None,
-                queue_position:  None,
-                error:           None,
-                archived:        false,
-                archived_at:     None,
+                queue_position: None,
+                error: None,
+                archived,
+                archived_at: None,
             },
             sandbox:          None,
             models:           Vec::new(),
