@@ -1,0 +1,521 @@
+{
+  "title": "Focused `Blocked` Run Status Plan",
+  "spec": {
+    "run_id": "01KRC096KRNQBP34DAED4TPSPS",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "# Focused `Blocked` Run Status Plan\n\n## Summary\n\n- Add `Blocked` as a first-class run lifecycle status for runs that are waiting on external intervention.\n- Keep `Paused` separate. `Paused` is operator intent; `Blocked` is an execution condition.\n- Keep existing engine concepts in scope: `Succeeded` and `Dead` remain real statuses in this pass.\n- Make `/api/v1/runs`, `/api/v1/runs/{id}`, mutation responses, and `/api/v1/runs/{id}/state` use one truthful operator vocabulary.\n- Keep `/api/v1/boards/runs` explicitly lossy and web-optimized.\n- Add `BlockedReason`, starting with `human_input_required`.\n- Add explicit lifecycle events for `run.queued`, `run.blocked`, and `run.unblocked`.\n- No alerting/email work in this pass.\n\n## Scope And Decisions\n\n### Canonical Operator Status Vocabulary\n\nUse one shared run status vocabulary across the durable projection, operator APIs, generated clients, and CLI:\n\n- `submitted`\n- `queued`\n- `starting`\n- `running`\n- `blocked`\n- `paused`\n- `removing`\n- `succeeded`\n- `failed`\n- `dead`\n\nAdditional decisions:\n\n- `cancelled` remains `failed` plus `status_reason=cancelled`; it is not a new top-level run status in this pass.\n- `status` becomes required/non-null on operator-facing surfaces.\n- If a run exists but the projection has no lifecycle status yet, synthesize `submitted` rather than returning `null`.\n- `/api/v1/boards/runs` remains a derived UI projection and does not need to preserve the full operator vocabulary.\n- This is an accepted breaking contract change. The app is greenfield with no prod installs, so do not add versioning, migration work, serde aliases, or compatibility shims for the status-enum changes or `reason -> status_reason` rename.\n\n### `Blocked` Semantics\n\n- `Blocked` means the run cannot proceed until some external condition is resolved.\n- In this pass the only `BlockedReason` is `human_input_required`, but the enum and event shapes should allow more reasons later.\n- `blocked_reason` is a separate field everywhere; do not overload `status_reason`.\n- A paused run may still retain `blocked_reason` if the underlying block is unresolved.\n- `Paused` wins as the visible status while a run is paused.\n- If a blocked run is unpaused and the block is still unresolved, the visible state returns to `blocked` (via the `paused -> running -> blocked` event sequence in Section 2).\n- If the block resolves while the run is paused, clear `blocked_reason` and emit `run.unblocked`, but leave `status=paused`.\n\n### Board Contract\n\n`/api/v1/boards/runs` remains a Trello-style projection for the web UI only.\n\nBoard columns after this change:\n\n- `initializing`\n- `running`\n- `blocked`\n- `succeeded`\n- `failed`\n\nBoard mapping rules:\n\n- `submitted`, `queued`, `starting` -> `initializing`\n- `running`, `paused` -> `running`\n- `blocked` -> `blocked`\n- `succeeded` -> `succeeded`\n- `failed`, `dead` -> `failed`\n- `removing` -> off-board\n\nAdditional board decisions:\n\n- Replace the current `waiting` column with `blocked`.\n- Replace the older `working | review | merge` board schema entirely. Update OpenAPI `BoardColumn`, server responses, and web `ColumnStatus` types to use only `initializing | running | blocked | succeeded | failed`.\n- Keep failed behavior as-is.\n- Keep paused runs visually indistinguishable from running in this pass.\n- Blocked cards should show the oldest unresolved pending interview question text.\n- That question text should be derived only in `/api/v1/boards/runs`, not added to `StoreRunSummary`.\n- Known limitation for this pass: a run that is both paused and still blocked appears in the `running` column. A follow-up can add a paused attention indicator or richer board card state.\n\n## Implementation Units\n\n### 1. Shared Types And OpenAPI\n\nUpdate the shared contract in:\n\n- [docs/api-reference/fabro-api.yaml](/Users/bhelmkamp/p/fabro-sh/fabro/docs/api-reference/fabro-api.yaml)\n- [lib/crates/fabro-types/src/status.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/status.rs)\n- [lib/crates/fabro-types/src/run_event/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/run_event/mod.rs)\n- generated Rust client/types under `lib/crates/fabro-api`\n- generated TypeScript models under `lib/packages/fabro-api-client/src/models/`\n\nRequired changes:\n\n- Collapse OpenAPI `RunStatus` and `InternalRunStatus` into one shared `RunStatus` schema with the canonical operator vocabulary above.\n- Add `Queued` and `Blocked` variants to the Rust `RunStatus` enum in `status.rs`. Update `is_active()` to include both (they are incomplete active states). Update `is_terminal()`, `can_transition_to()`, `Display`, and `FromStr` accordingly.\n- This is an intentional breaking API change: remove public `completed` and `cancelled`, add public `blocked`, `removing`, `succeeded`, and `dead`, and rename `RunStatusRecord.reason` to `status_reason` with no compatibility layer.\n- Add `BlockedReason` schema with initial value `human_input_required`.\n- Add `blocked_reason` to:\n  - `RunStatusResponse`\n  - `RunStatusRecord`\n  - `StoreRunSummary`\n- Rename `RunStatusRecord.reason` to `status_reason` and keep `blocked_reason` separate.\n- Make `StoreRunSummary.status` a non-null `RunStatus` reference instead of `string | null`.\n- Keep `status_reason` on responses and summaries.\n- Expose `pending_interviews` on the `RunProjection` schema for `/api/v1/runs/{id}/state`.\n- Regenerate Rust and TypeScript API clients after the spec update.\n\n### 2. Lifecycle Events And Transition Rules\n\nAdd event-backed lifecycle support in:\n\n- [lib/crates/fabro-workflow/src/event.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/event.rs)\n- [lib/crates/fabro-types/src/run_event/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/run_event/mod.rs)\n- [lib/crates/fabro-workflow/src/handler/human.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/handler/human.rs)\n- [lib/crates/fabro-workflow/src/operations/start.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/operations/start.rs)\n- [lib/crates/fabro-workflow/src/run_control.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/run_control.rs)\n- [lib/crates/fabro-types/src/status.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/status.rs)\n\nAdd new explicit lifecycle events:\n\n- `run.queued`\n- `run.blocked`\n- `run.unblocked`\n\nPayload decisions:\n\n- `run.blocked` carries `blocked_reason`.\n- `run.unblocked` is a minimal effect event; it does not repeat `blocked_reason`.\n- `run.queued` mirrors existing status-transition event style.\n\nEvent ordering and rules:\n\n- Emit `run.queued` from the server `start`/`resume` path at the moment the run is inserted into managed queued state. Persist it to the durable run event log there; do not synthesize `queued` later in projection replay.\n- Emit `run.started` later, when execution begins.\n- Keep `run.starting` and `run.running` as the worker bootstrap/execution transitions.\n- `run.blocked` and `run.unblocked` must be durable `run.*` events appended through the normal workflow event sink, not SSE-only notifications and not projection-synthesized state.\n- Add a run-scoped blocked-state tracker in the workflow runtime, owned by `StartServices`/`RunSession` in `operations/start.rs` and passed into `HumanHandler` through a new `EngineServices` field such as `blocked_state_tracker: Option<Arc<BlockedStateTracker>>`. The tracker should guard unresolved interview count with a mutex so parallel human stages can safely detect `0 -> 1` and `1 -> 0` transitions.\n- On first pending interview (`0 -> 1` unresolved questions), the workflow runtime emits `interview.started` and then appends `run.blocked`.\n- While already blocked, additional `interview.started` events do not emit another `run.blocked`.\n- On final interview resolution (`1 -> 0` unresolved questions), the workflow runtime emits `interview.completed` or `interview.timeout` or `interview.interrupted` and then appends `run.unblocked`.\n- Do not emit `run.unblocked` when a blocked run reaches `failed`, `succeeded`, or `dead`; terminal events end the blocked condition implicitly.\n\nPause/unpause decisions:\n\n- Keep existing cooperative pause behavior for actively running work.\n- In this pass, make pause immediate only when the current visible status is `blocked`.\n- For immediate pause from blocked:\n  - append `run.pause.requested`\n  - append `run.paused` immediately\n  - do not emit `run.unblocked`\n  - this direct server-appended `run.paused` may race with worker-emitted interview resolution and `run.unblocked`; accept that race in this pass and make projection logic order-insensitive so either ordering converges on the same final paused-or-unblocked state\n- For unpause when the underlying human block is still unresolved:\n  - append `run.unpause.requested`\n  - append `run.unpaused`\n  - append `run.blocked`\n  - this is explicitly `paused -> running -> blocked`; do not add a direct `paused -> blocked` transition\n- For unpause when the underlying block has already resolved:\n  - append `run.unpause.requested`\n  - append `run.unpaused`\n- If the blocked condition resolves while paused:\n  - emit the interview resolution event\n  - emit `run.unblocked`\n  - keep `status=paused`\n\nTransition helper updates in `status.rs`:\n\n- add `submitted -> queued`\n- add `queued -> starting`\n- add `running -> blocked`\n- add `blocked -> running`\n- add `blocked -> paused` (immediate pause from blocked)\n- preserve `running -> paused`\n- preserve `paused -> running`\n- preserve non-terminal `-> failed` (including from `blocked`)\n- keep `dead` as a real terminal status in this pass\n\n### 3. Durable Projection And Truthful Run APIs\n\nUpdate durable state and operator-facing API behavior in:\n\n- [lib/crates/fabro-store/src/run_state.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/run_state.rs)\n- [lib/crates/fabro-store/src/types.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/types.rs)\n- [lib/crates/fabro-store/src/slate/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/slate/mod.rs)\n- [lib/crates/fabro-server/src/server.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/server.rs)\n- [lib/crates/fabro-server/src/demo/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/demo/mod.rs)\n\nProjection changes:\n\n- Extend `RunStatusRecord` and `StoreRunSummary` (Rust: `RunSummary`) with `blocked_reason`.\n- Store `blocked_reason=human_input_required` while blocked on pending human input.\n- Preserve `blocked_reason` while the run is paused over an unresolved block.\n- Clear `blocked_reason` on `run.unblocked`.\n- Clear pending interviews on terminal completion/failure as today.\n- Synthesize `submitted` if a run exists but no lifecycle status has been projected yet.\n\nOperator API changes:\n\n- `/api/v1/runs` and `/api/v1/runs/{id}` become truthful operator surfaces.\n- Remove the lossy status remap that currently converts:\n  - `removing -> running`\n  - `succeeded -> completed`\n  - `failed(cancelled) -> cancelled`\n  - `dead -> failed`\n- Expose the canonical operator vocabulary directly on these endpoints.\n- Keep `status_reason=cancelled` on failed cancellations.\n- Include `blocked_reason` alongside `status_reason` and `pending_control`.\n- Because `ManagedRun.status` uses the generated API `RunStatus`, this enum collapse intentionally requires broad match-arm updates throughout `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/demo/mod.rs`, and generated client consumers.\n- Return the actual current status from mutation endpoints rather than a target status:\n  - `start` returns `queued`\n  - `pause` from `blocked` returns `paused`\n  - `unpause` back to unresolved human input returns `blocked`\n  - cooperative `pause` from `running` still returns `running` with `pending_control=pause` until the worker reaches a pause point\n\nRaw state endpoint changes:\n\n- `/api/v1/runs/{id}/state` remains the raw projection surface.\n- Make the schema truthful to the Rust payload by exposing `pending_interviews`.\n- Use `RunStatusRecord.status_reason` plus `blocked_reason` there too.\n\nLive managed-run reconciliation:\n\n- Update `update_live_run_from_event()` in `server.rs` for `run.queued`, `run.blocked`, and `run.unblocked`.\n- Keep `Blocked` treated as an incomplete active state for shutdown/startup handling in this pass.\n- Allow blocked runs to be cancelled through the existing cancel endpoint.\n- Update `pause_run` to accept `Blocked` in addition to `Running`, implementing the immediate-pause path (appending `run.paused` directly rather than sending a control signal to the worker).\n- Update `should_reconcile_run_on_startup` to include `Blocked` and `Queued`.\n\n### 4. Web Board Projection And UI\n\nUpdate the web-only board projection in:\n\n- [lib/crates/fabro-server/src/server.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/server.rs)\n- [apps/fabro-web/app/data/runs.ts](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/data/runs.ts)\n- [apps/fabro-web/app/routes/runs.tsx](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/routes/runs.tsx)\n- [apps/fabro-web/app/routes/run-detail.tsx](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/routes/run-detail.tsx)\n\nRequired changes:\n\n- Replace `waiting` with `blocked` in the board projection and UI types.\n- Add `queued` and `blocked` to the `RunStatus` type and `runStatusDisplay` record in `apps/fabro-web/app/data/runs.ts` with appropriate labels and colors.\n- Update OpenAPI `BoardColumn`, server board responses, and web `ColumnStatus` types to remove `working`, `review`, and `merge`.\n- Keep board columns `initializing | running | blocked | succeeded | failed`.\n- Map statuses per the board contract above.\n- Keep `removing` off-board.\n- Keep `paused` in the `running` column with no special indicator in this pass.\n- Keep `dead` in the `failed` column on the board.\n- Populate board card question text from the oldest unresolved pending interview only in `/api/v1/boards/runs`.\n- Implement that by having `list_board_runs` open run readers only for summaries whose mapped board column is `blocked`, inspect `RunProjection.pending_interviews`, and choose the oldest question by earliest `started_at`. Keep `StoreRunSummary` unchanged. This may replay or reload projection state per blocked run during board refresh; that performance profile is acceptable in this pass, and implementers should reuse existing `run_store.state()` / projection-cache behavior where available rather than introducing a new caching layer.\n- Do not add question text to `StoreRunSummary`.\n\nBoard refresh behavior:\n\n- Preserve the current status-refresh triggers and add the new ones. `STATUS_EVENTS` in `apps/fabro-web/app/routes/runs.tsx` should include:\n  - `run.submitted`\n  - `run.queued`\n  - `run.starting`\n  - `run.running`\n  - `run.removing`\n  - `run.paused`\n  - `run.unpaused`\n  - `run.blocked`\n  - `run.unblocked`\n  - `run.completed`\n  - `run.failed`\n  - `interview.started`\n  - `interview.completed`\n  - `interview.timeout`\n  - `interview.interrupted`\n\nRationale:\n\n- `run.blocked` and `run.unblocked` cover status changes.\n- `interview.*` still need to refresh the board because the displayed oldest unresolved question can change while the run remains blocked.\n\n### 5. CLI Consumers\n\nUpdate CLI consumers in:\n\n- [lib/crates/fabro-cli/src/server_runs.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/server_runs.rs)\n- [lib/crates/fabro-cli/src/commands/runs/list.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/commands/runs/list.rs)\n- [lib/crates/fabro-cli/src/commands/run/wait.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/commands/run/wait.rs)\n\nRequired changes:\n\n- Treat `/api/v1/runs` as truthful and stop inventing fallback status in `server_runs.rs`.\n- Add display/color handling for `Queued` and `Blocked`.\n- Keep `Succeeded` as the success exit state for CLI wait behavior in this pass.\n- Keep `Dead` as a real displayable terminal state when it is actually present.\n- Stop using `Dead` as a synthetic fallback for missing server summary status now that `status` is non-null.\n- Continue to show `status_reason=cancelled` for cancellations rather than inventing a `Cancelled` top-level status.\n\n## Test Plan\n\n### Shared Types And Event Model\n\n- `lib/crates/fabro-types/src/run_event/mod.rs`\n  - round-trip serialization for `run.queued`, `run.blocked`, and `run.unblocked`\n  - `run.blocked` payload includes `blocked_reason`\n- `lib/crates/fabro-types/src/status.rs`\n  - transition tests for `submitted -> queued`, `running -> blocked`, and `blocked -> running`\n  - paused overlay path still flows through explicit event order rather than a direct `paused -> blocked` transition\n- `lib/crates/fabro-workflow/src/handler/human.rs`\n  - first pending interview emits `interview.started` then durable `run.blocked`\n  - second pending interview while already blocked does not emit another `run.blocked`\n  - final resolution emits `interview.completed`/`timeout`/`interrupted` then durable `run.unblocked`\n- `lib/crates/fabro-workflow/src/operations/start.rs`\n  - run-scoped blocked-state tracker emits exactly one `run.blocked` on `0 -> 1` and exactly one `run.unblocked` on `1 -> 0`, including parallel human-stage races\n\n### Durable Projection And Server\n\n- `lib/crates/fabro-store/src/run_state.rs`\n  - `run.queued` sets `status=Queued`\n  - `run.blocked` sets `status=Blocked` and `blocked_reason=HumanInputRequired`\n  - `run.unblocked` while status is `Blocked` clears `blocked_reason` and restores `Running`\n  - paused-over-blocked preserves `blocked_reason` while `status=Paused`\n  - unpause-to-still-blocked yields `RunUnpaused` followed by `RunBlocked`\n  - interview resolution while paused clears `blocked_reason` without changing visible `Paused`\n  - missing lifecycle status synthesizes `Submitted`\n- `lib/crates/fabro-store/src/slate/mod.rs`\n  - list/find summaries expose non-null `status`\n  - summaries expose `blocked_reason`\n- `lib/crates/fabro-server/src/server.rs`\n  - `/api/v1/runs` and `/api/v1/runs/{id}` expose `blocked`, `removing`, `succeeded`, and `dead` directly\n  - mutation responses return actual current status\n  - blocked runs are cancellable\n  - startup/shutdown handling still treats blocked runs as incomplete active work in this pass\n  - `/api/v1/runs/{id}/state` includes `pending_interviews`\n  - `start`/`resume` append durable `run.queued` when enqueueing\n  - board response emits `blocked` column, blocked question text, paused-in-running, removing off-board, and dead-in-failed\n\n### Web UI\n\n- `apps/fabro-web/app/data/runs.test.ts`\n  - accepts `blocked`, `queued`, `removing`, `succeeded`, and `dead`\n  - removes dependency on `waiting`\n- `apps/fabro-web/app/routes/runs.test.tsx`\n  - blocked runs render in the `blocked` lane\n  - paused runs remain in the `running` lane\n  - blocked card shows oldest unresolved question text\n  - `STATUS_EVENTS` retains `run.starting` and `run.running` while adding the new blocked/queued events\n  - question text refreshes correctly on `interview.*` events without a status change\n\n### CLI\n\n- `lib/crates/fabro-cli/src/commands/runs/list.rs`\n  - `Queued` and `Blocked` render with expected labels/colors\n  - `Dead` remains renderable when actually returned by the API\n- `lib/crates/fabro-cli/src/commands/run/wait.rs`\n  - `Succeeded` remains the success exit state\n  - `Blocked` is non-terminal and continues waiting\n  - no synthetic `Dead` fallback is used for server summary status\n\n## Explicit Non-Goals\n\n- No alerting, email, or notification policy in this pass.\n- No new paused indicator on the board in this pass.\n- No broader redesign of cooperative pause for actively running work.\n- No change to cancellation semantics beyond making blocked runs cancellable and keeping `failed + status_reason=cancelled`.\n- No attempt to make blocked runs survive restart as a durable parked state in this pass.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": []
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": []
+        },
+        "sandbox": {
+          "provider": "daytona",
+          "preserve": false,
+          "stop_on_terminal": true,
+          "devcontainer": false,
+          "env": {},
+          "docker": {
+            "image": "buildpack-deps:noble",
+            "network_mode": null,
+            "memory_limit": 4000000000,
+            "cpu_quota": 200000,
+            "env_vars": {},
+            "skip_clone": false
+          },
+          "daytona": {
+            "auto_stop_interval": 30,
+            "labels": {
+              "repo": "fabro-sh/fabro"
+            },
+            "snapshot": {
+              "name": "fabro-v8",
+              "cpu": 8,
+              "memory_gb": 16,
+              "disk_gb": 20,
+              "dockerfile": {
+                "type": "inline",
+                "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates build-essential pkg-config libssl-dev unzip python3 && rm -rf /var/lib/apt/lists/*\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null && apt-get update && apt-get install -y --no-install-recommends gh && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+              }
+            },
+            "network": null,
+            "skip_clone": false
+          }
+        },
+        "notifications": {},
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "label": {
+              "String": "Implement"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "provider": {
+              "String": "openai"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Start"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fmt": {
+          "id": "fmt",
+          "attrs": {
+            "label": {
+              "String": "Format"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 fmt --all 2>&1"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Simplify (Opus)"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "retry_target": {
+              "String": "fixup"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Verify"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1"
+            },
+            "goal_gate": {
+              "Boolean": true
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "max_visits": {
+              "Integer": 3
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Fixup"
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors."
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Exit"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "fmt",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "fmt",
+          "to": "exit",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "goal": {
+          "String": "# Focused `Blocked` Run Status Plan\n\n## Summary\n\n- Add `Blocked` as a first-class run lifecycle status for runs that are waiting on external intervention.\n- Keep `Paused` separate. `Paused` is operator intent; `Blocked` is an execution condition.\n- Keep existing engine concepts in scope: `Succeeded` and `Dead` remain real statuses in this pass.\n- Make `/api/v1/runs`, `/api/v1/runs/{id}`, mutation responses, and `/api/v1/runs/{id}/state` use one truthful operator vocabulary.\n- Keep `/api/v1/boards/runs` explicitly lossy and web-optimized.\n- Add `BlockedReason`, starting with `human_input_required`.\n- Add explicit lifecycle events for `run.queued`, `run.blocked`, and `run.unblocked`.\n- No alerting/email work in this pass.\n\n## Scope And Decisions\n\n### Canonical Operator Status Vocabulary\n\nUse one shared run status vocabulary across the durable projection, operator APIs, generated clients, and CLI:\n\n- `submitted`\n- `queued`\n- `starting`\n- `running`\n- `blocked`\n- `paused`\n- `removing`\n- `succeeded`\n- `failed`\n- `dead`\n\nAdditional decisions:\n\n- `cancelled` remains `failed` plus `status_reason=cancelled`; it is not a new top-level run status in this pass.\n- `status` becomes required/non-null on operator-facing surfaces.\n- If a run exists but the projection has no lifecycle status yet, synthesize `submitted` rather than returning `null`.\n- `/api/v1/boards/runs` remains a derived UI projection and does not need to preserve the full operator vocabulary.\n- This is an accepted breaking contract change. The app is greenfield with no prod installs, so do not add versioning, migration work, serde aliases, or compatibility shims for the status-enum changes or `reason -> status_reason` rename.\n\n### `Blocked` Semantics\n\n- `Blocked` means the run cannot proceed until some external condition is resolved.\n- In this pass the only `BlockedReason` is `human_input_required`, but the enum and event shapes should allow more reasons later.\n- `blocked_reason` is a separate field everywhere; do not overload `status_reason`.\n- A paused run may still retain `blocked_reason` if the underlying block is unresolved.\n- `Paused` wins as the visible status while a run is paused.\n- If a blocked run is unpaused and the block is still unresolved, the visible state returns to `blocked` (via the `paused -> running -> blocked` event sequence in Section 2).\n- If the block resolves while the run is paused, clear `blocked_reason` and emit `run.unblocked`, but leave `status=paused`.\n\n### Board Contract\n\n`/api/v1/boards/runs` remains a Trello-style projection for the web UI only.\n\nBoard columns after this change:\n\n- `initializing`\n- `running`\n- `blocked`\n- `succeeded`\n- `failed`\n\nBoard mapping rules:\n\n- `submitted`, `queued`, `starting` -> `initializing`\n- `running`, `paused` -> `running`\n- `blocked` -> `blocked`\n- `succeeded` -> `succeeded`\n- `failed`, `dead` -> `failed`\n- `removing` -> off-board\n\nAdditional board decisions:\n\n- Replace the current `waiting` column with `blocked`.\n- Replace the older `working | review | merge` board schema entirely. Update OpenAPI `BoardColumn`, server responses, and web `ColumnStatus` types to use only `initializing | running | blocked | succeeded | failed`.\n- Keep failed behavior as-is.\n- Keep paused runs visually indistinguishable from running in this pass.\n- Blocked cards should show the oldest unresolved pending interview question text.\n- That question text should be derived only in `/api/v1/boards/runs`, not added to `StoreRunSummary`.\n- Known limitation for this pass: a run that is both paused and still blocked appears in the `running` column. A follow-up can add a paused attention indicator or richer board card state.\n\n## Implementation Units\n\n### 1. Shared Types And OpenAPI\n\nUpdate the shared contract in:\n\n- [docs/api-reference/fabro-api.yaml](/Users/bhelmkamp/p/fabro-sh/fabro/docs/api-reference/fabro-api.yaml)\n- [lib/crates/fabro-types/src/status.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/status.rs)\n- [lib/crates/fabro-types/src/run_event/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/run_event/mod.rs)\n- generated Rust client/types under `lib/crates/fabro-api`\n- generated TypeScript models under `lib/packages/fabro-api-client/src/models/`\n\nRequired changes:\n\n- Collapse OpenAPI `RunStatus` and `InternalRunStatus` into one shared `RunStatus` schema with the canonical operator vocabulary above.\n- Add `Queued` and `Blocked` variants to the Rust `RunStatus` enum in `status.rs`. Update `is_active()` to include both (they are incomplete active states). Update `is_terminal()`, `can_transition_to()`, `Display`, and `FromStr` accordingly.\n- This is an intentional breaking API change: remove public `completed` and `cancelled`, add public `blocked`, `removing`, `succeeded`, and `dead`, and rename `RunStatusRecord.reason` to `status_reason` with no compatibility layer.\n- Add `BlockedReason` schema with initial value `human_input_required`.\n- Add `blocked_reason` to:\n  - `RunStatusResponse`\n  - `RunStatusRecord`\n  - `StoreRunSummary`\n- Rename `RunStatusRecord.reason` to `status_reason` and keep `blocked_reason` separate.\n- Make `StoreRunSummary.status` a non-null `RunStatus` reference instead of `string | null`.\n- Keep `status_reason` on responses and summaries.\n- Expose `pending_interviews` on the `RunProjection` schema for `/api/v1/runs/{id}/state`.\n- Regenerate Rust and TypeScript API clients after the spec update.\n\n### 2. Lifecycle Events And Transition Rules\n\nAdd event-backed lifecycle support in:\n\n- [lib/crates/fabro-workflow/src/event.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/event.rs)\n- [lib/crates/fabro-types/src/run_event/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/run_event/mod.rs)\n- [lib/crates/fabro-workflow/src/handler/human.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/handler/human.rs)\n- [lib/crates/fabro-workflow/src/operations/start.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/operations/start.rs)\n- [lib/crates/fabro-workflow/src/run_control.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-workflow/src/run_control.rs)\n- [lib/crates/fabro-types/src/status.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-types/src/status.rs)\n\nAdd new explicit lifecycle events:\n\n- `run.queued`\n- `run.blocked`\n- `run.unblocked`\n\nPayload decisions:\n\n- `run.blocked` carries `blocked_reason`.\n- `run.unblocked` is a minimal effect event; it does not repeat `blocked_reason`.\n- `run.queued` mirrors existing status-transition event style.\n\nEvent ordering and rules:\n\n- Emit `run.queued` from the server `start`/`resume` path at the moment the run is inserted into managed queued state. Persist it to the durable run event log there; do not synthesize `queued` later in projection replay.\n- Emit `run.started` later, when execution begins.\n- Keep `run.starting` and `run.running` as the worker bootstrap/execution transitions.\n- `run.blocked` and `run.unblocked` must be durable `run.*` events appended through the normal workflow event sink, not SSE-only notifications and not projection-synthesized state.\n- Add a run-scoped blocked-state tracker in the workflow runtime, owned by `StartServices`/`RunSession` in `operations/start.rs` and passed into `HumanHandler` through a new `EngineServices` field such as `blocked_state_tracker: Option<Arc<BlockedStateTracker>>`. The tracker should guard unresolved interview count with a mutex so parallel human stages can safely detect `0 -> 1` and `1 -> 0` transitions.\n- On first pending interview (`0 -> 1` unresolved questions), the workflow runtime emits `interview.started` and then appends `run.blocked`.\n- While already blocked, additional `interview.started` events do not emit another `run.blocked`.\n- On final interview resolution (`1 -> 0` unresolved questions), the workflow runtime emits `interview.completed` or `interview.timeout` or `interview.interrupted` and then appends `run.unblocked`.\n- Do not emit `run.unblocked` when a blocked run reaches `failed`, `succeeded`, or `dead`; terminal events end the blocked condition implicitly.\n\nPause/unpause decisions:\n\n- Keep existing cooperative pause behavior for actively running work.\n- In this pass, make pause immediate only when the current visible status is `blocked`.\n- For immediate pause from blocked:\n  - append `run.pause.requested`\n  - append `run.paused` immediately\n  - do not emit `run.unblocked`\n  - this direct server-appended `run.paused` may race with worker-emitted interview resolution and `run.unblocked`; accept that race in this pass and make projection logic order-insensitive so either ordering converges on the same final paused-or-unblocked state\n- For unpause when the underlying human block is still unresolved:\n  - append `run.unpause.requested`\n  - append `run.unpaused`\n  - append `run.blocked`\n  - this is explicitly `paused -> running -> blocked`; do not add a direct `paused -> blocked` transition\n- For unpause when the underlying block has already resolved:\n  - append `run.unpause.requested`\n  - append `run.unpaused`\n- If the blocked condition resolves while paused:\n  - emit the interview resolution event\n  - emit `run.unblocked`\n  - keep `status=paused`\n\nTransition helper updates in `status.rs`:\n\n- add `submitted -> queued`\n- add `queued -> starting`\n- add `running -> blocked`\n- add `blocked -> running`\n- add `blocked -> paused` (immediate pause from blocked)\n- preserve `running -> paused`\n- preserve `paused -> running`\n- preserve non-terminal `-> failed` (including from `blocked`)\n- keep `dead` as a real terminal status in this pass\n\n### 3. Durable Projection And Truthful Run APIs\n\nUpdate durable state and operator-facing API behavior in:\n\n- [lib/crates/fabro-store/src/run_state.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/run_state.rs)\n- [lib/crates/fabro-store/src/types.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/types.rs)\n- [lib/crates/fabro-store/src/slate/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-store/src/slate/mod.rs)\n- [lib/crates/fabro-server/src/server.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/server.rs)\n- [lib/crates/fabro-server/src/demo/mod.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/demo/mod.rs)\n\nProjection changes:\n\n- Extend `RunStatusRecord` and `StoreRunSummary` (Rust: `RunSummary`) with `blocked_reason`.\n- Store `blocked_reason=human_input_required` while blocked on pending human input.\n- Preserve `blocked_reason` while the run is paused over an unresolved block.\n- Clear `blocked_reason` on `run.unblocked`.\n- Clear pending interviews on terminal completion/failure as today.\n- Synthesize `submitted` if a run exists but no lifecycle status has been projected yet.\n\nOperator API changes:\n\n- `/api/v1/runs` and `/api/v1/runs/{id}` become truthful operator surfaces.\n- Remove the lossy status remap that currently converts:\n  - `removing -> running`\n  - `succeeded -> completed`\n  - `failed(cancelled) -> cancelled`\n  - `dead -> failed`\n- Expose the canonical operator vocabulary directly on these endpoints.\n- Keep `status_reason=cancelled` on failed cancellations.\n- Include `blocked_reason` alongside `status_reason` and `pending_control`.\n- Because `ManagedRun.status` uses the generated API `RunStatus`, this enum collapse intentionally requires broad match-arm updates throughout `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/demo/mod.rs`, and generated client consumers.\n- Return the actual current status from mutation endpoints rather than a target status:\n  - `start` returns `queued`\n  - `pause` from `blocked` returns `paused`\n  - `unpause` back to unresolved human input returns `blocked`\n  - cooperative `pause` from `running` still returns `running` with `pending_control=pause` until the worker reaches a pause point\n\nRaw state endpoint changes:\n\n- `/api/v1/runs/{id}/state` remains the raw projection surface.\n- Make the schema truthful to the Rust payload by exposing `pending_interviews`.\n- Use `RunStatusRecord.status_reason` plus `blocked_reason` there too.\n\nLive managed-run reconciliation:\n\n- Update `update_live_run_from_event()` in `server.rs` for `run.queued`, `run.blocked`, and `run.unblocked`.\n- Keep `Blocked` treated as an incomplete active state for shutdown/startup handling in this pass.\n- Allow blocked runs to be cancelled through the existing cancel endpoint.\n- Update `pause_run` to accept `Blocked` in addition to `Running`, implementing the immediate-pause path (appending `run.paused` directly rather than sending a control signal to the worker).\n- Update `should_reconcile_run_on_startup` to include `Blocked` and `Queued`.\n\n### 4. Web Board Projection And UI\n\nUpdate the web-only board projection in:\n\n- [lib/crates/fabro-server/src/server.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-server/src/server.rs)\n- [apps/fabro-web/app/data/runs.ts](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/data/runs.ts)\n- [apps/fabro-web/app/routes/runs.tsx](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/routes/runs.tsx)\n- [apps/fabro-web/app/routes/run-detail.tsx](/Users/bhelmkamp/p/fabro-sh/fabro/apps/fabro-web/app/routes/run-detail.tsx)\n\nRequired changes:\n\n- Replace `waiting` with `blocked` in the board projection and UI types.\n- Add `queued` and `blocked` to the `RunStatus` type and `runStatusDisplay` record in `apps/fabro-web/app/data/runs.ts` with appropriate labels and colors.\n- Update OpenAPI `BoardColumn`, server board responses, and web `ColumnStatus` types to remove `working`, `review`, and `merge`.\n- Keep board columns `initializing | running | blocked | succeeded | failed`.\n- Map statuses per the board contract above.\n- Keep `removing` off-board.\n- Keep `paused` in the `running` column with no special indicator in this pass.\n- Keep `dead` in the `failed` column on the board.\n- Populate board card question text from the oldest unresolved pending interview only in `/api/v1/boards/runs`.\n- Implement that by having `list_board_runs` open run readers only for summaries whose mapped board column is `blocked`, inspect `RunProjection.pending_interviews`, and choose the oldest question by earliest `started_at`. Keep `StoreRunSummary` unchanged. This may replay or reload projection state per blocked run during board refresh; that performance profile is acceptable in this pass, and implementers should reuse existing `run_store.state()` / projection-cache behavior where available rather than introducing a new caching layer.\n- Do not add question text to `StoreRunSummary`.\n\nBoard refresh behavior:\n\n- Preserve the current status-refresh triggers and add the new ones. `STATUS_EVENTS` in `apps/fabro-web/app/routes/runs.tsx` should include:\n  - `run.submitted`\n  - `run.queued`\n  - `run.starting`\n  - `run.running`\n  - `run.removing`\n  - `run.paused`\n  - `run.unpaused`\n  - `run.blocked`\n  - `run.unblocked`\n  - `run.completed`\n  - `run.failed`\n  - `interview.started`\n  - `interview.completed`\n  - `interview.timeout`\n  - `interview.interrupted`\n\nRationale:\n\n- `run.blocked` and `run.unblocked` cover status changes.\n- `interview.*` still need to refresh the board because the displayed oldest unresolved question can change while the run remains blocked.\n\n### 5. CLI Consumers\n\nUpdate CLI consumers in:\n\n- [lib/crates/fabro-cli/src/server_runs.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/server_runs.rs)\n- [lib/crates/fabro-cli/src/commands/runs/list.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/commands/runs/list.rs)\n- [lib/crates/fabro-cli/src/commands/run/wait.rs](/Users/bhelmkamp/p/fabro-sh/fabro/lib/crates/fabro-cli/src/commands/run/wait.rs)\n\nRequired changes:\n\n- Treat `/api/v1/runs` as truthful and stop inventing fallback status in `server_runs.rs`.\n- Add display/color handling for `Queued` and `Blocked`.\n- Keep `Succeeded` as the success exit state for CLI wait behavior in this pass.\n- Keep `Dead` as a real displayable terminal state when it is actually present.\n- Stop using `Dead` as a synthetic fallback for missing server summary status now that `status` is non-null.\n- Continue to show `status_reason=cancelled` for cancellations rather than inventing a `Cancelled` top-level status.\n\n## Test Plan\n\n### Shared Types And Event Model\n\n- `lib/crates/fabro-types/src/run_event/mod.rs`\n  - round-trip serialization for `run.queued`, `run.blocked`, and `run.unblocked`\n  - `run.blocked` payload includes `blocked_reason`\n- `lib/crates/fabro-types/src/status.rs`\n  - transition tests for `submitted -> queued`, `running -> blocked`, and `blocked -> running`\n  - paused overlay path still flows through explicit event order rather than a direct `paused -> blocked` transition\n- `lib/crates/fabro-workflow/src/handler/human.rs`\n  - first pending interview emits `interview.started` then durable `run.blocked`\n  - second pending interview while already blocked does not emit another `run.blocked`\n  - final resolution emits `interview.completed`/`timeout`/`interrupted` then durable `run.unblocked`\n- `lib/crates/fabro-workflow/src/operations/start.rs`\n  - run-scoped blocked-state tracker emits exactly one `run.blocked` on `0 -> 1` and exactly one `run.unblocked` on `1 -> 0`, including parallel human-stage races\n\n### Durable Projection And Server\n\n- `lib/crates/fabro-store/src/run_state.rs`\n  - `run.queued` sets `status=Queued`\n  - `run.blocked` sets `status=Blocked` and `blocked_reason=HumanInputRequired`\n  - `run.unblocked` while status is `Blocked` clears `blocked_reason` and restores `Running`\n  - paused-over-blocked preserves `blocked_reason` while `status=Paused`\n  - unpause-to-still-blocked yields `RunUnpaused` followed by `RunBlocked`\n  - interview resolution while paused clears `blocked_reason` without changing visible `Paused`\n  - missing lifecycle status synthesizes `Submitted`\n- `lib/crates/fabro-store/src/slate/mod.rs`\n  - list/find summaries expose non-null `status`\n  - summaries expose `blocked_reason`\n- `lib/crates/fabro-server/src/server.rs`\n  - `/api/v1/runs` and `/api/v1/runs/{id}` expose `blocked`, `removing`, `succeeded`, and `dead` directly\n  - mutation responses return actual current status\n  - blocked runs are cancellable\n  - startup/shutdown handling still treats blocked runs as incomplete active work in this pass\n  - `/api/v1/runs/{id}/state` includes `pending_interviews`\n  - `start`/`resume` append durable `run.queued` when enqueueing\n  - board response emits `blocked` column, blocked question text, paused-in-running, removing off-board, and dead-in-failed\n\n### Web UI\n\n- `apps/fabro-web/app/data/runs.test.ts`\n  - accepts `blocked`, `queued`, `removing`, `succeeded`, and `dead`\n  - removes dependency on `waiting`\n- `apps/fabro-web/app/routes/runs.test.tsx`\n  - blocked runs render in the `blocked` lane\n  - paused runs remain in the `running` lane\n  - blocked card shows oldest unresolved question text\n  - `STATUS_EVENTS` retains `run.starting` and `run.running` while adding the new blocked/queued events\n  - question text refreshes correctly on `interview.*` events without a status change\n\n### CLI\n\n- `lib/crates/fabro-cli/src/commands/runs/list.rs`\n  - `Queued` and `Blocked` render with expected labels/colors\n  - `Dead` remains renderable when actually returned by the API\n- `lib/crates/fabro-cli/src/commands/run/wait.rs`\n  - `Succeeded` remains the success exit state\n  - `Blocked` is non-terminal and continues waiting\n  - no synthetic `Dead` fallback is used for server summary status\n\n## Explicit Non-Goals\n\n- No alerting, email, or notification policy in this pass.\n- No new paused indicator on the board in this pass.\n- No broader redesign of cooperative pause for actively running work.\n- No change to cancellation semantics beyond making blocked runs cancellable and keeping `failed + status_reason=cancelled`.\n- No attempt to make blocked runs survive restart as a durable parked state in this pass.\n"
+        },
+        "rankdir": {
+          "String": "LR"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors.\", max_visits=3]\n    fmt               [label=\"Format\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 fmt --all 2>&1\", max_retries=0]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> fmt   [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n    fmt -> exit\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.230.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.230.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.230.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github"
+      }
+    },
+    "manifest_blob": "e35a12626d861125390f097e75daa7904e3c5cfbf22700ae227c725fe6e63fb8",
+    "definition_blob": "791b2ce7454b6fff8fa26bea4af48533a25d0e56c4cecc44be1ea071680b4f9d",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "9ea00185dc565e0ebd84e1e6cca231a32b7ad927",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KRC096KRNQBP34DAED4TPSPS",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-11T17:10:15.446966Z",
+  "last_event_at": "2026-05-11T17:10:29.651177Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "image": "buildpack-deps:noble",
+    "snapshot": "fabro-v8",
+    "runtime": {
+      "id": "fabro-01KRC096KRNQBP34DAED4TPSPS",
+      "working_directory": "/home/daytona/workspace",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
