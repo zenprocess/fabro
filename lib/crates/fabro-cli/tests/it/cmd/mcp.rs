@@ -16,6 +16,8 @@ use fabro_mcp::client::McpClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
 
+use crate::support::{RealAuthHarness, TEST_DEV_TOKEN, seed_dev_token_auth};
+
 #[test]
 fn help() {
     let context = test_context!();
@@ -417,6 +419,71 @@ async fn stdio_startup_and_list_tools_is_fast() {
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_create_and_search_manage_real_runs_with_cli_auth() {
+    let context = test_context!();
+    let harness =
+        RealAuthHarness::start_with_dev_token(fabro_test::GitHubAppState::default()).await;
+    let target_url = harness.api_target();
+    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
+    seed_dev_token_auth(&context.home_dir, &target, TEST_DEV_TOKEN);
+    let workflow = context.install_fixture("simple.fabro");
+
+    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
+
+    let create = call_tool_json(
+        &client,
+        "fabro_run_create",
+        serde_json::json!({
+            "runs": [{
+                "workflow": workflow,
+                "dry_run": true,
+                "auto_approve": true,
+                "labels": { "source": "mcp-test" }
+            }]
+        }),
+    )
+    .await;
+    let run_id = create["runs"][0]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(create["runs"][0]["started"], true);
+
+    let search = call_tool_json(
+        &client,
+        "fabro_run_search",
+        serde_json::json!({
+            "run_ids": [run_id],
+            "labels": { "source": "mcp-test" },
+            "first": 10
+        }),
+    )
+    .await;
+    fabro_json_snapshot!(context, normalize_run_search(search), @r#"
+    {
+      "runs": [
+        {
+          "run_id": "[RUN_ID]",
+          "workflow_name": "Simple",
+          "workflow_slug": "simple",
+          "status": "queued",
+          "archived": false,
+          "created_at": "[TIMESTAMP]",
+          "started_at": null,
+          "completed_at": null,
+          "labels": {
+            "source": "mcp-test"
+          },
+          "source_directory": "[SOURCE_DIRECTORY]",
+          "repo_origin_url": null,
+          "goal": "Run the Fabro workflow."
+        }
+      ],
+      "next_cursor": null
+    }
+    "#);
+
+    harness.shutdown().await;
+}
+
 fn expected_claude_config_path(home_dir: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -487,4 +554,49 @@ async fn spawn_mcp_client(context: &fabro_test::TestContext, extra_args: &[&str]
         .await
         .expect("MCP server should initialize");
     client
+}
+
+async fn call_tool_json(
+    client: &McpClient,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let result = client
+        .call_tool(name, arguments, std::time::Duration::from_secs(30))
+        .await
+        .expect("tool call should complete");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "tool returned error: {result:?}"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|content| serde_json::to_value(content).ok())
+        .and_then(|content| content["text"].as_str().map(ToOwned::to_owned))
+        .expect("tool result should include text fallback");
+    assert!(!text.starts_with('{') && !text.starts_with('['));
+    result
+        .structured_content
+        .expect("tool result should include structured content")
+}
+
+fn normalize_run_search(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(runs) = value["runs"].as_array_mut() {
+        for run in runs {
+            run["run_id"] = serde_json::json!("[RUN_ID]");
+            run["created_at"] = serde_json::json!("[TIMESTAMP]");
+            if run["started_at"].is_string() {
+                run["started_at"] = serde_json::json!("[TIMESTAMP]");
+            }
+            if run["completed_at"].is_string() {
+                run["completed_at"] = serde_json::json!("[TIMESTAMP]");
+            }
+            if run["source_directory"].is_string() {
+                run["source_directory"] = serde_json::json!("[SOURCE_DIRECTORY]");
+            }
+        }
+    }
+    value
 }

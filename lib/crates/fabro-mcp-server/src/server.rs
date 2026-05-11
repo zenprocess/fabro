@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
-use fabro_client::Client;
+use anyhow::{Context as _, Result, anyhow};
+use fabro_client::{
+    AuthEntry, AuthStore, Client, Credential, ServerTarget, TransportConnector,
+    apply_bearer_token_auth,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ServerCapabilities, ServerInfo};
@@ -171,7 +174,66 @@ impl FabroMcpServer {
     }
 }
 
-async fn client_from_settings(_settings: &McpServerSettings) -> Result<Client> {
+async fn client_from_settings(settings: &McpServerSettings) -> Result<Client> {
     yield_now().await;
-    Err(anyhow!("fabro MCP API client is not implemented yet"))
+    let Some(server) = settings.config.server.as_ref() else {
+        return Err(anyhow!(
+            "fabro mcp start requires --server for run tools in this release"
+        ));
+    };
+    let target: ServerTarget = server.parse()?;
+    let credential = AuthStore::new(settings.home_dir.join(".fabro").join("auth.json"))
+        .get(&target)?
+        .map(credential_from_auth_entry);
+    let mut builder = Client::builder()
+        .target(target.clone())
+        .transport_connector(target_transport_connector(target))
+        .request_timeout(std::time::Duration::from_secs(30));
+    if let Some(credential) = credential {
+        builder = builder.credential(credential);
+    }
+    builder
+        .connect()
+        .await
+        .context("failed to connect Fabro API")
+}
+
+fn credential_from_auth_entry(entry: AuthEntry) -> Credential {
+    match entry {
+        AuthEntry::OAuth(entry) => Credential::OAuth(entry),
+        AuthEntry::DevToken(entry) => Credential::DevToken(entry.token),
+    }
+}
+
+fn target_transport_connector(target: ServerTarget) -> TransportConnector {
+    TransportConnector::new(move |bearer_token| {
+        let target = target.clone();
+        async move { connect_target_transport(&target, bearer_token.as_deref()) }
+    })
+}
+
+fn connect_target_transport(
+    target: &ServerTarget,
+    bearer_token: Option<&str>,
+) -> Result<(fabro_http::HttpClient, String)> {
+    if let Some(api_url) = target.as_http_url() {
+        let mut builder = fabro_http::HttpClientBuilder::new().no_proxy();
+        if let Some(token) = bearer_token {
+            builder = apply_bearer_token_auth(builder, token)?;
+        }
+        return Ok((builder.build()?, api_url.to_string()));
+    }
+
+    let Some(path) = target.as_unix_socket_path() else {
+        return Err(anyhow!(
+            "server target must be an http(s) URL or absolute Unix socket path"
+        ));
+    };
+    let mut builder = fabro_http::HttpClientBuilder::new()
+        .unix_socket(path)
+        .no_proxy();
+    if let Some(token) = bearer_token {
+        builder = apply_bearer_token_auth(builder, token)?;
+    }
+    Ok((builder.build()?, "http://fabro".to_string()))
 }

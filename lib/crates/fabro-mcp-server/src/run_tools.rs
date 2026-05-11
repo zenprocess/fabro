@@ -7,11 +7,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, NaiveDate, Utc};
+use fabro_api::types;
 use fabro_client::Client;
+use fabro_types::{Run, RunId, RunStatus};
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::fs;
 use tokio::task::yield_now;
 
 #[derive(Debug)]
@@ -71,6 +75,11 @@ impl TryFrom<FabroRunCreateParams> for ValidatedCreateRuns {
 
     fn try_from(params: FabroRunCreateParams) -> Result<Self, Self::Error> {
         validate_len("runs", params.runs.len(), 1, 50)?;
+        for spec in &params.runs {
+            for (key, value) in &spec.inputs {
+                json_to_toml_value(key, value)?;
+            }
+        }
         Ok(Self { runs: params.runs })
     }
 }
@@ -112,6 +121,12 @@ impl TryFrom<FabroRunSearchParams> for ValidatedSearchRuns {
     fn try_from(params: FabroRunSearchParams) -> Result<Self, Self::Error> {
         if params.first.is_some_and(|first| first > 100) {
             return Err(ToolError::message("first must be <= 100"));
+        }
+        if let Some(created_after) = params.created_after.as_deref() {
+            parse_datetime_filter("created_after", created_after)?;
+        }
+        if let Some(created_before) = params.created_before.as_deref() {
+            parse_datetime_filter("created_before", created_before)?;
         }
         Ok(Self { raw: params })
     }
@@ -300,24 +315,105 @@ pub(crate) struct RunEventResult {
 }
 
 pub(crate) async fn create_runs(
-    _client: Arc<Client>,
-    _base_cwd: &Path,
-    _params: ValidatedCreateRuns,
+    client: Arc<Client>,
+    base_cwd: &Path,
+    params: ValidatedCreateRuns,
 ) -> ToolResult<CreateRunsResult> {
-    yield_now().await;
-    Err(ToolError::message(
-        "fabro_run_create is not implemented yet",
-    ))
+    let mut created = Vec::with_capacity(params.runs.len());
+    for spec in params.runs {
+        let cwd = spec.cwd.clone().unwrap_or_else(|| base_cwd.to_path_buf());
+        let manifest = build_run_manifest(&spec, &cwd).await?;
+        let run_id = client
+            .create_run_from_manifest(manifest)
+            .await
+            .map_err(|err| ToolError::from_anyhow(&err))?;
+        let started = spec.start.unwrap_or(true);
+        if started {
+            client
+                .start_run(&run_id, false)
+                .await
+                .map_err(|err| ToolError::from_anyhow(&err))?;
+        }
+        let summary = client
+            .retrieve_run(&run_id)
+            .await
+            .map_err(|err| ToolError::from_anyhow(&err))?;
+        created.push(CreatedRunResult {
+            run_id: summary.id.to_string(),
+            workflow: spec.workflow,
+            started,
+            status: run_status_kind(summary.lifecycle.status).to_string(),
+        });
+    }
+    Ok(CreateRunsResult { runs: created })
 }
 
 pub(crate) async fn search_runs(
-    _client: Arc<Client>,
-    _params: ValidatedSearchRuns,
+    client: Arc<Client>,
+    params: ValidatedSearchRuns,
 ) -> ToolResult<SearchRunsResult> {
-    yield_now().await;
-    Err(ToolError::message(
-        "fabro_run_search is not implemented yet",
-    ))
+    let raw = params.raw;
+    let mut runs = client
+        .list_store_runs()
+        .await
+        .map_err(|err| ToolError::from_anyhow(&err))?;
+    runs.sort_by(|a, b| {
+        b.timestamps
+            .created_at
+            .cmp(&a.timestamps.created_at)
+            .then_with(|| b.id.to_string().cmp(&a.id.to_string()))
+    });
+
+    if let Some(after) = raw.after.as_deref() {
+        if let Some(position) = runs.iter().position(|run| run.id.to_string() == after) {
+            runs = runs.into_iter().skip(position + 1).collect();
+        }
+    }
+
+    if let Some(run_ids) = raw.run_ids.as_ref() {
+        runs.retain(|run| run_ids.iter().any(|id| id == &run.id.to_string()));
+    }
+    if let Some(workflow) = raw.workflow.as_deref() {
+        runs.retain(|run| {
+            run.workflow.name == workflow || run.workflow.slug.as_deref() == Some(workflow)
+        });
+    }
+    if let Some(labels) = raw.labels.as_ref() {
+        runs.retain(|run| {
+            labels
+                .iter()
+                .all(|(key, value)| run.labels.get(key) == Some(value))
+        });
+    }
+    if let Some(status) = raw.status.as_ref() {
+        runs.retain(|run| {
+            status
+                .iter()
+                .any(|status| status == run_status_kind(run.lifecycle.status))
+        });
+    }
+    if let Some(archived) = raw.archived {
+        runs.retain(|run| run.lifecycle.archived == archived);
+    }
+    if let Some(created_after) = raw.created_after.as_deref() {
+        let cutoff = parse_datetime_filter("created_after", created_after)?;
+        runs.retain(|run| run.timestamps.created_at >= cutoff);
+    }
+    if let Some(created_before) = raw.created_before.as_deref() {
+        let cutoff = parse_datetime_filter("created_before", created_before)?;
+        runs.retain(|run| run.timestamps.created_at <= cutoff);
+    }
+
+    let first = raw.first.unwrap_or(20).min(100);
+    let has_more = runs.len() > first;
+    let page = runs.into_iter().take(first).collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| page.last().map(|run| run.id.to_string()))
+        .flatten();
+    Ok(SearchRunsResult {
+        runs: page.iter().map(run_summary_result).collect(),
+        next_cursor,
+    })
 }
 
 pub(crate) async fn interact_run(
@@ -416,4 +512,240 @@ fn validate_len(name: &str, len: usize, min: usize, max: usize) -> ToolResult<()
 
 fn format_tool_error(err: &anyhow::Error) -> String {
     format!("{err:#}")
+}
+
+async fn build_run_manifest(spec: &CreateRunSpec, cwd: &Path) -> ToolResult<types::RunManifest> {
+    if let Some(run_id) = spec.run_id.as_deref() {
+        run_id.parse::<RunId>().map_err(|err| {
+            ToolError::message(format!("run_id must be a valid Fabro run id: {err}"))
+        })?;
+    }
+    let workflow_path = resolve_workflow_path(&spec.workflow, cwd);
+    let manifest_cwd = manifest_cwd_for_workflow(cwd, &workflow_path);
+    let workflow_key = workflow_path
+        .strip_prefix(&manifest_cwd)
+        .unwrap_or(&workflow_path)
+        .display()
+        .to_string();
+    let source = fs::read_to_string(&workflow_path).await.map_err(|err| {
+        ToolError::message(format!(
+            "failed to read workflow {}: {err}",
+            workflow_path.display()
+        ))
+    })?;
+    let workflows = HashMap::from([(workflow_key.clone(), types::ManifestWorkflow {
+        config: None,
+        files: HashMap::new(),
+        source,
+    })]);
+    Ok(types::RunManifest {
+        args: mcp_manifest_args(spec),
+        configs: Vec::new(),
+        cwd: manifest_cwd.display().to_string(),
+        git: None,
+        goal: Some(types::ManifestGoal {
+            path:  None,
+            text:  spec
+                .goal
+                .clone()
+                .unwrap_or_else(|| "Run the Fabro workflow.".to_string()),
+            type_: types::ManifestGoalType::Value,
+        }),
+        run_id: spec.run_id.clone(),
+        target: types::ManifestTarget {
+            identifier: spec.workflow.clone(),
+            path:       workflow_key,
+        },
+        title: None,
+        version: 1,
+        workflows,
+    })
+}
+
+fn resolve_workflow_path(workflow: &str, cwd: &Path) -> PathBuf {
+    let path = PathBuf::from(workflow);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn manifest_cwd_for_workflow(cwd: &Path, workflow_path: &Path) -> PathBuf {
+    if workflow_path.strip_prefix(cwd).is_ok() {
+        cwd.to_path_buf()
+    } else {
+        workflow_path
+            .parent()
+            .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf)
+    }
+}
+
+fn mcp_manifest_args(spec: &CreateRunSpec) -> Option<types::ManifestArgs> {
+    let label = spec
+        .labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    let input = spec
+        .inputs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    let payload = types::ManifestArgs {
+        auto_approve: spec.auto_approve.filter(|value| *value),
+        docker_image: None,
+        dry_run: spec.dry_run.filter(|value| *value),
+        input,
+        label,
+        model: spec.model.clone(),
+        preserve_sandbox: spec.preserve_sandbox.filter(|value| *value),
+        provider: spec.provider.clone(),
+        sandbox: spec.sandbox.clone(),
+        verbose: None,
+    };
+    (!mcp_manifest_args_is_empty(&payload)).then_some(payload)
+}
+
+fn mcp_manifest_args_is_empty(args: &types::ManifestArgs) -> bool {
+    args.auto_approve.is_none()
+        && args.docker_image.is_none()
+        && args.dry_run.is_none()
+        && args.input.is_empty()
+        && args.label.is_empty()
+        && args.model.is_none()
+        && args.preserve_sandbox.is_none()
+        && args.provider.is_none()
+        && args.sandbox.is_none()
+        && args.verbose.is_none()
+}
+
+fn json_to_toml_value(key: &str, value: &Value) -> ToolResult<toml::Value> {
+    match value {
+        Value::Null => Err(ToolError::message(format!(
+            "input `{key}` cannot be null; use a string, boolean, number, array, or object"
+        ))),
+        Value::Bool(value) => Ok(toml::Value::Boolean(*value)),
+        Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(toml::Value::Integer(integer))
+            } else if let Some(float) = value.as_f64() {
+                Ok(toml::Value::Float(float))
+            } else {
+                Err(ToolError::message(format!(
+                    "input `{key}` contains a number outside TOML's supported range"
+                )))
+            }
+        }
+        Value::String(value) => Ok(toml::Value::String(value.clone())),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| json_to_toml_value(key, value))
+            .collect::<ToolResult<Vec<_>>>()
+            .map(toml::Value::Array),
+        Value::Object(values) => {
+            let mut table = toml::Table::new();
+            for (child_key, child_value) in values {
+                table.insert(child_key.clone(), json_to_toml_value(key, child_value)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+fn run_summary_result(run: &Run) -> RunSummaryResult {
+    RunSummaryResult {
+        run_id:           run.id.to_string(),
+        workflow_name:    run.workflow.name.clone(),
+        workflow_slug:    run.workflow.slug.clone(),
+        status:           run_status_kind(run.lifecycle.status).to_string(),
+        archived:         run.lifecycle.archived,
+        created_at:       run.timestamps.created_at.to_rfc3339(),
+        started_at:       run
+            .timestamps
+            .started_at
+            .map(|timestamp| timestamp.to_rfc3339()),
+        completed_at:     run
+            .timestamps
+            .completed_at
+            .map(|timestamp| timestamp.to_rfc3339()),
+        labels:           run.labels.clone(),
+        source_directory: run.source_directory.clone(),
+        repo_origin_url:  run
+            .repository
+            .as_ref()
+            .and_then(|repository| repository.origin_url.clone()),
+        goal:             run.goal.clone(),
+    }
+}
+
+fn parse_datetime_filter(name: &str, raw: &str) -> ToolResult<DateTime<Utc>> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|err| {
+        ToolError::message(format!("{name} must be RFC3339 or YYYY-MM-DD: {err}"))
+    })?;
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| ToolError::message(format!("{name} contains an invalid date")))?;
+    Ok(DateTime::from_naive_utc_and_offset(datetime, Utc))
+}
+
+fn run_status_kind(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Submitted => "submitted",
+        RunStatus::Queued => "queued",
+        RunStatus::Starting => "starting",
+        RunStatus::Running => "running",
+        RunStatus::Blocked { .. } => "blocked",
+        RunStatus::Paused { .. } => "paused",
+        RunStatus::Removing => "removing",
+        RunStatus::Succeeded { .. } => "succeeded",
+        RunStatus::Failed { .. } => "failed",
+        RunStatus::Dead => "dead",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn json_inputs_convert_to_toml_values() {
+        let cases = [
+            (json!("hello"), toml::Value::String("hello".to_string())),
+            (json!(true), toml::Value::Boolean(true)),
+            (json!(42), toml::Value::Integer(42)),
+            (json!(0.5), toml::Value::Float(0.5)),
+            (
+                json!(["a", 1]),
+                toml::Value::Array(vec![
+                    toml::Value::String("a".to_string()),
+                    toml::Value::Integer(1),
+                ]),
+            ),
+            (
+                json!({ "enabled": true, "count": 2 }),
+                toml::Value::Table(toml::Table::from_iter([
+                    ("enabled".to_string(), toml::Value::Boolean(true)),
+                    ("count".to_string(), toml::Value::Integer(2)),
+                ])),
+            ),
+        ];
+
+        for (json, expected) in cases {
+            assert_eq!(json_to_toml_value("input", &json).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn json_input_null_is_rejected_with_key_name() {
+        let err = json_to_toml_value("goal", &Value::Null).unwrap_err();
+
+        assert!(err.as_str().contains("goal"));
+        assert!(err.as_str().contains("null"));
+    }
 }
