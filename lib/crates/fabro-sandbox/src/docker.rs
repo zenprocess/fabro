@@ -884,22 +884,46 @@ struct DockerStdioProcessControl {
     container_id: String,
     exec_id:      String,
     stop_file:    String,
-    termination:  TokioMutex<Option<StdioProcessTermination>>,
+    state:        DockerStdioProcessState,
+}
+
+#[derive(Default)]
+struct DockerStdioProcessState {
+    stop_requested: TokioMutex<bool>,
+    termination:    TokioMutex<Option<StdioProcessTermination>>,
+}
+
+impl DockerStdioProcessState {
+    async fn cached_termination(&self) -> Option<StdioProcessTermination> {
+        *self.termination.lock().await
+    }
+
+    async fn should_request_stop(&self) -> bool {
+        self.cached_termination().await.is_none() && !*self.stop_requested.lock().await
+    }
+
+    async fn mark_stop_requested(&self) {
+        *self.stop_requested.lock().await = true;
+    }
+
+    async fn cache_termination(&self, termination: StdioProcessTermination) {
+        *self.termination.lock().await = Some(termination);
+    }
 }
 
 #[async_trait]
 impl StdioProcessControl for DockerStdioProcessControl {
     async fn terminate(&self) -> crate::Result<()> {
-        if self.termination.lock().await.is_some() {
+        if !self.state.should_request_stop().await {
             return Ok(());
         }
         request_docker_exec_stop_with(&self.docker, &self.container_id, &self.stop_file).await?;
-        *self.termination.lock().await = Some(StdioProcessTermination::cancelled());
+        self.state.mark_stop_requested().await;
         Ok(())
     }
 
     async fn wait(&self) -> crate::Result<StdioProcessTermination> {
-        if let Some(termination) = *self.termination.lock().await {
+        if let Some(termination) = self.state.cached_termination().await {
             return Ok(termination);
         }
 
@@ -912,7 +936,7 @@ impl StdioProcessControl for DockerStdioProcessControl {
             if inspect.running != Some(true) {
                 let exit_code = inspect.exit_code.and_then(|code| i32::try_from(code).ok());
                 let termination = StdioProcessTermination::exited(exit_code);
-                *self.termination.lock().await = Some(termination);
+                self.state.cache_termination(termination).await;
                 return Ok(termination);
             }
             time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1516,7 +1540,7 @@ impl Sandbox for DockerSandbox {
             container_id,
             exec_id,
             stop_file,
-            termination: TokioMutex::new(None),
+            state: DockerStdioProcessState::default(),
         });
 
         if let Some(token) = cancel_token {
@@ -2058,6 +2082,21 @@ mod tests {
             "controlled shell command should exit successfully: {output:?}"
         );
         assert_eq!(output.stdout, b"abc\n");
+    }
+
+    #[tokio::test]
+    async fn docker_stdio_process_state_does_not_cache_cancelled_on_stop_request() {
+        let state = DockerStdioProcessState::default();
+
+        assert!(state.should_request_stop().await);
+        state.mark_stop_requested().await;
+        assert_eq!(state.cached_termination().await, None);
+        assert!(!state.should_request_stop().await);
+
+        let termination = StdioProcessTermination::exited(Some(143));
+        state.cache_termination(termination).await;
+        assert_eq!(state.cached_termination().await, Some(termination));
+        assert!(!state.should_request_stop().await);
     }
 
     #[tokio::test]

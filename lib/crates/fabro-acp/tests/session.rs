@@ -119,17 +119,19 @@ async fn runs_inside_sandbox_and_uses_requested_cwd() {
 async fn cancellation_sends_session_cancel_and_returns_cancelled() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let cancel_path = tempdir.path().join("cancel.txt");
+    let tempdir_path = tempdir.path().to_path_buf();
+    let cancel_path_for_task = cancel_path.clone();
     let cancel_token = CancellationToken::new();
     let cancel_for_task = cancel_token.clone();
 
     let task = tokio::spawn(async move {
         run_fake_agent(
-            tempdir.path(),
+            &tempdir_path,
             HashMap::from([
                 ("ACP_MODE".to_string(), "cancel".to_string()),
                 (
                     "ACP_CANCEL_RECORD".to_string(),
-                    cancel_path.to_string_lossy().into_owned(),
+                    cancel_path_for_task.to_string_lossy().into_owned(),
                 ),
             ]),
             Some(5_000),
@@ -146,6 +148,12 @@ async fn cancellation_sends_session_cancel_and_returns_cancelled() {
         .expect_err("cancelled turn should error");
 
     assert!(matches!(err, AcpError::Cancelled));
+    assert_eq!(
+        read_to_string(cancel_path)
+            .await
+            .expect("read cancel record"),
+        "session/cancel\n"
+    );
 }
 
 #[tokio::test]
