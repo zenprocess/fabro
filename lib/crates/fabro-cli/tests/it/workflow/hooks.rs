@@ -15,13 +15,11 @@ use fabro_auth::{AuthCredential, AuthDetails};
 use fabro_config::Storage;
 use fabro_model::Provider;
 use fabro_test::{
-    TestMode, TwinOpenAi, TwinScenario, TwinScenarios, TwinToolCall, expect_reqwest_status,
-    test_context, twin_openai,
+    TestMode, TwinOpenAi, TwinScenario, TwinScenarios, TwinToolCall, test_context, twin_openai,
 };
 use fabro_vault::{SecretType, Vault};
 
-use super::run_id_for;
-use crate::cmd::support::server_endpoint;
+use super::read_conclusion;
 
 async fn run_success_output(mut cmd: assert_cmd::Command) -> Output {
     tokio::task::spawn_blocking(move || cmd.assert().success().get_output().clone())
@@ -146,25 +144,14 @@ fn configure_hook_env(cmd: &mut assert_cmd::Command, hook_model: &str) {
 
 async fn conclusion_status(context: &fabro_test::TestContext) -> String {
     let run_dir = context.single_run_dir();
-    let run_id = run_id_for(&run_dir);
-    let (client, base_url) =
-        server_endpoint(&context.storage_dir).expect("server endpoint should exist");
-    let response = client
-        .get(format!("{base_url}/api/v1/runs/{run_id}/state"))
-        .send()
-        .await
-        .expect("run state request should succeed");
-    let response = expect_reqwest_status(
-        response,
-        fabro_http::StatusCode::OK,
-        format!("GET /api/v1/runs/{run_id}/state"),
-    )
-    .await;
-    let state: serde_json::Value = response.json().await.expect("run state should parse");
-    state["conclusion"]["status"]
-        .as_str()
-        .expect("conclusion should include a string status")
-        .to_string()
+    tokio::task::spawn_blocking(move || {
+        read_conclusion(&run_dir)["status"]
+            .as_str()
+            .expect("conclusion should include a string status")
+            .to_string()
+    })
+    .await
+    .expect("conclusion status task should complete")
 }
 
 #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]
