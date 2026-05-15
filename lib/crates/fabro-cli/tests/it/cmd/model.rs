@@ -103,9 +103,13 @@ fn list_query() {
     success: true
     exit_code: 0
     ----- stdout -----
-    MODEL            PROVIDER   ALIASES            CONTEXT          COST     SPEED 
-     claude-opus-4-6  anthropic                          1m  $5.0 / $25.0  25 tok/s 
-     claude-opus-4-7  anthropic  opus, claude-opus       1m  $5.0 / $25.0  25 tok/s
+    MODEL                   PROVIDER   ALIASES            CONTEXT          COST     SPEED 
+     claude-opus-4-6         anthropic                          1m  $5.0 / $25.0  25 tok/s 
+     claude-opus-4-7         anthropic  opus, claude-opus       1m  $5.0 / $25.0  25 tok/s 
+     vertex-claude-opus-4-1  vertex                           200k         - / -  25 tok/s 
+     vertex-claude-opus-4-5  vertex                           200k         - / -  25 tok/s 
+     vertex-claude-opus-4-6  vertex                             1m         - / -  25 tok/s 
+     vertex-claude-opus-4-7  vertex                             1m         - / -  25 tok/s
     ----- stderr -----
     ");
 }
@@ -136,9 +140,13 @@ fn list_query_case_insensitive() {
     success: true
     exit_code: 0
     ----- stdout -----
-    MODEL            PROVIDER   ALIASES            CONTEXT          COST     SPEED 
-     claude-opus-4-6  anthropic                          1m  $5.0 / $25.0  25 tok/s 
-     claude-opus-4-7  anthropic  opus, claude-opus       1m  $5.0 / $25.0  25 tok/s
+    MODEL                   PROVIDER   ALIASES            CONTEXT          COST     SPEED 
+     claude-opus-4-6         anthropic                          1m  $5.0 / $25.0  25 tok/s 
+     claude-opus-4-7         anthropic  opus, claude-opus       1m  $5.0 / $25.0  25 tok/s 
+     vertex-claude-opus-4-1  vertex                           200k         - / -  25 tok/s 
+     vertex-claude-opus-4-5  vertex                           200k         - / -  25 tok/s 
+     vertex-claude-opus-4-6  vertex                             1m         - / -  25 tok/s 
+     vertex-claude-opus-4-7  vertex                             1m         - / -  25 tok/s
     ----- stderr -----
     ");
 }
