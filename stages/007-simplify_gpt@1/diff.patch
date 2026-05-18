@@ -1,0 +1,662 @@
+diff --git a/apps/fabro-web/app/data/runs.ts b/apps/fabro-web/app/data/runs.ts
+index 36b7c2f3c..b24abc825 100644
+--- a/apps/fabro-web/app/data/runs.ts
++++ b/apps/fabro-web/app/data/runs.ts
+@@ -41,23 +41,19 @@ export interface RunItem {
+ }
+ 
+ export const columnStatuses = [
+-  BoardColumn.QUEUED,
+   BoardColumn.INITIALIZING,
+   BoardColumn.RUNNING,
+   BoardColumn.BLOCKED,
+   BoardColumn.SUCCEEDED,
+   BoardColumn.FAILED,
+-  BoardColumn.ARCHIVED,
+ ] as const satisfies readonly BoardColumn[];
+ 
+ export const columnStatusDisplay: Record<BoardColumn, { label: string; dot: string; text: string }> = {
+-  queued:       { label: "Queued",       dot: "bg-fg-muted",  text: "text-fg-muted" },
+   initializing: { label: "Initializing", dot: "bg-amber",     text: "text-amber" },
+   running:      { label: "Running",      dot: "bg-teal-500",  text: "text-teal-500" },
+   blocked:      { label: "Blocked",      dot: "bg-amber",     text: "text-amber" },
+   succeeded:    { label: "Succeeded",    dot: "bg-teal-300",  text: "text-teal-300" },
+   failed:       { label: "Failed",       dot: "bg-coral",     text: "text-coral" },
+-  archived:     { label: "Archived",     dot: "bg-fg-muted",  text: "text-fg-muted" },
+ };
+ 
+ export interface RunWithStatus extends RunItem {
+@@ -112,7 +108,6 @@ export function columnForStatus(status: ApiRunStatus | null | undefined): BoardC
+   switch (status?.kind) {
+     case "submitted":
+     case "queued":
+-      return "queued";
+     case "starting":
+       return "initializing";
+     case "running":
+@@ -132,13 +127,13 @@ export function columnForStatus(status: ApiRunStatus | null | undefined): BoardC
+ }
+ 
+ export function columnForRun(run: Run): BoardColumn | null {
+-  if (run.lifecycle.archived) return "archived";
++  if (run.lifecycle.archived) return null;
+   return columnForStatus(run.lifecycle.status);
+ }
+ 
+ export function toRunWithStatus(run: Run): RunWithStatus {
+   const item = mapRunListItem(run);
+-  const column = columnForRun(run) ?? "queued";
++  const column = columnForRun(run) ?? "initializing";
+   return {
+     ...item,
+     status: column,
+diff --git a/apps/fabro-web/app/lib/board-events.test.tsx b/apps/fabro-web/app/lib/board-events.test.tsx
+index a032d0a12..46b3ac4ab 100644
+--- a/apps/fabro-web/app/lib/board-events.test.tsx
++++ b/apps/fabro-web/app/lib/board-events.test.tsx
+@@ -71,7 +71,7 @@ describe("subscribeToBoardEvents", () => {
+     source.emit({ event: "run.running" });
+ 
+     expect(created).toEqual(["/api/v1/attach"]);
+-    expect(keys).toEqual([queryKeys.boards.runs(false), queryKeys.boards.runs(true)]);
++    expect(keys).toEqual([queryKeys.boards.runs()]);
+ 
+     firstCleanup();
+     expect(source.closed).toBe(false);
+@@ -101,7 +101,7 @@ describe("subscribeToBoardEvents", () => {
+     source.emit({ event: "run.running" });
+ 
+     expect(created).toEqual(["/api/v1/attach"]);
+-    expect(keys).toEqual([queryKeys.boards.runs(false), queryKeys.boards.runs(true)]);
++    expect(keys).toEqual([queryKeys.boards.runs()]);
+ 
+     firstCleanup();
+     expect(source.closed).toBe(false);
+diff --git a/apps/fabro-web/app/lib/board-events.ts b/apps/fabro-web/app/lib/board-events.ts
+index 77e44f520..ece047540 100644
+--- a/apps/fabro-web/app/lib/board-events.ts
++++ b/apps/fabro-web/app/lib/board-events.ts
+@@ -85,7 +85,7 @@ function boardInvalidation(payload: EventPayload) {
+ }
+ 
+ function boardRunKeys() {
+-  return [queryKeys.boards.runs(false), queryKeys.boards.runs(true)];
++  return [queryKeys.boards.runs()];
+ }
+ 
+ export function useBoardEvents() {
+diff --git a/apps/fabro-web/app/lib/mutations.ts b/apps/fabro-web/app/lib/mutations.ts
+index 5852a7544..30f0aec36 100644
+--- a/apps/fabro-web/app/lib/mutations.ts
++++ b/apps/fabro-web/app/lib/mutations.ts
+@@ -117,7 +117,6 @@ export function useUpdateRunTitle(id: string | undefined) {
+         if (!id) return;
+         void mutate(queryKeys.runs.detail(id), run, { revalidate: false });
+         void mutate(queryKeys.boards.runs());
+-        void mutate(queryKeys.boards.runs(true));
+       },
+     },
+   );
+diff --git a/apps/fabro-web/app/lib/queries.ts b/apps/fabro-web/app/lib/queries.ts
+index 8f7bce147..998631592 100644
+--- a/apps/fabro-web/app/lib/queries.ts
++++ b/apps/fabro-web/app/lib/queries.ts
+@@ -91,12 +91,12 @@ export function useSystemInfo() {
+   );
+ }
+ 
+-export function useBoardsRuns(includeArchived: boolean = false) {
++export function useBoardsRuns() {
+   return useSWR<BoardRunsEnvelope>(
+-    queryKeys.boards.runs(includeArchived),
++    queryKeys.boards.runs(),
+     () =>
+       fetchAllPages("board runs", (limit, offset) =>
+-        apiData(() => runsApi.listBoardRuns(limit, offset, includeArchived)),
++        apiData(() => runsApi.listBoardRuns(limit, offset)),
+       ),
+   );
+ }
+diff --git a/apps/fabro-web/app/lib/query-keys.ts b/apps/fabro-web/app/lib/query-keys.ts
+index eaf2b952c..23c7ce008 100644
+--- a/apps/fabro-web/app/lib/query-keys.ts
++++ b/apps/fabro-web/app/lib/query-keys.ts
+@@ -38,7 +38,7 @@ export const queryKeys = {
+     attachUrl: () => "/api/v1/attach",
+   },
+   boards: {
+-    runs: (includeArchived = false) => ["boards", "runs", includeArchived] as const,
++    runs: () => ["boards", "runs"] as const,
+   },
+   runs: {
+     detail: (id: string) => ["runs", "detail", id] as const,
+diff --git a/apps/fabro-web/app/routes/run-detail.tsx b/apps/fabro-web/app/routes/run-detail.tsx
+index ba02cf0ea..581fe9f68 100644
+--- a/apps/fabro-web/app/routes/run-detail.tsx
++++ b/apps/fabro-web/app/routes/run-detail.tsx
+@@ -267,7 +267,6 @@ export default function RunDetail({ params }: { params: { id: string } }) {
+     try {
+       await deleteRun(params.id);
+       void mutate(queryKeys.boards.runs());
+-      void mutate(queryKeys.boards.runs(true));
+       push({ message: "Run deleted." });
+       navigate("/runs");
+     } catch (error) {
+diff --git a/apps/fabro-web/app/routes/runs.test.tsx b/apps/fabro-web/app/routes/runs.test.tsx
+index 54722ae0d..fb1f1fc33 100644
+--- a/apps/fabro-web/app/routes/runs.test.tsx
++++ b/apps/fabro-web/app/routes/runs.test.tsx
+@@ -10,16 +10,14 @@ import {
+ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
+   const status =
+     column === "blocked"
+-      ? { kind: "blocked" as const, reason: "interview", pending_question_id: null }
++      ? { kind: "blocked" as const, blocked_reason: "human_input_required" }
+       : column === "succeeded"
+         ? { kind: "succeeded" as const, reason: "completed" }
+         : column === "failed"
+-          ? { kind: "failed" as const, reason: "error" }
+-          : column === "queued"
+-            ? { kind: "queued" as const }
+-            : column === "initializing"
+-              ? { kind: "starting" as const }
+-              : { kind: "running" as const };
++          ? { kind: "failed" as const, reason: "workflow_error" }
++          : column === "initializing"
++            ? { kind: "starting" as const }
++            : { kind: "running" as const };
+   return {
+     id,
+     goal:             `Run ${id}`,
+@@ -35,8 +33,8 @@ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
+       pending_control: null,
+       queue_position:  null,
+       error:           null,
+-      archived:        column === "archived",
+-      archived_at:     column === "archived" ? "2026-04-19T12:05:00Z" : null,
++      archived:        false,
++      archived_at:     null,
+     },
+     sandbox:          null,
+     models:           [],
+@@ -60,7 +58,6 @@ describe("runs route board mapping", () => {
+   test("keeps blocked runs in the blocked lane and preserves question text", () => {
+     const columns = buildBoardColumns({
+       columns: [
+-        { id: "queued", name: "Queued" },
+         { id: "initializing", name: "Initializing" },
+         { id: "running", name: "Running" },
+         { id: "blocked", name: "Blocked" },
+@@ -79,56 +76,56 @@ describe("runs route board mapping", () => {
+     expect(columns.find((column) => column.id === "blocked")?.items[0]?.question).toBe("Older unresolved question?");
+   });
+ 
+-  test("renders an archived column when the response includes one", () => {
++  test("renders the five board columns returned by the API", () => {
+     const columns = buildBoardColumns({
+       columns: [
+-        { id: "queued", name: "Queued" },
+         { id: "initializing", name: "Initializing" },
+         { id: "running", name: "Running" },
+         { id: "blocked", name: "Blocked" },
+         { id: "succeeded", name: "Succeeded" },
+         { id: "failed", name: "Failed" },
+-        { id: "archived", name: "Archived" },
+-      ],
+-      data: [
+-        boardRun("succeeded-run", "succeeded"),
+-        boardRun("archived-run", "archived"),
+       ],
++      data: [boardRun("succeeded-run", "succeeded")],
+       meta: { has_more: false },
+     });
+ 
+     expect(columns.map((column) => column.id)).toEqual([
+-      "queued",
+       "initializing",
+       "running",
+       "blocked",
+       "succeeded",
+       "failed",
+-      "archived",
+     ]);
+-    expect(
+-      columns.find((column) => column.id === "archived")?.items.map((item) => item.id),
+-    ).toEqual(["archived-run"]);
+     expect(
+       columns.find((column) => column.id === "succeeded")?.items.map((item) => item.id),
+     ).toEqual(["succeeded-run"]);
+   });
+ 
+-  test("omits the archived column when the response does not include it", () => {
++  test("omits archived runs because archived is not a board column", () => {
++    const archivedRun = boardRun("archived-run", "succeeded");
++    archivedRun.lifecycle.archived = true;
++    archivedRun.lifecycle.archived_at = "2026-04-19T12:05:00Z";
++
+     const columns = buildBoardColumns({
+       columns: [
+-        { id: "queued", name: "Queued" },
+         { id: "initializing", name: "Initializing" },
+         { id: "running", name: "Running" },
+         { id: "blocked", name: "Blocked" },
+         { id: "succeeded", name: "Succeeded" },
+         { id: "failed", name: "Failed" },
+       ],
+-      data: [boardRun("succeeded-run", "succeeded")],
++      data: [boardRun("succeeded-run", "succeeded"), archivedRun],
+       meta: { has_more: false },
+     });
+ 
+-    expect(columns.some((column) => column.id === "archived")).toBe(false);
++    expect(columns.map((column) => column.id)).toEqual([
++      "initializing",
++      "running",
++      "blocked",
++      "succeeded",
++      "failed",
++    ]);
++    expect(columns.flatMap((column) => column.items).map((item) => item.id)).toEqual(["succeeded-run"]);
+   });
+ 
+   test("refreshes for blocked status and interview events", () => {
+diff --git a/apps/fabro-web/app/routes/runs.tsx b/apps/fabro-web/app/routes/runs.tsx
+index 6eb1652cd..a16026723 100644
+--- a/apps/fabro-web/app/routes/runs.tsx
++++ b/apps/fabro-web/app/routes/runs.tsx
+@@ -1,6 +1,6 @@
+ import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+ import { Link, useSearchParams } from "react-router";
+-import { ArchiveBoxIcon, ChevronDownIcon, CommandLineIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
++import { ChevronDownIcon, CommandLineIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
+ import { EllipsisVerticalIcon } from "@heroicons/react/20/solid";
+ import { Menu, MenuButton, MenuItem, MenuItems } from "@headlessui/react";
+ import { useSWRConfig } from "swr";
+@@ -45,13 +45,11 @@ interface ColumnStyle {
+ }
+ 
+ const columnStyles: Record<BoardColumn, ColumnStyle> = {
+-  queued:       { actions: [] },
+   initializing: { actions: [] },
+   running:      { actions: [] },
+   blocked:      { actions: ["Answer Question"] },
+   succeeded:    { actions: [] },
+   failed:       { actions: [] },
+-  archived:     { actions: [] },
+ };
+ 
+ const defaultColumnStyle: ColumnStyle = { actions: [] };
+@@ -72,9 +70,8 @@ type Column = {
+   items: RunItem[];
+ };
+ 
+-function buildSkeletonColumns(includeArchived: boolean): Column[] {
++function buildSkeletonColumns(): Column[] {
+   return columnStatuses
+-    .filter((id) => includeArchived || id !== "archived")
+     .map((id) => {
+       const colors = columnStatusDisplay[id];
+       return {
+@@ -768,7 +765,6 @@ export default function Runs() {
+   const repoFilter = searchParams.get("repo") ?? "all";
+   const workflowFilter = searchParams.get("workflow") ?? "all";
+   const createdFilter = parseCreatedFilter(searchParams.get("created"));
+-  const includeArchived = searchParams.get("archived") === "1";
+   const view = parseView(searchParams.get("view"));
+ 
+   const updateParam = useCallback(
+@@ -793,10 +789,9 @@ export default function Runs() {
+   const setRepoFilter = (value: string) => updateParam("repo", value === "all" ? null : value);
+   const setWorkflowFilter = (value: string) => updateParam("workflow", value === "all" ? null : value);
+   const setCreatedFilter = (value: CreatedFilter) => updateParam("created", value === "all" ? null : value);
+-  const setIncludeArchived = (value: boolean) => updateParam("archived", value ? "1" : null);
+   const setView = (value: ViewMode) => updateParam("view", value === "columns" ? null : value);
+ 
+-  const boardRuns = useBoardsRuns(includeArchived);
++  const boardRuns = useBoardsRuns();
+   const authConfig = useAuthConfig();
+   const systemInfo = useSystemInfo();
+   const isLandingReady =
+@@ -807,8 +802,8 @@ export default function Runs() {
+     () =>
+       boardRuns.data
+         ? buildBoardColumns(boardRuns.data)
+-        : buildSkeletonColumns(includeArchived),
+-    [boardRuns.data, includeArchived],
++        : buildSkeletonColumns(),
++    [boardRuns.data],
+   );
+   const hasGitHubAuth = authConfig.data?.methods.includes("github") === true;
+   const serverUrl = systemInfo.data?.server_url;
+@@ -871,9 +866,7 @@ export default function Runs() {
+     (sum, col) => sum + col.items.length,
+     0,
+   );
+-  const visibleColumns = filteredColumns.filter(
+-    (col) => col.id !== "queued" || col.items.length > 0,
+-  );
++  const visibleColumns = filteredColumns;
+ 
+   return (
+     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+@@ -935,16 +928,6 @@ export default function Runs() {
+             </select>
+             <ChevronDownIcon className="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
+           </div>
+-          <button
+-            type="button"
+-            onClick={() => setIncludeArchived(!includeArchived)}
+-            aria-pressed={includeArchived}
+-            title={includeArchived ? "Hide archived runs" : "Show archived runs"}
+-            className={`inline-flex items-center gap-1.5 rounded-md border border-line bg-panel/80 px-3 py-2 text-xs font-medium transition-colors ${includeArchived ? "text-teal-500" : "text-fg-muted hover:text-fg-3"}`}
+-          >
+-            <ArchiveBoxIcon className="size-4" aria-hidden="true" />
+-            <span>Show archived</span>
+-          </button>
+           <div role="group" aria-label="Run list view" className="flex rounded-md border border-line bg-panel/80 p-0.5">
+             <button
+               type="button"
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index 4426ccb7f..7e4909d12 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -1990,11 +1990,10 @@ paths:
+       operationId: listBoardRuns
+       tags: [Runs]
+       summary: List Board Runs
+-      description: Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
++      description: Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived and removing runs are off-board.
+       parameters:
+         - $ref: "#/components/parameters/PageLimit"
+         - $ref: "#/components/parameters/PageOffset"
+-        - $ref: "#/components/parameters/IncludeArchived"
+       responses:
+         "200":
+           description: Paginated list of runs for the board view
+@@ -7561,13 +7560,11 @@ components:
+       description: Board column status for a run in the list view.
+       type: string
+       enum:
+-        - queued
+         - initializing
+         - running
+         - blocked
+         - succeeded
+         - failed
+-        - archived
+ 
+     BoardColumnDefinition:
+       type: object
+diff --git a/lib/crates/fabro-server/src/demo/mod.rs b/lib/crates/fabro-server/src/demo/mod.rs
+index 213df8cd1..e468df41a 100644
+--- a/lib/crates/fabro-server/src/demo/mod.rs
++++ b/lib/crates/fabro-server/src/demo/mod.rs
+@@ -1159,10 +1159,6 @@ mod runs {
+ 
+     pub(super) fn columns() -> Vec<BoardColumnDefinition> {
+         vec![
+-            BoardColumnDefinition {
+-                id:   BoardColumn::Queued,
+-                name: "Queued".into(),
+-            },
+             BoardColumnDefinition {
+                 id:   BoardColumn::Initializing,
+                 name: "Initializing".into(),
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index 7fc1a3fd9..9856cfe7a 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -98,11 +98,12 @@ impl ListRunsParams {
+ 
+ fn board_column(status: RunStatus, archived: bool) -> Option<BoardColumn> {
+     if archived {
+-        return Some(BoardColumn::Archived);
++        return None;
+     }
+     match status {
+-        RunStatus::Submitted | RunStatus::Queued => Some(BoardColumn::Queued),
+-        RunStatus::Starting => Some(BoardColumn::Initializing),
++        RunStatus::Submitted | RunStatus::Queued | RunStatus::Starting => {
++            Some(BoardColumn::Initializing)
++        }
+         RunStatus::Running | RunStatus::Paused { .. } => Some(BoardColumn::Running),
+         RunStatus::Blocked { .. } => Some(BoardColumn::Blocked),
+         RunStatus::Succeeded { .. } => Some(BoardColumn::Succeeded),
+@@ -111,12 +112,8 @@ fn board_column(status: RunStatus, archived: bool) -> Option<BoardColumn> {
+     }
+ }
+ 
+-pub(crate) fn board_columns(include_archived: bool) -> Vec<BoardColumnDefinition> {
+-    let mut columns = vec![
+-        BoardColumnDefinition {
+-            id:   BoardColumn::Queued,
+-            name: "Queued".into(),
+-        },
++pub(crate) fn board_columns() -> Vec<BoardColumnDefinition> {
++    vec![
+         BoardColumnDefinition {
+             id:   BoardColumn::Initializing,
+             name: "Initializing".into(),
+@@ -137,14 +134,7 @@ pub(crate) fn board_columns(include_archived: bool) -> Vec<BoardColumnDefinition
+             id:   BoardColumn::Failed,
+             name: "Failed".into(),
+         },
+-    ];
+-    if include_archived {
+-        columns.push(BoardColumnDefinition {
+-            id:   BoardColumn::Archived,
+-            name: "Archived".into(),
+-        });
+-    }
+-    columns
++    ]
+ }
+ 
+ fn paginate_items<T>(items: Vec<T>, pagination: &PaginationParams) -> (Vec<T>, bool) {
+@@ -175,18 +165,14 @@ async fn list_board_runs(
+                 .into_response();
+         }
+     };
+-    let include_archived = params.include_archived;
+     let board_summaries: Vec<_> = entries
+         .into_iter()
+-        .filter_map(|entry| {
+-            let column = board_column(
++        .filter(|entry| {
++            board_column(
+                 entry.summary.lifecycle.status,
+                 entry.summary.lifecycle.archived,
+-            )?;
+-            if column == BoardColumn::Archived && !include_archived {
+-                return None;
+-            }
+-            Some(entry)
++            )
++            .is_some()
+         })
+         .collect();
+     let (page_summaries, has_more) = paginate_items(board_summaries, &params.pagination());
+@@ -194,7 +180,7 @@ async fn list_board_runs(
+     (
+         StatusCode::OK,
+         Json(serde_json::json!({
+-            "columns": board_columns(include_archived),
++            "columns": board_columns(),
+             "data": page_summaries
+                 .into_iter()
+                 .map(|entry| entry.summary)
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index e753ee7c9..e39d17e1e 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -10039,7 +10039,7 @@ async fn pause_run_sets_pending_control_on_board_response() {
+     assert_eq!(run_json_pending_control(&body).as_str(), Some("pause"));
+ 
+     // Verify the run appears on the board (store has Submitted status →
+-    // "queued" column)
++    // "initializing" column)
+     let req = Request::builder()
+         .method("GET")
+         .uri(api("/boards/runs"))
+@@ -10963,7 +10963,7 @@ async fn boards_runs_excludes_archived_by_default() {
+ }
+ 
+ #[tokio::test]
+-async fn boards_runs_includes_archived_when_flag_set() {
++async fn boards_runs_keeps_archived_runs_off_board_even_when_flag_set() {
+     let state = test_app_state();
+     let app = crate::test_support::build_test_router(Arc::clone(&state));
+     let archived_id = fixtures::RUN_1;
+@@ -11018,14 +11018,11 @@ async fn boards_runs_includes_archived_when_flag_set() {
+     let body = response_json!(response, StatusCode::OK).await;
+     let data = body["data"].as_array().expect("data should be array");
+ 
+-    let archived_item = data
+-        .iter()
+-        .find(|i| run_json_id(i) == Some(&archived_id.to_string()))
+-        .expect("archived run should appear when include_archived=true");
+-    assert!(run_json_archived(archived_item));
+-    assert_eq!(
+-        run_json_status(archived_item)["kind"].as_str().unwrap(),
+-        "succeeded"
++    assert!(
++        !data
++            .iter()
++            .any(|i| run_json_id(i) == Some(&archived_id.to_string())),
++        "archived run should remain off-board",
+     );
+ 
+     let succeeded_item = data
+@@ -11043,13 +11040,11 @@ async fn boards_runs_includes_archived_when_flag_set() {
+         .map(|c| c["id"].as_str().unwrap().to_string())
+         .collect();
+     assert_eq!(column_ids, vec![
+-        "queued",
+         "initializing",
+         "running",
+         "blocked",
+         "succeeded",
+         "failed",
+-        "archived",
+     ],);
+ }
+ 
+diff --git a/lib/packages/fabro-api-client/src/api/runs-api.ts b/lib/packages/fabro-api-client/src/api/runs-api.ts
+index e3150d58e..4ba0871bf 100644
+--- a/lib/packages/fabro-api-client/src/api/runs-api.ts
++++ b/lib/packages/fabro-api-client/src/api/runs-api.ts
+@@ -539,15 +539,14 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
+             };
+         },
+         /**
+-         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
++         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived and removing runs are off-board.
+          * @summary List Board Runs
+          * @param {number} [pageLimit] Maximum number of items to return per page.
+          * @param {number} [pageOffset] Number of items to skip before returning results.
+-         * @param {boolean} [includeArchived] Whether to include archived runs in the response. Defaults to &#x60;false&#x60;.
+          * @param {*} [options] Override http request option.
+          * @throws {RequiredError}
+          */
+-        listBoardRuns: async (pageLimit?: number, pageOffset?: number, includeArchived?: boolean, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
++        listBoardRuns: async (pageLimit?: number, pageOffset?: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+             const localVarPath = `/api/v1/boards/runs`;
+             // use dummy base URL string because the URL constructor only accepts absolute URLs.
+             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+@@ -574,9 +573,6 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
+                 localVarQueryParameter['page[offset]'] = pageOffset;
+             }
+ 
+-            if (includeArchived !== undefined) {
+-                localVarQueryParameter['include_archived'] = includeArchived;
+-            }
+ 
+             localVarHeaderParameter['Accept'] = 'application/json';
+ 
+@@ -594,7 +590,6 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
+          * @summary List Runs
+          * @param {number} [pageLimit] Maximum number of items to return per page.
+          * @param {number} [pageOffset] Number of items to skip before returning results.
+-         * @param {boolean} [includeArchived] Whether to include archived runs in the response. Defaults to &#x60;false&#x60;.
+          * @param {string} [parentId] Return only runs currently linked to this orchestration parent.
+          * @param {*} [options] Override http request option.
+          * @throws {RequiredError}
+@@ -1470,16 +1465,15 @@ export const RunsApiFp = function(configuration?: Configuration) {
+             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+         },
+         /**
+-         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
++         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived and removing runs are off-board.
+          * @summary List Board Runs
+          * @param {number} [pageLimit] Maximum number of items to return per page.
+          * @param {number} [pageOffset] Number of items to skip before returning results.
+-         * @param {boolean} [includeArchived] Whether to include archived runs in the response. Defaults to &#x60;false&#x60;.
+          * @param {*} [options] Override http request option.
+          * @throws {RequiredError}
+          */
+-        async listBoardRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedBoardRunList>> {
+-            const localVarAxiosArgs = await localVarAxiosParamCreator.listBoardRuns(pageLimit, pageOffset, includeArchived, options);
++        async listBoardRuns(pageLimit?: number, pageOffset?: number, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedBoardRunList>> {
++            const localVarAxiosArgs = await localVarAxiosParamCreator.listBoardRuns(pageLimit, pageOffset, options);
+             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+             const localVarOperationServerBasePath = operationServerMap['RunsApi.listBoardRuns']?.[localVarOperationServerIndex]?.url;
+             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+@@ -1838,16 +1832,15 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
+             return localVarFp.linkRunPullRequest(id, linkRunPullRequestRequest, options).then((request) => request(axios, basePath));
+         },
+         /**
+-         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
++         * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived and removing runs are off-board.
+          * @summary List Board Runs
+          * @param {number} [pageLimit] Maximum number of items to return per page.
+          * @param {number} [pageOffset] Number of items to skip before returning results.
+-         * @param {boolean} [includeArchived] Whether to include archived runs in the response. Defaults to &#x60;false&#x60;.
+          * @param {*} [options] Override http request option.
+          * @throws {RequiredError}
+          */
+-        listBoardRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedBoardRunList> {
+-            return localVarFp.listBoardRuns(pageLimit, pageOffset, includeArchived, options).then((request) => request(axios, basePath));
++        listBoardRuns(pageLimit?: number, pageOffset?: number, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedBoardRunList> {
++            return localVarFp.listBoardRuns(pageLimit, pageOffset, options).then((request) => request(axios, basePath));
+         },
+         /**
+          * Returns durable run summaries from the backing store, including runs persisted before the current server boot. Archived runs are hidden by default; pass `include_archived=true` to include them in the response.
+@@ -2161,16 +2154,15 @@ export class RunsApi extends BaseAPI {
+     }
+ 
+     /**
+-     * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
++     * Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived and removing runs are off-board.
+      * @summary List Board Runs
+      * @param {number} [pageLimit] Maximum number of items to return per page.
+      * @param {number} [pageOffset] Number of items to skip before returning results.
+-     * @param {boolean} [includeArchived] Whether to include archived runs in the response. Defaults to &#x60;false&#x60;.
+      * @param {*} [options] Override http request option.
+      * @throws {RequiredError}
+      */
+-    public listBoardRuns(pageLimit?: number, pageOffset?: number, includeArchived?: boolean, options?: RawAxiosRequestConfig) {
+-        return RunsApiFp(this.configuration).listBoardRuns(pageLimit, pageOffset, includeArchived, options).then((request) => request(this.axios, this.basePath));
++    public listBoardRuns(pageLimit?: number, pageOffset?: number, options?: RawAxiosRequestConfig) {
++        return RunsApiFp(this.configuration).listBoardRuns(pageLimit, pageOffset, options).then((request) => request(this.axios, this.basePath));
+     }
+ 
+     /**
+diff --git a/lib/packages/fabro-api-client/src/models/board-column.ts b/lib/packages/fabro-api-client/src/models/board-column.ts
+index a64be75b0..9d97dc120 100644
+--- a/lib/packages/fabro-api-client/src/models/board-column.ts
++++ b/lib/packages/fabro-api-client/src/models/board-column.ts
+@@ -19,13 +19,11 @@
+  */
+ 
+ export const BoardColumn = {
+-    QUEUED: 'queued',
+     INITIALIZING: 'initializing',
+     RUNNING: 'running',
+     BLOCKED: 'blocked',
+     SUCCEEDED: 'succeeded',
+-    FAILED: 'failed',
+-    ARCHIVED: 'archived'
++    FAILED: 'failed'
+ } as const;
+ 
+ export type BoardColumn = typeof BoardColumn[keyof typeof BoardColumn];
