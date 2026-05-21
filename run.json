@@ -1,0 +1,539 @@
+{
+  "title": "Compute LLM cost on-read for in-flight stages",
+  "spec": {
+    "run_id": "01KS6AW28FZVV4M2EHBJA7JMNP",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "# Plan: Compute LLM cost on-read for in-flight stages\n\n## Context\n\nOn the run billing page (`/runs/{id}/billing`), an active stage shows token\nusage but no dollar cost — cost renders as `—` until the stage completes.\n\nRoot cause: while a stage runs, `AgentMessage` events carry usage built by\n`billed_token_counts_from_llm` (`fabro-workflow/src/outcome.rs:43`), which\nhard-codes `total_usd_micros: None`. Dollar cost is only computed by\n`billed_model_usage_from_llm` (`outcome.rs:14`) — which needs the pricing\n`Catalog` — and that runs only on `StageCompleted`/`PromptCompleted`/`StageFailed`.\nSo an in-flight stage's `StageProjection.usage.total_usd_micros` stays `None`.\n\nFix: price stages whose cost is `None` when the billing rollup is built for a\nread request, using the model + token counts already in the projection. The\nwire contract is unchanged (`total_usd_micros` is already nullable everywhere)\nand the frontend already renders whatever value comes back — no UI change.\n\n## Decisions\n\n- **Price any stage with `total_usd_micros == None`**, not just in-flight ones.\n  Completed stages with unpriceable providers (`BillingPolicy::None`) return\n  `None` again — harmless; no need to thread `StageState`.\n- **No \"estimated\" label.** Cost-so-far is exact for tokens consumed so far,\n  matching the already-unlabeled live token counts and ticking runtime.\n- **Aggregate billing stays finalized-only.** The `BillingAccumulator` call\n  sites pass `None` so a run's running estimate is never folded into org-wide\n  totals (avoids double-count when the run later finalizes).\n- Per-stage rows, `totals`, and `by_model` are all priced from the same source\n  so the billing page stays internally consistent.\n\n## Changes\n\n### 1. `lib/crates/fabro-model/src/billing.rs`\n\n- Add `BilledTokenCounts::token_counts(&self) -> TokenCounts` — drops\n  `total_tokens`/`total_usd_micros`, keeps the five disjoint buckets.\n- Add `Catalog::price_tokens(&self, model: &ModelRef, tokens: &TokenCounts) -> Option<i64>`\n  next to `pricing_for`/`billing_facts_for`. Body mirrors the cost lines of\n  `billed_model_usage_from_llm`: build `ModelBillingFacts` via\n  `billing_facts_for`, assemble `ModelBillingInput { ModelUsage { model, tokens }, facts }`,\n  then `pricing_for(model).and_then(|p| p.bill(&input)).map(|a| a.0)`. Returns\n  `None` when the provider has no billing policy.\n\n### 2. `lib/crates/fabro-workflow/src/billing_rollup.rs`\n\n- Change signature to\n  `billing_rollup_from_projection(projection: &RunProjection, catalog: Option<&Catalog>)`.\n- Add a module-private helper `stage_usage_with_cost(catalog, stage) -> BilledTokenCounts`:\n  clone `stage.usage`; if `total_usd_micros.is_none()` and both `catalog` and\n  `stage.model` are present, set it via `catalog.price_tokens(model, &usage.token_counts())`.\n- In the loop, compute `priced` once per stage and use it in place of\n  `&stage.usage` for the `is_zero` check, `row.billing.add_counts`,\n  `totals.add_counts`, and `model_entry.billing.add_counts`.\n- Update the existing tests to pass `None`; add one new test: an in-flight\n  stage (no `completion`, non-zero `usage` with `total_usd_micros: None`, a\n  builtin `model`) yields `Some(..)` cost on the stage row and in `totals` when\n  called with `Some(Catalog::builtin())`.\n\n### 3. Call sites of `billing_rollup_from_projection`\n\n- `lib/crates/fabro-server/src/server/handler/billing.rs:82` — bind\n  `let catalog = state.catalog();` (returns `Arc<Catalog>`) and pass\n  `Some(&catalog)`.\n- `lib/crates/fabro-server/src/server.rs` (2 aggregate-billing sites) — pass `None`.\n- `lib/crates/fabro-workflow/src/pipeline/finalize.rs` (4 sites) — pass `None`\n  (stages already priced at completion; pricing would be a no-op anyway).\n\nNo changes to `fabro-api.yaml`, the generated clients, or `apps/fabro-web`.\n\n## Out of scope / known limitation\n\nIn-flight **prompt** stages have no `model` until `PromptCompleted` (only\n`AgentMessage` sets `stage.model` mid-run), so they still show `—` while\nrunning. Acceptable: prompt stages are a single short LLM call. The bug report\nconcerns agent stages, where `model` is available.\n\n## Verification\n\n- `cargo nextest run -p fabro-workflow billing_rollup` — new + updated unit tests pass.\n- `cargo nextest run -p fabro-server billing` — handler conformance still passes.\n- `cargo build --workspace` and `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- Manual: `fabro server start` + `cd apps/fabro-web && bun run dev`, start a\n  workflow with an agent stage, open `/runs/{id}/billing` mid-run — the active\n  stage row and totals show a non-`—` dollar amount that grows with tokens.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": []
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "sandbox": {
+          "provider": "daytona",
+          "preserve": false,
+          "stop_on_terminal": true,
+          "devcontainer": false,
+          "env": {},
+          "docker": {
+            "image": "buildpack-deps:noble",
+            "network_mode": null,
+            "memory_limit": 4000000000,
+            "cpu_quota": 200000,
+            "env_vars": {}
+          },
+          "daytona": {
+            "auto_stop_interval": 30,
+            "labels": {
+              "repo": "fabro-sh/fabro"
+            },
+            "volumes": [],
+            "snapshot": {
+              "name": "fabro-v11",
+              "cpu": 8,
+              "memory_gb": 16,
+              "disk_gb": 20,
+              "dockerfile": {
+                "type": "inline",
+                "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+              }
+            },
+            "network": null
+          }
+        },
+        "notifications": {},
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "retry_target": {
+              "String": "fixup"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Verify"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1"
+            }
+          }
+        },
+        "fmt": {
+          "id": "fmt",
+          "attrs": {
+            "script": {
+              "String": "cargo +nightly-2026-04-14 fmt --all 2>&1"
+            },
+            "label": {
+              "String": "Format"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "provider": {
+              "String": "openai"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "label": {
+              "String": "Fixup"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors."
+            }
+          }
+        },
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Preflight Lint"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "label": {
+              "String": "Exit"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "Msquare"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "label": {
+              "String": "Fix Lints"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Start"
+            },
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "fmt",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "fmt",
+          "to": "exit",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "goal": {
+          "String": "# Plan: Compute LLM cost on-read for in-flight stages\n\n## Context\n\nOn the run billing page (`/runs/{id}/billing`), an active stage shows token\nusage but no dollar cost — cost renders as `—` until the stage completes.\n\nRoot cause: while a stage runs, `AgentMessage` events carry usage built by\n`billed_token_counts_from_llm` (`fabro-workflow/src/outcome.rs:43`), which\nhard-codes `total_usd_micros: None`. Dollar cost is only computed by\n`billed_model_usage_from_llm` (`outcome.rs:14`) — which needs the pricing\n`Catalog` — and that runs only on `StageCompleted`/`PromptCompleted`/`StageFailed`.\nSo an in-flight stage's `StageProjection.usage.total_usd_micros` stays `None`.\n\nFix: price stages whose cost is `None` when the billing rollup is built for a\nread request, using the model + token counts already in the projection. The\nwire contract is unchanged (`total_usd_micros` is already nullable everywhere)\nand the frontend already renders whatever value comes back — no UI change.\n\n## Decisions\n\n- **Price any stage with `total_usd_micros == None`**, not just in-flight ones.\n  Completed stages with unpriceable providers (`BillingPolicy::None`) return\n  `None` again — harmless; no need to thread `StageState`.\n- **No \"estimated\" label.** Cost-so-far is exact for tokens consumed so far,\n  matching the already-unlabeled live token counts and ticking runtime.\n- **Aggregate billing stays finalized-only.** The `BillingAccumulator` call\n  sites pass `None` so a run's running estimate is never folded into org-wide\n  totals (avoids double-count when the run later finalizes).\n- Per-stage rows, `totals`, and `by_model` are all priced from the same source\n  so the billing page stays internally consistent.\n\n## Changes\n\n### 1. `lib/crates/fabro-model/src/billing.rs`\n\n- Add `BilledTokenCounts::token_counts(&self) -> TokenCounts` — drops\n  `total_tokens`/`total_usd_micros`, keeps the five disjoint buckets.\n- Add `Catalog::price_tokens(&self, model: &ModelRef, tokens: &TokenCounts) -> Option<i64>`\n  next to `pricing_for`/`billing_facts_for`. Body mirrors the cost lines of\n  `billed_model_usage_from_llm`: build `ModelBillingFacts` via\n  `billing_facts_for`, assemble `ModelBillingInput { ModelUsage { model, tokens }, facts }`,\n  then `pricing_for(model).and_then(|p| p.bill(&input)).map(|a| a.0)`. Returns\n  `None` when the provider has no billing policy.\n\n### 2. `lib/crates/fabro-workflow/src/billing_rollup.rs`\n\n- Change signature to\n  `billing_rollup_from_projection(projection: &RunProjection, catalog: Option<&Catalog>)`.\n- Add a module-private helper `stage_usage_with_cost(catalog, stage) -> BilledTokenCounts`:\n  clone `stage.usage`; if `total_usd_micros.is_none()` and both `catalog` and\n  `stage.model` are present, set it via `catalog.price_tokens(model, &usage.token_counts())`.\n- In the loop, compute `priced` once per stage and use it in place of\n  `&stage.usage` for the `is_zero` check, `row.billing.add_counts`,\n  `totals.add_counts`, and `model_entry.billing.add_counts`.\n- Update the existing tests to pass `None`; add one new test: an in-flight\n  stage (no `completion`, non-zero `usage` with `total_usd_micros: None`, a\n  builtin `model`) yields `Some(..)` cost on the stage row and in `totals` when\n  called with `Some(Catalog::builtin())`.\n\n### 3. Call sites of `billing_rollup_from_projection`\n\n- `lib/crates/fabro-server/src/server/handler/billing.rs:82` — bind\n  `let catalog = state.catalog();` (returns `Arc<Catalog>`) and pass\n  `Some(&catalog)`.\n- `lib/crates/fabro-server/src/server.rs` (2 aggregate-billing sites) — pass `None`.\n- `lib/crates/fabro-workflow/src/pipeline/finalize.rs` (4 sites) — pass `None`\n  (stages already priced at completion; pricing would be a no-op anyway).\n\nNo changes to `fabro-api.yaml`, the generated clients, or `apps/fabro-web`.\n\n## Out of scope / known limitation\n\nIn-flight **prompt** stages have no `model` until `PromptCompleted` (only\n`AgentMessage` sets `stage.model` mid-run), so they still show `—` while\nrunning. Acceptable: prompt stages are a single short LLM call. The bug report\nconcerns agent stages, where `model` is available.\n\n## Verification\n\n- `cargo nextest run -p fabro-workflow billing_rollup` — new + updated unit tests pass.\n- `cargo nextest run -p fabro-server billing` — handler conformance still passes.\n- `cargo build --workspace` and `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- Manual: `fabro server start` + `cd apps/fabro-web && bun run dev`, start a\n  workflow with an agent stage, open `/runs/{id}/billing` mid-run — the active\n  stage row and totals show a non-`—` dollar amount that grows with tokens.\n"
+        },
+        "rankdir": {
+          "String": "LR"
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors.\", max_visits=3]\n    fmt               [label=\"Format\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 fmt --all 2>&1\", max_retries=0]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> fmt   [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n    fmt -> exit\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.240.0-nightly.1"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.240.0-nightly.1",
+        "name": "fabro-cli",
+        "version": "0.240.0-nightly.1"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github"
+      }
+    },
+    "manifest_blob": "64773a53c5f3919f0b59469ee68433946d1d77c0df41a6ceabdc9e4d728a22f4",
+    "definition_blob": "5ace3f97710c4df8f504c4d2063948448720ee6c698e9cc4fd1d2fc99249e085",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "06ee2fea39a9e367134990d7ca88d2b6cf9f73ed",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KS6AW28FZVV4M2EHBJA7JMNP",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-21T22:35:34.576662Z",
+  "last_event_at": "2026-05-21T22:35:51.960182Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "image": "buildpack-deps:noble",
+    "snapshot": "fabro-v11",
+    "runtime": {
+      "id": "fabro-01KS6AW28FZVV4M2EHBJA7JMNP",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
