@@ -1,0 +1,1148 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 108394aec..8ee3219ec 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2041,6 +2041,7 @@ dependencies = [
+  "fabro-redact",
+  "fabro-static",
+  "fabro-test",
++ "fabro-types",
+  "fabro-util",
+  "futures",
+  "http",
+diff --git a/lib/crates/fabro-llm/Cargo.toml b/lib/crates/fabro-llm/Cargo.toml
+index e2e04924c..26e6b104a 100644
+--- a/lib/crates/fabro-llm/Cargo.toml
++++ b/lib/crates/fabro-llm/Cargo.toml
+@@ -37,6 +37,7 @@ fabro-auth = { path = "../fabro-auth" }
+ fabro-model = { path = "../fabro-model" }
+ fabro-redact.workspace = true
+ fabro-static.workspace = true
++fabro-types = { path = "../fabro-types" }
+ fabro-util = { path = "../fabro-util" }
+ 
+ [dev-dependencies]
+@@ -47,4 +48,4 @@ httpmock = "0.8"
+ serde_json.workspace = true
+ toml.workspace = true
+ fabro-macros = { path = "../fabro-macros" }
+-fabro-test = { workspace = true }
++fabro-test = { workspace = true }
+\ No newline at end of file
+diff --git a/lib/crates/fabro-llm/src/types.rs b/lib/crates/fabro-llm/src/types.rs
+index 541640c3d..e09989ab3 100644
+--- a/lib/crates/fabro-llm/src/types.rs
++++ b/lib/crates/fabro-llm/src/types.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ use fabro_util::backoff::BackoffPolicy;
+-use serde::{Deserialize, Serialize, de};
++use serde::{Deserialize, Serialize};
+ 
+ use crate::error::Error;
+ 
+@@ -19,235 +19,15 @@ pub enum Role {
+ }
+ 
+ // --- 3.5 Content Data Structures ---
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct ImageData {
+-    pub url:        Option<String>,
+-    pub data:       Option<Vec<u8>>,
+-    pub media_type: Option<String>,
+-    pub detail:     Option<String>,
+-}
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct AudioData {
+-    pub url:        Option<String>,
+-    pub data:       Option<Vec<u8>>,
+-    pub media_type: Option<String>,
+-}
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct DocumentData {
+-    pub url:        Option<String>,
+-    pub data:       Option<Vec<u8>>,
+-    pub media_type: Option<String>,
+-    pub file_name:  Option<String>,
+-}
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct ThinkingData {
+-    pub text:      String,
+-    pub signature: Option<String>,
+-    pub redacted:  bool,
+-}
+-
+-// --- 5.4 ToolCall / ToolResult ---
+-
+-fn default_tool_type() -> String {
+-    "function".to_string()
+-}
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct ToolCall {
+-    pub id:                String,
+-    pub name:              String,
+-    #[serde(rename = "type", default = "default_tool_type")]
+-    pub tool_type:         String,
+-    pub arguments:         serde_json::Value,
+-    pub raw_arguments:     Option<String>,
+-    /// Opaque provider-specific metadata (e.g. Gemini `thought_signature`).
+-    /// Preserved across round-trips so the provider can include it when
+-    /// sending conversation history back to the API.
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub provider_metadata: Option<serde_json::Value>,
+-}
+-
+-impl ToolCall {
+-    pub fn new(
+-        id: impl Into<String>,
+-        name: impl Into<String>,
+-        arguments: serde_json::Value,
+-    ) -> Self {
+-        Self {
+-            id: id.into(),
+-            name: name.into(),
+-            tool_type: "function".to_string(),
+-            arguments,
+-            raw_arguments: None,
+-            provider_metadata: None,
+-        }
+-    }
+-}
+-
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-pub struct ToolResult {
+-    pub tool_call_id:     String,
+-    pub content:          serde_json::Value,
+-    pub is_error:         bool,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub image_data:       Option<Vec<u8>>,
+-    #[serde(skip_serializing_if = "Option::is_none")]
+-    pub image_media_type: Option<String>,
+-}
+-
+-impl ToolResult {
+-    pub fn success(id: impl Into<String>, content: serde_json::Value) -> Self {
+-        Self {
+-            tool_call_id: id.into(),
+-            content,
+-            is_error: false,
+-            image_data: None,
+-            image_media_type: None,
+-        }
+-    }
+-
+-    pub fn error(id: impl Into<String>, message: impl Into<String>) -> Self {
+-        Self {
+-            tool_call_id:     id.into(),
+-            content:          serde_json::Value::String(message.into()),
+-            is_error:         true,
+-            image_data:       None,
+-            image_media_type: None,
+-        }
+-    }
+-}
+-
+-// --- 3.3 ContentPart ---
+-
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub enum ContentPart {
+-    Text(String),
+-    Image(ImageData),
+-    Audio(AudioData),
+-    Document(DocumentData),
+-    ToolCall(ToolCall),
+-    ToolResult(ToolResult),
+-    Thinking(ThinkingData),
+-    Other {
+-        kind: String,
+-        data: serde_json::Value,
+-    },
+-}
+-
+-impl Serialize for ContentPart {
+-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+-        use serde::ser::SerializeMap;
+-        let mut map = serializer.serialize_map(Some(2))?;
+-        match self {
+-            Self::Text(v) => {
+-                map.serialize_entry("kind", "text")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::Image(v) => {
+-                map.serialize_entry("kind", "image")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::Audio(v) => {
+-                map.serialize_entry("kind", "audio")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::Document(v) => {
+-                map.serialize_entry("kind", "document")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::ToolCall(v) => {
+-                map.serialize_entry("kind", "tool_call")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::ToolResult(v) => {
+-                map.serialize_entry("kind", "tool_result")?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::Thinking(v) => {
+-                let kind = if v.redacted {
+-                    "redacted_thinking"
+-                } else {
+-                    "thinking"
+-                };
+-                map.serialize_entry("kind", kind)?;
+-                map.serialize_entry("data", v)?;
+-            }
+-            Self::Other { kind, data } => {
+-                map.serialize_entry("kind", kind)?;
+-                map.serialize_entry("data", data)?;
+-            }
+-        }
+-        map.end()
+-    }
+-}
+-
+-impl<'de> Deserialize<'de> for ContentPart {
+-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+-        let value = serde_json::Value::deserialize(deserializer)?;
+-        let kind = value
+-            .get("kind")
+-            .and_then(serde_json::Value::as_str)
+-            .ok_or_else(|| de::Error::missing_field("kind"))?;
+-        let data = value
+-            .get("data")
+-            .cloned()
+-            .unwrap_or(serde_json::Value::Null);
+-        match kind {
+-            "text" => serde_json::from_value(data)
+-                .map(Self::Text)
+-                .map_err(de::Error::custom),
+-            "image" => serde_json::from_value(data)
+-                .map(Self::Image)
+-                .map_err(de::Error::custom),
+-            "audio" => serde_json::from_value(data)
+-                .map(Self::Audio)
+-                .map_err(de::Error::custom),
+-            "document" => serde_json::from_value(data)
+-                .map(Self::Document)
+-                .map_err(de::Error::custom),
+-            "tool_call" => serde_json::from_value(data)
+-                .map(Self::ToolCall)
+-                .map_err(de::Error::custom),
+-            "tool_result" => serde_json::from_value(data)
+-                .map(Self::ToolResult)
+-                .map_err(de::Error::custom),
+-            "thinking" => serde_json::from_value(data)
+-                .map(Self::Thinking)
+-                .map_err(de::Error::custom),
+-            "redacted_thinking" => serde_json::from_value::<ThinkingData>(data)
+-                .map(|mut td| {
+-                    td.redacted = true;
+-                    Self::Thinking(td)
+-                })
+-                .map_err(de::Error::custom),
+-            other => Ok(Self::Other {
+-                kind: other.to_string(),
+-                data,
+-            }),
+-        }
+-    }
+-}
+-
+-impl ContentPart {
+-    /// Kind string for opaque OpenAI reasoning output items.
+-    pub const OPENAI_REASONING: &str = "openai_reasoning";
+-    /// Kind string for opaque OpenAI message output items.
+-    pub const OPENAI_MESSAGE: &str = "openai_message";
+-
+-    pub fn text(text: impl Into<String>) -> Self {
+-        Self::Text(text.into())
+-    }
+-
+-    /// Returns `true` if this is an opaque OpenAI item (reasoning or message)
+-    /// that should be round-tripped verbatim through the API.
+-    pub fn is_opaque_openai(&self) -> bool {
+-        matches!(self, Self::Other { kind, .. } if kind == Self::OPENAI_REASONING || kind == Self::OPENAI_MESSAGE)
+-    }
+-}
++//
++// `ContentPart`, `ImageData`, `AudioData`, `DocumentData`, `ThinkingData`,
++// `ToolCall`, and `ToolResult` are the canonical provider-neutral replay
++// primitives. They live in `fabro-types` so the event stream, API responses,
++// and runtime history can share one model. They are re-exported here so
++// existing `fabro_llm::types::*` imports keep working.
++pub use fabro_types::{
++    AudioData, ContentPart, DocumentData, ImageData, ThinkingData, ToolCall, ToolResult,
++};
+ 
+ // --- 3.1 Message ---
+ 
+diff --git a/lib/crates/fabro-server/src/demo/mod.rs b/lib/crates/fabro-server/src/demo/mod.rs
+index 9f4f845af..a71d9c748 100644
+--- a/lib/crates/fabro-server/src/demo/mod.rs
++++ b/lib/crates/fabro-server/src/demo/mod.rs
+@@ -1446,16 +1446,20 @@ mod runs {
+                     billing:         BilledTokenCounts::default(),
+                     tool_call_count: 0,
+                     visit:           1,
++                    message:         None,
+                 }),
+             ),
+             make_envelope(
+                 3,
+                 "evt-detect-drift-3",
+                 EventBody::AgentToolStarted(AgentToolStartedProps {
+-                    tool_name:    "read_file".into(),
+-                    tool_call_id: "toolu_01".into(),
+-                    arguments:    serde_json::json!({ "path": "environments/production/config.toml" }),
+-                    visit:        1,
++                    tool_name:         "read_file".into(),
++                    tool_call_id:      "toolu_01".into(),
++                    arguments:         serde_json::json!({ "path": "environments/production/config.toml" }),
++                    visit:             1,
++                    tool_call:         None,
++                    turn_id:           None,
++                    parent_message_id: None,
+                 }),
+             ),
+             make_envelope(
+@@ -1467,16 +1471,21 @@ mod runs {
+                     output:       serde_json::json!("[redis]\nhost = \"redis-prod.internal\"\nport = 6379"),
+                     is_error:     false,
+                     visit:        1,
++                    tool_result:  None,
++                    turn_id:      None,
+                 }),
+             ),
+             make_envelope(
+                 5,
+                 "evt-detect-drift-5",
+                 EventBody::AgentToolStarted(AgentToolStartedProps {
+-                    tool_name:    "read_file".into(),
+-                    tool_call_id: "toolu_02".into(),
+-                    arguments:    serde_json::json!({ "path": "environments/staging/config.toml" }),
+-                    visit:        1,
++                    tool_name:         "read_file".into(),
++                    tool_call_id:      "toolu_02".into(),
++                    arguments:         serde_json::json!({ "path": "environments/staging/config.toml" }),
++                    visit:             1,
++                    tool_call:         None,
++                    turn_id:           None,
++                    parent_message_id: None,
+                 }),
+             ),
+             make_envelope(
+@@ -1488,6 +1497,8 @@ mod runs {
+                     output:       serde_json::json!("[redis]\nhost = \"redis-staging.internal\"\nport = 6379"),
+                     is_error:     false,
+                     visit:        1,
++                    tool_result:  None,
++                    turn_id:      None,
+                 }),
+             ),
+             make_envelope(
+@@ -1503,6 +1514,7 @@ mod runs {
+                     billing:         BilledTokenCounts::default(),
+                     tool_call_count: 0,
+                     visit:           1,
++                    message:         None,
+                 }),
+             ),
+         ]
+diff --git a/lib/crates/fabro-server/src/server/handler/pair.rs b/lib/crates/fabro-server/src/server/handler/pair.rs
+index 5d90146b9..942325fe6 100644
+--- a/lib/crates/fabro-server/src/server/handler/pair.rs
++++ b/lib/crates/fabro-server/src/server/handler/pair.rs
+@@ -924,6 +924,7 @@ mod tests {
+                     billing:         BilledTokenCounts::default(),
+                     tool_call_count: 0,
+                     visit:           1,
++                    message:         None,
+                 }),
+             ),
+         )
+@@ -954,6 +955,7 @@ mod tests {
+                         billing:         BilledTokenCounts::default(),
+                         tool_call_count: 0,
+                         visit:           1,
++                        message:         None,
+                     }),
+                 ),
+             )
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index 028baa8e3..0da6e957c 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -2828,6 +2828,7 @@ mod tests {
+             billing,
+             tool_call_count: 0,
+             visit: 1,
++            message: None,
+         }
+     }
+ 
+diff --git a/lib/crates/fabro-types/src/lib.rs b/lib/crates/fabro-types/src/lib.rs
+index 45f1d1f4d..b6e1ab4ae 100644
+--- a/lib/crates/fabro-types/src/lib.rs
++++ b/lib/crates/fabro-types/src/lib.rs
+@@ -44,6 +44,7 @@ pub mod status;
+ pub mod steering;
+ pub mod timing;
+ pub mod todo;
++pub mod transcript;
+ 
+ pub use artifact::ArtifactUpload;
+ pub use auth::{IdpIdentity, IdpIdentityError};
+@@ -134,3 +135,7 @@ pub use status::{
+ pub use steering::SteeringMessage;
+ pub use timing::{RunTiming, StageTiming};
+ pub use todo::{TodoListKind, TodoListProjection, TodoPatch, TodoProjection, TodoStatus};
++pub use transcript::{
++    AudioData, ContentPart, DocumentData, ImageData, MessageId, MessageKind, MessageSource,
++    PairMessageRef, ThinkingData, ToolCall, ToolResult, TranscriptMessage, TranscriptUsage,
++};
+diff --git a/lib/crates/fabro-types/src/run_event/agent.rs b/lib/crates/fabro-types/src/run_event/agent.rs
+index eb4fe13c2..e9f898039 100644
+--- a/lib/crates/fabro-types/src/run_event/agent.rs
++++ b/lib/crates/fabro-types/src/run_event/agent.rs
+@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
+ use super::BilledTokenCounts;
+-use crate::{ModelRef, PairId, PairMessageId, PairSystemMessageKind};
++use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
++use crate::{MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind, TurnId};
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentSessionStartedProps {
+@@ -55,28 +56,56 @@ pub struct AgentInputProps {
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentMessageProps {
++    // Narrow legacy fields retained for consumer compatibility.
+     pub text:            String,
+     pub model:           ModelRef,
+     pub billing:         BilledTokenCounts,
+     pub tool_call_count: usize,
+     pub visit:           u32,
++    /// Canonical replay-authoritative transcript message. Present on events
++    /// emitted after the unified transcript migration; absent on legacy
++    /// payloads so older events still deserialize.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub message:         Option<TranscriptMessage>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentToolStartedProps {
+-    pub tool_name:    String,
+-    pub tool_call_id: String,
+-    pub arguments:    Value,
+-    pub visit:        u32,
++    // Narrow legacy fields retained for consumer compatibility.
++    pub tool_name:         String,
++    pub tool_call_id:      String,
++    pub arguments:         Value,
++    pub visit:             u32,
++    /// Canonical tool call payload. Carries `tool_type`, `raw_arguments`, and
++    /// `provider_metadata` (e.g. Gemini `thought_signature`) so tool actions
++    /// can be replayed against the originating provider.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub tool_call:         Option<ToolCall>,
++    /// Turn that initiated this tool call.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub turn_id:           Option<TurnId>,
++    /// Agent message id that owns this tool call. Minted before tool
++    /// execution so tool actions can be linked back to their parent agent
++    /// response in the transcript.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub parent_message_id: Option<MessageId>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentToolCompletedProps {
++    // Narrow legacy fields retained for consumer compatibility.
+     pub tool_name:    String,
+     pub tool_call_id: String,
+     pub output:       Value,
+     pub is_error:     bool,
+     pub visit:        u32,
++    /// Canonical tool result payload. Carries the structured output, error
++    /// state, and supported media/artifact fields.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub tool_result:  Option<ToolResult>,
++    /// Turn that owned this tool call.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub turn_id:      Option<TurnId>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -224,3 +253,132 @@ pub struct AgentMcpFailedProps {
+     pub error:       String,
+     pub visit:       u32,
+ }
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use super::*;
++    use crate::transcript::{ContentPart, MessageKind, MessageSource, TranscriptMessage};
++
++    fn sample_model_ref() -> ModelRef {
++        ModelRef {
++            provider: fabro_model::ProviderId::openai(),
++            model_id: "gpt-5".to_string(),
++            speed:    None,
++        }
++    }
++
++    #[test]
++    fn agent_message_props_back_compat_deserializes_without_message_field() {
++        // Legacy payload from before the transcript migration.
++        let v = json!({
++            "text": "hello",
++            "model": {"provider": "openai", "model_id": "gpt-5"},
++            "billing": {
++                "input_tokens": 10,
++                "output_tokens": 5,
++                "total_tokens": 15,
++            },
++            "tool_call_count": 0,
++            "visit": 1,
++        });
++        let props: AgentMessageProps = serde_json::from_value(v).unwrap();
++        assert_eq!(props.text, "hello");
++        assert!(props.message.is_none());
++    }
++
++    #[test]
++    fn agent_message_props_carries_canonical_transcript_message() {
++        let msg = TranscriptMessage::new(MessageKind::Agent, MessageSource::ProviderAnswer, vec![
++            ContentPart::text("ok"),
++        ]);
++        let props = AgentMessageProps {
++            text:            "ok".to_string(),
++            model:           sample_model_ref(),
++            billing:         BilledTokenCounts::default(),
++            tool_call_count: 0,
++            visit:           1,
++            message:         Some(msg.clone()),
++        };
++        let v = serde_json::to_value(&props).unwrap();
++        assert_eq!(v["message"]["kind"], "agent");
++        assert_eq!(v["message"]["source"], "provider_answer");
++        let back: AgentMessageProps = serde_json::from_value(v).unwrap();
++        assert_eq!(back, props);
++    }
++
++    #[test]
++    fn agent_tool_started_props_back_compat_deserializes_without_canonical_fields() {
++        let v = json!({
++            "tool_name": "Bash",
++            "tool_call_id": "call_1",
++            "arguments": {"cmd": "ls"},
++            "visit": 1,
++        });
++        let props: AgentToolStartedProps = serde_json::from_value(v).unwrap();
++        assert_eq!(props.tool_name, "Bash");
++        assert!(props.tool_call.is_none());
++        assert!(props.turn_id.is_none());
++        assert!(props.parent_message_id.is_none());
++    }
++
++    #[test]
++    fn agent_tool_started_props_carries_canonical_tool_call_and_linkage() {
++        let mut tc = ToolCall::new("call_1", "Bash", json!({"cmd": "ls"}));
++        tc.provider_metadata = Some(json!({"thought_signature": "sig"}));
++        let parent = MessageId::new();
++        let turn = TurnId::new();
++        let props = AgentToolStartedProps {
++            tool_name:         "Bash".to_string(),
++            tool_call_id:      "call_1".to_string(),
++            arguments:         json!({"cmd": "ls"}),
++            visit:             1,
++            tool_call:         Some(tc.clone()),
++            turn_id:           Some(turn),
++            parent_message_id: Some(parent),
++        };
++        let v = serde_json::to_value(&props).unwrap();
++        assert_eq!(
++            v["tool_call"]["provider_metadata"]["thought_signature"],
++            "sig"
++        );
++        assert_eq!(v["turn_id"], turn.to_string());
++        assert_eq!(v["parent_message_id"], parent.to_string());
++        let back: AgentToolStartedProps = serde_json::from_value(v).unwrap();
++        assert_eq!(back, props);
++    }
++
++    #[test]
++    fn agent_tool_completed_props_back_compat_deserializes_without_canonical_fields() {
++        let v = json!({
++            "tool_name": "Bash",
++            "tool_call_id": "call_1",
++            "output": "ok\n",
++            "is_error": false,
++            "visit": 1,
++        });
++        let props: AgentToolCompletedProps = serde_json::from_value(v).unwrap();
++        assert!(props.tool_result.is_none());
++        assert!(props.turn_id.is_none());
++    }
++
++    #[test]
++    fn agent_tool_completed_props_carries_canonical_tool_result() {
++        let tr = ToolResult::success("call_1", json!({"stdout": "ok"}));
++        let turn = TurnId::new();
++        let props = AgentToolCompletedProps {
++            tool_name:    "Bash".to_string(),
++            tool_call_id: "call_1".to_string(),
++            output:       json!({"stdout": "ok"}),
++            is_error:     false,
++            visit:        1,
++            tool_result:  Some(tr.clone()),
++            turn_id:      Some(turn),
++        };
++        let v = serde_json::to_value(&props).unwrap();
++        assert_eq!(v["tool_result"]["content"]["stdout"], "ok");
++        let back: AgentToolCompletedProps = serde_json::from_value(v).unwrap();
++        assert_eq!(back, props);
++    }
++}
+diff --git a/lib/crates/fabro-types/src/transcript.rs b/lib/crates/fabro-types/src/transcript.rs
+new file mode 100644
+index 000000000..150e12f42
+--- /dev/null
++++ b/lib/crates/fabro-types/src/transcript.rs
+@@ -0,0 +1,482 @@
++//! Canonical provider-neutral transcript primitives.
++//!
++//! These types are the durable replay shapes for agent sessions. They were
++//! promoted from `fabro-llm` so the Fabro event stream, API responses, and
++//! runtime history can share one canonical Rust model rather than ferrying
++//! parallel DTOs between layers. `fabro-llm::types` re-exports these so
++//! existing imports keep working.
++
++use std::collections::BTreeMap;
++
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize, de};
++
++use crate::id::ulid_id;
++use crate::pair::{PairId, PairMessageId};
++use crate::principal::Principal;
++use crate::session::TurnId;
++
++ulid_id!(MessageId);
++
++// --- Content data structures -------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ImageData {
++    pub url:        Option<String>,
++    pub data:       Option<Vec<u8>>,
++    pub media_type: Option<String>,
++    pub detail:     Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AudioData {
++    pub url:        Option<String>,
++    pub data:       Option<Vec<u8>>,
++    pub media_type: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct DocumentData {
++    pub url:        Option<String>,
++    pub data:       Option<Vec<u8>>,
++    pub media_type: Option<String>,
++    pub file_name:  Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ThinkingData {
++    pub text:      String,
++    pub signature: Option<String>,
++    pub redacted:  bool,
++}
++
++// --- Tool call / tool result -------------------------------------------------
++
++fn default_tool_type() -> String {
++    "function".to_string()
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ToolCall {
++    pub id:                String,
++    pub name:              String,
++    #[serde(rename = "type", default = "default_tool_type")]
++    pub tool_type:         String,
++    pub arguments:         serde_json::Value,
++    pub raw_arguments:     Option<String>,
++    /// Opaque provider-specific metadata (e.g. Gemini `thought_signature`).
++    /// Preserved across round-trips so the provider can include it when
++    /// sending conversation history back to the API.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub provider_metadata: Option<serde_json::Value>,
++}
++
++impl ToolCall {
++    pub fn new(
++        id: impl Into<String>,
++        name: impl Into<String>,
++        arguments: serde_json::Value,
++    ) -> Self {
++        Self {
++            id: id.into(),
++            name: name.into(),
++            tool_type: "function".to_string(),
++            arguments,
++            raw_arguments: None,
++            provider_metadata: None,
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ToolResult {
++    pub tool_call_id:     String,
++    pub content:          serde_json::Value,
++    pub is_error:         bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub image_data:       Option<Vec<u8>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub image_media_type: Option<String>,
++}
++
++impl ToolResult {
++    pub fn success(id: impl Into<String>, content: serde_json::Value) -> Self {
++        Self {
++            tool_call_id: id.into(),
++            content,
++            is_error: false,
++            image_data: None,
++            image_media_type: None,
++        }
++    }
++
++    pub fn error(id: impl Into<String>, message: impl Into<String>) -> Self {
++        Self {
++            tool_call_id:     id.into(),
++            content:          serde_json::Value::String(message.into()),
++            is_error:         true,
++            image_data:       None,
++            image_media_type: None,
++        }
++    }
++}
++
++// --- ContentPart -------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ContentPart {
++    Text(String),
++    Image(ImageData),
++    Audio(AudioData),
++    Document(DocumentData),
++    ToolCall(ToolCall),
++    ToolResult(ToolResult),
++    Thinking(ThinkingData),
++    Other {
++        kind: String,
++        data: serde_json::Value,
++    },
++}
++
++impl Serialize for ContentPart {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        use serde::ser::SerializeMap;
++        let mut map = serializer.serialize_map(Some(2))?;
++        match self {
++            Self::Text(v) => {
++                map.serialize_entry("kind", "text")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::Image(v) => {
++                map.serialize_entry("kind", "image")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::Audio(v) => {
++                map.serialize_entry("kind", "audio")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::Document(v) => {
++                map.serialize_entry("kind", "document")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::ToolCall(v) => {
++                map.serialize_entry("kind", "tool_call")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::ToolResult(v) => {
++                map.serialize_entry("kind", "tool_result")?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::Thinking(v) => {
++                let kind = if v.redacted {
++                    "redacted_thinking"
++                } else {
++                    "thinking"
++                };
++                map.serialize_entry("kind", kind)?;
++                map.serialize_entry("data", v)?;
++            }
++            Self::Other { kind, data } => {
++                map.serialize_entry("kind", kind)?;
++                map.serialize_entry("data", data)?;
++            }
++        }
++        map.end()
++    }
++}
++
++impl<'de> Deserialize<'de> for ContentPart {
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let value = serde_json::Value::deserialize(deserializer)?;
++        let kind = value
++            .get("kind")
++            .and_then(serde_json::Value::as_str)
++            .ok_or_else(|| de::Error::missing_field("kind"))?;
++        let data = value
++            .get("data")
++            .cloned()
++            .unwrap_or(serde_json::Value::Null);
++        match kind {
++            "text" => serde_json::from_value(data)
++                .map(Self::Text)
++                .map_err(de::Error::custom),
++            "image" => serde_json::from_value(data)
++                .map(Self::Image)
++                .map_err(de::Error::custom),
++            "audio" => serde_json::from_value(data)
++                .map(Self::Audio)
++                .map_err(de::Error::custom),
++            "document" => serde_json::from_value(data)
++                .map(Self::Document)
++                .map_err(de::Error::custom),
++            "tool_call" => serde_json::from_value(data)
++                .map(Self::ToolCall)
++                .map_err(de::Error::custom),
++            "tool_result" => serde_json::from_value(data)
++                .map(Self::ToolResult)
++                .map_err(de::Error::custom),
++            "thinking" => serde_json::from_value(data)
++                .map(Self::Thinking)
++                .map_err(de::Error::custom),
++            "redacted_thinking" => serde_json::from_value::<ThinkingData>(data)
++                .map(|mut td| {
++                    td.redacted = true;
++                    Self::Thinking(td)
++                })
++                .map_err(de::Error::custom),
++            other => Ok(Self::Other {
++                kind: other.to_string(),
++                data,
++            }),
++        }
++    }
++}
++
++impl ContentPart {
++    /// Kind string for opaque OpenAI reasoning output items.
++    pub const OPENAI_REASONING: &str = "openai_reasoning";
++    /// Kind string for opaque OpenAI message output items.
++    pub const OPENAI_MESSAGE: &str = "openai_message";
++
++    pub fn text(text: impl Into<String>) -> Self {
++        Self::Text(text.into())
++    }
++
++    /// Returns `true` if this is an opaque OpenAI item (reasoning or message)
++    /// that should be round-tripped verbatim through the API.
++    pub fn is_opaque_openai(&self) -> bool {
++        matches!(
++            self,
++            Self::Other { kind, .. }
++                if kind == Self::OPENAI_REASONING || kind == Self::OPENAI_MESSAGE
++        )
++    }
++}
++
++// --- TranscriptMessage ------------------------------------------------------
++
++/// Provider/model-role semantics for a committed transcript message.
++///
++/// Captured separately from [`MessageSource`] so audit/UI provenance
++/// (`steer`, `pair`, …) does not collapse the LLM role that the message
++/// replays as.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum MessageKind {
++    System,
++    User,
++    Reasoning,
++    Agent,
++}
++
++/// Audit/UI provenance for a committed transcript message.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum MessageSource {
++    SystemPrompt,
++    TurnInput,
++    Followup,
++    Steer,
++    Pair,
++    InjectedSystem,
++    InjectedUser,
++    LoopDetection,
++    /// Reasoning blocks emitted by the model.
++    ProviderReasoning,
++    /// Final agent answer emitted by the model.
++    ProviderAnswer,
++}
++
++/// Reference to the originating pair chat message for messages that
++/// entered LLM history via the pair channel.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PairMessageRef {
++    pub pair_id:           PairId,
++    pub message_id:        PairMessageId,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub client_message_id: Option<String>,
++}
++
++/// Optional usage attribution carried on a committed message.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
++pub struct TranscriptUsage {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub input_tokens:        Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub output_tokens:       Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub cached_input_tokens: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub reasoning_tokens:    Option<u64>,
++    /// Additional provider-specific usage counters.
++    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
++    pub extra:               BTreeMap<String, u64>,
++}
++
++/// Canonical durable transcript message.
++///
++/// Named `TranscriptMessage` rather than `Message` to avoid import ambiguity
++/// with `fabro_agent::Message` and `fabro_llm::types::Message`.
++///
++/// `kind` captures provider/model-role semantics for replay; `source`
++/// captures audit/UI provenance. Both are required to faithfully reconstruct
++/// an API-mode session from the event stream.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct TranscriptMessage {
++    pub id:          MessageId,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub turn_id:     Option<TurnId>,
++    pub kind:        MessageKind,
++    pub source:      MessageSource,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub actor:       Option<Principal>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pair:        Option<PairMessageRef>,
++    pub content:     Vec<ContentPart>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub provider:    Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub model:       Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub response_id: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub usage:       Option<TranscriptUsage>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub created_at:  Option<DateTime<Utc>>,
++}
++
++impl TranscriptMessage {
++    /// Constructs a new transcript message with the supplied kind, source, and
++    /// content.
++    pub fn new(kind: MessageKind, source: MessageSource, content: Vec<ContentPart>) -> Self {
++        Self {
++            id: MessageId::new(),
++            turn_id: None,
++            kind,
++            source,
++            actor: None,
++            pair: None,
++            content,
++            provider: None,
++            model: None,
++            response_id: None,
++            usage: None,
++            created_at: None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use super::*;
++
++    #[test]
++    fn content_part_text_roundtrips() {
++        let part = ContentPart::text("hello");
++        let v = serde_json::to_value(&part).unwrap();
++        assert_eq!(v, json!({"kind": "text", "data": "hello"}));
++        let back: ContentPart = serde_json::from_value(v).unwrap();
++        assert_eq!(back, part);
++    }
++
++    #[test]
++    fn content_part_thinking_preserves_signature_and_redaction() {
++        let part = ContentPart::Thinking(ThinkingData {
++            text:      "private thought".to_string(),
++            signature: Some("sig_abc".to_string()),
++            redacted:  true,
++        });
++        let v = serde_json::to_value(&part).unwrap();
++        assert_eq!(v["kind"], "redacted_thinking");
++        assert_eq!(v["data"]["signature"], "sig_abc");
++        let back: ContentPart = serde_json::from_value(v).unwrap();
++        assert_eq!(back, part);
++    }
++
++    #[test]
++    fn content_part_other_preserves_provider_kind() {
++        let part = ContentPart::Other {
++            kind: ContentPart::OPENAI_REASONING.to_string(),
++            data: json!({"item_id": "rs_1", "encrypted": "x"}),
++        };
++        assert!(part.is_opaque_openai());
++        let v = serde_json::to_value(&part).unwrap();
++        let back: ContentPart = serde_json::from_value(v).unwrap();
++        assert_eq!(back, part);
++    }
++
++    #[test]
++    fn tool_call_preserves_provider_metadata() {
++        let mut tc = ToolCall::new("call_1", "Bash", json!({"cmd": "ls"}));
++        tc.provider_metadata = Some(json!({"thought_signature": "sig"}));
++        tc.raw_arguments = Some("{\"cmd\":\"ls\"}".to_string());
++        let v = serde_json::to_value(&tc).unwrap();
++        assert_eq!(v["provider_metadata"]["thought_signature"], "sig");
++        let back: ToolCall = serde_json::from_value(v).unwrap();
++        assert_eq!(back, tc);
++    }
++
++    #[test]
++    fn tool_result_round_trips_with_default_image_fields() {
++        let tr = ToolResult::success("call_1", json!({"ok": true}));
++        let v = serde_json::to_value(&tr).unwrap();
++        // Optional image fields are omitted on serialize.
++        assert!(v.get("image_data").is_none());
++        let back: ToolResult = serde_json::from_value(v).unwrap();
++        assert_eq!(back, tr);
++    }
++
++    #[test]
++    fn transcript_message_serde_round_trip() {
++        let msg = TranscriptMessage {
++            id:          MessageId::new(),
++            turn_id:     None,
++            kind:        MessageKind::User,
++            source:      MessageSource::Steer,
++            actor:       None,
++            pair:        None,
++            content:     vec![ContentPart::text("please continue")],
++            provider:    None,
++            model:       None,
++            response_id: None,
++            usage:       None,
++            created_at:  None,
++        };
++        let v = serde_json::to_value(&msg).unwrap();
++        assert_eq!(v["kind"], "user");
++        assert_eq!(v["source"], "steer");
++        let back: TranscriptMessage = serde_json::from_value(v).unwrap();
++        assert_eq!(back, msg);
++    }
++
++    #[test]
++    fn transcript_message_drops_optional_fields_on_serialize() {
++        let msg = TranscriptMessage::new(MessageKind::Agent, MessageSource::ProviderAnswer, vec![
++            ContentPart::text("done"),
++        ]);
++        let v = serde_json::to_value(&msg).unwrap();
++        let obj = v.as_object().unwrap();
++        // Optional fields should be omitted, not present as nulls.
++        assert!(!obj.contains_key("turn_id"));
++        assert!(!obj.contains_key("actor"));
++        assert!(!obj.contains_key("pair"));
++        assert!(!obj.contains_key("provider"));
++        assert!(!obj.contains_key("model"));
++        assert!(!obj.contains_key("response_id"));
++        assert!(!obj.contains_key("usage"));
++        assert!(!obj.contains_key("created_at"));
++    }
++
++    #[test]
++    fn pair_message_ref_skips_empty_client_id() {
++        let r = PairMessageRef {
++            pair_id:           PairId::new(),
++            message_id:        PairMessageId::new(),
++            client_message_id: None,
++        };
++        let v = serde_json::to_value(&r).unwrap();
++        assert!(v.as_object().unwrap().get("client_message_id").is_none());
++    }
++}
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index 83eefb759..aa2714307 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -593,6 +593,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                     billing,
+                     tool_call_count: *tool_call_count,
+                     visit: *visit,
++                    message: None,
+                 })
+             }
+             AgentEvent::ToolCallStarted {
+@@ -600,10 +601,13 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                 tool_call_id,
+                 arguments,
+             } => EventBody::AgentToolStarted(fabro_types::AgentToolStartedProps {
+-                tool_name:    tool_name.clone(),
+-                tool_call_id: tool_call_id.clone(),
+-                arguments:    arguments.clone(),
+-                visit:        *visit,
++                tool_name:         tool_name.clone(),
++                tool_call_id:      tool_call_id.clone(),
++                arguments:         arguments.clone(),
++                visit:             *visit,
++                tool_call:         None,
++                turn_id:           None,
++                parent_message_id: None,
+             }),
+             AgentEvent::ToolCallCompleted {
+                 tool_name,
+@@ -616,6 +620,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                 output:       output.clone(),
+                 is_error:     *is_error,
+                 visit:        *visit,
++                tool_result:  None,
++                turn_id:      None,
+             }),
+             AgentEvent::Error { error } => EventBody::AgentError(fabro_types::AgentErrorProps {
+                 error: serde_json::to_value(error).expect("serializable agent error"),
