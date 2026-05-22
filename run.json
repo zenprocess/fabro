@@ -517,7 +517,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-22T18:57:01.494747Z",
-  "last_event_at": "2026-05-22T19:49:37.027930Z",
+  "last_event_at": "2026-05-22T19:49:41.407123Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1084,9 +1084,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1419,
       "checkpoint": {
-        "timestamp": "2026-05-22T19:49:37.073882Z",
+        "timestamp": "2026-05-22T19:49:41.402628Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1099,6 +1099,226 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.retry_count.preflight_lint": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.retry_count.simplify_opus": 0,
+          "response.implement": "Let me do a quick sanity check on the plan's \"final sanity checks\":\n\n1. ✅ Memory events never contain file contents — verified by test `agent_memory_loaded_payload_excludes_file_contents` and structural design.\n2. ✅ Skills discovered and memory loaded emitted even for empty lists — verified by tests `initialize_emits_memory_loaded_event_with_empty_files_when_no_memory` and `initialize_emits_skills_discovered_event_when_no_skills`.\n3. ✅ Skill activation is persisted rather than filtered as streaming noise — `SkillActivated` is not in `is_streaming_noise()` and has conversion + name mapping.\n4. ✅ `agent.mcp.ready` backwards-compatible — verified by `agent_mcp_ready_deserializes_legacy_payload_without_tools` test and `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]`.\n5. ✅ Docs match the serialized event names and payload shapes.\n\nSummary of changes:\n\n**Task 1 (fabro-types):** Added `AgentMemoryLoadedProps`, `AgentMemoryFileProps`, `AgentSkillsDiscoveredProps`, `AgentSkillSummary`, `AgentSkillActivationSource`, `AgentSkillActivatedProps`, `AgentMcpToolSummary`. Extended `AgentMcpReadyProps` with a backwards-compatible `tools` field. Added 3 new `EventBody` variants (`AgentMemoryLoaded`, `AgentSkillsDiscovered`, `AgentSkillActivated`) plus the legacy whitelist entries. Added 5 serde tests.\n\n**Task 2 (fabro-agent / fabro-workflow):** Added internal `AgentEvent::MemoryLoaded`, `SkillsDiscovered`, `SkillActivated` variants plus support structs (`MemoryFileSummary`, `SkillSummary`, `McpToolSummary`, `SkillActivationSource`). Extended `AgentEvent::McpServerReady` with `tools`. Added tracing for the new variants. Updated workflow `convert.rs` and `names.rs`. Added 4 conversion tests.\n\n**Task 3 (memory):** Changed `discover_memory` to return `Vec<MemoryDocument>` with `{path, content, byte_count, loaded_bytes, truncated}`. `Session::initialize` emits `MemoryLoaded` immediately after discovery, always (even for empty results). The prompt assembly receives content-only strings. Memory test added for truncation metadata.\n\n**Task 4 (skills):** `Session::initialize` emits `SkillsDiscovered` (always). Slash expansion now emits `SkillActivated { Slash }` instead of `SkillExpanded`. `make_use_skill_tool` emits `SkillActivated { Tool }` only on successful lookup. Failed lookups do not emit. Added 4 session tests.\n\n**Task 5 (MCP):** Added `McpConnectionManager::tool_summaries_for_server` that filters/sorts by qualified name. `Session::initialize` includes the summaries in `McpServerReady`. Existing MCP e2e test now asserts the names-only summary content. Added an mcp unit test.\n\n**Task 6 (docs):** Updated `docs/internal/events.md` with the enriched `agent.mcp.ready` payload, three new sections for `agent.memory.loaded`, `agent.skills.discovered`, `agent.skill.activated`, and a note about the retired `agent.skill.expanded` notification.\n\n**Task 7:** All 1841 tests in `fabro-agent`, `fabro-workflow`, `fabro-types`, `fabro-mcp` pass; workspace clippy clean under nightly-2026-04-14; formatting checked.",
+          "current_node": "simplify_gpt",
+          "graph.rankdir": "LR",
+          "thread.preflight_lint.current_node": "implement",
+          "outcome": "succeeded",
+          "internal.run_id": "01KS8GR1P97NYP93VVXWYCZHYZ",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.fidelity": "compact",
+          "response.simplify_gpt": "Implemented review cleanup and validation.\n\nWhat I fixed:\n- Restored the durable `provider_profile` contract to `String` for:\n  - `AgentMemoryLoadedProps`\n  - `AgentSkillsDiscoveredProps`\n- Added explicit `loaded_bytes` to `MemoryDocument` instead of deriving it ad hoc from `content.len()`.\n- Reduced `fabro-agent` coupling to durable API props by adding internal agent summary types:\n  - `MemoryFileSummary`\n  - `SkillSummary`\n  - `SkillActivationSource`\n  - `McpToolSummary`\n- Restored explicit internal `tool_count` on `AgentEvent::McpServerReady`, while still carrying names-only tool summaries.\n- Updated workflow conversion to map internal agent summary types into `fabro-types` event props.\n- Updated tests to match the cleaned-up internal/durable boundaries.\n- Ran rustfmt.\n\nValidation passed:\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp`\n  - 1840 passed, 122 skipped\n- `cargo +nightly-2026-04-14 fmt --all`\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp --all-targets -- -D warnings`\n\nWorking tree now has cleanup modifications in 8 Rust files; no docs changes were needed during this review pass.",
+          "failure_signature": "",
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "internal.retry_count.toolchain": 0,
+          "response.simplify_opus": "All checks green. Here's the summary:\n\n## Summary\n\nThree review agents flagged overlapping issues. I applied the high-value cleanups and skipped low-value or out-of-scope ones.\n\n### Fixed\n1. **Eliminated 4 duplicate types** between `fabro-agent` and `fabro-types` (`McpToolSummary`, `MemoryFileSummary`, `SkillSummary`, `SkillActivationSource`). `AgentEvent` now embeds the `fabro-types` versions directly, mirroring the existing `TodoCreated/Updated/Deleted` pattern. Removed ~50 lines of field-by-field cloning in `convert.rs`.\n2. **Deleted dead `SkillExpanded` variant** entirely — its emit site had already been replaced with `SkillActivated { source: Slash }`. Removed from `types.rs` (variant, streaming-noise classification, trace arm, test), `convert.rs` (panic-list), and `names.rs` (name mapping).\n3. **Strongly typed `provider_profile`** as `fabro_model::AgentProfileKind` (Copy enum with existing `Display`) on both wire props and in-memory variants instead of `String`. Removed two `.to_string()` calls and per-event clones.\n4. **Dropped redundant derived fields** from in-memory variants:\n   - `MemoryDocument.loaded_bytes` → always equals `content.len()`.\n   - `AgentEvent::McpServerReady.tool_count` → always equals `tools.len()`.\n   - `AgentEvent::MemoryLoaded.total_loaded_bytes` → sum of `files[].loaded_bytes`.\n   - All three are computed at the conversion boundary so the wire shape is preserved.\n\n### Skipped (with reason)\n- **`build_system_prompt` signature change** (memory clone elimination): touches 6 files including public SDK reference docs and 4 profile impls for a single 32 KiB clone at session init. Not worth the API churn.\n- **MCP tool N+1 fix**: one-shot pass at session startup, not a hot path.\n- **`ToolContext` Option accretion**: out of scope for this PR; should be its own refactor when the next field is added.\n- **Two-pass over memory in init**: micro-optimization, current code is clearer.\n\n### Verification\n- `cargo check --workspace --all-targets` — clean\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp` — 1840 passed, 0 failed\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — clean\n- `cargo +nightly-2026-04-14 fmt --all` — applied\n\nNet change: removed ~100 lines while preserving all behavior, wire format, and test coverage.",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "last_response": "Implemented review cleanup and validation.\n\nWhat I fixed:\n- Restored the durable `provider_profile` contract to `String` for:\n  - `AgentMemoryLoadedProps`\n  - `AgentSkillsDiscoveredProps`\n- Added expl",
+          "internal.retry_count.implement": 0,
+          "internal.thread_id": "simplify_opus",
+          "last_stage": "simplify_gpt",
+          "failure_class": "",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "thread.implement.current_node": "simplify_opus",
+          "thread.toolchain.current_node": "preflight_compile",
+          "graph.goal": "# Agent Context Observability Events Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add durable API/backend events that report loaded memory files, discovered and activated skills, and per-server MCP tool names for agent runs.\n\n**Architecture:** Keep this API-backend scoped. Emit typed `AgentEvent` variants from the existing `fabro-agent` initialization and skill activation paths, convert them through `fabro-workflow` into durable `fabro-types` run events, and document the event contracts. Do not add run projection fields in this pass; consumers can read the event stream/history.\n\n**Tech Stack:** Rust, Serde, Fabro agent/session events, Fabro workflow event conversion, Fabro MCP connection manager, `cargo nextest`.\n\n---\n\n## Scope\n\nImplement these event changes:\n\n- Add `agent.memory.loaded` with memory file paths, byte counts, loaded byte counts, truncation flags, provider profile, total loaded bytes, and budget bytes.\n- Add `agent.skills.discovered` with source directories, provider profile, and sorted skill summaries.\n- Add persisted `agent.skill.activated` for slash skill expansion and successful `use_skill` tool calls.\n- Enrich `agent.mcp.ready` with names-only tool summaries: qualified tool name and original server tool name.\n\nDo not implement ACP-native equivalents in this pass. Do not include memory file contents in any event payload. Do not include MCP tool descriptions or schemas.\n\n## Existing Patterns To Follow\n\n- Read `docs/internal/events-strategy.md` before changing event variants, names, conversion, or progress JSONL behavior.\n- Read `docs/internal/testing-strategy.md` before adding or reorganizing tests.\n- Follow the current `AgentEvent` flow:\n  - `lib/crates/fabro-agent/src/types.rs`\n  - `lib/crates/fabro-agent/src/session.rs`\n  - `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n  - `lib/crates/fabro-workflow/src/event/convert.rs`\n  - `lib/crates/fabro-workflow/src/event/names.rs`\n  - `lib/crates/fabro-types/src/run_event/agent.rs`\n  - `lib/crates/fabro-types/src/run_event/mod.rs`\n- Follow Rust import style from `AGENTS.md`: import types by name, import functions through their parent module, and avoid glob imports in production code.\n\n## File Map\n\n- Modify `lib/crates/fabro-types/src/run_event/agent.rs`: add new prop structs and extend `AgentMcpReadyProps`.\n- Modify `lib/crates/fabro-types/src/run_event/mod.rs`: add `EventBody` variants for the new event names.\n- Modify `lib/crates/fabro-agent/src/types.rs`: add internal `AgentEvent` variants, trace output, and noise filtering decisions.\n- Modify `lib/crates/fabro-agent/src/memory.rs`: return memory content plus metadata instead of bare strings.\n- Modify `lib/crates/fabro-agent/src/session.rs`: emit memory, skills, skill activation, and enriched MCP events.\n- Modify `lib/crates/fabro-agent/src/skills.rs`: emit tool-sourced skill activation from `use_skill`.\n- Modify `lib/crates/fabro-mcp/src/connection_manager.rs`: expose or support deterministic names-only tool summaries per server.\n- Modify `lib/crates/fabro-workflow/src/event/convert.rs`: convert new agent events to durable event bodies.\n- Modify `lib/crates/fabro-workflow/src/event/names.rs`: add event names.\n- Modify `lib/crates/fabro-workflow/src/event/events.rs` only if the agent event name mapping also lives there for these variants.\n- Modify `lib/crates/fabro-workflow/src/event/stored_fields.rs` only if a new event needs non-standard stored fields; otherwise rely on existing `Event::Agent` handling.\n- Modify `docs/internal/events.md`: document new event shapes and the richer MCP payload.\n- Add or update tests in `lib/crates/fabro-agent`, `lib/crates/fabro-mcp`, `lib/crates/fabro-types`, and `lib/crates/fabro-workflow`.\n\n---\n\n### Task 1: Add Typed Durable Event Contracts\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/run_event/agent.rs`\n- Modify: `lib/crates/fabro-types/src/run_event/mod.rs`\n- Test: existing `fabro-types` run event serde tests, or add focused coverage near the existing run event tests.\n\n- [ ] **Step 1: Add agent memory props**\n\nAdd event prop structs with this shape:\n\n```rust\npub struct AgentMemoryLoadedProps {\n    pub provider_profile:  String,\n    pub files:             Vec<AgentMemoryFileProps>,\n    pub total_loaded_bytes: usize,\n    pub budget_bytes:      usize,\n    pub visit:             u32,\n}\n\npub struct AgentMemoryFileProps {\n    pub path:         String,\n    pub byte_count:   usize,\n    pub loaded_bytes: usize,\n    pub truncated:    bool,\n}\n```\n\n- [ ] **Step 2: Add skill props**\n\nAdd skill discovery and activation props:\n\n```rust\npub struct AgentSkillsDiscoveredProps {\n    pub provider_profile: String,\n    pub source_dirs:      Vec<String>,\n    pub skills:           Vec<AgentSkillSummary>,\n    pub visit:            u32,\n}\n\npub struct AgentSkillSummary {\n    pub name:        String,\n    pub description: String,\n}\n\npub enum AgentSkillActivationSource {\n    Slash,\n    Tool,\n}\n\npub struct AgentSkillActivatedProps {\n    pub skill_name: String,\n    pub source:     AgentSkillActivationSource,\n    pub visit:      u32,\n}\n```\n\nUse serde names `slash` and `tool` for `AgentSkillActivationSource`. If a local enum string pattern already exists, follow that pattern.\n\n- [ ] **Step 3: Extend MCP ready props**\n\nExtend `AgentMcpReadyProps` with a backwards-compatible field:\n\n```rust\n#[serde(default, skip_serializing_if = \"Vec::is_empty\")]\npub tools: Vec<AgentMcpToolSummary>,\n```\n\nAdd:\n\n```rust\npub struct AgentMcpToolSummary {\n    pub name:          String,\n    pub original_name: String,\n}\n```\n\n- [ ] **Step 4: Add EventBody variants**\n\nAdd `EventBody` variants using these serialized event names:\n\n- `agent.memory.loaded`\n- `agent.skills.discovered`\n- `agent.skill.activated`\n\nKeep existing `agent.mcp.ready` name unchanged and only enrich its props.\n\n- [ ] **Step 5: Add serde tests**\n\nCover:\n\n- New event names serialize to the expected dot names.\n- `AgentSkillActivationSource` serializes as `slash` and `tool`.\n- Old `agent.mcp.ready` JSON without `tools` still deserializes with `tools == []`.\n\n---\n\n### Task 2: Add Internal Agent Events And Conversion\n\n**Files:**\n- Modify: `lib/crates/fabro-agent/src/types.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/convert.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/names.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/events.rs` if needed by the existing name mapping.\n- Test: `lib/crates/fabro-workflow` event conversion tests.\n\n- [ ] **Step 1: Add internal AgentEvent variants**\n\nAdd variants equivalent to:\n\n```rust\nMemoryLoaded {\n    provider_profile: String,\n    files: Vec<MemoryFileSummary>,\n    total_loaded_bytes: usize,\n    budget_bytes: usize,\n}\n\nSkillsDiscovered {\n    provider_profile: String,\n    source_dirs: Vec<String>,\n    skills: Vec<SkillSummary>,\n}\n\nSkillActivated {\n    skill_name: String,\n    source: SkillActivationSource,\n}\n\nMcpServerReady {\n    server_name: String,\n    tool_count: usize,\n    tools: Vec<McpToolSummary>,\n}\n```\n\nPrefer small shared internal structs near `AgentEvent` if that matches the existing file organization.\n\n- [ ] **Step 2: Persist skill activation**\n\nDo not classify `SkillActivated` as streaming noise. The existing `SkillExpanded` event is currently filtered before persistence; replace slash expansion emissions with `SkillActivated { source: Slash }` or keep `SkillExpanded` internal-only if removing it would create unnecessary churn.\n\n- [ ] **Step 3: Add trace behavior**\n\nUpdate `AgentEvent::trace` so the new events emit concise tracing summaries:\n\n- memory loaded: profile, file count, total loaded bytes, budget bytes\n- skills discovered: profile, skill count, source dir count\n- skill activated: name and source\n- MCP ready: server, count, and summary count\n\n- [ ] **Step 4: Convert to durable events**\n\nUpdate `fabro-workflow` event conversion so the new agent events map to the new `fabro-types` props and include `visit`.\n\n- [ ] **Step 5: Add conversion tests**\n\nCover each new event with a focused conversion assertion that checks:\n\n- durable event name\n- `visit`\n- core fields\n- no memory content in the converted payload\n\n---\n\n### Task 3: Emit Memory Loaded Metadata\n\n**Files:**\n- Modify: `lib/crates/fabro-agent/src/memory.rs`\n- Modify: `lib/crates/fabro-agent/src/session.rs`\n- Test: relevant `fabro-agent` memory/session tests.\n\n- [ ] **Step 1: Change memory discovery return type**\n\nChange memory discovery from bare `Vec<String>` to a document type carrying both prompt content and event metadata:\n\n```rust\npub struct MemoryDocument {\n    pub path:         String,\n    pub content:      String,\n    pub byte_count:   usize,\n    pub loaded_bytes: usize,\n    pub truncated:    bool,\n}\n```\n\nKeep existing behavior unchanged:\n\n- provider profile filename candidates stay the same\n- root-to-working-dir walk stays the same\n- content dedupe stays the same\n- empty files are skipped\n- total budget remains 32 KiB\n- truncated content keeps the existing truncation marker\n\n- [ ] **Step 2: Preserve prompt assembly behavior**\n\nAdjust session/profile prompt assembly to pass only memory contents where prompt assembly expects memory text. The system prompt should be byte-for-byte equivalent except where existing tests allow non-semantic ordering differences.\n\n- [ ] **Step 3: Emit agent.memory.loaded**\n\nIn `Session::initialize()`, emit `AgentEvent::MemoryLoaded` immediately after memory discovery, before skills and MCP initialization.\n\nEmit the event even when no memory files are loaded. That lets consumers distinguish \"no memory\" from \"not reported.\"\n\n- [ ] **Step 4: Add memory tests**\n\nCover:\n\n- loaded file path appears in event metadata\n- `byte_count` is the original file byte count\n- `loaded_bytes` reflects bytes actually loaded into the prompt budget\n- `truncated` is true only for truncated files\n- event payload never contains memory file contents\n- empty discovery still emits a memory-loaded event with `files == []`\n\n---\n\n### Task 4: Emit Skills Discovered And Skill Activated\n\n**Files:**\n- Modify: `lib/crates/fabro-agent/src/session.rs`\n- Modify: `lib/crates/fabro-agent/src/skills.rs`\n- Test: relevant `fabro-agent` skill/session tests.\n\n- [ ] **Step 1: Emit skills discovered**\n\nAfter `discover_skills(...)`, emit `AgentEvent::SkillsDiscovered` with:\n\n- `provider_profile`\n- `source_dirs`\n- sorted `skills: [{ name, description }]`\n\nEmit the event even when no skills are discovered.\n\n- [ ] **Step 2: Emit slash activation**\n\nWhere slash skill expansion currently emits or creates `SkillExpanded`, emit:\n\n```rust\nAgentEvent::SkillActivated {\n    skill_name,\n    source: SkillActivationSource::Slash,\n}\n```\n\n- [ ] **Step 3: Emit tool activation**\n\nIn `make_use_skill_tool`, use `ToolContext::emit_agent_event(...)` after a requested skill is found and before returning the skill template. Emit:\n\n```rust\nAgentEvent::SkillActivated {\n    skill_name: name.to_string(),\n    source: SkillActivationSource::Tool,\n}\n```\n\nDo not emit activation for failed `use_skill` lookups.\n\n- [ ] **Step 4: Add skill tests**\n\nCover:\n\n- discovery event includes all discovered skills sorted by name\n- discovery event includes configured source directories\n- empty discovery emits `skills == []`\n- slash expansion emits `source == slash`\n- successful `use_skill` emits `source == tool`\n- failed `use_skill` does not emit activation\n\n---\n\n### Task 5: Enrich agent.mcp.ready With Names-Only Tool Summaries\n\n**Files:**\n- Modify: `lib/crates/fabro-mcp/src/connection_manager.rs`\n- Modify: `lib/crates/fabro-agent/src/session.rs`\n- Test: relevant `fabro-mcp` or `fabro-agent` MCP tests.\n\n- [ ] **Step 1: Add deterministic tool summaries**\n\nExpose a helper on `McpConnectionManager` or compute in `Session` from `all_tools()`:\n\n- filter tools by `server_name`\n- return qualified tool name as `name`\n- return server-provided tool name as `original_name`\n- sort by qualified `name`\n\n- [ ] **Step 2: Enrich ready emissions**\n\nWhen emitting `AgentEvent::McpServerReady`, include the tool summaries for that server. Keep existing `server_name` and `tool_count`.\n\n- [ ] **Step 3: Add MCP tests**\n\nCover:\n\n- ready event includes only tools from the ready server\n- summaries are sorted by qualified name\n- `name` is the Fabro-qualified MCP tool name\n- `original_name` is the server-provided tool name\n- descriptions and input schemas are not included\n\n---\n\n### Task 6: Update Event Documentation\n\n**Files:**\n- Modify: `docs/internal/events.md`\n\n- [ ] **Step 1: Document new events**\n\nAdd sections for:\n\n- `agent.memory.loaded`\n- `agent.skills.discovered`\n- `agent.skill.activated`\n\nFor `agent.memory.loaded`, explicitly state that file contents are excluded.\n\n- [ ] **Step 2: Update MCP ready docs**\n\nUpdate `agent.mcp.ready` to show:\n\n```json\n{\n  \"server_name\": \"github\",\n  \"tool_count\": 2,\n  \"tools\": [\n    {\n      \"name\": \"mcp__github__create_issue\",\n      \"original_name\": \"create_issue\"\n    }\n  ],\n  \"visit\": 1\n}\n```\n\n- [ ] **Step 3: Record skill event replacement**\n\nIf `agent.skill.expanded` remains in internal code or docs, mark it internal-only or replaced by `agent.skill.activated`.\n\n---\n\n### Task 7: Verify\n\n**Files:**\n- No new files unless test placement requires it.\n\n- [ ] **Step 1: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp\n```\n\n- [ ] **Step 2: Run formatting**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --all\n```\n\n- [ ] **Step 3: Run clippy for touched crates or workspace**\n\nPrefer the workspace command if time permits:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] **Step 4: Final sanity checks**\n\nConfirm:\n\n- memory events never contain file contents\n- skills discovered and memory loaded are emitted even for empty lists\n- skill activation is persisted rather than filtered as streaming noise\n- `agent.mcp.ready` remains backwards-compatible for old events without `tools`\n- docs match the serialized event names and payload shapes\n\n",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "thread.start.current_node": "toolchain"
+        },
+        "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Let me do a quick sanity check on the plan's \"final sanity checks\":\n\n1. ✅ Memory events never contain file contents — verified by test `agent_memory_loaded_payload_excludes_file_contents` and stru",
+              "response.implement": "Let me do a quick sanity check on the plan's \"final sanity checks\":\n\n1. ✅ Memory events never contain file contents — verified by test `agent_memory_loaded_payload_excludes_file_contents` and structural design.\n2. ✅ Skills discovered and memory loaded emitted even for empty lists — verified by tests `initialize_emits_memory_loaded_event_with_empty_files_when_no_memory` and `initialize_emits_skills_discovered_event_when_no_skills`.\n3. ✅ Skill activation is persisted rather than filtered as streaming noise — `SkillActivated` is not in `is_streaming_noise()` and has conversion + name mapping.\n4. ✅ `agent.mcp.ready` backwards-compatible — verified by `agent_mcp_ready_deserializes_legacy_payload_without_tools` test and `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]`.\n5. ✅ Docs match the serialized event names and payload shapes.\n\nSummary of changes:\n\n**Task 1 (fabro-types):** Added `AgentMemoryLoadedProps`, `AgentMemoryFileProps`, `AgentSkillsDiscoveredProps`, `AgentSkillSummary`, `AgentSkillActivationSource`, `AgentSkillActivatedProps`, `AgentMcpToolSummary`. Extended `AgentMcpReadyProps` with a backwards-compatible `tools` field. Added 3 new `EventBody` variants (`AgentMemoryLoaded`, `AgentSkillsDiscovered`, `AgentSkillActivated`) plus the legacy whitelist entries. Added 5 serde tests.\n\n**Task 2 (fabro-agent / fabro-workflow):** Added internal `AgentEvent::MemoryLoaded`, `SkillsDiscovered`, `SkillActivated` variants plus support structs (`MemoryFileSummary`, `SkillSummary`, `McpToolSummary`, `SkillActivationSource`). Extended `AgentEvent::McpServerReady` with `tools`. Added tracing for the new variants. Updated workflow `convert.rs` and `names.rs`. Added 4 conversion tests.\n\n**Task 3 (memory):** Changed `discover_memory` to return `Vec<MemoryDocument>` with `{path, content, byte_count, loaded_bytes, truncated}`. `Session::initialize` emits `MemoryLoaded` immediately after discovery, always (even for empty results). The prompt assembly receives content-only strings. Memory test added for truncation metadata.\n\n**Task 4 (skills):** `Session::initialize` emits `SkillsDiscovered` (always). Slash expansion now emits `SkillActivated { Slash }` instead of `SkillExpanded`. `make_use_skill_tool` emits `SkillActivated { Tool }` only on successful lookup. Failed lookups do not emit. Added 4 session tests.\n\n**Task 5 (MCP):** Added `McpConnectionManager::tool_summaries_for_server` that filters/sorts by qualified name. `Session::initialize` includes the summaries in `McpServerReady`. Existing MCP e2e test now asserts the names-only summary content. Added an mcp unit test.\n\n**Task 6 (docs):** Updated `docs/internal/events.md` with the enriched `agent.mcp.ready` payload, three new sections for `agent.memory.loaded`, `agent.skills.discovered`, `agent.skill.activated`, and a note about the retired `agent.skill.expanded` notification.\n\n**Task 7:** All 1841 tests in `fabro-agent`, `fabro-workflow`, `fabro-types`, `fabro-mcp` pass; workspace clippy clean under nightly-2026-04-14; formatting checked.",
+              "last_stage": "implement"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 220090,
+                    "output_tokens": 51681,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 24871894,
+                    "cache_write_tokens": 231090
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 231090,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 16272734
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/docs/internal/events.md",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/lib.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/memory.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/session.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/skills.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/types.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-mcp/src/connection_manager.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_event/agent.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_event/mod.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/event/convert.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/event/names.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/prompt.rs"
+            ]
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.simplify_gpt": "Implemented review cleanup and validation.\n\nWhat I fixed:\n- Restored the durable `provider_profile` contract to `String` for:\n  - `AgentMemoryLoadedProps`\n  - `AgentSkillsDiscoveredProps`\n- Added explicit `loaded_bytes` to `MemoryDocument` instead of deriving it ad hoc from `content.len()`.\n- Reduced `fabro-agent` coupling to durable API props by adding internal agent summary types:\n  - `MemoryFileSummary`\n  - `SkillSummary`\n  - `SkillActivationSource`\n  - `McpToolSummary`\n- Restored explicit internal `tool_count` on `AgentEvent::McpServerReady`, while still carrying names-only tool summaries.\n- Updated workflow conversion to map internal agent summary types into `fabro-types` event props.\n- Updated tests to match the cleaned-up internal/durable boundaries.\n- Ran rustfmt.\n\nValidation passed:\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp`\n  - 1840 passed, 122 skipped\n- `cargo +nightly-2026-04-14 fmt --all`\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp --all-targets -- -D warnings`\n\nWorking tree now has cleanup modifications in 8 Rust files; no docs changes were needed during this review pass.",
+              "last_stage": "simplify_gpt",
+              "last_response": "Implemented review cleanup and validation.\n\nWhat I fixed:\n- Restored the durable `provider_profile` contract to `String` for:\n  - `AgentMemoryLoadedProps`\n  - `AgentSkillsDiscoveredProps`\n- Added expl"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 136605,
+                    "output_tokens": 13950,
+                    "reasoning_tokens": 4034,
+                    "cache_read_tokens": 6260224,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 4352657
+            }
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.simplify_opus": "All checks green. Here's the summary:\n\n## Summary\n\nThree review agents flagged overlapping issues. I applied the high-value cleanups and skipped low-value or out-of-scope ones.\n\n### Fixed\n1. **Eliminated 4 duplicate types** between `fabro-agent` and `fabro-types` (`McpToolSummary`, `MemoryFileSummary`, `SkillSummary`, `SkillActivationSource`). `AgentEvent` now embeds the `fabro-types` versions directly, mirroring the existing `TodoCreated/Updated/Deleted` pattern. Removed ~50 lines of field-by-field cloning in `convert.rs`.\n2. **Deleted dead `SkillExpanded` variant** entirely — its emit site had already been replaced with `SkillActivated { source: Slash }`. Removed from `types.rs` (variant, streaming-noise classification, trace arm, test), `convert.rs` (panic-list), and `names.rs` (name mapping).\n3. **Strongly typed `provider_profile`** as `fabro_model::AgentProfileKind` (Copy enum with existing `Display`) on both wire props and in-memory variants instead of `String`. Removed two `.to_string()` calls and per-event clones.\n4. **Dropped redundant derived fields** from in-memory variants:\n   - `MemoryDocument.loaded_bytes` → always equals `content.len()`.\n   - `AgentEvent::McpServerReady.tool_count` → always equals `tools.len()`.\n   - `AgentEvent::MemoryLoaded.total_loaded_bytes` → sum of `files[].loaded_bytes`.\n   - All three are computed at the conversion boundary so the wire shape is preserved.\n\n### Skipped (with reason)\n- **`build_system_prompt` signature change** (memory clone elimination): touches 6 files including public SDK reference docs and 4 profile impls for a single 32 KiB clone at session init. Not worth the API churn.\n- **MCP tool N+1 fix**: one-shot pass at session startup, not a hot path.\n- **`ToolContext` Option accretion**: out of scope for this PR; should be its own refactor when the next field is added.\n- **Two-pass over memory in init**: micro-optimization, current code is clearer.\n\n### Verification\n- `cargo check --workspace --all-targets` — clean\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp` — 1840 passed, 0 failed\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — clean\n- `cargo +nightly-2026-04-14 fmt --all` — applied\n\nNet change: removed ~100 lines while preserving all behavior, wire format, and test coverage.",
+              "last_response": "All checks green. Here's the summary:\n\n## Summary\n\nThree review agents flagged overlapping issues. I applied the high-value cleanups and skipped low-value or out-of-scope ones.\n\n### Fixed\n1. **Elimina",
+              "last_stage": "simplify_opus"
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 119287,
+                    "output_tokens": 38365,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 8304451,
+                    "cache_write_tokens": 129921
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 129921,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 6519791
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/lib.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/memory.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/session.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/skills.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/types.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/lib.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_event/agent.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_event/mod.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/event/convert.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/event/names.rs"
+            ]
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "1f1f488e7c28cd61dc9455f872283ca4eee7c67b",
+        "node_visits": {
+          "preflight_lint": 1,
+          "preflight_compile": 1,
+          "start": 1,
+          "simplify_gpt": 1,
+          "simplify_opus": 1,
+          "toolchain": 1,
+          "implement": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-agent/src/lib.rs b/lib/crates/fabro-agent/src/lib.rs\nindex 13e6aa049..00be22526 100644\n--- a/lib/crates/fabro-agent/src/lib.rs\n+++ b/lib/crates/fabro-agent/src/lib.rs\n@@ -70,7 +70,10 @@ pub use tools::{\n     make_shell_tool, make_shell_tool_with_config, make_write_file_tool, register_core_tools,\n };\n pub use truncation::{TruncationMode, truncate_lines, truncate_output, truncate_tool_output};\n-pub use types::{AgentEvent, Message, SessionEvent, SessionState};\n+pub use types::{\n+    AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,\n+    SkillActivationSource, SkillSummary,\n+};\n \n #[cfg(test)]\n #[allow(\ndiff --git a/lib/crates/fabro-agent/src/memory.rs b/lib/crates/fabro-agent/src/memory.rs\nindex 7d413556c..16f9b5739 100644\n--- a/lib/crates/fabro-agent/src/memory.rs\n+++ b/lib/crates/fabro-agent/src/memory.rs\n@@ -11,14 +11,14 @@ pub const BUDGET_BYTES: usize = 32768;\n \n /// One discovered memory file. `content` is what gets inlined into the\n /// system prompt. The remaining fields describe the file for\n-/// observability and never carry the file's text. The number of bytes\n-/// actually loaded into the prompt is `content.len()`.\n+/// observability and never carry the file's text.\n #[derive(Debug, Clone, PartialEq)]\n pub struct MemoryDocument {\n-    pub path:       String,\n-    pub content:    String,\n-    pub byte_count: usize,\n-    pub truncated:  bool,\n+    pub path:         String,\n+    pub content:      String,\n+    pub byte_count:   usize,\n+    pub loaded_bytes: usize,\n+    pub truncated:    bool,\n }\n \n pub async fn discover_memory(\n@@ -67,6 +67,7 @@ pub async fn discover_memory(\n                         path,\n                         content,\n                         byte_count,\n+                        loaded_bytes: byte_count,\n                         truncated: false,\n                     });\n                 } else if budget_remaining > 0 {\n@@ -77,11 +78,13 @@ pub async fn discover_memory(\n                         \"Project doc truncated to fit budget\"\n                     );\n                     let truncated = truncate_to_budget(&content, budget_remaining);\n+                    let loaded_bytes = truncated.len();\n                     budget_remaining = 0;\n                     results.push(MemoryDocument {\n                         path,\n                         content: truncated,\n                         byte_count,\n+                        loaded_bytes,\n                         truncated: true,\n                     });\n                 } else {\n@@ -91,7 +94,7 @@ pub async fn discover_memory(\n         }\n     }\n \n-    let total_bytes: usize = results.iter().map(|doc| doc.content.len()).sum();\n+    let total_bytes: usize = results.iter().map(|doc| doc.loaded_bytes).sum();\n     info!(files = results.len(), total_bytes, \"Project docs loaded\");\n \n     Ok(results)\n@@ -170,7 +173,7 @@ mod tests {\n         assert_eq!(docs[0].content, \"Agent instructions\");\n         assert_eq!(docs[0].path, \"/repo/AGENTS.md\");\n         assert_eq!(docs[0].byte_count, \"Agent instructions\".len());\n-        assert_eq!(docs[0].content.len(), docs[0].byte_count);\n+        assert_eq!(docs[0].loaded_bytes, docs[0].byte_count);\n         assert!(!docs[0].truncated);\n     }\n \ndiff --git a/lib/crates/fabro-agent/src/session.rs b/lib/crates/fabro-agent/src/session.rs\nindex 30a1b1201..f62ce0a48 100644\n--- a/lib/crates/fabro-agent/src/session.rs\n+++ b/lib/crates/fabro-agent/src/session.rs\n@@ -39,7 +39,10 @@ use crate::skills::{\n };\n use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentManager};\n use crate::tool_execution::execute_tool_calls;\n-use crate::types::{AgentEvent, Message, SessionEvent, SessionState};\n+use crate::types::{\n+    AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,\n+    SkillActivationSource, SkillSummary,\n+};\n \n /// One queued external control item for a live session.\n #[derive(Debug, Clone)]\n@@ -489,24 +492,26 @@ impl Session {\n         )\n         .await?;\n \n-        let provider_profile = self.provider_profile.profile_kind();\n+        let provider_profile = self.provider_profile.profile_kind().to_string();\n \n         // Emit memory loaded event with file metadata. Contents are deliberately\n         // omitted so the durable event stream never carries file bytes.\n-        let memory_files: Vec<fabro_types::AgentMemoryFileProps> = self\n+        let memory_files: Vec<MemoryFileSummary> = self\n             .memory\n             .iter()\n-            .map(|doc| fabro_types::AgentMemoryFileProps {\n+            .map(|doc| MemoryFileSummary {\n                 path:         doc.path.clone(),\n                 byte_count:   doc.byte_count,\n-                loaded_bytes: doc.content.len(),\n+                loaded_bytes: doc.loaded_bytes,\n                 truncated:    doc.truncated,\n             })\n             .collect();\n+        let total_loaded_bytes = self.memory.iter().map(|doc| doc.loaded_bytes).sum();\n         self.event_emitter\n             .emit(self.id.clone(), AgentEvent::MemoryLoaded {\n-                provider_profile,\n+                provider_profile: provider_profile.clone(),\n                 files: memory_files,\n+                total_loaded_bytes,\n                 budget_bytes: BUDGET_BYTES,\n             });\n \n@@ -521,10 +526,10 @@ impl Session {\n         self.skills = discover_skills(self.sandbox.as_ref(), &skill_dirs, &cancel_token).await?;\n         debug!(skill_count = self.skills.len(), \"Skills discovered\");\n \n-        let skill_summaries: Vec<fabro_types::AgentSkillSummary> = self\n+        let skill_summaries: Vec<SkillSummary> = self\n             .skills\n             .iter()\n-            .map(|skill| fabro_types::AgentSkillSummary {\n+            .map(|skill| SkillSummary {\n                 name:        skill.name.clone(),\n                 description: skill.description.clone(),\n             })\n@@ -557,11 +562,11 @@ impl Session {\n \n             for (server_name, result) in &results {\n                 match result {\n-                    Ok(_) => {\n+                    Ok(tool_count) => {\n                         let tools = manager\n                             .tool_summaries_for_server(server_name)\n                             .into_iter()\n-                            .map(|(name, original_name)| fabro_types::AgentMcpToolSummary {\n+                            .map(|(name, original_name)| McpToolSummary {\n                                 name,\n                                 original_name,\n                             })\n@@ -569,6 +574,7 @@ impl Session {\n                         self.event_emitter\n                             .emit(self.id.clone(), AgentEvent::McpServerReady {\n                                 server_name: server_name.clone(),\n+                                tool_count: *tool_count,\n                                 tools,\n                             });\n                     }\n@@ -1188,7 +1194,7 @@ impl Session {\n             self.event_emitter\n                 .emit(self.id.clone(), AgentEvent::SkillActivated {\n                     skill_name: name.clone(),\n-                    source:     fabro_types::AgentSkillActivationSource::Slash,\n+                    source:     SkillActivationSource::Slash,\n                 });\n         }\n         let expanded_input = expanded.text;\n@@ -3703,7 +3709,10 @@ mod tests {\n         // summaries pulled from the connection manager.\n         let mut mcp_ready = false;\n         while let Ok(event) = rx.try_recv() {\n-            if let AgentEvent::McpServerReady { server_name, tools } = &event.event {\n+            if let AgentEvent::McpServerReady {\n+                server_name, tools, ..\n+            } = &event.event\n+            {\n                 assert_eq!(server_name, \"test-echo\");\n                 assert_eq!(tools.len(), 1);\n                 assert_eq!(tools[0].name, \"mcp__test_echo__echo\");\n@@ -3947,6 +3956,7 @@ mod tests {\n                 files,\n                 budget_bytes,\n                 provider_profile,\n+                ..\n             } = envelope.event\n             {\n                 memory_event = Some((files, budget_bytes, provider_profile));\n@@ -3955,7 +3965,7 @@ mod tests {\n         }\n         let (files, budget_bytes, provider_profile) =\n             memory_event.expect(\"MemoryLoaded should be emitted\");\n-        assert_eq!(provider_profile, fabro_model::AgentProfileKind::Anthropic);\n+        assert_eq!(provider_profile, \"anthropic\");\n         assert_eq!(budget_bytes, 32768);\n         assert_eq!(files.len(), 1);\n         assert_eq!(files[0].path, \"/home/test/AGENTS.md\");\n@@ -4025,7 +4035,7 @@ mod tests {\n         }\n         let (provider_profile, source_dirs, skills) =\n             got.expect(\"SkillsDiscovered must be emitted\");\n-        assert_eq!(provider_profile, fabro_model::AgentProfileKind::Anthropic);\n+        assert_eq!(provider_profile, \"anthropic\");\n         assert_eq!(source_dirs, vec![\"/skills\".to_string()]);\n         assert_eq!(skills.len(), 1);\n         assert_eq!(skills[0].name, \"commit\");\n@@ -4084,15 +4094,16 @@ mod tests {\n         let mut rx = session.subscribe();\n         session.process_input(\"/commit fix things\").await.unwrap();\n \n-        let mut activations: Vec<(String, fabro_types::AgentSkillActivationSource)> = Vec::new();\n+        let mut activations: Vec<(String, SkillActivationSource)> = Vec::new();\n         while let Ok(envelope) = rx.try_recv() {\n             if let AgentEvent::SkillActivated { skill_name, source } = envelope.event {\n                 activations.push((skill_name, source));\n             }\n         }\n         assert!(\n-            activations.iter().any(|(name, source)| name == \"commit\"\n-                && *source == fabro_types::AgentSkillActivationSource::Slash),\n+            activations\n+                .iter()\n+                .any(|(name, source)| name == \"commit\" && *source == SkillActivationSource::Slash),\n             \"expected slash skill activation, got {activations:?}\"\n         );\n     }\n@@ -4135,8 +4146,7 @@ mod tests {\n         let mut tool_activations = 0;\n         while let Ok(envelope) = rx.try_recv() {\n             if let AgentEvent::SkillActivated { source, skill_name } = envelope.event {\n-                if source == fabro_types::AgentSkillActivationSource::Tool && skill_name == \"commit\"\n-                {\n+                if source == SkillActivationSource::Tool && skill_name == \"commit\" {\n                     tool_activations += 1;\n                 }\n             }\ndiff --git a/lib/crates/fabro-agent/src/skills.rs b/lib/crates/fabro-agent/src/skills.rs\nindex 34c6e126b..f7b4e3eaf 100644\n--- a/lib/crates/fabro-agent/src/skills.rs\n+++ b/lib/crates/fabro-agent/src/skills.rs\n@@ -7,7 +7,7 @@ use crate::error::{Error, InterruptReason};\n use crate::sandbox::Sandbox;\n use crate::tool_registry::RegisteredTool;\n use crate::tools::required_str;\n-use crate::types::AgentEvent;\n+use crate::types::{AgentEvent, SkillActivationSource};\n \n #[derive(Debug, Clone)]\n pub struct Skill {\n@@ -187,7 +187,7 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {\n                     .ok_or_else(|| format!(\"Unknown skill: {name}\"))?;\n                 ctx.emit_agent_event(AgentEvent::SkillActivated {\n                     skill_name: name.to_string(),\n-                    source:     fabro_types::AgentSkillActivationSource::Tool,\n+                    source:     SkillActivationSource::Tool,\n                 });\n                 Ok(skill.template.clone())\n             })\ndiff --git a/lib/crates/fabro-agent/src/types.rs b/lib/crates/fabro-agent/src/types.rs\nindex 9e497bbd0..a15b8ae20 100644\n--- a/lib/crates/fabro-agent/src/types.rs\n+++ b/lib/crates/fabro-agent/src/types.rs\n@@ -3,7 +3,7 @@ use std::time::SystemTime;\n use chrono::{DateTime, Utc};\n use fabro_llm::Error as LlmError;\n use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};\n-use fabro_model::{AgentProfileKind, ModelRef};\n+use fabro_model::ModelRef;\n use fabro_types::SessionMessage;\n use serde::de::DeserializeOwned;\n use serde::{Deserialize, Serialize};\n@@ -194,6 +194,33 @@ pub enum SessionState {\n     Closed,\n }\n \n+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n+pub struct MemoryFileSummary {\n+    pub path:         String,\n+    pub byte_count:   usize,\n+    pub loaded_bytes: usize,\n+    pub truncated:    bool,\n+}\n+\n+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n+pub struct SkillSummary {\n+    pub name:        String,\n+    pub description: String,\n+}\n+\n+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n+#[serde(rename_all = \"snake_case\")]\n+pub enum SkillActivationSource {\n+    Slash,\n+    Tool,\n+}\n+\n+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n+pub struct McpToolSummary {\n+    pub name:          String,\n+    pub original_name: String,\n+}\n+\n #[derive(Debug, Clone, Serialize, Deserialize)]\n pub enum AgentEvent {\n     SessionStarted {\n@@ -299,25 +326,27 @@ pub enum AgentEvent {\n     },\n     McpServerReady {\n         server_name: String,\n-        tools:       Vec<fabro_types::AgentMcpToolSummary>,\n+        tool_count:  usize,\n+        tools:       Vec<McpToolSummary>,\n     },\n     McpServerFailed {\n         server_name: String,\n         error:       String,\n     },\n     MemoryLoaded {\n-        provider_profile: AgentProfileKind,\n-        files:            Vec<fabro_types::AgentMemoryFileProps>,\n-        budget_bytes:     usize,\n+        provider_profile:   String,\n+        files:              Vec<MemoryFileSummary>,\n+        total_loaded_bytes: usize,\n+        budget_bytes:       usize,\n     },\n     SkillsDiscovered {\n-        provider_profile: AgentProfileKind,\n+        provider_profile: String,\n         source_dirs:      Vec<String>,\n-        skills:           Vec<fabro_types::AgentSkillSummary>,\n+        skills:           Vec<SkillSummary>,\n     },\n     SkillActivated {\n         skill_name: String,\n-        source:     fabro_types::AgentSkillActivationSource,\n+        source:     SkillActivationSource,\n     },\n     /// New todo / task was created. Carries the full row so the projection\n     /// can be reconstructed from `todo.created` alone.\n@@ -508,24 +537,30 @@ impl AgentEvent {\n             Self::SubAgentClosed { agent_id, depth } => {\n                 debug!(session_id, agent_id, depth, \"Sub-agent closed\");\n             }\n-            Self::McpServerReady { server_name, tools } => {\n+            Self::McpServerReady {\n+                server_name,\n+                tool_count,\n+                tools,\n+            } => {\n                 info!(\n                     session_id,\n                     server = server_name.as_str(),\n-                    tool_count = tools.len(),\n+                    tool_count,\n+                    summary_count = tools.len(),\n                     \"MCP server ready\"\n                 );\n             }\n             Self::MemoryLoaded {\n                 provider_profile,\n                 files,\n+                total_loaded_bytes,\n                 budget_bytes,\n             } => {\n                 info!(\n                     session_id,\n-                    provider_profile = %provider_profile,\n+                    provider_profile = provider_profile.as_str(),\n                     file_count = files.len(),\n-                    total_loaded_bytes = files.iter().map(|f| f.loaded_bytes).sum::<usize>(),\n+                    total_loaded_bytes,\n                     budget_bytes,\n                     \"Agent memory loaded\"\n                 );\n@@ -780,6 +815,7 @@ mod tests {\n     fn mcp_server_ready_constructible() {\n         let event = AgentEvent::McpServerReady {\n             server_name: \"filesystem\".into(),\n+            tool_count:  0,\n             tools:       Vec::new(),\n         };\n         assert!(matches!(\n@@ -804,6 +840,7 @@ mod tests {\n         let events = vec![\n             AgentEvent::McpServerReady {\n                 server_name: \"fs\".into(),\n+                tool_count:  0,\n                 tools:       Vec::new(),\n             },\n             AgentEvent::McpServerFailed {\ndiff --git a/lib/crates/fabro-types/src/run_event/agent.rs b/lib/crates/fabro-types/src/run_event/agent.rs\nindex 1666e6c43..56106dc60 100644\n--- a/lib/crates/fabro-types/src/run_event/agent.rs\n+++ b/lib/crates/fabro-types/src/run_event/agent.rs\n@@ -1,4 +1,3 @@\n-use fabro_model::AgentProfileKind;\n use serde::{Deserialize, Serialize};\n use serde_json::Value;\n \n@@ -236,7 +235,7 @@ pub struct AgentMcpFailedProps {\n \n #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n pub struct AgentMemoryLoadedProps {\n-    pub provider_profile:   AgentProfileKind,\n+    pub provider_profile:   String,\n     pub files:              Vec<AgentMemoryFileProps>,\n     pub total_loaded_bytes: usize,\n     pub budget_bytes:       usize,\n@@ -253,7 +252,7 @@ pub struct AgentMemoryFileProps {\n \n #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n pub struct AgentSkillsDiscoveredProps {\n-    pub provider_profile: AgentProfileKind,\n+    pub provider_profile: String,\n     pub source_dirs:      Vec<String>,\n     pub skills:           Vec<AgentSkillSummary>,\n     pub visit:            u32,\ndiff --git a/lib/crates/fabro-types/src/run_event/mod.rs b/lib/crates/fabro-types/src/run_event/mod.rs\nindex 91fba066d..564dea99a 100644\n--- a/lib/crates/fabro-types/src/run_event/mod.rs\n+++ b/lib/crates/fabro-types/src/run_event/mod.rs\n@@ -1999,7 +1999,7 @@ mod tests {\n     #[test]\n     fn agent_memory_loaded_serializes_with_canonical_name() {\n         let body = EventBody::AgentMemoryLoaded(AgentMemoryLoadedProps {\n-            provider_profile:   fabro_model::AgentProfileKind::Anthropic,\n+            provider_profile:   \"anthropic\".to_string(),\n             files:              vec![AgentMemoryFileProps {\n                 path:         \"/repo/AGENTS.md\".to_string(),\n                 byte_count:   100,\n@@ -2029,7 +2029,7 @@ mod tests {\n     #[test]\n     fn agent_skills_discovered_serializes_with_canonical_name() {\n         let body = EventBody::AgentSkillsDiscovered(AgentSkillsDiscoveredProps {\n-            provider_profile: fabro_model::AgentProfileKind::OpenAi,\n+            provider_profile: \"openai\".to_string(),\n             source_dirs:      vec![\"/repo/.fabro/skills\".to_string()],\n             skills:           vec![AgentSkillSummary {\n                 name:        \"commit\".to_string(),\ndiff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs\nindex bc038d71c..712a016b5 100644\n--- a/lib/crates/fabro-workflow/src/event/convert.rs\n+++ b/lib/crates/fabro-workflow/src/event/convert.rs\n@@ -2,7 +2,7 @@ use ::fabro_types::{\n     EventBody, RunControlAction, RunEvent, RunId, StageOutcome, run_event as fabro_types,\n };\n use chrono::Utc;\n-use fabro_agent::{AgentEvent, SandboxEvent};\n+use fabro_agent::{AgentEvent, SandboxEvent, SkillActivationSource};\n use uuid::Uuid;\n \n use super::Event;\n@@ -719,14 +719,22 @@ fn event_body_from_event(event: &Event) -> EventBody {\n                     visit:    *visit,\n                 })\n             }\n-            AgentEvent::McpServerReady { server_name, tools } => {\n-                EventBody::AgentMcpReady(fabro_types::AgentMcpReadyProps {\n-                    server_name: server_name.clone(),\n-                    tool_count:  tools.len(),\n-                    tools:       tools.clone(),\n-                    visit:       *visit,\n-                })\n-            }\n+            AgentEvent::McpServerReady {\n+                server_name,\n+                tool_count,\n+                tools,\n+            } => EventBody::AgentMcpReady(fabro_types::AgentMcpReadyProps {\n+                server_name: server_name.clone(),\n+                tool_count:  *tool_count,\n+                tools:       tools\n+                    .iter()\n+                    .map(|tool| fabro_types::AgentMcpToolSummary {\n+                        name:          tool.name.clone(),\n+                        original_name: tool.original_name.clone(),\n+                    })\n+                    .collect(),\n+                visit:       *visit,\n+            }),\n             AgentEvent::McpServerFailed { server_name, error } => {\n                 EventBody::AgentMcpFailed(fabro_types::AgentMcpFailedProps {\n                     server_name: server_name.clone(),\n@@ -737,11 +745,20 @@ fn event_body_from_event(event: &Event) -> EventBody {\n             AgentEvent::MemoryLoaded {\n                 provider_profile,\n                 files,\n+                total_loaded_bytes,\n                 budget_bytes,\n             } => EventBody::AgentMemoryLoaded(fabro_types::AgentMemoryLoadedProps {\n-                provider_profile:   *provider_profile,\n-                total_loaded_bytes: files.iter().map(|f| f.loaded_bytes).sum(),\n-                files:              files.clone(),\n+                provider_profile:   provider_profile.clone(),\n+                total_loaded_bytes: *total_loaded_bytes,\n+                files:              files\n+                    .iter()\n+                    .map(|file| fabro_types::AgentMemoryFileProps {\n+                        path:         file.path.clone(),\n+                        byte_count:   file.byte_count,\n+                        loaded_bytes: file.loaded_bytes,\n+                        truncated:    file.truncated,\n+                    })\n+                    .collect(),\n                 budget_bytes:       *budget_bytes,\n                 visit:              *visit,\n             }),\n@@ -750,15 +767,28 @@ fn event_body_from_event(event: &Event) -> EventBody {\n                 source_dirs,\n                 skills,\n             } => EventBody::AgentSkillsDiscovered(fabro_types::AgentSkillsDiscoveredProps {\n-                provider_profile: *provider_profile,\n+                provider_profile: provider_profile.clone(),\n                 source_dirs:      source_dirs.clone(),\n-                skills:           skills.clone(),\n+                skills:           skills\n+                    .iter()\n+                    .map(|skill| fabro_types::AgentSkillSummary {\n+                        name:        skill.name.clone(),\n+                        description: skill.description.clone(),\n+                    })\n+                    .collect(),\n                 visit:            *visit,\n             }),\n             AgentEvent::SkillActivated { skill_name, source } => {\n                 EventBody::AgentSkillActivated(fabro_types::AgentSkillActivatedProps {\n                     skill_name: skill_name.clone(),\n-                    source:     *source,\n+                    source:     match source {\n+                        SkillActivationSource::Slash => {\n+                            fabro_types::AgentSkillActivationSource::Slash\n+                        }\n+                        SkillActivationSource::Tool => {\n+                            fabro_types::AgentSkillActivationSource::Tool\n+                        }\n+                    },\n                     visit:      *visit,\n                 })\n             }\n@@ -1338,7 +1368,10 @@ mod tests {\n         RunProvenance, StageId, SystemActorKind, fixtures, run_event as fabro_types,\n     };\n     use chrono::Utc;\n-    use fabro_agent::{AgentEvent, SandboxEvent};\n+    use fabro_agent::{\n+        AgentEvent, McpToolSummary, MemoryFileSummary, SandboxEvent, SkillActivationSource,\n+        SkillSummary,\n+    };\n     use fabro_llm::types::TokenCounts as LlmTokenCounts;\n     use fabro_model::{ModelRef, ProviderId};\n \n@@ -2296,14 +2329,15 @@ mod tests {\n             stage:             \"code\".to_string(),\n             visit:             3,\n             event:             AgentEvent::MemoryLoaded {\n-                provider_profile: fabro_model::AgentProfileKind::Anthropic,\n-                files:            vec![fabro_types::AgentMemoryFileProps {\n+                provider_profile:   \"anthropic\".to_string(),\n+                files:              vec![MemoryFileSummary {\n                     path:         \"/repo/AGENTS.md\".to_string(),\n                     byte_count:   200,\n                     loaded_bytes: 200,\n                     truncated:    false,\n                 }],\n-                budget_bytes:     32768,\n+                total_loaded_bytes: 200,\n+                budget_bytes:       32768,\n             },\n             session_id:        Some(\"ses_1\".to_string()),\n             parent_session_id: None,\n@@ -2313,10 +2347,7 @@ mod tests {\n         match stored.body {\n             EventBody::AgentMemoryLoaded(props) => {\n                 assert_eq!(props.visit, 3);\n-                assert_eq!(\n-                    props.provider_profile,\n-                    fabro_model::AgentProfileKind::Anthropic\n-                );\n+                assert_eq!(props.provider_profile, \"anthropic\");\n                 assert_eq!(props.budget_bytes, 32768);\n                 assert_eq!(props.total_loaded_bytes, 200);\n                 assert_eq!(props.files.len(), 1);\n@@ -2335,14 +2366,15 @@ mod tests {\n             stage:             \"code\".to_string(),\n             visit:             1,\n             event:             AgentEvent::MemoryLoaded {\n-                provider_profile: fabro_model::AgentProfileKind::OpenAi,\n-                files:            vec![fabro_types::AgentMemoryFileProps {\n+                provider_profile:   \"openai\".to_string(),\n+                files:              vec![MemoryFileSummary {\n                     path:         \"/repo/AGENTS.md\".to_string(),\n                     byte_count:   100,\n                     loaded_bytes: 100,\n                     truncated:    false,\n                 }],\n-                budget_bytes:     32768,\n+                total_loaded_bytes: 100,\n+                budget_bytes:       32768,\n             },\n             session_id:        None,\n             parent_session_id: None,\n@@ -2361,9 +2393,9 @@ mod tests {\n             stage:             \"code\".to_string(),\n             visit:             2,\n             event:             AgentEvent::SkillsDiscovered {\n-                provider_profile: fabro_model::AgentProfileKind::Anthropic,\n+                provider_profile: \"anthropic\".to_string(),\n                 source_dirs:      vec![\"/repo/.fabro/skills\".to_string()],\n-                skills:           vec![fabro_types::AgentSkillSummary {\n+                skills:           vec![SkillSummary {\n                     name:        \"commit\".to_string(),\n                     description: \"Make a commit\".to_string(),\n                 }],\n@@ -2376,10 +2408,7 @@ mod tests {\n         match stored.body {\n             EventBody::AgentSkillsDiscovered(props) => {\n                 assert_eq!(props.visit, 2);\n-                assert_eq!(\n-                    props.provider_profile,\n-                    fabro_model::AgentProfileKind::Anthropic\n-                );\n+                assert_eq!(props.provider_profile, \"anthropic\");\n                 assert_eq!(props.source_dirs, vec![\"/repo/.fabro/skills\".to_string()]);\n                 assert_eq!(props.skills.len(), 1);\n                 assert_eq!(props.skills[0].name, \"commit\");\n@@ -2396,7 +2425,7 @@ mod tests {\n             visit:             1,\n             event:             AgentEvent::SkillActivated {\n                 skill_name: \"commit\".to_string(),\n-                source:     fabro_types::AgentSkillActivationSource::Slash,\n+                source:     SkillActivationSource::Slash,\n             },\n             session_id:        Some(\"ses_1\".to_string()),\n             parent_session_id: None,\n@@ -2417,7 +2446,7 @@ mod tests {\n             visit:             4,\n             event:             AgentEvent::SkillActivated {\n                 skill_name: \"review\".to_string(),\n-                source:     fabro_types::AgentSkillActivationSource::Tool,\n+                source:     SkillActivationSource::Tool,\n             },\n             session_id:        None,\n             parent_session_id: None,\n@@ -2440,12 +2469,13 @@ mod tests {\n             visit:             5,\n             event:             AgentEvent::McpServerReady {\n                 server_name: \"github\".to_string(),\n+                tool_count:  2,\n                 tools:       vec![\n-                    fabro_types::AgentMcpToolSummary {\n+                    McpToolSummary {\n                         name:          \"mcp__github__create_issue\".to_string(),\n                         original_name: \"create_issue\".to_string(),\n                     },\n-                    fabro_types::AgentMcpToolSummary {\n+                    McpToolSummary {\n                         name:          \"mcp__github__list_issues\".to_string(),\n                         original_name: \"list_issues\".to_string(),\n                     },\n",
+        "summary": {
+          "files_changed": 13,
+          "additions": 1176,
+          "deletions": 76
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-22T19:54:05.462791Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
           "thread.toolchain.current_node": "preflight_compile",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "response.implement": "Let me do a quick sanity check on the plan's \"final sanity checks\":\n\n1. ✅ Memory events never contain file contents — verified by test `agent_memory_loaded_payload_excludes_file_contents` and structural design.\n2. ✅ Skills discovered and memory loaded emitted even for empty lists — verified by tests `initialize_emits_memory_loaded_event_with_empty_files_when_no_memory` and `initialize_emits_skills_discovered_event_when_no_skills`.\n3. ✅ Skill activation is persisted rather than filtered as streaming noise — `SkillActivated` is not in `is_streaming_noise()` and has conversion + name mapping.\n4. ✅ `agent.mcp.ready` backwards-compatible — verified by `agent_mcp_ready_deserializes_legacy_payload_without_tools` test and `#[serde(default, skip_serializing_if = \"Vec::is_empty\")]`.\n5. ✅ Docs match the serialized event names and payload shapes.\n\nSummary of changes:\n\n**Task 1 (fabro-types):** Added `AgentMemoryLoadedProps`, `AgentMemoryFileProps`, `AgentSkillsDiscoveredProps`, `AgentSkillSummary`, `AgentSkillActivationSource`, `AgentSkillActivatedProps`, `AgentMcpToolSummary`. Extended `AgentMcpReadyProps` with a backwards-compatible `tools` field. Added 3 new `EventBody` variants (`AgentMemoryLoaded`, `AgentSkillsDiscovered`, `AgentSkillActivated`) plus the legacy whitelist entries. Added 5 serde tests.\n\n**Task 2 (fabro-agent / fabro-workflow):** Added internal `AgentEvent::MemoryLoaded`, `SkillsDiscovered`, `SkillActivated` variants plus support structs (`MemoryFileSummary`, `SkillSummary`, `McpToolSummary`, `SkillActivationSource`). Extended `AgentEvent::McpServerReady` with `tools`. Added tracing for the new variants. Updated workflow `convert.rs` and `names.rs`. Added 4 conversion tests.\n\n**Task 3 (memory):** Changed `discover_memory` to return `Vec<MemoryDocument>` with `{path, content, byte_count, loaded_bytes, truncated}`. `Session::initialize` emits `MemoryLoaded` immediately after discovery, always (even for empty results). The prompt assembly receives content-only strings. Memory test added for truncation metadata.\n\n**Task 4 (skills):** `Session::initialize` emits `SkillsDiscovered` (always). Slash expansion now emits `SkillActivated { Slash }` instead of `SkillExpanded`. `make_use_skill_tool` emits `SkillActivated { Tool }` only on successful lookup. Failed lookups do not emit. Added 4 session tests.\n\n**Task 5 (MCP):** Added `McpConnectionManager::tool_summaries_for_server` that filters/sorts by qualified name. `Session::initialize` includes the summaries in `McpServerReady`. Existing MCP e2e test now asserts the names-only summary content. Added an mcp unit test.\n\n**Task 6 (docs):** Updated `docs/internal/events.md` with the enriched `agent.mcp.ready` payload, three new sections for `agent.memory.loaded`, `agent.skills.discovered`, `agent.skill.activated`, and a note about the retired `agent.skill.expanded` notification.\n\n**Task 7:** All 1841 tests in `fabro-agent`, `fabro-workflow`, `fabro-types`, `fabro-mcp` pass; workspace clippy clean under nightly-2026-04-14; formatting checked.",
@@ -1107,18 +1327,20 @@
           "failure_class": "",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.retry_count.simplify_opus": 0,
-          "internal.thread_id": "simplify_opus",
+          "internal.thread_id": "simplify_gpt",
           "internal.retry_count.preflight_compile": 0,
           "internal.fidelity": "compact",
           "outcome": "succeeded",
           "internal.retry_count.implement": 0,
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "thread.simplify_opus.current_node": "simplify_gpt",
           "graph.rankdir": "LR",
           "internal.retry_count.simplify_gpt": 0,
           "internal.run_id": "01KS8GR1P97NYP93VVXWYCZHYZ",
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.retry_count.verify": 0,
+          "command.output": "blob://sha256/d7becd4452dfa33e7f83f9bb42ff5f072da178ba87bfa9384398afd8eb45dbf1",
           "thread.implement.current_node": "simplify_opus",
+          "thread.simplify_gpt.current_node": "verify",
           "failure_signature": "",
           "internal.retry_count.preflight_lint": 0,
           "internal.node_visit_count": 1,
@@ -1132,6 +1354,14 @@
           "response.simplify_opus": "All checks green. Here's the summary:\n\n## Summary\n\nThree review agents flagged overlapping issues. I applied the high-value cleanups and skipped low-value or out-of-scope ones.\n\n### Fixed\n1. **Eliminated 4 duplicate types** between `fabro-agent` and `fabro-types` (`McpToolSummary`, `MemoryFileSummary`, `SkillSummary`, `SkillActivationSource`). `AgentEvent` now embeds the `fabro-types` versions directly, mirroring the existing `TodoCreated/Updated/Deleted` pattern. Removed ~50 lines of field-by-field cloning in `convert.rs`.\n2. **Deleted dead `SkillExpanded` variant** entirely — its emit site had already been replaced with `SkillActivated { source: Slash }`. Removed from `types.rs` (variant, streaming-noise classification, trace arm, test), `convert.rs` (panic-list), and `names.rs` (name mapping).\n3. **Strongly typed `provider_profile`** as `fabro_model::AgentProfileKind` (Copy enum with existing `Display`) on both wire props and in-memory variants instead of `String`. Removed two `.to_string()` calls and per-event clones.\n4. **Dropped redundant derived fields** from in-memory variants:\n   - `MemoryDocument.loaded_bytes` → always equals `content.len()`.\n   - `AgentEvent::McpServerReady.tool_count` → always equals `tools.len()`.\n   - `AgentEvent::MemoryLoaded.total_loaded_bytes` → sum of `files[].loaded_bytes`.\n   - All three are computed at the conversion boundary so the wire shape is preserved.\n\n### Skipped (with reason)\n- **`build_system_prompt` signature change** (memory clone elimination): touches 6 files including public SDK reference docs and 4 profile impls for a single 32 KiB clone at session init. Not worth the API churn.\n- **MCP tool N+1 fix**: one-shot pass at session startup, not a hot path.\n- **`ToolContext` Option accretion**: out of scope for this PR; should be its own refactor when the next field is added.\n- **Two-pass over memory in init**: micro-optimization, current code is clearer.\n\n### Verification\n- `cargo check --workspace --all-targets` — clean\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-types -p fabro-mcp` — 1840 passed, 0 failed\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — clean\n- `cargo +nightly-2026-04-14 fmt --all` — applied\n\nNet change: removed ~100 lines while preserving all behavior, wire format, and test coverage."
         },
         "node_outcomes": {
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/d7becd4452dfa33e7f83f9bb42ff5f072da178ba87bfa9384398afd8eb45dbf1"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+            "usage": null
+          },
           "toolchain": {
             "status": "succeeded",
             "context_updates": {
@@ -1281,15 +1511,16 @@
             "usage": null
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "fmt",
         "node_visits": {
           "start": 1,
           "toolchain": 1,
           "preflight_compile": 1,
-          "preflight_lint": 1,
           "implement": 1,
           "simplify_opus": 1,
-          "simplify_gpt": 1
+          "preflight_lint": 1,
+          "simplify_gpt": 1,
+          "verify": 1
         }
       },
       "diff": {}
@@ -1474,48 +1705,32 @@
       },
       "state": "succeeded"
     },
-    "simplify_opus@1": {
-      "first_event_seq": 498,
+    "verify@1": {
+      "first_event_seq": 1422,
       "prompt": null,
       "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Stage completed: simplify_opus",
-        "failure_reason": null,
-        "timestamp": "2026-05-22T19:38:59.336982Z"
-      },
-      "provider_used": {
-        "mode": "agent",
-        "provider": "anthropic",
-        "model": "claude-opus-4-7"
-      },
+      "completion": null,
+      "provider_used": null,
       "diff": null,
-      "script_invocation": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+        "language": "shell"
+      },
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-22T19:23:37.882517Z",
-      "handler": "agent",
-      "timing": {
-        "wall_time_ms": 921449,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
+      "started_at": "2026-05-22T19:49:41.406605Z",
+      "handler": "command",
       "usage": {
-        "input_tokens": 119287,
-        "output_tokens": 38365,
-        "total_tokens": 8592024,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 8304451,
-        "cache_write_tokens": 129921,
-        "total_usd_micros": 6519791
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
       },
-      "model": {
-        "provider": "anthropic",
-        "model_id": "claude-opus-4-7"
-      },
-      "state": "succeeded"
+      "state": "running"
     },
     "start@1": {
       "first_event_seq": 16,
@@ -1594,11 +1809,59 @@
       },
       "state": "succeeded"
     },
+    "simplify_opus@1": {
+      "first_event_seq": 498,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_opus",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T19:38:59.336982Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "anthropic",
+        "model": "claude-opus-4-7"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T19:23:37.882517Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 921449,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 119287,
+        "output_tokens": 38365,
+        "total_tokens": 8592024,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 8304451,
+        "cache_write_tokens": 129921,
+        "total_usd_micros": 6519791
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-opus-4-7"
+      },
+      "state": "succeeded"
+    },
     "simplify_gpt@1": {
       "first_event_seq": 990,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_gpt",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T19:49:37.073380Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "openai",
@@ -1611,6 +1874,12 @@
       "output": null,
       "started_at": "2026-05-22T19:39:03.374495Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 633695,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 136605,
         "output_tokens": 13950,
@@ -1624,7 +1893,7 @@
         "provider": "openai",
         "model_id": "gpt-5.5"
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_lint@1": {
       "first_event_seq": 40,
