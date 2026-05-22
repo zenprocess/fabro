@@ -518,7 +518,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-22T23:29:15.683328Z",
-  "last_event_at": "2026-05-22T23:29:27.130952Z",
+  "last_event_at": "2026-05-22T23:31:55.173728Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -616,9 +616,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 37,
       "checkpoint": {
-        "timestamp": "2026-05-22T23:31:49.250316Z",
+        "timestamp": "2026-05-22T23:31:55.170603Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -627,19 +627,91 @@
         ],
         "node_retries": {},
         "context_values": {
+          "failure_class": "",
+          "internal.fidelity": "compact",
+          "internal.thread_id": "toolchain",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.run_id": "01KS90AE4A0NVW9T31X71J4RZG",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "current_node": "preflight_compile",
+          "graph.rankdir": "LR",
+          "internal.retry_count.preflight_compile": 0,
+          "graph.goal": "# Named Environments Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.\n\n**Goal:** Replace run-scoped sandbox configuration with named, provider-explicit environments that runs can select by slug.\n\n**Architecture:** Add a shared top-level environment catalog, resolve a selected environment into the run's dense settings, validate provider capabilities, and convert the resolved environment into the existing sandbox runtime specs. Keep \"environment\" as reusable desired configuration and \"sandbox\" as the concrete runtime instance created for a run.\n\n**Tech Stack:** Rust config/types crates, TOML settings layers, Fabro workflow sandbox providers, OpenAPI-generated clients, public docs.\n\n---\n\n## Summary\n\nReplace run-scoped sandbox configuration with named, provider-explicit environments. A run selects an environment by slug via `[run.environment] id = \"...\"`; Fabro resolves the environment catalog through normal config precedence, applies run-level environment overrides, validates provider capabilities, freezes the resolved environment into the run settings, and creates a concrete sandbox instance from it.\n\nThis is a greenfield break: no `[run.sandbox]` compatibility layer, no server policy layer, and no required/optional volume semantics.\n\n## Key Interface Changes\n\n- Add top-level `[environments.<slug>]` to the shared settings schema. It is valid in `settings.toml`, `.fabro/project.toml`, and `workflow.toml`.\n- Replace sandbox selection with:\n\n```toml\n[run.environment]\nid = \"fabro-dev\"\n```\n\n- Allow sparse run-level overrides under the same table:\n\n```toml\n[run.environment.resources]\nmemory = \"32GB\"\n\n[run.environment.lifecycle]\npreserve = true\n```\n\n- Environment shape:\n\n```toml\n[environments.fabro-dev]\nprovider = \"daytona\" # local | docker | daytona\n\n[environments.fabro-dev.image]\nref = \"fabro-v11\"              # Docker image or Daytona snapshot name\ndockerfile = { path = \"Dockerfile\" }\n\n[environments.fabro-dev.resources]\ncpu = 8\nmemory = \"16GB\"\ndisk = \"20GB\"\n\n[environments.fabro-dev.network]\nmode = \"block\"                # allow_all | block | cidr_allow_list\nallow = [\"10.0.0.0/8\"]\n\n[environments.fabro-dev.lifecycle]\npreserve = false\nstop_on_terminal = true\nauto_stop = \"30m\"\n\n[environments.fabro-dev.labels]\nrepo = \"fabro-sh/fabro\"\n\n[[environments.fabro-dev.volumes]]\nid = \"vol-agent-state\"\nmount_path = \"/home/daytona/agent-state\"\nsubpath = \"auth\"\n\n[environments.fabro-dev.env]\nNODE_ENV = \"development\"\n```\n\n- Built-in default becomes:\n\n```toml\n[run.environment]\nid = \"default\"\n\n[environments.default]\nprovider = \"docker\"\n\n[environments.default.image]\nref = \"buildpack-deps:noble\"\n\n[environments.default.resources]\ncpu = 2\nmemory = \"4GB\"\n\n[environments.default.lifecycle]\npreserve = false\nstop_on_terminal = true\n```\n\n## Implementation Changes\n\n- Add environment sparse and dense types:\n  - Sparse layer in `fabro-config` for `EnvironmentLayer`, `RunEnvironmentLayer`, image/resources/network/lifecycle/volume sublayers, and `[environments]` as a `MergeMap`.\n  - Dense types in `fabro-types` for `EnvironmentSettings`, `RunEnvironmentSettings`, `EnvironmentProvider`, `EnvironmentNetworkMode`, and related subsettings.\n  - Add `environments` to the top-level `SettingsLayer` and resolved `WorkflowSettings`; add selected `environment` to `RunNamespace`.\n- Resolve environments before run consumers use sandbox data:\n  - Merge environment definitions by slug.\n  - Resolve `[run.environment].id`; error if the slug is missing.\n  - Overlay sparse `[run.environment.*]` fields onto the selected environment.\n  - Validate provider is `local`, `docker`, or `daytona`.\n  - Validate CIDRs with existing `ipnet`.\n  - Store the selected resolved environment in `RunNamespace.environment`.\n- Replace sandbox runtime mapping:\n  - Convert `RunNamespace.environment` to `SandboxSpec` in workflow start and server preflight paths.\n  - Daytona: `image.ref` maps to snapshot name, `dockerfile` to snapshot Dockerfile, resources to snapshot sizing, network to Daytona policy, labels/volumes/env/lifecycle to existing provider fields.\n  - Docker: `image.ref` maps to Docker image, `cpu` maps to `cpu_quota = cpu * 100000`, memory maps to memory limit, `network.mode = block` maps to `network_mode = none`, `allow_all` maps to default/bridge.\n  - Local: use resolved working directory; env overlays process env as today.\n- Capability diagnostics:\n  - Hard error for explicit security/isolation properties a provider cannot enforce:\n    - local with `network.mode = block` or `cidr_allow_list`\n    - docker with `network.mode = cidr_allow_list`\n  - Warnings only for unsupported resource limits, volumes, labels, `auto_stop`, and Docker `image.dockerfile`.\n  - If Daytona has `image.dockerfile` without `image.ref`, error because snapshot creation needs a name.\n- Remove old sandbox config surface:\n  - Delete `[run.sandbox]` parsing/resolution/types from user-facing config.\n  - Replace CLI/API/tool manifest args named `sandbox` with `environment` where they select execution profile.\n  - Keep runtime/public \"sandbox\" terminology only for concrete instances, e.g. `fabro sandbox ssh`, `RunSandbox`, sandbox details.\n- Update docs and generated clients:\n  - Update run configuration, environments, Daytona, server configuration, CLI reference, and OpenAPI spec.\n  - Regenerate Rust API types/client and TypeScript API client after OpenAPI changes.\n\n## Test Plan\n\n- Config tests:\n  - default resolves to `run.environment.id = \"default\"` and Docker environment settings.\n  - project/workflow/run layers merge environment catalog by slug.\n  - `[run.environment]` overrides selected environment fields.\n  - `env` and `labels` merge by key; `volumes` replace wholesale.\n  - missing environment slug errors.\n  - old `[run.sandbox]` is rejected as an unknown field.\n- Provider mapping tests:\n  - Daytona environment maps to snapshot/resources/network/labels/volumes/env.\n  - Docker environment maps image, CPU, memory, network block, and env.\n  - Local environment ignores non-security unsupported fields with warnings.\n- Validation tests:\n  - docker plus CIDR allow-list errors.\n  - local plus blocked network errors.\n  - resource limits unsupported by provider produce warnings, not errors.\n  - volumes unsupported by provider produce warnings, not errors.\n  - Daytona dockerfile without image ref errors.\n- Integration/API tests:\n  - run manifest with `[environments.<slug>]` and `[run.environment]` starts with the selected provider.\n  - Dockerfile path bundling works from environment image config.\n  - preflight reports capability warnings and security errors.\n  - CLI/API `environment` override wins over config selection.\n\n## Assumptions\n\n- No compatibility behavior is required for `[run.sandbox]` or `--sandbox`.\n- No server-side environment policy or quota enforcement is in scope.\n- Volumes are simple provider hints; unsupported volume config warns and continues.\n- Resource limits are best-effort hints; unsupported resource fields warn and continue.\n- Provider names remain explicit for now: `local`, `docker`, and `daytona`.\n",
+          "outcome": "succeeded",
+          "thread.start.current_node": "toolchain",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.node_visit_count": 1,
+          "failure_signature": "",
+          "internal.retry_count.start": 0,
+          "internal.retry_count.toolchain": 0
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "95857d40610ed1d30fc1fcf01f4abad45e6ac1c6",
+        "node_visits": {
+          "start": 1,
+          "preflight_compile": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-22T23:40:48.823808Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
           "outcome": "succeeded",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "graph.rankdir": "LR",
-          "internal.thread_id": "toolchain",
+          "internal.thread_id": "preflight_compile",
           "internal.retry_count.start": 0,
           "internal.retry_count.preflight_compile": 0,
           "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.preflight_lint": 0,
           "internal.run_id": "01KS90AE4A0NVW9T31X71J4RZG",
           "internal.fidelity": "compact",
-          "current_node": "preflight_compile",
+          "current_node": "preflight_lint",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "thread.start.current_node": "toolchain",
           "failure_class": "",
+          "thread.preflight_compile.current_node": "preflight_lint",
           "internal.retry_count.toolchain": 0,
           "internal.node_visit_count": 1,
           "failure_signature": "",
@@ -666,13 +738,22 @@
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
           "preflight_compile": 1,
+          "toolchain": 1,
           "start": 1,
-          "toolchain": 1
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -737,7 +818,12 @@
       "first_event_seq": 30,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T23:31:49.249029Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -745,11 +831,27 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 142107,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-22T23:29:27.130079Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 142118,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -758,7 +860,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "toolchain@1": {
       "first_event_seq": 20,
@@ -807,6 +909,33 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 40,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T23:31:55.173150Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
     }
   }
 }
