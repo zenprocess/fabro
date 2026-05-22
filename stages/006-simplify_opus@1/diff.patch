@@ -1,0 +1,107 @@
+diff --git a/docs/public/administration/server-configuration.mdx b/docs/public/administration/server-configuration.mdx
+index 8552987b6..39cc026a3 100644
+--- a/docs/public/administration/server-configuration.mdx
++++ b/docs/public/administration/server-configuration.mdx
+@@ -398,4 +398,4 @@ Fabro resolves these from `process env -> server.env`.
+ | Variable | Default | Description |
+ |---|---|---|
+ | `FABRO_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug` |
+-| `FABRO_LOG_DESTINATION` | Command-mode default | Server log destination: `file` or `stdout` |
+\ No newline at end of file
++| `FABRO_LOG_DESTINATION` | Command-mode default | Server log destination: `file` or `stdout` |
+diff --git a/docs/public/execution/run-configuration.mdx b/docs/public/execution/run-configuration.mdx
+index 9439ba073..14891af32 100644
+--- a/docs/public/execution/run-configuration.mdx
++++ b/docs/public/execution/run-configuration.mdx
+@@ -560,4 +560,4 @@ Use `fabro preflight` to validate a run config without executing it:
+ 
+ ```bash
+ fabro preflight run.toml
+-```
+\ No newline at end of file
++```
+diff --git a/lib/crates/fabro-workflow/src/handler/parallel.rs b/lib/crates/fabro-workflow/src/handler/parallel.rs
+index 885df80a1..4ec7fbcd8 100644
+--- a/lib/crates/fabro-workflow/src/handler/parallel.rs
++++ b/lib/crates/fabro-workflow/src/handler/parallel.rs
+@@ -195,7 +195,7 @@ impl Handler for ParallelHandler {
+                 None,
+                 &gs.checkpoint_exclude_globs,
+                 &gs.git_author,
+-                gs.checkpoint_skip_hooks,
++                gs.checkpoint_skip_git_hooks,
+             )
+             .await;
+             match result {
+@@ -321,7 +321,7 @@ impl Handler for ParallelHandler {
+                 .unwrap_or_default();
+             let skip_git_hooks = git_state
+                 .as_ref()
+-                .is_some_and(|gs| gs.checkpoint_skip_hooks);
++                .is_some_and(|gs| gs.checkpoint_skip_git_hooks);
+             let group_id = parallel_group_id.clone();
+             let branch_scope = StageScope::for_parallel_branch(
+                 setup.target_id.clone(),
+@@ -677,9 +677,10 @@ fn parallel_branch_commit_cmd(
+     skip_git_hooks: bool,
+ ) -> String {
+     let no_verify = if skip_git_hooks { " --no-verify" } else { "" };
+-    format!(
+-        "{git_remote} -c 'user.name={author_name}' -c 'user.email={author_email}' commit --allow-empty{no_verify} -m '{message}'",
+-    )
++    let name = fabro_sandbox::shell_quote(&format!("user.name={author_name}"));
++    let email = fabro_sandbox::shell_quote(&format!("user.email={author_email}"));
++    let msg = fabro_sandbox::shell_quote(message);
++    format!("{git_remote} -c {name} -c {email} commit --allow-empty{no_verify} -m {msg}")
+ }
+ 
+ #[cfg(test)]
+diff --git a/lib/crates/fabro-workflow/src/pipeline/execute.rs b/lib/crates/fabro-workflow/src/pipeline/execute.rs
+index dfd22c655..4a82a509c 100644
+--- a/lib/crates/fabro-workflow/src/pipeline/execute.rs
++++ b/lib/crates/fabro-workflow/src/pipeline/execute.rs
+@@ -63,7 +63,7 @@ pub async fn execute(init: Initialized) -> Executed {
+             run_branch: git.run_branch.clone(),
+             meta_branch: git.meta_branch.clone(),
+             checkpoint_exclude_globs: run_options.checkpoint_exclude_globs(),
+-            checkpoint_skip_hooks: run_options.checkpoint_skip_git_hooks(),
++            checkpoint_skip_git_hooks: run_options.checkpoint_skip_git_hooks(),
+             git_author: run_options.git_author(),
+         }))
+     });
+diff --git a/lib/crates/fabro-workflow/src/sandbox_git.rs b/lib/crates/fabro-workflow/src/sandbox_git.rs
+index eeace9f84..cd7dfe7c4 100644
+--- a/lib/crates/fabro-workflow/src/sandbox_git.rs
++++ b/lib/crates/fabro-workflow/src/sandbox_git.rs
+@@ -22,13 +22,13 @@ pub struct GitCommandError {
+ /// Captured git state for a workflow run, shared with handlers.
+ #[derive(Debug, Clone)]
+ pub struct GitState {
+-    pub run_id:                   RunId,
+-    pub base_sha:                 String,
+-    pub run_branch:               Option<String>,
+-    pub meta_branch:              Option<String>,
+-    pub checkpoint_exclude_globs: Vec<String>,
+-    pub checkpoint_skip_hooks:    bool,
+-    pub git_author:               GitAuthor,
++    pub run_id:                    RunId,
++    pub base_sha:                  String,
++    pub run_branch:                Option<String>,
++    pub meta_branch:               Option<String>,
++    pub checkpoint_exclude_globs:  Vec<String>,
++    pub checkpoint_skip_git_hooks: bool,
++    pub git_author:                GitAuthor,
+ }
+ 
+ pub const GIT_REMOTE: &str =
+diff --git a/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts b/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts
+index 22f96ffc3..9b36fe41a 100644
+--- a/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts
++++ b/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts
+@@ -22,4 +22,4 @@ export interface RunCheckpointSettings {
+      * @memberof RunCheckpointSettings
+      */
+     'skip_git_hooks': boolean;
+-}
+\ No newline at end of file
++}
