@@ -517,7 +517,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-22T18:56:04.773364Z",
-  "last_event_at": "2026-05-22T19:40:47.787118Z",
+  "last_event_at": "2026-05-22T19:40:52.657428Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1087,9 +1087,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1171,
       "checkpoint": {
-        "timestamp": "2026-05-22T19:40:47.878180Z",
+        "timestamp": "2026-05-22T19:40:52.653492Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1102,8 +1102,226 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.retry_count.implement": 0,
+          "graph.rankdir": "LR",
           "thread.implement.current_node": "simplify_opus",
+          "failure_class": "",
+          "internal.node_visit_count": 1,
+          "failure_signature": "",
+          "internal.retry_count.start": 0,
           "internal.thread_id": "simplify_opus",
+          "response.simplify_opus": "All changes look correct, formatted, and tested. \n\n## Summary of cleanup applied\n\nThree review agents found a mix of issues; I fixed the ones clearly within this diff's responsibility and skipped the larger refactors that would have expanded scope beyond the feature.\n\n**Fixed:**\n\n1. **Trailing newline regression** — restored final `\\n` on three files that lost it during the implement phase: `docs/public/administration/server-configuration.mdx`, `docs/public/execution/run-configuration.mdx`, `lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts`.\n\n2. **Field-name inconsistency** — renamed `GitState.checkpoint_skip_hooks` → `checkpoint_skip_git_hooks` in `sandbox_git.rs` and its two readers (`handler/parallel.rs`, `pipeline/execute.rs`). The feature is named `skip_git_hooks` everywhere else (settings, OpenAPI, TS, MDX, accessor); the local field was the only outlier dropping `_git_`.\n\n3. **Shell quoting in `parallel_branch_commit_cmd`** — the new helper interpolated `author_name`, `author_email`, and `message` directly inside literal single-quoted strings, violating the CLAUDE.md \"always use `shell_quote()`\" rule. Rewrote it to use `fabro_sandbox::shell_quote` for all three values, matching `sandbox_git.rs::git_checkpoint`'s style. Existing substring-based tests for `--no-verify` and `commit --allow-empty` continue to pass.\n\n4. **Rustfmt alignment** — `cargo fmt` re-aligned struct-field colons in `GitState` after the rename.\n\n**Verification:** `cargo check --workspace`, `cargo +nightly-2026-04-14 fmt --check --all`, `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` all clean. `cargo nextest run -p fabro-workflow -p fabro-config -p fabro-api` passed all 1462 tests; the targeted `fabro-cli` attach/inspect tests passed 34/34.\n\n**Skipped (out of scope):**\n\n- Extracting a unified commit-command builder between `git_checkpoint` (uses `-F <file>`) and `parallel_branch_commit_cmd` (uses `-m <msg>`). Real DRY, but the two differ on enough axes (message source, exclude pathspecs, metadata trailers) that it's a separate refactor.\n- Replacing the 9-positional-arg `git_checkpoint` signature with an options struct. Predates this diff (already has `#[allow(clippy::too_many_arguments)]`); changing it would touch many call sites unrelated to the feature.\n- Switching `self.skip_git_hooks.or(other.skip_git_hooks)` to `.combine(...)` in `combine.rs`. The surrounding `impl_combine_or_option!` macro is defined as `self.or(other)`, so the two are literally identical — pure style and the file's hand-rolled impls already use `.or()`-shaped logic.\n- Hoisting `skip_git_hooks` outside the `for setup in branch_setups` loop. Efficiency agent flagged this then dismissed it as zero-cost.",
+          "internal.retry_count.preflight_compile": 0,
+          "response.implement": "All green. Here's a summary of the changes implemented per the plan:\n\n## Summary\n\n**Types & config (`fabro-types`, `fabro-config`)**\n- `RunCheckpointSettings`: added `skip_git_hooks: bool` (defaults to `false`).\n- `RunCheckpointLayer`: added `skip_git_hooks: Option<bool>` (sparse, distinguishes unset from explicit `false`).\n- `Combine for RunCheckpointLayer`: `exclude_globs` keeps replace/inherit semantics; `skip_git_hooks` uses normal option-override semantics.\n- `resolve_checkpoint`: missing config now resolves `skip_git_hooks = false`.\n\n**Workflow engine (`fabro-workflow`)**\n- `GitState.checkpoint_skip_hooks` field threaded through `pipeline/execute.rs` and `RunOptions::checkpoint_skip_git_hooks()`.\n- `git_checkpoint` / `checked_git_checkpoint`: new `skip_git_hooks: bool` parameter that appends ` --no-verify` to the `git commit` command when `true`.\n- `lifecycle/git.rs` lifecycle checkpoint path threads the resolved setting through.\n- `handler/parallel.rs`: both the parallel-base checkpoint (via `checked_git_checkpoint`) and the per-branch worktree commit respect the setting; extracted `parallel_branch_commit_cmd` helper for testability.\n\n**OpenAPI / clients**\n- `docs/public/api-reference/fabro-api.yaml` `RunCheckpointSettings`: added `skip_git_hooks: boolean` (required).\n- `lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts`: regenerated with the new field.\n\n**Docs**\n- `docs/public/execution/run-configuration.mdx`: documents `skip_git_hooks`, default `false`, that it doesn't disable `[[run.hooks]]`.\n- `docs/public/administration/server-configuration.mdx`: same.\n\n**Tests added (TDD: red → green for each)**\n- `fabro-config` (`tests::resolve_run::run_checkpoint_skip_git_hooks::*`): 4 tests — `true` resolves, default `false`, higher-layer `false` overrides lower `true`, and `exclude_globs` replace behavior is preserved when only `skip_git_hooks` is set on a higher layer.\n- `fabro-workflow` (`sandbox_git::tests::*`): 2 new tests — checkpoint commit includes `--no-verify` when enabled, omits when disabled.\n- `fabro-workflow` (`handler::parallel::tests::*`): 2 new tests covering the parallel-branch commit command builder.\n- `fabro-api` (`workflow_settings_round_trip.rs`): JSON round-trip includes `skip_git_hooks`, defaults to `false`.\n\n**Snapshot updates**\n- `lib/crates/fabro-cli/tests/it/cmd/attach.rs` and `inspect.rs` inline JSON updated to include `\"skip_git_hooks\": false`.\n\nFinal status: workspace `cargo nextest run` → 6067 passed, clippy clean, fmt clean.",
+          "thread.start.current_node": "toolchain",
+          "outcome": "succeeded",
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.simplify_opus": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "internal.retry_count.preflight_lint": 0,
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.run_id": "01KS8GPB6C00GQ6G5A05S9AAC8",
+          "last_stage": "simplify_gpt",
+          "current_node": "simplify_gpt",
+          "internal.retry_count.toolchain": 0,
+          "last_response": "Review/cleanup complete. I found and fixed two issues:\n\n- Added `skip_git_hooks: false` to the `WorkflowSettings` sample object in `apps/fabro-web/app/routes/automation-detail.tsx`, since the generate",
+          "response.simplify_gpt": "Review/cleanup complete. I found and fixed two issues:\n\n- Added `skip_git_hooks: false` to the `WorkflowSettings` sample object in `apps/fabro-web/app/routes/automation-detail.tsx`, since the generated API client now requires the field.\n- Added machine-readable `default: false` to OpenAPI `RunCheckpointSettings.skip_git_hooks` in `docs/public/api-reference/fabro-api.yaml`.\n\nValidation run:\n\n- `cargo test -p fabro-api --test workflow_settings_round_trip` ✅\n- `cargo test -p fabro-config run_checkpoint_skip_git_hooks` ✅\n- `cargo test -p fabro-workflow skip_hooks` ✅\n- `git diff --check` ✅\n\nAttempted but could not complete due local tool/dependency environment:\n\n- `cd apps/fabro-web && bun run typecheck` failed because `tsc` is not installed/found.\n- `cd lib/packages/fabro-api-client && bun run generate` failed during OpenAPI generator CLI startup; no generated files were changed.\n\nCurrent uncommitted cleanup changes:\n\n- `apps/fabro-web/app/routes/automation-detail.tsx`\n- `docs/public/api-reference/fabro-api.yaml`",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "graph.goal": "---\ntitle: Add run.checkpoint.skip_git_hooks\ntype: feat\nstatus: active\ndate: 2026-05-22\n---\n\n# Add `run.checkpoint.skip_git_hooks`\n\n## Summary\n\nAdd an opt-in setting:\n\n```toml\n[run.checkpoint]\nskip_git_hooks = true\n```\n\nWhen enabled, Fabro-created run-branch checkpoint commits bypass Git commit hooks. Default remains `false`, preserving current behavior. This setting does not affect Fabro workflow hooks or metadata-branch snapshots.\n\n## Key Changes\n\n- Add `skip_git_hooks: bool` to dense checkpoint settings in `fabro-types`, defaulting to `false`.\n- Add `skip_git_hooks: Option<bool>` to sparse `fabro-config::RunCheckpointLayer` so layered config can distinguish unset from explicit `false`.\n- Update checkpoint layer merging so `exclude_globs` keeps its existing replace/inherit behavior and `skip_git_hooks` uses normal override semantics.\n- Update checkpoint resolution so missing config resolves to `skip_git_hooks = false`.\n- Thread the resolved setting into run-branch checkpoint commit creation.\n- Append the hook-skipping commit option only for Fabro-managed run-branch checkpoint commits, including:\n  - normal lifecycle checkpoint commits in `sandbox_git.rs`\n  - parallel base checkpoint commits through the same helper\n  - parallel branch worktree commits in `handler/parallel.rs`\n- Update OpenAPI `RunCheckpointSettings` and regenerate the TypeScript API client so persisted run settings expose the new field.\n- Update user docs/options reference to document `skip_git_hooks`, its default, and that it does not disable Fabro `[[run.hooks]]`.\n\n## Test Plan\n\n- `fabro-config` tests:\n  - `[run.checkpoint] skip_git_hooks = true` resolves to `true`.\n  - omitted `skip_git_hooks` resolves to `false`.\n  - higher-layer `skip_git_hooks = false` overrides lower-layer `true`.\n  - `exclude_globs` merging behavior remains unchanged.\n- `fabro-workflow` tests:\n  - checkpoint commit command includes the hook-skip option when enabled.\n  - checkpoint commit command omits it when disabled.\n  - parallel branch commit command respects the setting.\n- API/client tests:\n  - `WorkflowSettings` / `RunCheckpointSettings` round-trip includes `skip_git_hooks`.\n  - OpenAPI-generated Rust and TypeScript clients reflect the new boolean field.\n- Regression:\n  - existing git checkpoint tests still pass, including metadata branch tests.\n\n## Assumptions\n\n- The setting applies to Git commit hooks for run-branch checkpoint commits; it does not change metadata-branch behavior because metadata snapshots already use `git2` and do not fire local hooks.\n- The setting does not disable Fabro lifecycle hooks under `[[run.hooks]]`.\n- Default `false` is required for backward compatibility.\n",
+          "internal.fidelity": "compact",
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.work_dir": "/home/daytona/workspace/fabro"
+        },
+        "node_outcomes": {
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "All green. Here's a summary of the changes implemented per the plan:\n\n## Summary\n\n**Types & config (`fabro-types`, `fabro-config`)**\n- `RunCheckpointSettings`: added `skip_git_hooks: bool` (defaults t",
+              "last_stage": "implement",
+              "response.implement": "All green. Here's a summary of the changes implemented per the plan:\n\n## Summary\n\n**Types & config (`fabro-types`, `fabro-config`)**\n- `RunCheckpointSettings`: added `skip_git_hooks: bool` (defaults to `false`).\n- `RunCheckpointLayer`: added `skip_git_hooks: Option<bool>` (sparse, distinguishes unset from explicit `false`).\n- `Combine for RunCheckpointLayer`: `exclude_globs` keeps replace/inherit semantics; `skip_git_hooks` uses normal option-override semantics.\n- `resolve_checkpoint`: missing config now resolves `skip_git_hooks = false`.\n\n**Workflow engine (`fabro-workflow`)**\n- `GitState.checkpoint_skip_hooks` field threaded through `pipeline/execute.rs` and `RunOptions::checkpoint_skip_git_hooks()`.\n- `git_checkpoint` / `checked_git_checkpoint`: new `skip_git_hooks: bool` parameter that appends ` --no-verify` to the `git commit` command when `true`.\n- `lifecycle/git.rs` lifecycle checkpoint path threads the resolved setting through.\n- `handler/parallel.rs`: both the parallel-base checkpoint (via `checked_git_checkpoint`) and the per-branch worktree commit respect the setting; extracted `parallel_branch_commit_cmd` helper for testability.\n\n**OpenAPI / clients**\n- `docs/public/api-reference/fabro-api.yaml` `RunCheckpointSettings`: added `skip_git_hooks: boolean` (required).\n- `lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts`: regenerated with the new field.\n\n**Docs**\n- `docs/public/execution/run-configuration.mdx`: documents `skip_git_hooks`, default `false`, that it doesn't disable `[[run.hooks]]`.\n- `docs/public/administration/server-configuration.mdx`: same.\n\n**Tests added (TDD: red → green for each)**\n- `fabro-config` (`tests::resolve_run::run_checkpoint_skip_git_hooks::*`): 4 tests — `true` resolves, default `false`, higher-layer `false` overrides lower `true`, and `exclude_globs` replace behavior is preserved when only `skip_git_hooks` is set on a higher layer.\n- `fabro-workflow` (`sandbox_git::tests::*`): 2 new tests — checkpoint commit includes `--no-verify` when enabled, omits when disabled.\n- `fabro-workflow` (`handler::parallel::tests::*`): 2 new tests covering the parallel-branch commit command builder.\n- `fabro-api` (`workflow_settings_round_trip.rs`): JSON round-trip includes `skip_git_hooks`, defaults to `false`.\n\n**Snapshot updates**\n- `lib/crates/fabro-cli/tests/it/cmd/attach.rs` and `inspect.rs` inline JSON updated to include `\"skip_git_hooks\": false`.\n\nFinal status: workspace `cargo nextest run` → 6067 passed, clippy clean, fmt clean."
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 150314,
+                    "output_tokens": 39407,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 15271872,
+                    "cache_write_tokens": 161266
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 161266,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 10380593
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/docs/public/administration/server-configuration.mdx",
+              "/home/daytona/workspace/fabro/docs/public/api-reference/fabro-api.yaml",
+              "/home/daytona/workspace/fabro/docs/public/execution/run-configuration.mdx",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-api/tests/workflow_settings_round_trip.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-cli/tests/it/cmd/attach.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-cli/tests/it/cmd/inspect.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-config/src/layers/combine.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-config/src/layers/run.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-config/src/resolve/run.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-config/src/tests/resolve_run.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/settings/run.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/parallel.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/lifecycle/git.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/pipeline/execute.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/run_options.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/sandbox_git.rs",
+              "/home/daytona/workspace/fabro/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts"
+            ]
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Review/cleanup complete. I found and fixed two issues:\n\n- Added `skip_git_hooks: false` to the `WorkflowSettings` sample object in `apps/fabro-web/app/routes/automation-detail.tsx`, since the generate",
+              "response.simplify_gpt": "Review/cleanup complete. I found and fixed two issues:\n\n- Added `skip_git_hooks: false` to the `WorkflowSettings` sample object in `apps/fabro-web/app/routes/automation-detail.tsx`, since the generated API client now requires the field.\n- Added machine-readable `default: false` to OpenAPI `RunCheckpointSettings.skip_git_hooks` in `docs/public/api-reference/fabro-api.yaml`.\n\nValidation run:\n\n- `cargo test -p fabro-api --test workflow_settings_round_trip` ✅\n- `cargo test -p fabro-config run_checkpoint_skip_git_hooks` ✅\n- `cargo test -p fabro-workflow skip_hooks` ✅\n- `git diff --check` ✅\n\nAttempted but could not complete due local tool/dependency environment:\n\n- `cd apps/fabro-web && bun run typecheck` failed because `tsc` is not installed/found.\n- `cd lib/packages/fabro-api-client && bun run generate` failed during OpenAPI generator CLI startup; no generated files were changed.\n\nCurrent uncommitted cleanup changes:\n\n- `apps/fabro-web/app/routes/automation-detail.tsx`\n- `docs/public/api-reference/fabro-api.yaml`",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 147474,
+                    "output_tokens": 4678,
+                    "reasoning_tokens": 3027,
+                    "cache_read_tokens": 1924096,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 1930568
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_opus",
+              "response.simplify_opus": "All changes look correct, formatted, and tested. \n\n## Summary of cleanup applied\n\nThree review agents found a mix of issues; I fixed the ones clearly within this diff's responsibility and skipped the larger refactors that would have expanded scope beyond the feature.\n\n**Fixed:**\n\n1. **Trailing newline regression** — restored final `\\n` on three files that lost it during the implement phase: `docs/public/administration/server-configuration.mdx`, `docs/public/execution/run-configuration.mdx`, `lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts`.\n\n2. **Field-name inconsistency** — renamed `GitState.checkpoint_skip_hooks` → `checkpoint_skip_git_hooks` in `sandbox_git.rs` and its two readers (`handler/parallel.rs`, `pipeline/execute.rs`). The feature is named `skip_git_hooks` everywhere else (settings, OpenAPI, TS, MDX, accessor); the local field was the only outlier dropping `_git_`.\n\n3. **Shell quoting in `parallel_branch_commit_cmd`** — the new helper interpolated `author_name`, `author_email`, and `message` directly inside literal single-quoted strings, violating the CLAUDE.md \"always use `shell_quote()`\" rule. Rewrote it to use `fabro_sandbox::shell_quote` for all three values, matching `sandbox_git.rs::git_checkpoint`'s style. Existing substring-based tests for `--no-verify` and `commit --allow-empty` continue to pass.\n\n4. **Rustfmt alignment** — `cargo fmt` re-aligned struct-field colons in `GitState` after the rename.\n\n**Verification:** `cargo check --workspace`, `cargo +nightly-2026-04-14 fmt --check --all`, `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` all clean. `cargo nextest run -p fabro-workflow -p fabro-config -p fabro-api` passed all 1462 tests; the targeted `fabro-cli` attach/inspect tests passed 34/34.\n\n**Skipped (out of scope):**\n\n- Extracting a unified commit-command builder between `git_checkpoint` (uses `-F <file>`) and `parallel_branch_commit_cmd` (uses `-m <msg>`). Real DRY, but the two differ on enough axes (message source, exclude pathspecs, metadata trailers) that it's a separate refactor.\n- Replacing the 9-positional-arg `git_checkpoint` signature with an options struct. Predates this diff (already has `#[allow(clippy::too_many_arguments)]`); changing it would touch many call sites unrelated to the feature.\n- Switching `self.skip_git_hooks.or(other.skip_git_hooks)` to `.combine(...)` in `combine.rs`. The surrounding `impl_combine_or_option!` macro is defined as `self.or(other)`, so the two are literally identical — pure style and the file's hand-rolled impls already use `.or()`-shaped logic.\n- Hoisting `skip_git_hooks` outside the `for setup in branch_setups` loop. Efficiency agent flagged this then dismissed it as zero-cost.",
+              "last_response": "All changes look correct, formatted, and tested. \n\n## Summary of cleanup applied\n\nThree review agents found a mix of issues; I fixed the ones clearly within this diff's responsibility and skipped the "
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 46865,
+                    "output_tokens": 12977,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 1367703,
+                    "cache_write_tokens": 56350
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 56350,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 1594788
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/parallel.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/pipeline/execute.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/sandbox_git.rs"
+            ]
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "1a938a8b8de85c640082563b85a84bd76cb57a4a",
+        "node_visits": {
+          "start": 1,
+          "implement": 1,
+          "simplify_opus": 1,
+          "preflight_compile": 1,
+          "preflight_lint": 1,
+          "toolchain": 1,
+          "simplify_gpt": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/apps/fabro-web/app/routes/automation-detail.tsx b/apps/fabro-web/app/routes/automation-detail.tsx\nindex fe2ce49a1..ba0d51e1f 100644\n--- a/apps/fabro-web/app/routes/automation-detail.tsx\n+++ b/apps/fabro-web/app/routes/automation-detail.tsx\n@@ -61,7 +61,7 @@ function sampleSettings({\n       git: { author: null },\n       prepare: { commands: prepareCommands, timeout_ms: 120_000 },\n       execution: { mode: \"normal\", approval: \"prompt\" },\n-      checkpoint: { exclude_globs: [] },\n+      checkpoint: { exclude_globs: [], skip_git_hooks: false },\n       clone: { enabled: true },\n       run_branch: { enabled: true, push: true },\n       meta_branch: { enabled: true, push: true },\ndiff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml\nindex 4931a7ba0..44bfe394c 100644\n--- a/docs/public/api-reference/fabro-api.yaml\n+++ b/docs/public/api-reference/fabro-api.yaml\n@@ -10639,6 +10639,7 @@ components:\n             type: string\n         skip_git_hooks:\n           type: boolean\n+          default: false\n           description: |\n             When true, Fabro-managed run-branch checkpoint commits bypass\n             local Git commit hooks. Does not affect Fabro `[[run.hooks]]`\n",
+        "summary": {
+          "files_changed": 18,
+          "additions": 350,
+          "deletions": 29
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-22T19:43:57.213958Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "thread.implement.current_node": "simplify_opus",
+          "internal.thread_id": "simplify_gpt",
           "graph.rankdir": "LR",
           "thread.preflight_compile.current_node": "preflight_lint",
           "thread.toolchain.current_node": "preflight_compile",
@@ -1114,6 +1332,7 @@
           "response.simplify_gpt": "Review/cleanup complete. I found and fixed two issues:\n\n- Added `skip_git_hooks: false` to the `WorkflowSettings` sample object in `apps/fabro-web/app/routes/automation-detail.tsx`, since the generated API client now requires the field.\n- Added machine-readable `default: false` to OpenAPI `RunCheckpointSettings.skip_git_hooks` in `docs/public/api-reference/fabro-api.yaml`.\n\nValidation run:\n\n- `cargo test -p fabro-api --test workflow_settings_round_trip` ✅\n- `cargo test -p fabro-config run_checkpoint_skip_git_hooks` ✅\n- `cargo test -p fabro-workflow skip_hooks` ✅\n- `git diff --check` ✅\n\nAttempted but could not complete due local tool/dependency environment:\n\n- `cd apps/fabro-web && bun run typecheck` failed because `tsc` is not installed/found.\n- `cd lib/packages/fabro-api-client && bun run generate` failed during OpenAPI generator CLI startup; no generated files were changed.\n\nCurrent uncommitted cleanup changes:\n\n- `apps/fabro-web/app/routes/automation-detail.tsx`\n- `docs/public/api-reference/fabro-api.yaml`",
           "failure_class": "",
           "internal.retry_count.start": 0,
+          "internal.retry_count.verify": 0,
           "internal.retry_count.toolchain": 0,
           "internal.retry_count.preflight_lint": 0,
           "thread.simplify_opus.current_node": "simplify_gpt",
@@ -1125,14 +1344,15 @@
           "internal.run_id": "01KS8GPB6C00GQ6G5A05S9AAC8",
           "internal.retry_count.preflight_compile": 0,
           "internal.work_dir": "/home/daytona/workspace/fabro",
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "command.output": "blob://sha256/7a91223ac3a5d764ed8b4d3bbf0454b9431c9443f6ca72af903e7474e95c3091",
           "response.simplify_opus": "All changes look correct, formatted, and tested. \n\n## Summary of cleanup applied\n\nThree review agents found a mix of issues; I fixed the ones clearly within this diff's responsibility and skipped the larger refactors that would have expanded scope beyond the feature.\n\n**Fixed:**\n\n1. **Trailing newline regression** — restored final `\\n` on three files that lost it during the implement phase: `docs/public/administration/server-configuration.mdx`, `docs/public/execution/run-configuration.mdx`, `lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts`.\n\n2. **Field-name inconsistency** — renamed `GitState.checkpoint_skip_hooks` → `checkpoint_skip_git_hooks` in `sandbox_git.rs` and its two readers (`handler/parallel.rs`, `pipeline/execute.rs`). The feature is named `skip_git_hooks` everywhere else (settings, OpenAPI, TS, MDX, accessor); the local field was the only outlier dropping `_git_`.\n\n3. **Shell quoting in `parallel_branch_commit_cmd`** — the new helper interpolated `author_name`, `author_email`, and `message` directly inside literal single-quoted strings, violating the CLAUDE.md \"always use `shell_quote()`\" rule. Rewrote it to use `fabro_sandbox::shell_quote` for all three values, matching `sandbox_git.rs::git_checkpoint`'s style. Existing substring-based tests for `--no-verify` and `commit --allow-empty` continue to pass.\n\n4. **Rustfmt alignment** — `cargo fmt` re-aligned struct-field colons in `GitState` after the rename.\n\n**Verification:** `cargo check --workspace`, `cargo +nightly-2026-04-14 fmt --check --all`, `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` all clean. `cargo nextest run -p fabro-workflow -p fabro-config -p fabro-api` passed all 1462 tests; the targeted `fabro-cli` attach/inspect tests passed 34/34.\n\n**Skipped (out of scope):**\n\n- Extracting a unified commit-command builder between `git_checkpoint` (uses `-F <file>`) and `parallel_branch_commit_cmd` (uses `-m <msg>`). Real DRY, but the two differ on enough axes (message source, exclude pathspecs, metadata trailers) that it's a separate refactor.\n- Replacing the 9-positional-arg `git_checkpoint` signature with an options struct. Predates this diff (already has `#[allow(clippy::too_many_arguments)]`); changing it would touch many call sites unrelated to the feature.\n- Switching `self.skip_git_hooks.or(other.skip_git_hooks)` to `.combine(...)` in `combine.rs`. The surrounding `impl_combine_or_option!` macro is defined as `self.or(other)`, so the two are literally identical — pure style and the file's hand-rolled impls already use `.or()`-shaped logic.\n- Hoisting `skip_git_hooks` outside the `for setup in branch_setups` loop. Efficiency agent flagged this then dismissed it as zero-cost.",
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "failure_signature": "",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "graph.goal": "---\ntitle: Add run.checkpoint.skip_git_hooks\ntype: feat\nstatus: active\ndate: 2026-05-22\n---\n\n# Add `run.checkpoint.skip_git_hooks`\n\n## Summary\n\nAdd an opt-in setting:\n\n```toml\n[run.checkpoint]\nskip_git_hooks = true\n```\n\nWhen enabled, Fabro-created run-branch checkpoint commits bypass Git commit hooks. Default remains `false`, preserving current behavior. This setting does not affect Fabro workflow hooks or metadata-branch snapshots.\n\n## Key Changes\n\n- Add `skip_git_hooks: bool` to dense checkpoint settings in `fabro-types`, defaulting to `false`.\n- Add `skip_git_hooks: Option<bool>` to sparse `fabro-config::RunCheckpointLayer` so layered config can distinguish unset from explicit `false`.\n- Update checkpoint layer merging so `exclude_globs` keeps its existing replace/inherit behavior and `skip_git_hooks` uses normal override semantics.\n- Update checkpoint resolution so missing config resolves to `skip_git_hooks = false`.\n- Thread the resolved setting into run-branch checkpoint commit creation.\n- Append the hook-skipping commit option only for Fabro-managed run-branch checkpoint commits, including:\n  - normal lifecycle checkpoint commits in `sandbox_git.rs`\n  - parallel base checkpoint commits through the same helper\n  - parallel branch worktree commits in `handler/parallel.rs`\n- Update OpenAPI `RunCheckpointSettings` and regenerate the TypeScript API client so persisted run settings expose the new field.\n- Update user docs/options reference to document `skip_git_hooks`, its default, and that it does not disable Fabro `[[run.hooks]]`.\n\n## Test Plan\n\n- `fabro-config` tests:\n  - `[run.checkpoint] skip_git_hooks = true` resolves to `true`.\n  - omitted `skip_git_hooks` resolves to `false`.\n  - higher-layer `skip_git_hooks = false` overrides lower-layer `true`.\n  - `exclude_globs` merging behavior remains unchanged.\n- `fabro-workflow` tests:\n  - checkpoint commit command includes the hook-skip option when enabled.\n  - checkpoint commit command omits it when disabled.\n  - parallel branch commit command respects the setting.\n- API/client tests:\n  - `WorkflowSettings` / `RunCheckpointSettings` round-trip includes `skip_git_hooks`.\n  - OpenAPI-generated Rust and TypeScript clients reflect the new boolean field.\n- Regression:\n  - existing git checkpoint tests still pass, including metadata branch tests.\n\n## Assumptions\n\n- The setting applies to Git commit hooks for run-branch checkpoint commits; it does not change metadata-branch behavior because metadata snapshots already use `git2` and do not fire local hooks.\n- The setting does not disable Fabro lifecycle hooks under `[[run.hooks]]`.\n- Default `false` is required for backward compatibility.\n",
           "internal.fidelity": "compact",
-          "internal.retry_count.simplify_gpt": 0
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.simplify_gpt.current_node": "verify"
         },
         "node_outcomes": {
           "preflight_compile": {
@@ -1273,6 +1493,14 @@
               "/home/daytona/workspace/fabro/lib/packages/fabro-api-client/src/models/run-checkpoint-settings.ts"
             ]
           },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/7a91223ac3a5d764ed8b4d3bbf0454b9431c9443f6ca72af903e7474e95c3091"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+            "usage": null
+          },
           "preflight_lint": {
             "status": "succeeded",
             "context_updates": {
@@ -1282,15 +1510,16 @@
             "usage": null
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "fmt",
         "node_visits": {
-          "implement": 1,
-          "simplify_gpt": 1,
           "toolchain": 1,
           "start": 1,
-          "preflight_lint": 1,
           "simplify_opus": 1,
-          "preflight_compile": 1
+          "implement": 1,
+          "preflight_compile": 1,
+          "verify": 1,
+          "simplify_gpt": 1,
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -1349,40 +1578,110 @@
     }
   },
   "stages": {
-    "toolchain@1": {
-      "first_event_seq": 20,
+    "verify@1": {
+      "first_event_seq": 1174,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T19:40:52.656884Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
+    "simplify_gpt@1": {
+      "first_event_seq": 828,
       "prompt": null,
       "response": null,
       "completion": {
         "outcome": "succeeded",
-        "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "notes": "Stage completed: simplify_gpt",
         "failure_reason": null,
-        "timestamp": "2026-05-22T18:56:09.854292Z"
+        "timestamp": "2026-05-22T19:40:47.877391Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T19:35:39.483711Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 308392,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 147474,
+        "output_tokens": 4678,
+        "total_tokens": 2079275,
+        "reasoning_tokens": 3027,
+        "cache_read_tokens": 1924096,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 1930568
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "state": "succeeded"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 30,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T18:58:19.212824Z"
       },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
-        "script": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-        "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
       "script_timing": {
-        "output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
         "exit_code": 0,
-        "duration_ms": 3045,
+        "duration_ms": 124018,
         "termination": "exited",
-        "output_bytes": 36,
+        "output_bytes": 0,
         "live_streaming": false
       },
       "parallel_results": null,
       "output": null,
-      "output_bytes": 36,
+      "output_bytes": 0,
       "live_streaming": false,
       "termination": "exited",
-      "started_at": "2026-05-22T18:56:06.792738Z",
+      "started_at": "2026-05-22T18:56:15.183584Z",
       "handler": "command",
       "timing": {
-        "wall_time_ms": 3061,
+        "wall_time_ms": 124028,
         "inference_time_ms": 0,
         "tool_time_ms": 0,
         "active_time_ms": 0
@@ -1440,120 +1739,40 @@
       },
       "state": "succeeded"
     },
-    "simplify_gpt@1": {
-      "first_event_seq": 828,
-      "prompt": null,
-      "response": null,
-      "completion": null,
-      "provider_used": {
-        "mode": "agent",
-        "provider": "openai",
-        "model": "gpt-5.5"
-      },
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-22T19:35:39.483711Z",
-      "handler": "agent",
-      "usage": {
-        "input_tokens": 147474,
-        "output_tokens": 4678,
-        "total_tokens": 2079275,
-        "reasoning_tokens": 3027,
-        "cache_read_tokens": 1924096,
-        "cache_write_tokens": 0,
-        "total_usd_micros": 1930568
-      },
-      "model": {
-        "provider": "openai",
-        "model_id": "gpt-5.5"
-      },
-      "state": "running"
-    },
-    "preflight_lint@1": {
-      "first_event_seq": 41,
+    "toolchain@1": {
+      "first_event_seq": 20,
       "prompt": null,
       "response": null,
       "completion": {
         "outcome": "succeeded",
-        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
         "failure_reason": null,
-        "timestamp": "2026-05-22T19:00:39.388788Z"
+        "timestamp": "2026-05-22T18:56:09.854292Z"
       },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
-        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "script": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
         "language": "shell"
       },
       "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
         "exit_code": 0,
-        "duration_ms": 135533,
+        "duration_ms": 3045,
         "termination": "exited",
-        "output_bytes": 0,
+        "output_bytes": 36,
         "live_streaming": false
       },
       "parallel_results": null,
       "output": null,
-      "output_bytes": 0,
+      "output_bytes": 36,
       "live_streaming": false,
       "termination": "exited",
-      "started_at": "2026-05-22T18:58:23.848937Z",
+      "started_at": "2026-05-22T18:56:06.792738Z",
       "handler": "command",
       "timing": {
-        "wall_time_ms": 135538,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "preflight_compile@1": {
-      "first_event_seq": 30,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo check -q --workspace 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-22T18:58:19.212824Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 124018,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-22T18:56:15.183584Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 124028,
+        "wall_time_ms": 3061,
         "inference_time_ms": 0,
         "tool_time_ms": 0,
         "active_time_ms": 0
@@ -1642,6 +1861,54 @@
       "model": {
         "provider": "anthropic",
         "model_id": "claude-opus-4-7"
+      },
+      "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 41,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T19:00:39.388788Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 135533,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-22T18:58:23.848937Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 135538,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
       },
       "state": "succeeded"
     }
