@@ -1,0 +1,300 @@
+diff --git a/apps/fabro-web/app/lib/ask-fabro-runtime.ts b/apps/fabro-web/app/lib/ask-fabro-runtime.ts
+index 92b2a0c2c..dce3d5795 100644
+--- a/apps/fabro-web/app/lib/ask-fabro-runtime.ts
++++ b/apps/fabro-web/app/lib/ask-fabro-runtime.ts
+@@ -8,7 +8,7 @@ import {
+   streamSessionTurn,
+   type SessionStreamEvent,
+ } from "./session-stream";
+-import { sessionsApi } from "./api-client";
++import { ApiError, sessionsApi } from "./api-client";
+ 
+ const SESSION_STORAGE_PREFIX = "fabro:ask-fabro-session:";
+ 
+@@ -296,8 +296,17 @@ export function createAskFabroAdapter(
+         }
+       }
+ 
+-      // Propagate any error from the stream task.
+-      await streamPromise;
++      // Propagate any error from the stream task. If the cached session was
++      // pruned server-side, clear it so the next turn creates a fresh session.
++      try {
++        await streamPromise;
++      } catch (error) {
++        if (error instanceof ApiError && error.status === 404) {
++          persisted.clear(options.runId);
++          sessionId = null;
++        }
++        throw error;
++      }
+       // Guarantee assistant-ui sees at least one result for an empty turn.
+       if (!yielded) yield snapshot(acc);
+     },
+diff --git a/lib/crates/fabro-server/src/server/handler/sessions.rs b/lib/crates/fabro-server/src/server/handler/sessions.rs
+index 123719cfa..7cfe23985 100644
+--- a/lib/crates/fabro-server/src/server/handler/sessions.rs
++++ b/lib/crates/fabro-server/src/server/handler/sessions.rs
+@@ -52,7 +52,7 @@ use super::super::{
+ use crate::error::ApiError;
+ use crate::principal_middleware::RequiredUser;
+ use crate::server_secrets::LlmClientResult;
+-use crate::worker_token::{WorkerScopeSet, issue_worker_token_with_scopes};
++use crate::worker_token::issue_worker_token;
+ 
+ const SESSION_SSE_BUFFER_CAPACITY: usize = 1024;
+ 
+@@ -697,14 +697,10 @@ async fn build_agent_session(
+ 
+     // Give the Ask Fabro agent access to run-control tools scoped to its
+     // owning run. The session reaches the local HTTP API via a same-run
+-    // worker token; the server's auth middleware enforces the run scope so
+-    // cross-run calls 403.
+-    let worker_token = issue_worker_token_with_scopes(
+-        state.worker_token_keys(),
+-        &run_id,
+-        WorkerScopeSet::run_worker_with_agent_run_tools(),
+-    )
+-    .map_err(|_| AskFabroBuildError::Agent(anyhow::anyhow!("failed to sign worker token")))?;
++    // worker token; the scoped backend rejects accidental cross-run tool calls
++    // and the server's auth middleware remains a backstop for direct HTTP.
++    let worker_token = issue_worker_token(state.worker_token_keys(), &run_id)
++        .map_err(|_| AskFabroBuildError::Agent(anyhow::anyhow!("failed to sign worker token")))?;
+     let target = state
+         .self_server_target()
+         .map_err(AskFabroBuildError::Agent)?;
+@@ -714,7 +710,7 @@ async fn build_agent_session(
+         .connect()
+         .await
+         .map_err(AskFabroBuildError::Agent)?;
+-    let backend = ClientBackend::new(Arc::new(api_client));
++    let backend = ClientBackend::new(Arc::new(api_client)).with_run_scope(run_id);
+     let services = FabroRunToolServices {
+         backend:            Arc::new(backend),
+         current_run_id:     run_id,
+diff --git a/lib/crates/fabro-server/src/worker_token.rs b/lib/crates/fabro-server/src/worker_token.rs
+index f64765801..b10568c91 100644
+--- a/lib/crates/fabro-server/src/worker_token.rs
++++ b/lib/crates/fabro-server/src/worker_token.rs
+@@ -66,7 +66,6 @@ pub(crate) struct WorkerScopeSet {
+ }
+ 
+ impl WorkerScopeSet {
+-    #[cfg(test)]
+     #[must_use]
+     pub(crate) const fn run_worker() -> Self {
+         Self {
+@@ -101,7 +100,6 @@ pub(crate) struct DecodedWorkerToken {
+     pub(crate) scopes: WorkerScopeSet,
+ }
+ 
+-#[cfg(test)]
+ pub(crate) fn issue_worker_token(
+     keys: &WorkerTokenKeys,
+     run_id: &RunId,
+diff --git a/lib/crates/fabro-tool/src/fabro_client.rs b/lib/crates/fabro-tool/src/fabro_client.rs
+index 887bd17c6..4f994c5ef 100644
+--- a/lib/crates/fabro-tool/src/fabro_client.rs
++++ b/lib/crates/fabro-tool/src/fabro_client.rs
+@@ -14,6 +14,7 @@ use crate::{FabroToolBackend, RunManifestBuilder, ToolError};
+ pub struct ClientBackend {
+     client:           Arc<::fabro_client::Client>,
+     manifest_builder: Option<Arc<dyn RunManifestBuilder>>,
++    run_scope:        Option<RunId>,
+ }
+ 
+ impl ClientBackend {
+@@ -22,6 +23,7 @@ impl ClientBackend {
+         Self {
+             client,
+             manifest_builder: None,
++            run_scope: None,
+         }
+     }
+ 
+@@ -30,6 +32,25 @@ impl ClientBackend {
+         self.manifest_builder = Some(builder);
+         self
+     }
++
++    /// Restrict this backend to a single run.
++    ///
++    /// Ask Fabro sessions use this with a same-run worker token so accidental
++    /// cross-run tool calls are rejected before they reach the API.
++    #[must_use]
++    pub fn with_run_scope(mut self, run_id: RunId) -> Self {
++        self.run_scope = Some(run_id);
++        self
++    }
++
++    fn ensure_run_scope(&self, run_id: &RunId) -> anyhow::Result<()> {
++        if let Some(scope) = self.run_scope {
++            if &scope != run_id {
++                anyhow::bail!("run {run_id} is outside this tool session's run scope");
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ #[async_trait]
+@@ -41,6 +62,9 @@ impl FabroToolBackend for ClientBackend {
+         user_settings_path: &Path,
+         parent_id: Option<RunId>,
+     ) -> anyhow::Result<RunId> {
++        if let Some(parent_id) = parent_id.as_ref() {
++            self.ensure_run_scope(parent_id)?;
++        }
+         let Some(builder) = self.manifest_builder.as_ref() else {
+             return Err(ToolError::message(format!(
+                 "{} is not available",
+@@ -56,54 +80,77 @@ impl FabroToolBackend for ClientBackend {
+     }
+ 
+     async fn resolve_run(&self, selector: &str) -> anyhow::Result<Run> {
++        if self.run_scope.is_some() {
++            let run_id: RunId = selector.parse().map_err(|err| {
++                anyhow::anyhow!(
++                    "run selector must be the owning run id for this tool session: {err}"
++                )
++            })?;
++            self.ensure_run_scope(&run_id)?;
++            return self.retrieve_run(&run_id).await;
++        }
+         self.client.resolve_run(selector).await
+     }
+ 
+     async fn retrieve_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
+         self.client.retrieve_run(run_id).await
+     }
+ 
+     async fn start_run(&self, run_id: &RunId, resume: bool) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
+         self.client.start_run(run_id, resume).await
+     }
+ 
+     async fn cancel_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
+         self.client.cancel_run(run_id).await
+     }
+ 
+     async fn interrupt_run(&self, run_id: &RunId) -> anyhow::Result<()> {
++        self.ensure_run_scope(run_id)?;
+         self.client.interrupt_run(run_id).await
+     }
+ 
+     async fn steer_run(&self, run_id: &RunId, text: String, interrupt: bool) -> anyhow::Result<()> {
++        self.ensure_run_scope(run_id)?;
+         self.client.steer_run(run_id, text, interrupt).await
+     }
+ 
+     async fn archive_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
+         self.client.archive_run(run_id).await
+     }
+ 
+     async fn unarchive_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
+         self.client.unarchive_run(run_id).await
+     }
+ 
+     async fn list_store_runs(&self) -> anyhow::Result<Vec<Run>> {
++        if let Some(run_id) = self.run_scope {
++            return Ok(vec![self.retrieve_run(&run_id).await?]);
++        }
+         self.client.list_store_runs().await
+     }
+ 
+     async fn list_store_runs_by_parent(&self, parent_id: RunId) -> anyhow::Result<Vec<Run>> {
++        self.ensure_run_scope(&parent_id)?;
+         self.client.list_store_runs_by_parent(parent_id).await
+     }
+ 
+     async fn link_run_parent(&self, child_id: &RunId, parent_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(child_id)?;
+         self.client.link_run_parent(child_id, parent_id).await
+     }
+ 
+     async fn unlink_run_parent(&self, child_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(child_id)?;
+         self.client.unlink_run_parent(child_id).await
+     }
+ 
+     async fn get_run_state(&self, run_id: &RunId) -> anyhow::Result<RunProjection> {
++        self.ensure_run_scope(run_id)?;
+         self.client.get_run_state(run_id).await
+     }
+ 
+@@ -113,6 +160,7 @@ impl FabroToolBackend for ClientBackend {
+         after: Option<u32>,
+         limit: Option<usize>,
+     ) -> anyhow::Result<Vec<EventEnvelope>> {
++        self.ensure_run_scope(run_id)?;
+         self.client.list_run_events(run_id, after, limit).await
+     }
+ 
+@@ -122,12 +170,14 @@ impl FabroToolBackend for ClientBackend {
+         after: Option<u32>,
+         limit: usize,
+     ) -> anyhow::Result<Vec<EventEnvelope>> {
++        self.ensure_run_scope(run_id)?;
+         self.client
+             .list_run_events_until(run_id, after, limit)
+             .await
+     }
+ 
+     async fn list_run_questions(&self, run_id: &RunId) -> anyhow::Result<Vec<types::ApiQuestion>> {
++        self.ensure_run_scope(run_id)?;
+         self.client.list_run_questions(run_id).await
+     }
+ 
+@@ -137,12 +187,14 @@ impl FabroToolBackend for ClientBackend {
+         question_id: &str,
+         body: types::SubmitAnswerRequest,
+     ) -> anyhow::Result<()> {
++        self.ensure_run_scope(run_id)?;
+         self.client
+             .submit_run_answer(run_id, question_id, body)
+             .await
+     }
+ 
+     async fn get_run_pair_status(&self, run_id: &RunId) -> anyhow::Result<RunPairStatusResponse> {
++        self.ensure_run_scope(run_id)?;
+         self.client.get_run_pair_status(run_id).await
+     }
+ 
+@@ -151,14 +203,17 @@ impl FabroToolBackend for ClientBackend {
+         run_id: &RunId,
+         stage_id: StageId,
+     ) -> anyhow::Result<PairRecord> {
++        self.ensure_run_scope(run_id)?;
+         self.client.start_run_pair(run_id, stage_id).await
+     }
+ 
+     async fn get_run_pair(&self, run_id: &RunId, pair_id: &PairId) -> anyhow::Result<PairRecord> {
++        self.ensure_run_scope(run_id)?;
+         self.client.get_run_pair(run_id, pair_id).await
+     }
+ 
+     async fn end_run_pair(&self, run_id: &RunId, pair_id: &PairId) -> anyhow::Result<PairRecord> {
++        self.ensure_run_scope(run_id)?;
+         self.client.end_run_pair(run_id, pair_id).await
+     }
+ 
+@@ -168,6 +223,7 @@ impl FabroToolBackend for ClientBackend {
+         pair_id: &PairId,
+         request: PairMessageRequest,
+     ) -> anyhow::Result<PairMessageRecord> {
++        self.ensure_run_scope(run_id)?;
+         self.client
+             .send_run_pair_message(run_id, pair_id, request)
+             .await
+@@ -180,6 +236,7 @@ impl FabroToolBackend for ClientBackend {
+         since_seq: Option<u32>,
+         limit: Option<u32>,
+     ) -> anyhow::Result<PairTranscriptResponse> {
++        self.ensure_run_scope(run_id)?;
+         self.client
+             .get_run_pair_transcript(run_id, pair_id, since_seq, limit)
+             .await
