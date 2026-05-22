@@ -1,0 +1,1638 @@
+diff --git a/docs/internal/events.md b/docs/internal/events.md
+index f9e99fd89..b6ed547d1 100644
+--- a/docs/internal/events.md
++++ b/docs/internal/events.md
+@@ -1468,8 +1468,19 @@ Emitted when a sub-agent is spawned.
+   "node_id": "code", "node_label": "code",
+   "session_id": "ses_abc",
+   "properties": {
+-    "server_name": "filesystem",
+-    "tool_count": 5
++    "server_name": "github",
++    "tool_count": 2,
++    "tools": [
++      {
++        "name": "mcp__github__create_issue",
++        "original_name": "create_issue"
++      },
++      {
++        "name": "mcp__github__list_issues",
++        "original_name": "list_issues"
++      }
++    ],
++    "visit": 1
+   }
+ }
+ ```
+@@ -1478,6 +1489,8 @@ Emitted when a sub-agent is spawned.
+ |----------|------|-------------|
+ | `server_name` | string | MCP server name |
+ | `tool_count` | number | Number of tools available |
++| `tools` | array | Names-only tool summaries for the ready server, sorted by qualified `name`. Each entry has `name` (Fabro-qualified `mcp__{server}__{tool}` identifier) and `original_name` (server-provided tool name). Descriptions and input schemas are intentionally omitted. The field is omitted from serialized JSON for legacy parity when empty. |
++| `visit` | number | Stage visit count when the server became ready |
+ 
+ ### `agent.mcp.failed`
+ 
+@@ -1499,6 +1512,121 @@ Emitted when a sub-agent is spawned.
+ | `server_name` | string | MCP server name |
+ | `error` | string | Error message |
+ 
++### `agent.memory.loaded`
++
++Emitted once per session right after memory discovery, before skills and MCP
++initialization. The event is always emitted, even when no memory files are
++loaded (in which case `files` is an empty array). Memory file **contents are
++deliberately excluded** from the payload to keep the durable event stream free
++of project documentation bytes; consumers that need contents must read the
++files themselves.
++
++```json
++{
++  "id": "...", "ts": "...", "run_id": "...",
++  "event": "agent.memory.loaded",
++  "node_id": "code", "node_label": "code",
++  "session_id": "ses_abc",
++  "properties": {
++    "provider_profile": "anthropic",
++    "files": [
++      {
++        "path": "/repo/AGENTS.md",
++        "byte_count": 4096,
++        "loaded_bytes": 4096,
++        "truncated": false
++      }
++    ],
++    "total_loaded_bytes": 4096,
++    "budget_bytes": 32768,
++    "visit": 1
++  }
++}
++```
++
++| Property | Type | Description |
++|----------|------|-------------|
++| `provider_profile` | string | Active agent profile (`anthropic`, `openai`, `gemini`) |
++| `files` | array | Discovered memory files. Empty when no memory was loaded. |
++| `files[].path` | string | Absolute path of the memory file in the sandbox |
++| `files[].byte_count` | number | Original file size in bytes |
++| `files[].loaded_bytes` | number | Bytes actually loaded into the prompt budget |
++| `files[].truncated` | boolean | `true` if the file was truncated to fit the budget |
++| `total_loaded_bytes` | number | Sum of `files[].loaded_bytes` |
++| `budget_bytes` | number | Total memory budget for the session (currently 32 KiB) |
++| `visit` | number | Stage visit count |
++
++### `agent.skills.discovered`
++
++Emitted once per session right after skill discovery completes. The event is
++always emitted, even when no skills are found (`skills` is an empty array).
++Skills are sorted by name. `source_dirs` lists the directories that were
++scanned in the configured precedence order.
++
++```json
++{
++  "id": "...", "ts": "...", "run_id": "...",
++  "event": "agent.skills.discovered",
++  "node_id": "code", "node_label": "code",
++  "session_id": "ses_abc",
++  "properties": {
++    "provider_profile": "anthropic",
++    "source_dirs": [
++      "/home/test/.fabro/skills",
++      "/repo/.fabro/skills",
++      "/repo/skills"
++    ],
++    "skills": [
++      { "name": "commit", "description": "Make a commit" }
++    ],
++    "visit": 1
++  }
++}
++```
++
++| Property | Type | Description |
++|----------|------|-------------|
++| `provider_profile` | string | Active agent profile |
++| `source_dirs` | array | Directories scanned for `SKILL.md` files (in precedence order) |
++| `skills` | array | Discovered skills, sorted by `name`. Each entry is `{ name, description }`. |
++| `visit` | number | Stage visit count |
++
++### `agent.skill.activated`
++
++Emitted whenever a skill is activated in the running session. Sources:
++
++- `slash` — the user input matched a `/skill-name` token and the skill template
++  was expanded inline. This event replaces the previous internal-only
++  `agent.skill.expanded` notification.
++- `tool` — the model successfully called the `use_skill` tool and the skill
++  template was returned. Failed `use_skill` lookups (unknown names, missing
++  parameters) do **not** emit this event.
++
++```json
++{
++  "id": "...", "ts": "...", "run_id": "...",
++  "event": "agent.skill.activated",
++  "node_id": "code", "node_label": "code",
++  "session_id": "ses_abc",
++  "properties": {
++    "skill_name": "commit",
++    "source": "slash",
++    "visit": 1
++  }
++}
++```
++
++| Property | Type | Description |
++|----------|------|-------------|
++| `skill_name` | string | Name of the activated skill |
++| `source` | string | `"slash"` for `/skill-name` expansion, `"tool"` for `use_skill` activations |
++| `visit` | number | Stage visit count |
++
++> `agent.skill.expanded` is no longer surfaced as a durable run event. The
++> internal `AgentEvent::SkillExpanded` variant remains classified as streaming
++> noise and is not persisted; slash-skill expansion is reported through
++> `agent.skill.activated` with `source == "slash"` instead.
++
+ ### `agent.failover`
+ 
+ Emitted when the agent fails over to a different LLM provider/model.
+@@ -2307,4 +2435,4 @@ Emitted when the stall watchdog detects no progress.
+ 
+ | Property | Type | Description |
+ |----------|------|-------------|
+-| `idle_seconds` | number | Seconds since last activity |
++| `idle_seconds` | number | Seconds since last activity |
+\ No newline at end of file
+diff --git a/lib/crates/fabro-agent/src/lib.rs b/lib/crates/fabro-agent/src/lib.rs
+index 34de5062c..00be22526 100644
+--- a/lib/crates/fabro-agent/src/lib.rs
++++ b/lib/crates/fabro-agent/src/lib.rs
+@@ -43,7 +43,7 @@ pub use fabro_types::SteeringMessage;
+ pub use history::History;
+ pub use local_sandbox::LocalSandbox;
+ pub use loop_detection::detect_loop;
+-pub use memory::discover_memory;
++pub use memory::{MemoryDocument, discover_memory};
+ pub use profiles::{AnthropicProfile, EnvContext, GeminiProfile, OpenAiProfile};
+ pub use read_before_write_sandbox::ReadBeforeWriteSandbox;
+ pub use sandbox::{
+@@ -70,7 +70,10 @@ pub use tools::{
+     make_shell_tool, make_shell_tool_with_config, make_write_file_tool, register_core_tools,
+ };
+ pub use truncation::{TruncationMode, truncate_lines, truncate_output, truncate_tool_output};
+-pub use types::{AgentEvent, Message, SessionEvent, SessionState};
++pub use types::{
++    AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
++    SkillActivationSource, SkillSummary,
++};
+ 
+ #[cfg(test)]
+ #[allow(
+diff --git a/lib/crates/fabro-agent/src/memory.rs b/lib/crates/fabro-agent/src/memory.rs
+index a86626846..07e59c6da 100644
+--- a/lib/crates/fabro-agent/src/memory.rs
++++ b/lib/crates/fabro-agent/src/memory.rs
+@@ -7,7 +7,19 @@ use tracing::{debug, info, warn};
+ use crate::error::{Error, InterruptReason};
+ use crate::sandbox::Sandbox;
+ 
+-const BUDGET_BYTES: usize = 32768;
++pub const BUDGET_BYTES: usize = 32768;
++
++/// One discovered memory file. `content` is what gets inlined into the
++/// system prompt. The remaining fields describe the file for
++/// observability and never carry the file's text.
++#[derive(Debug, Clone, PartialEq)]
++pub struct MemoryDocument {
++    pub path:         String,
++    pub content:      String,
++    pub byte_count:   usize,
++    pub loaded_bytes: usize,
++    pub truncated:    bool,
++}
+ 
+ pub async fn discover_memory(
+     env: &dyn Sandbox,
+@@ -15,7 +27,7 @@ pub async fn discover_memory(
+     working_dir: &str,
+     profile_kind: AgentProfileKind,
+     cancel_token: &CancellationToken,
+-) -> Result<Vec<String>, Error> {
++) -> Result<Vec<MemoryDocument>, Error> {
+     let directories = build_directory_walk(git_root, working_dir);
+ 
+     let candidate_filenames: Vec<&str> = match profile_kind {
+@@ -24,7 +36,7 @@ pub async fn discover_memory(
+         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
+     };
+ 
+-    let mut results = Vec::new();
++    let mut results: Vec<MemoryDocument> = Vec::new();
+     let mut budget_remaining = BUDGET_BYTES;
+     let mut seen_content = HashSet::new();
+ 
+@@ -47,28 +59,42 @@ pub async fn discover_memory(
+                     debug!(path = %path, "Project doc duplicate content, skipping");
+                     continue;
+                 }
+-                if content.len() <= budget_remaining {
+-                    debug!(path = %path, size_bytes = content.len(), "Project doc loaded");
+-                    budget_remaining -= content.len();
+-                    results.push(content);
++                let byte_count = content.len();
++                if byte_count <= budget_remaining {
++                    debug!(path = %path, size_bytes = byte_count, "Project doc loaded");
++                    budget_remaining -= byte_count;
++                    results.push(MemoryDocument {
++                        path,
++                        content,
++                        byte_count,
++                        loaded_bytes: byte_count,
++                        truncated: false,
++                    });
+                 } else if budget_remaining > 0 {
+                     warn!(
+                         path = %path,
+-                        size_bytes = content.len(),
++                        size_bytes = byte_count,
+                         budget_remaining,
+                         "Project doc truncated to fit budget"
+                     );
+                     let truncated = truncate_to_budget(&content, budget_remaining);
++                    let loaded_bytes = truncated.len();
+                     budget_remaining = 0;
+-                    results.push(truncated);
++                    results.push(MemoryDocument {
++                        path,
++                        content: truncated,
++                        byte_count,
++                        loaded_bytes,
++                        truncated: true,
++                    });
+                 } else {
+-                    warn!(path = %path, size_bytes = content.len(), "Project doc skipped, budget exhausted");
++                    warn!(path = %path, size_bytes = byte_count, "Project doc skipped, budget exhausted");
+                 }
+             }
+         }
+     }
+ 
+-    let total_bytes: usize = results.iter().map(std::string::String::len).sum();
++    let total_bytes: usize = results.iter().map(|doc| doc.loaded_bytes).sum();
+     info!(files = results.len(), total_bytes, "Project docs loaded");
+ 
+     Ok(results)
+@@ -144,7 +170,11 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(docs.len(), 1);
+-        assert_eq!(docs[0], "Agent instructions");
++        assert_eq!(docs[0].content, "Agent instructions");
++        assert_eq!(docs[0].path, "/repo/AGENTS.md");
++        assert_eq!(docs[0].byte_count, "Agent instructions".len());
++        assert_eq!(docs[0].loaded_bytes, "Agent instructions".len());
++        assert!(!docs[0].truncated);
+     }
+ 
+     #[tokio::test]
+@@ -169,8 +199,8 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(anthropic_docs.len(), 2);
+-        assert_eq!(anthropic_docs[0], "agents");
+-        assert_eq!(anthropic_docs[1], "claude");
++        assert_eq!(anthropic_docs[0].content, "agents");
++        assert_eq!(anthropic_docs[1].content, "claude");
+ 
+         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+             files: files.clone(),
+@@ -186,8 +216,8 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(openai_docs.len(), 2);
+-        assert_eq!(openai_docs[0], "agents");
+-        assert_eq!(openai_docs[1], "copilot");
++        assert_eq!(openai_docs[0].content, "agents");
++        assert_eq!(openai_docs[1].content, "copilot");
+ 
+         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+             files,
+@@ -203,8 +233,8 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(gemini_docs.len(), 2);
+-        assert_eq!(gemini_docs[0], "agents");
+-        assert_eq!(gemini_docs[1], "gemini");
++        assert_eq!(gemini_docs[0].content, "agents");
++        assert_eq!(gemini_docs[1].content, "gemini");
+     }
+ 
+     #[tokio::test]
+@@ -230,10 +260,18 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(docs.len(), 2);
+-        assert_eq!(docs[0], large_content);
++        assert_eq!(docs[0].content, large_content);
++        assert!(!docs[0].truncated);
++        assert_eq!(docs[0].byte_count, docs[0].loaded_bytes);
+         // Second doc should be truncated to fit remaining budget
+-        assert!(docs[1].ends_with("[Project instructions truncated at 32KB]"));
+-        assert!(docs[0].len() + docs[1].len() <= BUDGET_BYTES);
++        assert!(
++            docs[1]
++                .content
++                .ends_with("[Project instructions truncated at 32KB]")
++        );
++        assert!(docs[1].truncated);
++        assert!(docs[1].byte_count > docs[1].loaded_bytes);
++        assert!(docs[0].content.len() + docs[1].content.len() <= BUDGET_BYTES);
+     }
+ 
+     #[tokio::test]
+@@ -255,7 +293,7 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(docs.len(), 1);
+-        assert_eq!(docs[0], "shared instructions");
++        assert_eq!(docs[0].content, "shared instructions");
+     }
+ 
+     #[tokio::test]
+@@ -277,7 +315,35 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(docs.len(), 1);
+-        assert_eq!(docs[0], "shared instructions");
++        assert_eq!(docs[0].content, "shared instructions");
++    }
++
++    #[tokio::test]
++    async fn truncated_file_reports_byte_count_distinct_from_loaded_bytes() {
++        let mut files = HashMap::new();
++        // Single file larger than the budget so we hit the truncation branch
++        // without any preceding consumption.
++        let large_content = "x".repeat(BUDGET_BYTES + 1024);
++        files.insert("/repo/AGENTS.md".into(), large_content.clone());
++
++        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
++            files,
++            ..Default::default()
++        });
++        let docs = discover_memory(
++            env.as_ref(),
++            "/repo",
++            "/repo",
++            AgentProfileKind::Anthropic,
++            &CancellationToken::new(),
++        )
++        .await
++        .unwrap();
++        assert_eq!(docs.len(), 1);
++        assert!(docs[0].truncated);
++        assert_eq!(docs[0].byte_count, large_content.len());
++        assert!(docs[0].loaded_bytes < docs[0].byte_count);
++        assert!(docs[0].loaded_bytes <= BUDGET_BYTES);
+     }
+ 
+     #[tokio::test]
+@@ -301,8 +367,8 @@ mod tests {
+         .await
+         .unwrap();
+         assert_eq!(docs.len(), 3);
+-        assert_eq!(docs[0], "root agents");
+-        assert_eq!(docs[1], "src agents");
+-        assert_eq!(docs[2], "app agents");
++        assert_eq!(docs[0].content, "root agents");
++        assert_eq!(docs[1].content, "src agents");
++        assert_eq!(docs[2].content, "app agents");
+     }
+ }
+diff --git a/lib/crates/fabro-agent/src/session.rs b/lib/crates/fabro-agent/src/session.rs
+index 77d8ca00c..4163e70ed 100644
+--- a/lib/crates/fabro-agent/src/session.rs
++++ b/lib/crates/fabro-agent/src/session.rs
+@@ -31,7 +31,7 @@ use crate::file_tracker::FileTracker;
+ use crate::history::History;
+ use crate::loop_detection::detect_loop;
+ use crate::mcp_integration;
+-use crate::memory::discover_memory;
++use crate::memory::{BUDGET_BYTES, MemoryDocument, discover_memory};
+ use crate::profiles::EnvContext;
+ use crate::sandbox::Sandbox;
+ use crate::skills::{
+@@ -39,7 +39,10 @@ use crate::skills::{
+ };
+ use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentManager};
+ use crate::tool_execution::execute_tool_calls;
+-use crate::types::{AgentEvent, Message, SessionEvent, SessionState};
++use crate::types::{
++    AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
++    SkillActivationSource, SkillSummary,
++};
+ 
+ /// One queued external control item for a live session.
+ #[derive(Debug, Clone)]
+@@ -311,7 +314,7 @@ pub struct Session {
+     cancel_token:           CancellationToken,
+     round_token:            Arc<RwLock<CancellationToken>>,
+     interrupt_reason:       Arc<Mutex<Option<InterruptReason>>>,
+-    memory:                 Vec<String>,
++    memory:                 Vec<MemoryDocument>,
+     env_context:            EnvContext,
+     skills:                 Vec<Skill>,
+     system_prompt:          String,
+@@ -489,6 +492,29 @@ impl Session {
+         )
+         .await?;
+ 
++        let provider_profile_name = self.provider_profile.profile_kind().to_string();
++
++        // Emit memory loaded event with file metadata. Contents are deliberately
++        // omitted so the durable event stream never carries file bytes.
++        let memory_files: Vec<MemoryFileSummary> = self
++            .memory
++            .iter()
++            .map(|doc| MemoryFileSummary {
++                path:         doc.path.clone(),
++                byte_count:   doc.byte_count,
++                loaded_bytes: doc.loaded_bytes,
++                truncated:    doc.truncated,
++            })
++            .collect();
++        let total_loaded_bytes: usize = self.memory.iter().map(|doc| doc.loaded_bytes).sum();
++        self.event_emitter
++            .emit(self.id.clone(), AgentEvent::MemoryLoaded {
++                provider_profile: provider_profile_name.clone(),
++                files: memory_files,
++                total_loaded_bytes,
++                budget_bytes: BUDGET_BYTES,
++            });
++
+         // Discover skills
+         let skill_dirs = if let Some(dirs) = &self.config.skill_dirs {
+             dirs.clone()
+@@ -500,6 +526,21 @@ impl Session {
+         self.skills = discover_skills(self.sandbox.as_ref(), &skill_dirs, &cancel_token).await?;
+         debug!(skill_count = self.skills.len(), "Skills discovered");
+ 
++        let skill_summaries: Vec<SkillSummary> = self
++            .skills
++            .iter()
++            .map(|skill| SkillSummary {
++                name:        skill.name.clone(),
++                description: skill.description.clone(),
++            })
++            .collect();
++        self.event_emitter
++            .emit(self.id.clone(), AgentEvent::SkillsDiscovered {
++                provider_profile: provider_profile_name.clone(),
++                source_dirs:      skill_dirs.clone(),
++                skills:           skill_summaries,
++            });
++
+         // Register use_skill tool when skills are available
+         if !self.skills.is_empty() {
+             let skills_arc = Arc::new(self.skills.clone());
+@@ -522,10 +563,19 @@ impl Session {
+             for (server_name, result) in &results {
+                 match result {
+                     Ok(tool_count) => {
++                        let tools = manager
++                            .tool_summaries_for_server(server_name)
++                            .into_iter()
++                            .map(|(name, original_name)| McpToolSummary {
++                                name,
++                                original_name,
++                            })
++                            .collect();
+                         self.event_emitter
+                             .emit(self.id.clone(), AgentEvent::McpServerReady {
+                                 server_name: server_name.clone(),
+-                                tool_count:  *tool_count,
++                                tool_count: *tool_count,
++                                tools,
+                             });
+                     }
+                     Err(e) => {
+@@ -555,11 +605,15 @@ impl Session {
+             "Environment context built"
+         );
+ 
+-        // Build system prompt once (static for the session lifetime)
++        // Build system prompt once (static for the session lifetime). Only
++        // the loaded memory text is passed to the profile; the document
++        // metadata is already surfaced via the `agent.memory.loaded` event.
++        let memory_contents: Vec<String> =
++            self.memory.iter().map(|doc| doc.content.clone()).collect();
+         self.system_prompt = self.provider_profile.build_system_prompt(
+             self.sandbox.as_ref(),
+             &self.env_context,
+-            &self.memory,
++            &memory_contents,
+             self.config.user_instructions.as_deref(),
+             &self.skills,
+         );
+@@ -1138,8 +1192,9 @@ impl Session {
+         };
+         if let Some(ref name) = expanded.skill_name {
+             self.event_emitter
+-                .emit(self.id.clone(), AgentEvent::SkillExpanded {
++                .emit(self.id.clone(), AgentEvent::SkillActivated {
+                     skill_name: name.clone(),
++                    source:     SkillActivationSource::Slash,
+                 });
+         }
+         let expanded_input = expanded.text;
+@@ -1710,9 +1765,10 @@ mod tests {
+ 
+     use super::*;
+     use crate::config::{ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode};
++    use crate::skills::{Skill, make_use_skill_tool};
+     use crate::subagent::SubAgentStatus;
+     use crate::test_support::*;
+-    use crate::tool_registry::{RegisteredTool, ToolRegistry};
++    use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
+ 
+     struct NamedToolAccessPolicy {
+         decisions: Vec<(&'static str, ToolAccess)>,
+@@ -3649,16 +3705,21 @@ mod tests {
+         // Initialize starts the MCP server and registers tools
+         session.initialize().await.unwrap();
+ 
+-        // Verify McpServerReady event was emitted
++        // Verify McpServerReady event was emitted with deterministic tool
++        // summaries pulled from the connection manager.
+         let mut mcp_ready = false;
+         while let Ok(event) = rx.try_recv() {
+             if let AgentEvent::McpServerReady {
+                 server_name,
+                 tool_count,
++                tools,
+             } = &event.event
+             {
+                 assert_eq!(server_name, "test-echo");
+                 assert_eq!(*tool_count, 1);
++                assert_eq!(tools.len(), 1);
++                assert_eq!(tools[0].name, "mcp__test_echo__echo");
++                assert_eq!(tools[0].original_name, "echo");
+                 mcp_ready = true;
+             }
+         }
+@@ -3864,4 +3925,278 @@ mod tests {
+             "ProcessingEnd event should be emitted when returning to Idle"
+         );
+     }
++
++    async fn build_initialized_session(
++        sandbox: Arc<MockSandbox>,
++        config: SessionOptions,
++    ) -> Session {
++        let provider = Arc::new(MockLlmProvider::new(vec![text_response("ok")]));
++        let client = make_client(provider).await;
++        let profile = Arc::new(TestProfile::new());
++        Session::new(client, profile, sandbox, config, None)
++    }
++
++    #[tokio::test]
++    async fn initialize_emits_memory_loaded_with_file_metadata() {
++        let mut files = std::collections::HashMap::new();
++        files.insert("/home/test/AGENTS.md".into(), "Hello world".into());
++        let sandbox = Arc::new(MockSandbox {
++            files,
++            ..MockSandbox::linux()
++        });
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(Vec::new()),
++            ..Default::default()
++        };
++        let mut session = build_initialized_session(sandbox, config).await;
++        let mut rx = session.subscribe();
++        session.initialize().await.unwrap();
++
++        let mut memory_event = None;
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::MemoryLoaded {
++                files,
++                total_loaded_bytes,
++                budget_bytes,
++                provider_profile,
++            } = envelope.event
++            {
++                memory_event = Some((files, total_loaded_bytes, budget_bytes, provider_profile));
++                break;
++            }
++        }
++        let (files, total_loaded_bytes, budget_bytes, provider_profile) =
++            memory_event.expect("MemoryLoaded should be emitted");
++        assert_eq!(provider_profile, "anthropic");
++        assert_eq!(budget_bytes, 32768);
++        assert_eq!(total_loaded_bytes, "Hello world".len());
++        assert_eq!(files.len(), 1);
++        assert_eq!(files[0].path, "/home/test/AGENTS.md");
++        assert_eq!(files[0].byte_count, "Hello world".len());
++        assert_eq!(files[0].loaded_bytes, "Hello world".len());
++        assert!(!files[0].truncated);
++    }
++
++    #[tokio::test]
++    async fn initialize_emits_memory_loaded_event_with_empty_files_when_no_memory() {
++        let sandbox = Arc::new(MockSandbox::linux());
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(Vec::new()),
++            ..Default::default()
++        };
++        let mut session = build_initialized_session(sandbox, config).await;
++        let mut rx = session.subscribe();
++        session.initialize().await.unwrap();
++
++        let mut saw_memory = false;
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::MemoryLoaded { files, .. } = envelope.event {
++                assert!(files.is_empty());
++                saw_memory = true;
++                break;
++            }
++        }
++        assert!(
++            saw_memory,
++            "MemoryLoaded must be emitted even when no memory files are loaded"
++        );
++    }
++
++    #[tokio::test]
++    async fn initialize_emits_skills_discovered_with_summaries() {
++        let mut files = std::collections::HashMap::new();
++        files.insert(
++            "/skills/commit/SKILL.md".into(),
++            "---\nname: commit\ndescription: Make a commit\n---\nDo commit".into(),
++        );
++        let sandbox = Arc::new(MockSandbox {
++            files,
++            glob_results: vec!["/skills/commit/SKILL.md".into()],
++            ..MockSandbox::linux()
++        });
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(vec!["/skills".into()]),
++            ..Default::default()
++        };
++        let mut session = build_initialized_session(sandbox, config).await;
++        let mut rx = session.subscribe();
++        session.initialize().await.unwrap();
++
++        let mut got = None;
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::SkillsDiscovered {
++                provider_profile,
++                source_dirs,
++                skills,
++            } = envelope.event
++            {
++                got = Some((provider_profile, source_dirs, skills));
++                break;
++            }
++        }
++        let (provider_profile, source_dirs, skills) =
++            got.expect("SkillsDiscovered must be emitted");
++        assert_eq!(provider_profile, "anthropic");
++        assert_eq!(source_dirs, vec!["/skills".to_string()]);
++        assert_eq!(skills.len(), 1);
++        assert_eq!(skills[0].name, "commit");
++        assert_eq!(skills[0].description, "Make a commit");
++    }
++
++    #[tokio::test]
++    async fn initialize_emits_skills_discovered_event_when_no_skills() {
++        let sandbox = Arc::new(MockSandbox::linux());
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(Vec::new()),
++            ..Default::default()
++        };
++        let mut session = build_initialized_session(sandbox, config).await;
++        let mut rx = session.subscribe();
++        session.initialize().await.unwrap();
++
++        let mut saw_skills = false;
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::SkillsDiscovered { skills, .. } = envelope.event {
++                assert!(skills.is_empty());
++                saw_skills = true;
++                break;
++            }
++        }
++        assert!(
++            saw_skills,
++            "SkillsDiscovered must be emitted even when no skills are present"
++        );
++    }
++
++    #[tokio::test]
++    async fn slash_skill_expansion_emits_skill_activated_with_slash_source() {
++        let mut files = std::collections::HashMap::new();
++        files.insert(
++            "/skills/commit/SKILL.md".into(),
++            "---\nname: commit\ndescription: Make a commit\n---\nRun commit. {{user_input}}".into(),
++        );
++        let sandbox = Arc::new(MockSandbox {
++            files,
++            glob_results: vec!["/skills/commit/SKILL.md".into()],
++            ..MockSandbox::linux()
++        });
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(vec!["/skills".into()]),
++            ..Default::default()
++        };
++        let provider = Arc::new(MockLlmProvider::new(vec![text_response("ok")]));
++        let client = make_client(provider).await;
++        let profile = Arc::new(TestProfile::new());
++        let mut session = Session::new(client, profile, sandbox, config, None);
++        session.initialize().await.unwrap();
++
++        let mut rx = session.subscribe();
++        session.process_input("/commit fix things").await.unwrap();
++
++        let mut activations: Vec<(String, SkillActivationSource)> = Vec::new();
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::SkillActivated { skill_name, source } = envelope.event {
++                activations.push((skill_name, source));
++            }
++        }
++        assert!(
++            activations
++                .iter()
++                .any(|(name, source)| name == "commit" && *source == SkillActivationSource::Slash),
++            "expected slash skill activation, got {activations:?}"
++        );
++    }
++
++    #[tokio::test]
++    async fn use_skill_tool_success_emits_skill_activated_with_tool_source() {
++        let mut files = std::collections::HashMap::new();
++        files.insert(
++            "/skills/commit/SKILL.md".into(),
++            "---\nname: commit\ndescription: Make a commit\n---\nRun commit.".into(),
++        );
++        let sandbox = Arc::new(MockSandbox {
++            files,
++            glob_results: vec!["/skills/commit/SKILL.md".into()],
++            ..MockSandbox::linux()
++        });
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(vec!["/skills".into()]),
++            enable_loop_detection: false,
++            ..Default::default()
++        };
++        let responses = vec![
++            tool_call_response(
++                "use_skill",
++                "call_1",
++                serde_json::json!({"skill_name": "commit"}),
++            ),
++            text_response("done"),
++        ];
++        let provider = Arc::new(MockLlmProvider::new(responses));
++        let client = make_client(provider).await;
++        let profile = Arc::new(TestProfile::new());
++        let mut session = Session::new(client, profile, sandbox, config, None);
++        session.initialize().await.unwrap();
++
++        let mut rx = session.subscribe();
++        session.process_input("please commit").await.unwrap();
++
++        let mut tool_activations = 0;
++        while let Ok(envelope) = rx.try_recv() {
++            if let AgentEvent::SkillActivated { source, skill_name } = envelope.event {
++                if source == SkillActivationSource::Tool && skill_name == "commit" {
++                    tool_activations += 1;
++                }
++            }
++        }
++        assert_eq!(
++            tool_activations, 1,
++            "expected exactly one tool-sourced skill activation"
++        );
++    }
++
++    #[tokio::test]
++    async fn use_skill_tool_failed_lookup_does_not_emit_activation() {
++        let sandbox = Arc::new(MockSandbox::linux());
++        let config = SessionOptions {
++            git_root: Some("/home/test".into()),
++            skill_dirs: Some(Vec::new()),
++            ..Default::default()
++        };
++        let provider = Arc::new(MockLlmProvider::new(vec![text_response("ok")]));
++        let client = make_client(provider).await;
++        let profile = Arc::new(TestProfile::new());
++        let mut session = Session::new(client, profile, sandbox, config, None);
++        session.initialize().await.unwrap();
++
++        // Build a use_skill tool with an empty skill list, then invoke it
++        // directly with a missing name. We must NOT see a SkillActivated event.
++        let skills_arc = Arc::new(Vec::<Skill>::new());
++        let tool = make_use_skill_tool(skills_arc);
++        let mut rx = session.subscribe();
++        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
++        let ctx = ToolContext {
++            env,
++            cancel: CancellationToken::new(),
++            tool_env_provider: None,
++            session_id: Some(session.id().to_string()),
++            root_session_id: Some(session.id().to_string()),
++            tool_call_id: None,
++            agent_event_emitter: None,
++        };
++        let result = (tool.executor)(serde_json::json!({"skill_name": "nope"}), ctx).await;
++        assert!(result.is_err());
++
++        while let Ok(envelope) = rx.try_recv() {
++            if matches!(envelope.event, AgentEvent::SkillActivated { .. }) {
++                panic!("failed use_skill should not emit SkillActivated");
++            }
++        }
++    }
+ }
+diff --git a/lib/crates/fabro-agent/src/skills.rs b/lib/crates/fabro-agent/src/skills.rs
+index 4bb2ff8f4..f7b4e3eaf 100644
+--- a/lib/crates/fabro-agent/src/skills.rs
++++ b/lib/crates/fabro-agent/src/skills.rs
+@@ -7,6 +7,7 @@ use crate::error::{Error, InterruptReason};
+ use crate::sandbox::Sandbox;
+ use crate::tool_registry::RegisteredTool;
+ use crate::tools::required_str;
++use crate::types::{AgentEvent, SkillActivationSource};
+ 
+ #[derive(Debug, Clone)]
+ pub struct Skill {
+@@ -176,7 +177,7 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
+                 "required": ["skill_name"]
+             }),
+         },
+-        executor:   Arc::new(move |args, _ctx| {
++        executor:   Arc::new(move |args, ctx| {
+             let skills = skills.clone();
+             Box::pin(async move {
+                 let name = required_str(&args, "skill_name")?;
+@@ -184,6 +185,10 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
+                     .iter()
+                     .find(|s| s.name == name)
+                     .ok_or_else(|| format!("Unknown skill: {name}"))?;
++                ctx.emit_agent_event(AgentEvent::SkillActivated {
++                    skill_name: name.to_string(),
++                    source:     SkillActivationSource::Tool,
++                });
+                 Ok(skill.template.clone())
+             })
+         }),
+diff --git a/lib/crates/fabro-agent/src/types.rs b/lib/crates/fabro-agent/src/types.rs
+index 1f11584d1..95833a2d8 100644
+--- a/lib/crates/fabro-agent/src/types.rs
++++ b/lib/crates/fabro-agent/src/types.rs
+@@ -194,6 +194,33 @@ pub enum SessionState {
+     Closed,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct MemoryFileSummary {
++    pub path:         String,
++    pub byte_count:   usize,
++    pub loaded_bytes: usize,
++    pub truncated:    bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct SkillSummary {
++    pub name:        String,
++    pub description: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct McpToolSummary {
++    pub name:          String,
++    pub original_name: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum SkillActivationSource {
++    Slash,
++    Tool,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum AgentEvent {
+     SessionStarted {
+@@ -303,11 +330,27 @@ pub enum AgentEvent {
+     McpServerReady {
+         server_name: String,
+         tool_count:  usize,
++        tools:       Vec<McpToolSummary>,
+     },
+     McpServerFailed {
+         server_name: String,
+         error:       String,
+     },
++    MemoryLoaded {
++        provider_profile:   String,
++        files:              Vec<MemoryFileSummary>,
++        total_loaded_bytes: usize,
++        budget_bytes:       usize,
++    },
++    SkillsDiscovered {
++        provider_profile: String,
++        source_dirs:      Vec<String>,
++        skills:           Vec<SkillSummary>,
++    },
++    SkillActivated {
++        skill_name: String,
++        source:     SkillActivationSource,
++    },
+     /// New todo / task was created. Carries the full row so the projection
+     /// can be reconstructed from `todo.created` alone.
+     TodoCreated(fabro_types::TodoCreatedProps),
+@@ -504,14 +547,52 @@ impl AgentEvent {
+             Self::McpServerReady {
+                 server_name,
+                 tool_count,
++                tools,
+             } => {
+                 info!(
+                     session_id,
+                     server = server_name.as_str(),
+                     tool_count,
++                    summary_count = tools.len(),
+                     "MCP server ready"
+                 );
+             }
++            Self::MemoryLoaded {
++                provider_profile,
++                files,
++                total_loaded_bytes,
++                budget_bytes,
++            } => {
++                info!(
++                    session_id,
++                    provider_profile = provider_profile.as_str(),
++                    file_count = files.len(),
++                    total_loaded_bytes,
++                    budget_bytes,
++                    "Agent memory loaded"
++                );
++            }
++            Self::SkillsDiscovered {
++                provider_profile,
++                source_dirs,
++                skills,
++            } => {
++                info!(
++                    session_id,
++                    provider_profile = provider_profile.as_str(),
++                    skill_count = skills.len(),
++                    source_dir_count = source_dirs.len(),
++                    "Agent skills discovered"
++                );
++            }
++            Self::SkillActivated { skill_name, source } => {
++                debug!(
++                    session_id,
++                    skill = skill_name.as_str(),
++                    source = ?source,
++                    "Agent skill activated"
++                );
++            }
+             Self::McpServerFailed { server_name, error } => {
+                 error!(
+                     session_id,
+@@ -752,6 +833,7 @@ mod tests {
+         let event = AgentEvent::McpServerReady {
+             server_name: "filesystem".into(),
+             tool_count:  3,
++            tools:       Vec::new(),
+         };
+         assert!(matches!(event, AgentEvent::McpServerReady {
+             tool_count: 3,
+@@ -776,6 +858,7 @@ mod tests {
+             AgentEvent::McpServerReady {
+                 server_name: "fs".into(),
+                 tool_count:  5,
++                tools:       Vec::new(),
+             },
+             AgentEvent::McpServerFailed {
+                 server_name: "bad".into(),
+diff --git a/lib/crates/fabro-mcp/src/connection_manager.rs b/lib/crates/fabro-mcp/src/connection_manager.rs
+index 59e12f6cc..3eff94b30 100644
+--- a/lib/crates/fabro-mcp/src/connection_manager.rs
++++ b/lib/crates/fabro-mcp/src/connection_manager.rs
+@@ -151,6 +151,22 @@ impl McpConnectionManager {
+         &self.tools
+     }
+ 
++    /// Names-only tool summaries for the given server, sorted by qualified
++    /// name. Returns `(qualified_name, original_tool_name)` pairs. Useful
++    /// for emitting deterministic `agent.mcp.ready` payloads without
++    /// leaking descriptions or input schemas.
++    #[must_use]
++    pub fn tool_summaries_for_server(&self, server_name: &str) -> Vec<(String, String)> {
++        let mut summaries: Vec<(String, String)> = self
++            .tools
++            .iter()
++            .filter(|(_, info)| info.server_name == server_name)
++            .map(|(qualified, info)| (qualified.clone(), info.original_tool_name.clone()))
++            .collect();
++        summaries.sort_by(|a, b| a.0.cmp(&b.0));
++        summaries
++    }
++
+     /// Call a tool by its qualified name.
+     pub async fn call_tool(
+         &self,
+@@ -303,4 +319,45 @@ mod tests {
+         let mgr = McpConnectionManager::new();
+         assert!(mgr.all_tools().is_empty());
+     }
++
++    #[test]
++    fn tool_summaries_for_server_filters_and_sorts_by_qualified_name() {
++        let mut mgr = McpConnectionManager::new();
++        mgr.tools
++            .insert(qualified_tool_name("github", "list_issues"), ToolInfo {
++                server_name:        "github".to_string(),
++                original_tool_name: "list_issues".to_string(),
++                description:        "list issues".to_string(),
++                input_schema:       serde_json::json!({}),
++            });
++        mgr.tools
++            .insert(qualified_tool_name("github", "create_issue"), ToolInfo {
++                server_name:        "github".to_string(),
++                original_tool_name: "create_issue".to_string(),
++                description:        "create issue".to_string(),
++                input_schema:       serde_json::json!({}),
++            });
++        mgr.tools
++            .insert(qualified_tool_name("other", "noop"), ToolInfo {
++                server_name:        "other".to_string(),
++                original_tool_name: "noop".to_string(),
++                description:        "noop".to_string(),
++                input_schema:       serde_json::json!({}),
++            });
++
++        let summaries = mgr.tool_summaries_for_server("github");
++        assert_eq!(summaries.len(), 2);
++        assert_eq!(summaries[0].0, "mcp__github__create_issue");
++        assert_eq!(summaries[0].1, "create_issue");
++        assert_eq!(summaries[1].0, "mcp__github__list_issues");
++        assert_eq!(summaries[1].1, "list_issues");
++
++        let other = mgr.tool_summaries_for_server("other");
++        assert_eq!(other.len(), 1);
++        assert_eq!(other[0].0, "mcp__other__noop");
++        assert_eq!(other[0].1, "noop");
++
++        let none = mgr.tool_summaries_for_server("missing");
++        assert!(none.is_empty());
++    }
+ }
+diff --git a/lib/crates/fabro-types/src/run_event/agent.rs b/lib/crates/fabro-types/src/run_event/agent.rs
+index eb4fe13c2..56106dc60 100644
+--- a/lib/crates/fabro-types/src/run_event/agent.rs
++++ b/lib/crates/fabro-types/src/run_event/agent.rs
+@@ -215,12 +215,65 @@ pub struct AgentSubClosedProps {
+ pub struct AgentMcpReadyProps {
+     pub server_name: String,
+     pub tool_count:  usize,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub tools:       Vec<AgentMcpToolSummary>,
+     pub visit:       u32,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentMcpToolSummary {
++    pub name:          String,
++    pub original_name: String,
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentMcpFailedProps {
+     pub server_name: String,
+     pub error:       String,
+     pub visit:       u32,
+ }
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentMemoryLoadedProps {
++    pub provider_profile:   String,
++    pub files:              Vec<AgentMemoryFileProps>,
++    pub total_loaded_bytes: usize,
++    pub budget_bytes:       usize,
++    pub visit:              u32,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentMemoryFileProps {
++    pub path:         String,
++    pub byte_count:   usize,
++    pub loaded_bytes: usize,
++    pub truncated:    bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentSkillsDiscoveredProps {
++    pub provider_profile: String,
++    pub source_dirs:      Vec<String>,
++    pub skills:           Vec<AgentSkillSummary>,
++    pub visit:            u32,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentSkillSummary {
++    pub name:        String,
++    pub description: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum AgentSkillActivationSource {
++    Slash,
++    Tool,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentSkillActivatedProps {
++    pub skill_name: String,
++    pub source:     AgentSkillActivationSource,
++    pub visit:      u32,
++}
+diff --git a/lib/crates/fabro-types/src/run_event/mod.rs b/lib/crates/fabro-types/src/run_event/mod.rs
+index 4cfd89b00..564dea99a 100644
+--- a/lib/crates/fabro-types/src/run_event/mod.rs
++++ b/lib/crates/fabro-types/src/run_event/mod.rs
+@@ -242,6 +242,12 @@ pub enum EventBody {
+     AgentMcpReady(AgentMcpReadyProps),
+     #[serde(rename = "agent.mcp.failed")]
+     AgentMcpFailed(AgentMcpFailedProps),
++    #[serde(rename = "agent.memory.loaded")]
++    AgentMemoryLoaded(AgentMemoryLoadedProps),
++    #[serde(rename = "agent.skills.discovered")]
++    AgentSkillsDiscovered(AgentSkillsDiscoveredProps),
++    #[serde(rename = "agent.skill.activated")]
++    AgentSkillActivated(AgentSkillActivatedProps),
+     #[serde(rename = "todo.created")]
+     TodoCreated(TodoCreatedProps),
+     #[serde(rename = "todo.updated")]
+@@ -506,6 +512,9 @@ impl EventBody {
+             Self::AgentSubClosed(_) => "agent.sub.closed",
+             Self::AgentMcpReady(_) => "agent.mcp.ready",
+             Self::AgentMcpFailed(_) => "agent.mcp.failed",
++            Self::AgentMemoryLoaded(_) => "agent.memory.loaded",
++            Self::AgentSkillsDiscovered(_) => "agent.skills.discovered",
++            Self::AgentSkillActivated(_) => "agent.skill.activated",
+             Self::TodoCreated(_) => "todo.created",
+             Self::TodoUpdated(_) => "todo.updated",
+             Self::TodoDeleted(_) => "todo.deleted",
+@@ -680,6 +689,9 @@ fn is_known_event_name(event: &str) -> bool {
+             | "agent.sub.closed"
+             | "agent.mcp.ready"
+             | "agent.mcp.failed"
++            | "agent.memory.loaded"
++            | "agent.skills.discovered"
++            | "agent.skill.activated"
+             | "todo.created"
+             | "todo.updated"
+             | "todo.deleted"
+@@ -1983,4 +1995,138 @@ mod tests {
+             other => panic!("expected TodoDeleted, got {other:?}"),
+         }
+     }
++
++    #[test]
++    fn agent_memory_loaded_serializes_with_canonical_name() {
++        let body = EventBody::AgentMemoryLoaded(AgentMemoryLoadedProps {
++            provider_profile:   "anthropic".to_string(),
++            files:              vec![AgentMemoryFileProps {
++                path:         "/repo/AGENTS.md".to_string(),
++                byte_count:   100,
++                loaded_bytes: 100,
++                truncated:    false,
++            }],
++            total_loaded_bytes: 100,
++            budget_bytes:       32768,
++            visit:              1,
++        });
++        let value = serde_json::to_value(&body).unwrap();
++        assert_eq!(value["event"], "agent.memory.loaded");
++        assert_eq!(value["properties"]["provider_profile"], "anthropic");
++        assert_eq!(value["properties"]["files"][0]["path"], "/repo/AGENTS.md");
++        assert_eq!(value["properties"]["budget_bytes"], 32768);
++        assert!(
++            value["properties"]
++                .as_object()
++                .unwrap()
++                .get("content")
++                .is_none(),
++            "memory event must not include file content"
++        );
++        let _ = serde_json::from_value::<EventBody>(value).unwrap();
++    }
++
++    #[test]
++    fn agent_skills_discovered_serializes_with_canonical_name() {
++        let body = EventBody::AgentSkillsDiscovered(AgentSkillsDiscoveredProps {
++            provider_profile: "openai".to_string(),
++            source_dirs:      vec!["/repo/.fabro/skills".to_string()],
++            skills:           vec![AgentSkillSummary {
++                name:        "commit".to_string(),
++                description: "Create a commit".to_string(),
++            }],
++            visit:            2,
++        });
++        let value = serde_json::to_value(&body).unwrap();
++        assert_eq!(value["event"], "agent.skills.discovered");
++        assert_eq!(value["properties"]["skills"][0]["name"], "commit");
++        let _: EventBody = serde_json::from_value(value).unwrap();
++    }
++
++    #[test]
++    fn agent_skill_activated_serializes_source_variants() {
++        let slash = EventBody::AgentSkillActivated(AgentSkillActivatedProps {
++            skill_name: "commit".to_string(),
++            source:     AgentSkillActivationSource::Slash,
++            visit:      3,
++        });
++        let value = serde_json::to_value(&slash).unwrap();
++        assert_eq!(value["event"], "agent.skill.activated");
++        assert_eq!(value["properties"]["source"], "slash");
++
++        let tool = EventBody::AgentSkillActivated(AgentSkillActivatedProps {
++            skill_name: "commit".to_string(),
++            source:     AgentSkillActivationSource::Tool,
++            visit:      4,
++        });
++        let value = serde_json::to_value(&tool).unwrap();
++        assert_eq!(value["properties"]["source"], "tool");
++    }
++
++    #[test]
++    fn agent_mcp_ready_deserializes_legacy_payload_without_tools() {
++        let value = json!({
++            "id": "evt_mcp_ready",
++            "ts": "2026-05-22T12:00:00.000Z",
++            "run_id": fixtures::RUN_1,
++            "event": "agent.mcp.ready",
++            "properties": {
++                "server_name": "github",
++                "tool_count": 2,
++                "visit": 1
++            }
++        });
++        let parsed = RunEvent::from_value(value).unwrap();
++        match parsed.body {
++            EventBody::AgentMcpReady(props) => {
++                assert_eq!(props.server_name, "github");
++                assert_eq!(props.tool_count, 2);
++                assert!(props.tools.is_empty());
++                assert_eq!(props.visit, 1);
++            }
++            other => panic!("expected AgentMcpReady body, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn agent_mcp_ready_serializes_with_tool_summaries() {
++        let body = EventBody::AgentMcpReady(AgentMcpReadyProps {
++            server_name: "github".to_string(),
++            tool_count:  1,
++            tools:       vec![AgentMcpToolSummary {
++                name:          "mcp__github__create_issue".to_string(),
++                original_name: "create_issue".to_string(),
++            }],
++            visit:       1,
++        });
++        let value = serde_json::to_value(&body).unwrap();
++        assert_eq!(value["event"], "agent.mcp.ready");
++        assert_eq!(
++            value["properties"]["tools"][0]["name"],
++            "mcp__github__create_issue"
++        );
++        assert_eq!(
++            value["properties"]["tools"][0]["original_name"],
++            "create_issue"
++        );
++    }
++
++    #[test]
++    fn agent_mcp_ready_omits_tools_when_empty() {
++        let body = EventBody::AgentMcpReady(AgentMcpReadyProps {
++            server_name: "github".to_string(),
++            tool_count:  0,
++            tools:       Vec::new(),
++            visit:       1,
++        });
++        let value = serde_json::to_value(&body).unwrap();
++        assert!(
++            value["properties"]
++                .as_object()
++                .unwrap()
++                .get("tools")
++                .is_none(),
++            "empty tools should be omitted for legacy parity"
++        );
++    }
+ }
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index 83eefb759..c1e008159 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -722,9 +722,17 @@ fn event_body_from_event(event: &Event) -> EventBody {
+             AgentEvent::McpServerReady {
+                 server_name,
+                 tool_count,
++                tools,
+             } => EventBody::AgentMcpReady(fabro_types::AgentMcpReadyProps {
+                 server_name: server_name.clone(),
+                 tool_count:  *tool_count,
++                tools:       tools
++                    .iter()
++                    .map(|tool| fabro_types::AgentMcpToolSummary {
++                        name:          tool.name.clone(),
++                        original_name: tool.original_name.clone(),
++                    })
++                    .collect(),
+                 visit:       *visit,
+             }),
+             AgentEvent::McpServerFailed { server_name, error } => {
+@@ -734,6 +742,56 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                     visit:       *visit,
+                 })
+             }
++            AgentEvent::MemoryLoaded {
++                provider_profile,
++                files,
++                total_loaded_bytes,
++                budget_bytes,
++            } => EventBody::AgentMemoryLoaded(fabro_types::AgentMemoryLoadedProps {
++                provider_profile:   provider_profile.clone(),
++                files:              files
++                    .iter()
++                    .map(|file| fabro_types::AgentMemoryFileProps {
++                        path:         file.path.clone(),
++                        byte_count:   file.byte_count,
++                        loaded_bytes: file.loaded_bytes,
++                        truncated:    file.truncated,
++                    })
++                    .collect(),
++                total_loaded_bytes: *total_loaded_bytes,
++                budget_bytes:       *budget_bytes,
++                visit:              *visit,
++            }),
++            AgentEvent::SkillsDiscovered {
++                provider_profile,
++                source_dirs,
++                skills,
++            } => EventBody::AgentSkillsDiscovered(fabro_types::AgentSkillsDiscoveredProps {
++                provider_profile: provider_profile.clone(),
++                source_dirs:      source_dirs.clone(),
++                skills:           skills
++                    .iter()
++                    .map(|skill| fabro_types::AgentSkillSummary {
++                        name:        skill.name.clone(),
++                        description: skill.description.clone(),
++                    })
++                    .collect(),
++                visit:            *visit,
++            }),
++            AgentEvent::SkillActivated { skill_name, source } => {
++                EventBody::AgentSkillActivated(fabro_types::AgentSkillActivatedProps {
++                    skill_name: skill_name.clone(),
++                    source:     match source {
++                        fabro_agent::SkillActivationSource::Slash => {
++                            fabro_types::AgentSkillActivationSource::Slash
++                        }
++                        fabro_agent::SkillActivationSource::Tool => {
++                            fabro_types::AgentSkillActivationSource::Tool
++                        }
++                    },
++                    visit:      *visit,
++                })
++            }
+             AgentEvent::TodoCreated(props) => EventBody::TodoCreated(props.clone()),
+             AgentEvent::TodoUpdated(props) => EventBody::TodoUpdated(props.clone()),
+             AgentEvent::TodoDeleted(props) => EventBody::TodoDeleted(props.clone()),
+@@ -2262,4 +2320,181 @@ mod tests {
+         let actor = stored.actor.as_ref().expect("actor set");
+         assert_eq!(actor, &user_principal("alice"));
+     }
++
++    #[test]
++    fn agent_memory_loaded_maps_to_typed_event_body() {
++        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             3,
++            event:             AgentEvent::MemoryLoaded {
++                provider_profile:   "anthropic".to_string(),
++                files:              vec![fabro_agent::MemoryFileSummary {
++                    path:         "/repo/AGENTS.md".to_string(),
++                    byte_count:   200,
++                    loaded_bytes: 200,
++                    truncated:    false,
++                }],
++                total_loaded_bytes: 200,
++                budget_bytes:       32768,
++            },
++            session_id:        Some("ses_1".to_string()),
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        assert_eq!(stored.event_name(), "agent.memory.loaded");
++        match stored.body {
++            EventBody::AgentMemoryLoaded(props) => {
++                assert_eq!(props.visit, 3);
++                assert_eq!(props.provider_profile, "anthropic");
++                assert_eq!(props.budget_bytes, 32768);
++                assert_eq!(props.total_loaded_bytes, 200);
++                assert_eq!(props.files.len(), 1);
++                assert_eq!(props.files[0].path, "/repo/AGENTS.md");
++                assert_eq!(props.files[0].byte_count, 200);
++                assert_eq!(props.files[0].loaded_bytes, 200);
++                assert!(!props.files[0].truncated);
++            }
++            other => panic!("expected AgentMemoryLoaded body, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn agent_memory_loaded_payload_excludes_file_contents() {
++        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             1,
++            event:             AgentEvent::MemoryLoaded {
++                provider_profile:   "openai".to_string(),
++                files:              vec![fabro_agent::MemoryFileSummary {
++                    path:         "/repo/AGENTS.md".to_string(),
++                    byte_count:   100,
++                    loaded_bytes: 100,
++                    truncated:    false,
++                }],
++                total_loaded_bytes: 100,
++                budget_bytes:       32768,
++            },
++            session_id:        None,
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        let serialized = serde_json::to_string(&stored.body).unwrap();
++        assert!(
++            !serialized.contains("content"),
++            "memory event payload must not contain file content"
++        );
++    }
++
++    #[test]
++    fn agent_skills_discovered_maps_to_typed_event_body() {
++        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             2,
++            event:             AgentEvent::SkillsDiscovered {
++                provider_profile: "anthropic".to_string(),
++                source_dirs:      vec!["/repo/.fabro/skills".to_string()],
++                skills:           vec![fabro_agent::SkillSummary {
++                    name:        "commit".to_string(),
++                    description: "Make a commit".to_string(),
++                }],
++            },
++            session_id:        Some("ses_1".to_string()),
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        assert_eq!(stored.event_name(), "agent.skills.discovered");
++        match stored.body {
++            EventBody::AgentSkillsDiscovered(props) => {
++                assert_eq!(props.visit, 2);
++                assert_eq!(props.provider_profile, "anthropic");
++                assert_eq!(props.source_dirs, vec!["/repo/.fabro/skills".to_string()]);
++                assert_eq!(props.skills.len(), 1);
++                assert_eq!(props.skills[0].name, "commit");
++                assert_eq!(props.skills[0].description, "Make a commit");
++            }
++            other => panic!("expected AgentSkillsDiscovered body, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn agent_skill_activated_maps_slash_and_tool_sources() {
++        let slash = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             1,
++            event:             AgentEvent::SkillActivated {
++                skill_name: "commit".to_string(),
++                source:     fabro_agent::SkillActivationSource::Slash,
++            },
++            session_id:        Some("ses_1".to_string()),
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        assert_eq!(slash.event_name(), "agent.skill.activated");
++        match slash.body {
++            EventBody::AgentSkillActivated(props) => {
++                assert_eq!(props.visit, 1);
++                assert_eq!(props.skill_name, "commit");
++                assert_eq!(props.source, fabro_types::AgentSkillActivationSource::Slash);
++            }
++            other => panic!("expected AgentSkillActivated body, got {other:?}"),
++        }
++
++        let tool = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             4,
++            event:             AgentEvent::SkillActivated {
++                skill_name: "review".to_string(),
++                source:     fabro_agent::SkillActivationSource::Tool,
++            },
++            session_id:        None,
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        match tool.body {
++            EventBody::AgentSkillActivated(props) => {
++                assert_eq!(props.visit, 4);
++                assert_eq!(props.skill_name, "review");
++                assert_eq!(props.source, fabro_types::AgentSkillActivationSource::Tool);
++            }
++            other => panic!("expected AgentSkillActivated body, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn agent_mcp_ready_carries_tool_summaries_and_visit() {
++        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
++            stage:             "code".to_string(),
++            visit:             5,
++            event:             AgentEvent::McpServerReady {
++                server_name: "github".to_string(),
++                tool_count:  2,
++                tools:       vec![
++                    fabro_agent::McpToolSummary {
++                        name:          "mcp__github__create_issue".to_string(),
++                        original_name: "create_issue".to_string(),
++                    },
++                    fabro_agent::McpToolSummary {
++                        name:          "mcp__github__list_issues".to_string(),
++                        original_name: "list_issues".to_string(),
++                    },
++                ],
++            },
++            session_id:        Some("ses_1".to_string()),
++            parent_session_id: None,
++            tool_call_id:      None,
++        });
++        assert_eq!(stored.event_name(), "agent.mcp.ready");
++        match stored.body {
++            EventBody::AgentMcpReady(props) => {
++                assert_eq!(props.visit, 5);
++                assert_eq!(props.server_name, "github");
++                assert_eq!(props.tool_count, 2);
++                assert_eq!(props.tools.len(), 2);
++                assert_eq!(props.tools[0].name, "mcp__github__create_issue");
++                assert_eq!(props.tools[0].original_name, "create_issue");
++                assert_eq!(props.tools[1].name, "mcp__github__list_issues");
++            }
++            other => panic!("expected AgentMcpReady body, got {other:?}"),
++        }
++    }
+ }
+diff --git a/lib/crates/fabro-workflow/src/event/names.rs b/lib/crates/fabro-workflow/src/event/names.rs
+index 761372250..d730c1872 100644
+--- a/lib/crates/fabro-workflow/src/event/names.rs
++++ b/lib/crates/fabro-workflow/src/event/names.rs
+@@ -89,6 +89,9 @@ pub fn event_name(event: &Event) -> &'static str {
+             AgentEvent::SubAgentClosed { .. } => "agent.sub.closed",
+             AgentEvent::McpServerReady { .. } => "agent.mcp.ready",
+             AgentEvent::McpServerFailed { .. } => "agent.mcp.failed",
++            AgentEvent::MemoryLoaded { .. } => "agent.memory.loaded",
++            AgentEvent::SkillsDiscovered { .. } => "agent.skills.discovered",
++            AgentEvent::SkillActivated { .. } => "agent.skill.activated",
+             AgentEvent::TodoCreated(_) => "todo.created",
+             AgentEvent::TodoUpdated(_) => "todo.updated",
+             AgentEvent::TodoDeleted(_) => "todo.deleted",
+diff --git a/lib/crates/fabro-workflow/src/handler/prompt.rs b/lib/crates/fabro-workflow/src/handler/prompt.rs
+index 16979d9e5..625e4597f 100644
+--- a/lib/crates/fabro-workflow/src/handler/prompt.rs
++++ b/lib/crates/fabro-workflow/src/handler/prompt.rs
+@@ -94,7 +94,12 @@ impl Handler for PromptHandler {
+             if docs.is_empty() {
+                 None
+             } else {
+-                Some(docs.join("\n\n"))
++                Some(
++                    docs.into_iter()
++                        .map(|doc| doc.content)
++                        .collect::<Vec<_>>()
++                        .join("\n\n"),
++                )
+             }
+         } else {
+             None
