@@ -1,0 +1,539 @@
+{
+  "title": "Run Agent Fabro Tools Opt-In Implementation Plan",
+  "spec": {
+    "run_id": "01KS7SVN82CXM5KSTHQX65E735",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "# Run Agent Fabro Tools Opt-In Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `[run.agent] fabro_tools = true/false`, defaulting to `false`, so workflow agents only get Fabro run tools and the `agent:run_tools` worker JWT scope when a run opts in.\n\n**Architecture:** Treat `run.agent.fabro_tools` as the source of truth in resolved run settings. The server reads the effective run setting before spawning `__run-worker`, issues the worker token with or without `agent:run_tools`, and passes a private worker env flag so the CLI worker registers Fabro run tools only for opted-in runs. Server-side JWT scope checks remain the authorization backstop.\n\n**Tech Stack:** Rust, Serde TOML config layers, Fabro worker JWT scopes, Tokio subprocess spawning, `cargo nextest`.\n\n---\n\n## File Map\n\n- Modify `lib/crates/fabro-types/src/settings/run.rs`: add the resolved `RunAgentSettings::fabro_tools` boolean.\n- Modify `lib/crates/fabro-config/src/layers/run.rs`: add the optional layered `[run.agent] fabro_tools` field and options metadata.\n- Modify `lib/crates/fabro-config/src/resolve/run.rs`: resolve missing config to `false`.\n- Modify `lib/crates/fabro-config/src/tests/resolve_run.rs`: cover default, true, false, and layer override behavior.\n- Modify `lib/crates/fabro-static/src/env_vars.rs`: add a typed internal worker env var name.\n- Modify `lib/crates/fabro-server/src/worker_token.rs`: make `WorkerScopeSet::run_worker()` available to production code.\n- Modify `lib/crates/fabro-server/src/server.rs`: compute the opt-in flag from the run spec, choose worker JWT scopes, and pass the worker env flag.\n- Modify `lib/crates/fabro-server/src/server/tests.rs`: update worker command tests for default and opted-in scope/env behavior.\n- Modify `lib/crates/fabro-cli/src/commands/run/runner.rs`: gate `FabroRunToolServices` construction on the worker env flag and add unit coverage for the env parser.\n- Modify docs generator/reference docs: `lib/crates/fabro-dev/src/commands/docs_options_reference.rs`, `docs/public/reference/user-configuration.mdx`, and `docs/public/execution/run-configuration.mdx`.\n\n---\n\n### Task 1: Add Resolved Run Config\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/settings/run.rs`\n- Modify: `lib/crates/fabro-config/src/layers/run.rs`\n- Modify: `lib/crates/fabro-config/src/resolve/run.rs`\n- Test: `lib/crates/fabro-config/src/tests/resolve_run.rs`\n\n- [ ] **Step 1: Write config resolver tests first**\n\nAdd a `run_agent_fabro_tools` test module to `lib/crates/fabro-config/src/tests/resolve_run.rs` near the existing run settings tests.\n\n```rust\nmod run_agent_fabro_tools {\n    use crate::layers::Combine;\n    use crate::{SettingsLayer, WorkflowSettingsBuilder};\n\n    fn parse_settings(source: &str) -> SettingsLayer {\n        source\n            .parse::<SettingsLayer>()\n            .expect(\"fixture should parse via SettingsLayer\")\n    }\n\n    #[test]\n    fn defaults_to_false_when_run_agent_is_absent() {\n        let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())\n            .expect(\"empty settings should resolve\")\n            .run;\n\n        assert!(!settings.agent.fabro_tools);\n    }\n\n    #[test]\n    fn resolves_true_from_run_agent_table() {\n        let settings = WorkflowSettingsBuilder::from_toml(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = true\n\"#,\n        )\n        .expect(\"run.agent.fabro_tools should resolve\");\n\n        assert!(settings.run.agent.fabro_tools);\n    }\n\n    #[test]\n    fn resolves_explicit_false_from_run_agent_table() {\n        let settings = WorkflowSettingsBuilder::from_toml(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = false\n\"#,\n        )\n        .expect(\"run.agent.fabro_tools false should resolve\");\n\n        assert!(!settings.run.agent.fabro_tools);\n    }\n\n    #[test]\n    fn higher_layer_false_overrides_lower_true() {\n        let workflow = parse_settings(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = false\n\"#,\n        );\n        let user = parse_settings(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = true\n\"#,\n        );\n        let merged = workflow.combine(user);\n\n        let settings = WorkflowSettingsBuilder::from_layer(&merged)\n            .expect(\"merged settings should resolve\")\n            .run;\n\n        assert!(!settings.agent.fabro_tools);\n    }\n}\n```\n\n- [ ] **Step 2: Run the new tests and confirm they fail**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config run_agent_fabro_tools\n```\n\nExpected: compile failure mentioning `fabro_tools` is not a field, or parse failure saying `fabro_tools` is unknown.\n\n- [ ] **Step 3: Add the resolved setting**\n\nUpdate `RunAgentSettings` in `lib/crates/fabro-types/src/settings/run.rs`:\n\n```rust\n#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]\npub struct RunAgentSettings {\n    pub fabro_tools: bool,\n    pub permissions: Option<AgentPermissions>,\n    pub mcps:        HashMap<String, McpServerSettings>,\n}\n```\n\n- [ ] **Step 4: Add the layered TOML field**\n\nUpdate `RunAgentLayer` in `lib/crates/fabro-config/src/layers/run.rs`:\n\n```rust\n/// `[run.agent]` — agent knobs only (Fabro tools, permissions, MCPs).\n#[derive(\n    Debug,\n    Clone,\n    Default,\n    PartialEq,\n    Serialize,\n    Deserialize,\n    fabro_macros::Combine,\n    fabro_macros::OptionsMetadata,\n)]\n#[serde(deny_unknown_fields)]\npub struct RunAgentLayer {\n    /// Allow workflow agents to use Fabro run-management tools.\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    #[option(default = \"false\", value_type = \"boolean\")]\n    pub fabro_tools: Option<bool>,\n\n    /// Default tool permission level for workflow agents.\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    #[option(\n        default = \"\\\"read-write\\\"\",\n        value_type = \"\\\"read-only\\\" | \\\"read-write\\\" | \\\"full\\\"\"\n    )]\n    pub permissions: Option<AgentPermissions>,\n\n    /// Agent-scoped MCP server entries, keyed by name.\n    #[serde(default, skip_serializing_if = \"StickyMap::is_empty\")]\n    #[option(value_type = \"table\")]\n    pub mcps:        StickyMap<McpEntryLayer>,\n}\n```\n\n- [ ] **Step 5: Resolve the setting**\n\nUpdate `resolve_agent` in `lib/crates/fabro-config/src/resolve/run.rs`:\n\n```rust\nfn resolve_agent(agent: Option<&RunAgentLayer>) -> RunAgentSettings {\n    let Some(agent) = agent else {\n        return RunAgentSettings::default();\n    };\n\n    RunAgentSettings {\n        fabro_tools: agent.fabro_tools.unwrap_or(false),\n        permissions: agent.permissions,\n        mcps:        agent\n            .mcps\n            .iter()\n            .map(|(name, entry)| (name.clone(), resolve_mcp_entry(name, entry)))\n            .collect(),\n    }\n}\n```\n\n- [ ] **Step 6: Run config tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config run_agent_fabro_tools\n```\n\nExpected: PASS.\n\n- [ ] **Step 7: Commit**\n\n```bash\ngit add lib/crates/fabro-types/src/settings/run.rs lib/crates/fabro-config/src/layers/run.rs lib/crates/fabro-config/src/resolve/run.rs lib/crates/fabro-config/src/tests/resolve_run.rs\ngit commit -m \"feat: add run agent fabro tools setting\"\n```\n\n---\n\n### Task 2: Gate Worker JWT Scope and Worker Env\n\n**Files:**\n- Modify: `lib/crates/fabro-static/src/env_vars.rs`\n- Modify: `lib/crates/fabro-server/src/worker_token.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] **Step 1: Write server tests for default and opted-in runs**\n\nUpdate `worker_command_always_sets_worker_token_env` in `lib/crates/fabro-server/src/server/tests.rs` so the default case expects only `run:worker`. Add a second test that passes `agent_fabro_tools_enabled = true` and expects both scopes plus the worker env flag.\n\n```rust\n#[cfg(unix)]\n#[test]\nfn worker_command_default_token_omits_agent_run_tools_scope() {\n    let storage_dir = tempfile::tempdir().unwrap();\n    let state = worker_command_test_state(storage_dir.path(), &[\"dev-token\"], Some(TEST_DEV_TOKEN));\n    let run_id = RunId::new();\n\n    let cmd = worker_command(\n        state.as_ref(),\n        run_id,\n        RunExecutionMode::Start,\n        storage_dir.path(),\n        false,\n    )\n    .unwrap();\n\n    let EnvOverride::Set(token) = command_env_value(&cmd, EnvVars::FABRO_WORKER_TOKEN) else {\n        panic!(\"worker token env should be set\");\n    };\n    let claims = jsonwebtoken::decode::<crate::worker_token::WorkerTokenClaims>(\n        &token,\n        state.worker_token_keys().decoding_key(),\n        state.worker_token_keys().validation(),\n    )\n    .expect(\"worker token should decode\")\n    .claims;\n\n    assert_eq!(claims.scope.split_whitespace().collect::<Vec<_>>(), vec![\"run:worker\"]);\n    assert_eq!(\n        command_env_value(&cmd, EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS),\n        EnvOverride::Removed\n    );\n}\n\n#[cfg(unix)]\n#[test]\nfn worker_command_opt_in_token_includes_agent_run_tools_scope() {\n    let storage_dir = tempfile::tempdir().unwrap();\n    let state = worker_command_test_state(storage_dir.path(), &[\"dev-token\"], Some(TEST_DEV_TOKEN));\n    let run_id = RunId::new();\n\n    let cmd = worker_command(\n        state.as_ref(),\n        run_id,\n        RunExecutionMode::Start,\n        storage_dir.path(),\n        true,\n    )\n    .unwrap();\n\n    let EnvOverride::Set(token) = command_env_value(&cmd, EnvVars::FABRO_WORKER_TOKEN) else {\n        panic!(\"worker token env should be set\");\n    };\n    let claims = jsonwebtoken::decode::<crate::worker_token::WorkerTokenClaims>(\n        &token,\n        state.worker_token_keys().decoding_key(),\n        state.worker_token_keys().validation(),\n    )\n    .expect(\"worker token should decode\")\n    .claims;\n\n    assert_eq!(\n        claims.scope.split_whitespace().collect::<Vec<_>>(),\n        vec![\"run:worker\", \"agent:run_tools\"]\n    );\n    assert_eq!(\n        command_env_value(&cmd, EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS),\n        EnvOverride::Set(\"true\".to_string())\n    );\n}\n```\n\n- [ ] **Step 2: Run the server tests and confirm they fail**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server worker_command_\n```\n\nExpected: compile failure because `FABRO_WORKER_AGENT_RUN_TOOLS` and the new `worker_command` argument do not exist.\n\n- [ ] **Step 3: Add the internal env var constant**\n\nUpdate `lib/crates/fabro-static/src/env_vars.rs` near `FABRO_WORKER_TOKEN`:\n\n```rust\npub const FABRO_WORKER_AGENT_RUN_TOOLS: &'static str = \"FABRO_WORKER_AGENT_RUN_TOOLS\";\npub const FABRO_WORKER_TOKEN: &'static str = \"FABRO_WORKER_TOKEN\";\n```\n\nUpdate the EnvVars tests in the same file so the new constant is included in the alphabetized/core variable expectations.\n\n- [ ] **Step 4: Make the base worker scope constructor available**\n\nUpdate `lib/crates/fabro-server/src/worker_token.rs`:\n\n```rust\nimpl WorkerScopeSet {\n    #[must_use]\n    pub(crate) const fn run_worker() -> Self {\n        Self {\n            agent_run_tools: false,\n        }\n    }\n\n    #[must_use]\n    pub(crate) const fn run_worker_with_agent_run_tools() -> Self {\n        Self {\n            agent_run_tools: true,\n        }\n    }\n}\n```\n\nRemove only the `#[cfg(test)]` attribute from `run_worker`; leave the existing tests intact.\n\n- [ ] **Step 5: Add the worker command parameter and choose scopes**\n\nUpdate `worker_command` in `lib/crates/fabro-server/src/server.rs`:\n\n```rust\nfn worker_command(\n    state: &AppState,\n    run_id: RunId,\n    mode: RunExecutionMode,\n    run_dir: &std::path::Path,\n    agent_fabro_tools_enabled: bool,\n) -> anyhow::Result<Command> {\n    // existing setup...\n    let scopes = if agent_fabro_tools_enabled {\n        WorkerScopeSet::run_worker_with_agent_run_tools()\n    } else {\n        WorkerScopeSet::run_worker()\n    };\n    let worker_token = issue_worker_token_with_scopes(state.worker_token_keys(), &run_id, scopes)\n        .map_err(|_| anyhow::anyhow!(\"failed to sign worker token\"))?;\n\n    // existing Command construction...\n    cmd.env_remove(EnvVars::FABRO_WORKER_TOKEN);\n    cmd.env(EnvVars::FABRO_WORKER_TOKEN, worker_token);\n    cmd.env_remove(EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS);\n    if agent_fabro_tools_enabled {\n        cmd.env(EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS, \"true\");\n    }\n    // existing GitHub key forwarding...\n}\n```\n\nUpdate all `worker_command(...)` test call sites to pass `false` unless the test is explicitly about Fabro tool opt-in.\n\n- [ ] **Step 6: Load the effective run setting before spawning the worker**\n\nUpdate `execute_run_subprocess` in `lib/crates/fabro-server/src/server.rs` after `open_run` succeeds and before `spawn_blocking`:\n\n```rust\nlet run_state = match run_store.state().await {\n    Ok(run_state) => run_state,\n    Err(err) => {\n        tracing::error!(run_id = %run_id, error = %err, \"Failed to load run state\");\n        fail_managed_run(\n            &state,\n            run_id,\n            FailureReason::WorkflowError,\n            format!(\"Failed to load run state: {err}\"),\n        );\n        state.scheduler_notify.notify_one();\n        return;\n    }\n};\nlet agent_fabro_tools_enabled = run_state.spec.settings.run.agent.fabro_tools;\n```\n\nPass the boolean into `worker_command` inside the existing `spawn_blocking` closure:\n\n```rust\nworker_command(\n    state_for_build.as_ref(),\n    run_id,\n    execution_mode,\n    &run_dir_for_build,\n    agent_fabro_tools_enabled,\n)\n```\n\n- [ ] **Step 7: Run server tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server worker_command\n```\n\nExpected: PASS.\n\n- [ ] **Step 8: Commit**\n\n```bash\ngit add lib/crates/fabro-static/src/env_vars.rs lib/crates/fabro-server/src/worker_token.rs lib/crates/fabro-server/src/server.rs lib/crates/fabro-server/src/server/tests.rs\ngit commit -m \"feat: gate worker run tool scope by run setting\"\n```\n\n---\n\n### Task 3: Gate CLI Worker Tool Registration\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] **Step 1: Add a focused test for the env gate**\n\nAdd a `#[cfg(test)]` module at the bottom of `lib/crates/fabro-cli/src/commands/run/runner.rs`:\n\n```rust\n#[cfg(test)]\nmod tests {\n    use super::fabro_run_tools_enabled_from_env;\n\n    #[test]\n    fn fabro_run_tools_enabled_env_requires_true() {\n        assert!(!fabro_run_tools_enabled_from_env(None));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"\")));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"false\")));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"1\")));\n        assert!(fabro_run_tools_enabled_from_env(Some(\"true\")));\n    }\n}\n```\n\n- [ ] **Step 2: Run the new test and confirm it fails**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli fabro_run_tools_enabled_env_requires_true\n```\n\nExpected: compile failure because `fabro_run_tools_enabled_from_env` does not exist.\n\n- [ ] **Step 3: Add the env parsing helper**\n\nAdd this helper near `build_fabro_run_tool_services` in `lib/crates/fabro-cli/src/commands/run/runner.rs`:\n\n```rust\nfn fabro_run_tools_enabled_from_env(value: Option<&str>) -> bool {\n    value == Some(\"true\")\n}\n```\n\n- [ ] **Step 4: Gate service construction in worker startup**\n\nReplace the unconditional `build_fabro_run_tool_services(...)` call in `execute` with:\n\n```rust\nlet fabro_run_tools = if fabro_run_tools_enabled_from_env(process_env_var(\n    EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS,\n).as_deref()) {\n    build_fabro_run_tool_services(\n        worker_token,\n        client.clone_for_reuse(),\n        run_id,\n        run_spec.source_directory.as_deref(),\n        &run_dir,\n        Arc::clone(&catalog),\n    )\n} else {\n    None\n};\n```\n\nKeep `build_fabro_run_tool_services` returning `None` for an empty token. That keeps token presence as a second local guard.\n\n- [ ] **Step 5: Run CLI tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli fabro_run_tools_enabled_env_requires_true\ncargo nextest run -p fabro-cli --test it runner\n```\n\nExpected: PASS.\n\n- [ ] **Step 6: Commit**\n\n```bash\ngit add lib/crates/fabro-cli/src/commands/run/runner.rs\ngit commit -m \"feat: register fabro run tools only when opted in\"\n```\n\n---\n\n### Task 4: Update Docs and Generated Reference Text\n\n**Files:**\n- Modify: `lib/crates/fabro-dev/src/commands/docs_options_reference.rs`\n- Modify: `docs/public/reference/user-configuration.mdx`\n- Modify: `docs/public/execution/run-configuration.mdx`\n\n- [ ] **Step 1: Update the docs generator sample**\n\nUpdate the `[run.agent]` sample in `docs_options_reference.rs`:\n\n```rust\nSection::of::<fabro_config::RunAgentLayer>(\n    \"[run.agent]\",\n    r#\"[run.agent]\nfabro_tools = true\npermissions = \"read-write\"\"#,\n),\n```\n\n- [ ] **Step 2: Update generated/reference docs**\n\nIn `docs/public/reference/user-configuration.mdx`, update the `[run.agent]` description, example, and options table:\n\n```mdx\n## `[run.agent]`\n\n`[run.agent]` — agent knobs only (Fabro tools, permissions, MCPs)\n\n```toml\n[run.agent]\nfabro_tools = true\npermissions = \"read-write\"\n```\n\n| Option | Type | Default | Description |\n| --- | --- | --- | --- |\n| `fabro_tools` | boolean | false | Allow workflow agents to use Fabro run-management tools. |\n| `mcps` | table | None | Agent-scoped MCP server entries, keyed by name. |\n| `permissions` | \"read-only\" \\| \"read-write\" \\| \"full\" | \"read-write\" | Default tool permission level for workflow agents. |\n```\n\n- [ ] **Step 3: Add user-facing run configuration docs**\n\nIn `docs/public/execution/run-configuration.mdx`, add a short section before the existing `[run.agent.mcps]` section:\n\n```mdx\n### `[run.agent]`\n\nConfigure workflow agent behavior that is not tied to a single stage.\n\n```toml\n[run.agent]\nfabro_tools = true\n```\n\n`fabro_tools` defaults to `false`. Set it to `true` only for runs whose agents should be able to create, search, inspect, and interact with Fabro runs through the built-in Fabro run tools. This setting is separate from normal agent `permissions` and from MCP server configuration.\n```\n\n- [ ] **Step 4: Run docs/reference checks**\n\nRun:\n\n```bash\ncargo dev docs check\n```\n\nExpected before regenerating docs: FAIL with `docs/public/reference/user-configuration.mdx is stale; run cargo dev docs refresh`.\n\nThen run:\n\n```bash\ncargo dev docs refresh\ncargo dev docs check\n```\n\nExpected: PASS.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add lib/crates/fabro-dev/src/commands/docs_options_reference.rs docs/public/reference/user-configuration.mdx docs/public/execution/run-configuration.mdx\ngit commit -m \"docs: document run agent fabro tools opt in\"\n```\n\n---\n\n### Task 5: Full Verification\n\n**Files:**\n- No source edits unless verification finds a defect.\n\n- [ ] **Step 1: Run targeted package tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config\ncargo nextest run -p fabro-server\ncargo nextest run -p fabro-cli\n```\n\nExpected: all PASS.\n\n- [ ] **Step 2: Run formatting check**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\nExpected: PASS.\n\n- [ ] **Step 3: Run clippy for touched Rust crates**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 clippy -p fabro-types -p fabro-config -p fabro-static -p fabro-server -p fabro-cli -p fabro-dev --all-targets -- -D warnings\n```\n\nExpected: PASS.\n\n- [ ] **Step 4: Manually review behavior**\n\nConfirm these invariants in the final diff:\n\n```text\nDefault run:\n- resolved run.agent.fabro_tools == false\n- worker JWT scope == \"run:worker\"\n- FABRO_WORKER_AGENT_RUN_TOOLS is absent from worker env\n- StartServices.fabro_run_tools == None\n\nOpted-in run:\n- resolved run.agent.fabro_tools == true\n- worker JWT scope == \"run:worker agent:run_tools\"\n- FABRO_WORKER_AGENT_RUN_TOOLS == \"true\"\n- StartServices.fabro_run_tools is Some(...)\n```\n\n- [ ] **Step 5: Commit verification fixes**\n\nWhen verification changes files, inspect the exact paths and commit them:\n\n```bash\ngit status --short\ngit add -u\ngit commit -m \"test: cover run agent fabro tools opt in\"\n```\n\n---\n\n## Assumptions and Defaults\n\n- `fabro_tools` is a per-run opt-in setting only; this plan does not add a separate server-wide allow/deny policy.\n- Defaulting to `false` intentionally changes existing behavior: runs that need Fabro run tools must set `[run.agent] fabro_tools = true`.\n- `run.agent.permissions` remains about ordinary agent tool permissions and does not imply Fabro API access.\n- `[run.agent.mcps]` remains independent; MCP tools are not enabled or disabled by `fabro_tools`.\n- `fabro mcp start` and standalone MCP exposure of Fabro tools are out of scope.\n- The private worker env var uses the exact string `\"true\"` as the only enabling value, so accidental values such as `\"1\"` or `\"yes\"` do not grant tools.\n- The hidden `__run-worker` CLI argument contract should not grow; use the env var rather than a new hidden CLI flag.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": []
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "sandbox": {
+          "provider": "daytona",
+          "preserve": false,
+          "stop_on_terminal": true,
+          "devcontainer": false,
+          "env": {},
+          "docker": {
+            "image": "buildpack-deps:noble",
+            "network_mode": null,
+            "memory_limit": 4000000000,
+            "cpu_quota": 200000,
+            "env_vars": {}
+          },
+          "daytona": {
+            "auto_stop_interval": 30,
+            "labels": {
+              "repo": "fabro-sh/fabro"
+            },
+            "volumes": [],
+            "snapshot": {
+              "name": "fabro-v11",
+              "cpu": 8,
+              "memory_gb": 16,
+              "disk_gb": 20,
+              "dockerfile": {
+                "type": "inline",
+                "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+              }
+            },
+            "network": null
+          }
+        },
+        "notifications": {},
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "start": {
+          "id": "start",
+          "attrs": {
+            "label": {
+              "String": "Start"
+            },
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fmt": {
+          "id": "fmt",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Format"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 fmt --all 2>&1"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Preflight Compile"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "goal_gate": {
+              "Boolean": true
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "retry_target": {
+              "String": "fixup"
+            },
+            "label": {
+              "String": "Verify"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "Msquare"
+            },
+            "label": {
+              "String": "Exit"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Fixup"
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors."
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "fmt",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "fmt",
+          "to": "exit",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "goal": {
+          "String": "# Run Agent Fabro Tools Opt-In Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `[run.agent] fabro_tools = true/false`, defaulting to `false`, so workflow agents only get Fabro run tools and the `agent:run_tools` worker JWT scope when a run opts in.\n\n**Architecture:** Treat `run.agent.fabro_tools` as the source of truth in resolved run settings. The server reads the effective run setting before spawning `__run-worker`, issues the worker token with or without `agent:run_tools`, and passes a private worker env flag so the CLI worker registers Fabro run tools only for opted-in runs. Server-side JWT scope checks remain the authorization backstop.\n\n**Tech Stack:** Rust, Serde TOML config layers, Fabro worker JWT scopes, Tokio subprocess spawning, `cargo nextest`.\n\n---\n\n## File Map\n\n- Modify `lib/crates/fabro-types/src/settings/run.rs`: add the resolved `RunAgentSettings::fabro_tools` boolean.\n- Modify `lib/crates/fabro-config/src/layers/run.rs`: add the optional layered `[run.agent] fabro_tools` field and options metadata.\n- Modify `lib/crates/fabro-config/src/resolve/run.rs`: resolve missing config to `false`.\n- Modify `lib/crates/fabro-config/src/tests/resolve_run.rs`: cover default, true, false, and layer override behavior.\n- Modify `lib/crates/fabro-static/src/env_vars.rs`: add a typed internal worker env var name.\n- Modify `lib/crates/fabro-server/src/worker_token.rs`: make `WorkerScopeSet::run_worker()` available to production code.\n- Modify `lib/crates/fabro-server/src/server.rs`: compute the opt-in flag from the run spec, choose worker JWT scopes, and pass the worker env flag.\n- Modify `lib/crates/fabro-server/src/server/tests.rs`: update worker command tests for default and opted-in scope/env behavior.\n- Modify `lib/crates/fabro-cli/src/commands/run/runner.rs`: gate `FabroRunToolServices` construction on the worker env flag and add unit coverage for the env parser.\n- Modify docs generator/reference docs: `lib/crates/fabro-dev/src/commands/docs_options_reference.rs`, `docs/public/reference/user-configuration.mdx`, and `docs/public/execution/run-configuration.mdx`.\n\n---\n\n### Task 1: Add Resolved Run Config\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/settings/run.rs`\n- Modify: `lib/crates/fabro-config/src/layers/run.rs`\n- Modify: `lib/crates/fabro-config/src/resolve/run.rs`\n- Test: `lib/crates/fabro-config/src/tests/resolve_run.rs`\n\n- [ ] **Step 1: Write config resolver tests first**\n\nAdd a `run_agent_fabro_tools` test module to `lib/crates/fabro-config/src/tests/resolve_run.rs` near the existing run settings tests.\n\n```rust\nmod run_agent_fabro_tools {\n    use crate::layers::Combine;\n    use crate::{SettingsLayer, WorkflowSettingsBuilder};\n\n    fn parse_settings(source: &str) -> SettingsLayer {\n        source\n            .parse::<SettingsLayer>()\n            .expect(\"fixture should parse via SettingsLayer\")\n    }\n\n    #[test]\n    fn defaults_to_false_when_run_agent_is_absent() {\n        let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())\n            .expect(\"empty settings should resolve\")\n            .run;\n\n        assert!(!settings.agent.fabro_tools);\n    }\n\n    #[test]\n    fn resolves_true_from_run_agent_table() {\n        let settings = WorkflowSettingsBuilder::from_toml(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = true\n\"#,\n        )\n        .expect(\"run.agent.fabro_tools should resolve\");\n\n        assert!(settings.run.agent.fabro_tools);\n    }\n\n    #[test]\n    fn resolves_explicit_false_from_run_agent_table() {\n        let settings = WorkflowSettingsBuilder::from_toml(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = false\n\"#,\n        )\n        .expect(\"run.agent.fabro_tools false should resolve\");\n\n        assert!(!settings.run.agent.fabro_tools);\n    }\n\n    #[test]\n    fn higher_layer_false_overrides_lower_true() {\n        let workflow = parse_settings(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = false\n\"#,\n        );\n        let user = parse_settings(\n            r#\"\n_version = 1\n\n[run.agent]\nfabro_tools = true\n\"#,\n        );\n        let merged = workflow.combine(user);\n\n        let settings = WorkflowSettingsBuilder::from_layer(&merged)\n            .expect(\"merged settings should resolve\")\n            .run;\n\n        assert!(!settings.agent.fabro_tools);\n    }\n}\n```\n\n- [ ] **Step 2: Run the new tests and confirm they fail**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config run_agent_fabro_tools\n```\n\nExpected: compile failure mentioning `fabro_tools` is not a field, or parse failure saying `fabro_tools` is unknown.\n\n- [ ] **Step 3: Add the resolved setting**\n\nUpdate `RunAgentSettings` in `lib/crates/fabro-types/src/settings/run.rs`:\n\n```rust\n#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]\npub struct RunAgentSettings {\n    pub fabro_tools: bool,\n    pub permissions: Option<AgentPermissions>,\n    pub mcps:        HashMap<String, McpServerSettings>,\n}\n```\n\n- [ ] **Step 4: Add the layered TOML field**\n\nUpdate `RunAgentLayer` in `lib/crates/fabro-config/src/layers/run.rs`:\n\n```rust\n/// `[run.agent]` — agent knobs only (Fabro tools, permissions, MCPs).\n#[derive(\n    Debug,\n    Clone,\n    Default,\n    PartialEq,\n    Serialize,\n    Deserialize,\n    fabro_macros::Combine,\n    fabro_macros::OptionsMetadata,\n)]\n#[serde(deny_unknown_fields)]\npub struct RunAgentLayer {\n    /// Allow workflow agents to use Fabro run-management tools.\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    #[option(default = \"false\", value_type = \"boolean\")]\n    pub fabro_tools: Option<bool>,\n\n    /// Default tool permission level for workflow agents.\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    #[option(\n        default = \"\\\"read-write\\\"\",\n        value_type = \"\\\"read-only\\\" | \\\"read-write\\\" | \\\"full\\\"\"\n    )]\n    pub permissions: Option<AgentPermissions>,\n\n    /// Agent-scoped MCP server entries, keyed by name.\n    #[serde(default, skip_serializing_if = \"StickyMap::is_empty\")]\n    #[option(value_type = \"table\")]\n    pub mcps:        StickyMap<McpEntryLayer>,\n}\n```\n\n- [ ] **Step 5: Resolve the setting**\n\nUpdate `resolve_agent` in `lib/crates/fabro-config/src/resolve/run.rs`:\n\n```rust\nfn resolve_agent(agent: Option<&RunAgentLayer>) -> RunAgentSettings {\n    let Some(agent) = agent else {\n        return RunAgentSettings::default();\n    };\n\n    RunAgentSettings {\n        fabro_tools: agent.fabro_tools.unwrap_or(false),\n        permissions: agent.permissions,\n        mcps:        agent\n            .mcps\n            .iter()\n            .map(|(name, entry)| (name.clone(), resolve_mcp_entry(name, entry)))\n            .collect(),\n    }\n}\n```\n\n- [ ] **Step 6: Run config tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config run_agent_fabro_tools\n```\n\nExpected: PASS.\n\n- [ ] **Step 7: Commit**\n\n```bash\ngit add lib/crates/fabro-types/src/settings/run.rs lib/crates/fabro-config/src/layers/run.rs lib/crates/fabro-config/src/resolve/run.rs lib/crates/fabro-config/src/tests/resolve_run.rs\ngit commit -m \"feat: add run agent fabro tools setting\"\n```\n\n---\n\n### Task 2: Gate Worker JWT Scope and Worker Env\n\n**Files:**\n- Modify: `lib/crates/fabro-static/src/env_vars.rs`\n- Modify: `lib/crates/fabro-server/src/worker_token.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] **Step 1: Write server tests for default and opted-in runs**\n\nUpdate `worker_command_always_sets_worker_token_env` in `lib/crates/fabro-server/src/server/tests.rs` so the default case expects only `run:worker`. Add a second test that passes `agent_fabro_tools_enabled = true` and expects both scopes plus the worker env flag.\n\n```rust\n#[cfg(unix)]\n#[test]\nfn worker_command_default_token_omits_agent_run_tools_scope() {\n    let storage_dir = tempfile::tempdir().unwrap();\n    let state = worker_command_test_state(storage_dir.path(), &[\"dev-token\"], Some(TEST_DEV_TOKEN));\n    let run_id = RunId::new();\n\n    let cmd = worker_command(\n        state.as_ref(),\n        run_id,\n        RunExecutionMode::Start,\n        storage_dir.path(),\n        false,\n    )\n    .unwrap();\n\n    let EnvOverride::Set(token) = command_env_value(&cmd, EnvVars::FABRO_WORKER_TOKEN) else {\n        panic!(\"worker token env should be set\");\n    };\n    let claims = jsonwebtoken::decode::<crate::worker_token::WorkerTokenClaims>(\n        &token,\n        state.worker_token_keys().decoding_key(),\n        state.worker_token_keys().validation(),\n    )\n    .expect(\"worker token should decode\")\n    .claims;\n\n    assert_eq!(claims.scope.split_whitespace().collect::<Vec<_>>(), vec![\"run:worker\"]);\n    assert_eq!(\n        command_env_value(&cmd, EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS),\n        EnvOverride::Removed\n    );\n}\n\n#[cfg(unix)]\n#[test]\nfn worker_command_opt_in_token_includes_agent_run_tools_scope() {\n    let storage_dir = tempfile::tempdir().unwrap();\n    let state = worker_command_test_state(storage_dir.path(), &[\"dev-token\"], Some(TEST_DEV_TOKEN));\n    let run_id = RunId::new();\n\n    let cmd = worker_command(\n        state.as_ref(),\n        run_id,\n        RunExecutionMode::Start,\n        storage_dir.path(),\n        true,\n    )\n    .unwrap();\n\n    let EnvOverride::Set(token) = command_env_value(&cmd, EnvVars::FABRO_WORKER_TOKEN) else {\n        panic!(\"worker token env should be set\");\n    };\n    let claims = jsonwebtoken::decode::<crate::worker_token::WorkerTokenClaims>(\n        &token,\n        state.worker_token_keys().decoding_key(),\n        state.worker_token_keys().validation(),\n    )\n    .expect(\"worker token should decode\")\n    .claims;\n\n    assert_eq!(\n        claims.scope.split_whitespace().collect::<Vec<_>>(),\n        vec![\"run:worker\", \"agent:run_tools\"]\n    );\n    assert_eq!(\n        command_env_value(&cmd, EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS),\n        EnvOverride::Set(\"true\".to_string())\n    );\n}\n```\n\n- [ ] **Step 2: Run the server tests and confirm they fail**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server worker_command_\n```\n\nExpected: compile failure because `FABRO_WORKER_AGENT_RUN_TOOLS` and the new `worker_command` argument do not exist.\n\n- [ ] **Step 3: Add the internal env var constant**\n\nUpdate `lib/crates/fabro-static/src/env_vars.rs` near `FABRO_WORKER_TOKEN`:\n\n```rust\npub const FABRO_WORKER_AGENT_RUN_TOOLS: &'static str = \"FABRO_WORKER_AGENT_RUN_TOOLS\";\npub const FABRO_WORKER_TOKEN: &'static str = \"FABRO_WORKER_TOKEN\";\n```\n\nUpdate the EnvVars tests in the same file so the new constant is included in the alphabetized/core variable expectations.\n\n- [ ] **Step 4: Make the base worker scope constructor available**\n\nUpdate `lib/crates/fabro-server/src/worker_token.rs`:\n\n```rust\nimpl WorkerScopeSet {\n    #[must_use]\n    pub(crate) const fn run_worker() -> Self {\n        Self {\n            agent_run_tools: false,\n        }\n    }\n\n    #[must_use]\n    pub(crate) const fn run_worker_with_agent_run_tools() -> Self {\n        Self {\n            agent_run_tools: true,\n        }\n    }\n}\n```\n\nRemove only the `#[cfg(test)]` attribute from `run_worker`; leave the existing tests intact.\n\n- [ ] **Step 5: Add the worker command parameter and choose scopes**\n\nUpdate `worker_command` in `lib/crates/fabro-server/src/server.rs`:\n\n```rust\nfn worker_command(\n    state: &AppState,\n    run_id: RunId,\n    mode: RunExecutionMode,\n    run_dir: &std::path::Path,\n    agent_fabro_tools_enabled: bool,\n) -> anyhow::Result<Command> {\n    // existing setup...\n    let scopes = if agent_fabro_tools_enabled {\n        WorkerScopeSet::run_worker_with_agent_run_tools()\n    } else {\n        WorkerScopeSet::run_worker()\n    };\n    let worker_token = issue_worker_token_with_scopes(state.worker_token_keys(), &run_id, scopes)\n        .map_err(|_| anyhow::anyhow!(\"failed to sign worker token\"))?;\n\n    // existing Command construction...\n    cmd.env_remove(EnvVars::FABRO_WORKER_TOKEN);\n    cmd.env(EnvVars::FABRO_WORKER_TOKEN, worker_token);\n    cmd.env_remove(EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS);\n    if agent_fabro_tools_enabled {\n        cmd.env(EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS, \"true\");\n    }\n    // existing GitHub key forwarding...\n}\n```\n\nUpdate all `worker_command(...)` test call sites to pass `false` unless the test is explicitly about Fabro tool opt-in.\n\n- [ ] **Step 6: Load the effective run setting before spawning the worker**\n\nUpdate `execute_run_subprocess` in `lib/crates/fabro-server/src/server.rs` after `open_run` succeeds and before `spawn_blocking`:\n\n```rust\nlet run_state = match run_store.state().await {\n    Ok(run_state) => run_state,\n    Err(err) => {\n        tracing::error!(run_id = %run_id, error = %err, \"Failed to load run state\");\n        fail_managed_run(\n            &state,\n            run_id,\n            FailureReason::WorkflowError,\n            format!(\"Failed to load run state: {err}\"),\n        );\n        state.scheduler_notify.notify_one();\n        return;\n    }\n};\nlet agent_fabro_tools_enabled = run_state.spec.settings.run.agent.fabro_tools;\n```\n\nPass the boolean into `worker_command` inside the existing `spawn_blocking` closure:\n\n```rust\nworker_command(\n    state_for_build.as_ref(),\n    run_id,\n    execution_mode,\n    &run_dir_for_build,\n    agent_fabro_tools_enabled,\n)\n```\n\n- [ ] **Step 7: Run server tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server worker_command\n```\n\nExpected: PASS.\n\n- [ ] **Step 8: Commit**\n\n```bash\ngit add lib/crates/fabro-static/src/env_vars.rs lib/crates/fabro-server/src/worker_token.rs lib/crates/fabro-server/src/server.rs lib/crates/fabro-server/src/server/tests.rs\ngit commit -m \"feat: gate worker run tool scope by run setting\"\n```\n\n---\n\n### Task 3: Gate CLI Worker Tool Registration\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] **Step 1: Add a focused test for the env gate**\n\nAdd a `#[cfg(test)]` module at the bottom of `lib/crates/fabro-cli/src/commands/run/runner.rs`:\n\n```rust\n#[cfg(test)]\nmod tests {\n    use super::fabro_run_tools_enabled_from_env;\n\n    #[test]\n    fn fabro_run_tools_enabled_env_requires_true() {\n        assert!(!fabro_run_tools_enabled_from_env(None));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"\")));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"false\")));\n        assert!(!fabro_run_tools_enabled_from_env(Some(\"1\")));\n        assert!(fabro_run_tools_enabled_from_env(Some(\"true\")));\n    }\n}\n```\n\n- [ ] **Step 2: Run the new test and confirm it fails**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli fabro_run_tools_enabled_env_requires_true\n```\n\nExpected: compile failure because `fabro_run_tools_enabled_from_env` does not exist.\n\n- [ ] **Step 3: Add the env parsing helper**\n\nAdd this helper near `build_fabro_run_tool_services` in `lib/crates/fabro-cli/src/commands/run/runner.rs`:\n\n```rust\nfn fabro_run_tools_enabled_from_env(value: Option<&str>) -> bool {\n    value == Some(\"true\")\n}\n```\n\n- [ ] **Step 4: Gate service construction in worker startup**\n\nReplace the unconditional `build_fabro_run_tool_services(...)` call in `execute` with:\n\n```rust\nlet fabro_run_tools = if fabro_run_tools_enabled_from_env(process_env_var(\n    EnvVars::FABRO_WORKER_AGENT_RUN_TOOLS,\n).as_deref()) {\n    build_fabro_run_tool_services(\n        worker_token,\n        client.clone_for_reuse(),\n        run_id,\n        run_spec.source_directory.as_deref(),\n        &run_dir,\n        Arc::clone(&catalog),\n    )\n} else {\n    None\n};\n```\n\nKeep `build_fabro_run_tool_services` returning `None` for an empty token. That keeps token presence as a second local guard.\n\n- [ ] **Step 5: Run CLI tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli fabro_run_tools_enabled_env_requires_true\ncargo nextest run -p fabro-cli --test it runner\n```\n\nExpected: PASS.\n\n- [ ] **Step 6: Commit**\n\n```bash\ngit add lib/crates/fabro-cli/src/commands/run/runner.rs\ngit commit -m \"feat: register fabro run tools only when opted in\"\n```\n\n---\n\n### Task 4: Update Docs and Generated Reference Text\n\n**Files:**\n- Modify: `lib/crates/fabro-dev/src/commands/docs_options_reference.rs`\n- Modify: `docs/public/reference/user-configuration.mdx`\n- Modify: `docs/public/execution/run-configuration.mdx`\n\n- [ ] **Step 1: Update the docs generator sample**\n\nUpdate the `[run.agent]` sample in `docs_options_reference.rs`:\n\n```rust\nSection::of::<fabro_config::RunAgentLayer>(\n    \"[run.agent]\",\n    r#\"[run.agent]\nfabro_tools = true\npermissions = \"read-write\"\"#,\n),\n```\n\n- [ ] **Step 2: Update generated/reference docs**\n\nIn `docs/public/reference/user-configuration.mdx`, update the `[run.agent]` description, example, and options table:\n\n```mdx\n## `[run.agent]`\n\n`[run.agent]` — agent knobs only (Fabro tools, permissions, MCPs)\n\n```toml\n[run.agent]\nfabro_tools = true\npermissions = \"read-write\"\n```\n\n| Option | Type | Default | Description |\n| --- | --- | --- | --- |\n| `fabro_tools` | boolean | false | Allow workflow agents to use Fabro run-management tools. |\n| `mcps` | table | None | Agent-scoped MCP server entries, keyed by name. |\n| `permissions` | \"read-only\" \\| \"read-write\" \\| \"full\" | \"read-write\" | Default tool permission level for workflow agents. |\n```\n\n- [ ] **Step 3: Add user-facing run configuration docs**\n\nIn `docs/public/execution/run-configuration.mdx`, add a short section before the existing `[run.agent.mcps]` section:\n\n```mdx\n### `[run.agent]`\n\nConfigure workflow agent behavior that is not tied to a single stage.\n\n```toml\n[run.agent]\nfabro_tools = true\n```\n\n`fabro_tools` defaults to `false`. Set it to `true` only for runs whose agents should be able to create, search, inspect, and interact with Fabro runs through the built-in Fabro run tools. This setting is separate from normal agent `permissions` and from MCP server configuration.\n```\n\n- [ ] **Step 4: Run docs/reference checks**\n\nRun:\n\n```bash\ncargo dev docs check\n```\n\nExpected before regenerating docs: FAIL with `docs/public/reference/user-configuration.mdx is stale; run cargo dev docs refresh`.\n\nThen run:\n\n```bash\ncargo dev docs refresh\ncargo dev docs check\n```\n\nExpected: PASS.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add lib/crates/fabro-dev/src/commands/docs_options_reference.rs docs/public/reference/user-configuration.mdx docs/public/execution/run-configuration.mdx\ngit commit -m \"docs: document run agent fabro tools opt in\"\n```\n\n---\n\n### Task 5: Full Verification\n\n**Files:**\n- No source edits unless verification finds a defect.\n\n- [ ] **Step 1: Run targeted package tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config\ncargo nextest run -p fabro-server\ncargo nextest run -p fabro-cli\n```\n\nExpected: all PASS.\n\n- [ ] **Step 2: Run formatting check**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\nExpected: PASS.\n\n- [ ] **Step 3: Run clippy for touched Rust crates**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 clippy -p fabro-types -p fabro-config -p fabro-static -p fabro-server -p fabro-cli -p fabro-dev --all-targets -- -D warnings\n```\n\nExpected: PASS.\n\n- [ ] **Step 4: Manually review behavior**\n\nConfirm these invariants in the final diff:\n\n```text\nDefault run:\n- resolved run.agent.fabro_tools == false\n- worker JWT scope == \"run:worker\"\n- FABRO_WORKER_AGENT_RUN_TOOLS is absent from worker env\n- StartServices.fabro_run_tools == None\n\nOpted-in run:\n- resolved run.agent.fabro_tools == true\n- worker JWT scope == \"run:worker agent:run_tools\"\n- FABRO_WORKER_AGENT_RUN_TOOLS == \"true\"\n- StartServices.fabro_run_tools is Some(...)\n```\n\n- [ ] **Step 5: Commit verification fixes**\n\nWhen verification changes files, inspect the exact paths and commit them:\n\n```bash\ngit status --short\ngit add -u\ngit commit -m \"test: cover run agent fabro tools opt in\"\n```\n\n---\n\n## Assumptions and Defaults\n\n- `fabro_tools` is a per-run opt-in setting only; this plan does not add a separate server-wide allow/deny policy.\n- Defaulting to `false` intentionally changes existing behavior: runs that need Fabro run tools must set `[run.agent] fabro_tools = true`.\n- `run.agent.permissions` remains about ordinary agent tool permissions and does not imply Fabro API access.\n- `[run.agent.mcps]` remains independent; MCP tools are not enabled or disabled by `fabro_tools`.\n- `fabro mcp start` and standalone MCP exposure of Fabro tools are out of scope.\n- The private worker env var uses the exact string `\"true\"` as the only enabling value, so accidental values such as `\"1\"` or `\"yes\"` do not grant tools.\n- The hidden `__run-worker` CLI argument contract should not grow; use the env var rather than a new hidden CLI flag.\n"
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "rankdir": {
+          "String": "LR"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all clippy lint warnings, test failures, and generated docs errors.\", max_visits=3]\n    fmt               [label=\"Format\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 fmt --all 2>&1\", max_retries=0]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> fmt   [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n    fmt -> exit\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.240.0-nightly.1"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.240.0-nightly.1",
+        "name": "fabro-cli",
+        "version": "0.240.0-nightly.1"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github"
+      }
+    },
+    "manifest_blob": "3f5237045d8c3989ecc5d0aa690c2f7bf247aed323be4f4d9f68b62a9b7dcc63",
+    "definition_blob": "3ba6b8c938e8ad1844c5485d0892698cca79b060a264ff6185036cc3a6ad862a",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "3831c157fbc8651b4d906d8d2a5b48508aec7279",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KS7SVN82CXM5KSTHQX65E735",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-22T12:16:44.331016Z",
+  "last_event_at": "2026-05-22T12:17:01.393190Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "image": "buildpack-deps:noble",
+    "snapshot": "fabro-v11",
+    "runtime": {
+      "id": "fabro-01KS7SVN82CXM5KSTHQX65E735",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
