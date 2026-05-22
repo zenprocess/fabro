@@ -518,7 +518,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-22T12:03:57.890398Z",
-  "last_event_at": "2026-05-22T12:04:06.182913Z",
+  "last_event_at": "2026-05-22T12:06:21.933190Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -616,9 +616,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 37,
       "checkpoint": {
-        "timestamp": "2026-05-22T12:06:17.546362Z",
+        "timestamp": "2026-05-22T12:06:21.931571Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -627,23 +627,95 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "graph.rankdir": "LR",
+          "graph.goal": "# Ask Fabro Sidebar Wiring — Implementation Plan\n\n> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use `- [ ]` checkboxes.\n\n**Goal:** Ship the Ask Fabro sidebar on run pages — wired to real session APIs, with the agent able to inspect *and control* its owning run.\n\n**Architecture:** Two phases. Phase 1 (Rust): give Ask Fabro agent sessions the full `fabro_run_interact` + `fabro_run_events` tools, scoped to the owning run, via the existing HTTP `FabroClient` backend. Phase 2 (web): replace the scripted sidebar adapter with real session calls; drop `?ask=1`, gate on `run.ask_fabro.available`.\n\n**Tech Stack:** Rust (fabro-server, fabro-workflow, fabro-tool), React 19 + assistant-ui (fabro-web), generated API clients.\n\n**Decisions locked:**\n- Reuse `fabro-tool` — no new tool.\n- Subset = `fabro_run_interact` + `fabro_run_events`, **full access** (incl. mutating actions: start/cancel/steer/archive/answer).\n- Backend = existing HTTP `FabroClient` (already implements all reads + mutations).\n- Scoped to owning run — enforced by a same-run worker token; the API 403s cross-run calls.\n- File/shell tools stay read-only in Ask Fabro sessions (only the two run tools get full access).\n- Gate the sidebar on `run.ask_fabro.available`; drop `?ask=1`.\n\n---\n\n## Background (current state)\n\n- API endpoints exist (`296fbddec`): `SessionDetail`, `/sessions/{id}/events`, `/sessions/{id}/attach`, turn submission w/ `x-fabro-turn-id`, `Run.ask_fabro` readiness. Web helpers exist: `session-stream.ts`, `sessionsApi`.\n- Sidebar (`ask-fabro-sidebar.tsx`) is a prototype: scripted adapter (`chats-runtime.ts`/`chats-script.ts`), no API calls, gated behind `?ask=1` (`run-detail.tsx:363`).\n- Ask Fabro sessions built by `build_agent_session` (`fabro-server/.../handler/sessions.rs:633`): profile + run sandbox + `ReadOnly` gate (`build_ask_fabro_tool_approval`, `sessions.rs:867`). **No `fabro_run_*` tools.**\n- `fabro-tool`: tools built on the `FabroToolBackend` trait. `fabro_client::FabroClient` is the HTTP impl — already implements every trait method (reads + mutations). `FabroRunToolServices`, `register_fabro_run_tools`, `execute_fabro_run_tool` live in `fabro-workflow` (`handler/llm/api.rs`, `services.rs`); `register_fabro_run_tools` registers all 5 tools.\n- Worker tokens: `worker_token.rs` — `issue_worker_token(keys, &run_id)` mints a base same-run token; `AppState::worker_token_keys()` exposes the keys. `server.rs` already mints tokens this way for dispatched workers.\n- `register_fabro_run_tools` is `pub(crate)`; `fabro-server` already depends on `fabro-workflow`.\n\n---\n\n## File structure\n\n**Phase 1 — Rust**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs` — make `register_fabro_run_tools` `pub`; add subset variant.\n- Modify: `lib/crates/fabro-server/src/server/handler/sessions.rs` — `build_profile` returns `Box`; mint worker token, build `FabroClient`, register subset; allowlist the two tools in the gate.\n\n**Phase 2 — Web**\n- Create: `apps/fabro-web/app/lib/ask-fabro-runtime.ts` — real session adapter.\n- Modify: `apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx` — use real adapter, take `runId`.\n- Modify: `apps/fabro-web/app/routes/run-detail.tsx` — drop `?ask=1`, gate on `run.ask_fabro`.\n- Delete (verify orphaned first): `apps/fabro-web/app/lib/chats-script.ts` + scripted paths in `chats-runtime.ts`.\n\n---\n\n## Phase 1: Run tools for Ask Fabro sessions\n\n### Task 1 — Make run-tool registration callable from fabro-server\n\n- [ ] In `fabro-workflow/src/handler/llm/api.rs`: change `register_fabro_run_tools` from `pub(crate)` to `pub`. Add a subset variant:\n  ```rust\n  pub fn register_fabro_run_tools_subset(\n      registry: &mut ToolRegistry,\n      services: &FabroRunToolServices,\n      only: &[&str],\n  ) {\n      for definition in fabro_tool::tool_definitions() {\n          if only.is_empty() || only.contains(&definition.name) {\n              registry.register(fabro_run_tool(definition, services.clone()));\n          }\n      }\n  }\n  ```\n  Refactor `register_fabro_run_tools` to call it with `&[]`. `fabro_run_tool` stays private.\n- [ ] Confirm `FabroRunToolServices` (`fabro-workflow/src/services.rs`) is `pub` — it is. No change.\n- [ ] `cargo build --workspace`; `cargo nextest run -p fabro-workflow agent_run`.\n- [ ] Commit: `refactor(fabro-workflow): expose run-tool registration with tool subset`.\n\n### Task 2 — Wire FabroClient + worker token into `build_agent_session`\n\nThe session's run-control backend is the HTTP `FabroClient` pointed at the server's own API, authed with a same-run worker token. The token enforces run scoping (cross-run calls 403).\n\n**Files:** `fabro-server/src/server/handler/sessions.rs`\n\n- [ ] Change `build_profile` to return `Box<dyn AgentProfile>` (currently `Arc`); the caller registers tools on `&mut` then `Arc::from`s.\n- [ ] In `build_agent_session`, after `build_profile`, before `Session::from_record`:\n  ```rust\n  let worker_token = issue_worker_token(state.worker_token_keys(), &run_id)\n      .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;\n  // fabro_client::Client = generated reqwest client from the `fabro-client` crate.\n  let api_client = fabro_client::Client::new_with_client(\n      &state.self_base_url(),                 // server's own loopback base URL\n      reqwest_client_with_bearer(&worker_token),\n  );\n  let backend = fabro_tool::fabro_client::FabroClient::new(Arc::new(api_client));\n  let services = FabroRunToolServices {\n      backend:            Arc::new(backend),\n      current_run_id:     run_id,\n      base_cwd:           PathBuf::new(),     // unused by events/interact\n      user_settings_path: PathBuf::new(),    // unused by events/interact\n  };\n  register_fabro_run_tools_subset(\n      profile.tool_registry_mut(),\n      &services,\n      &[fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME, fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME],\n  );\n  ```\n  Reference impls: the worker-token mint in `server.rs`; `FabroRunToolServices` construction in `fabro-cli/src/commands/run/runner.rs`.\n- [ ] Resolve `self_base_url()` — the server's own loopback address. If `AppState` doesn't already expose it, add an accessor from the bound listen addr (`http://127.0.0.1:<port>`). Local-only call; never the public URL.\n- [ ] Ensure the session prompt/context names the owning run id so the agent passes the correct `run_id` to the tools. (Backstop: wrong id → API 403, agent self-corrects.)\n- [ ] `cargo build --workspace`.\n- [ ] Commit: `feat(fabro-server): give Ask Fabro sessions run-control tools`.\n\n### Task 3 — Allowlist the two run tools in the session gate\n\n`build_ask_fabro_tool_approval` (`sessions.rs:867`) currently denies everything not `ReadOnly`-approved. The two run tools need full access; file/shell stay read-only.\n\n- [ ] Update the closure:\n  ```rust\n  Arc::new(move |tool_name: &str, _args: &Value| {\n      if matches!(tool_name, \"fabro_run_interact\" | \"fabro_run_events\") {\n          return Ok(()); // run-control tools: full access, scoped by worker token\n      }\n      if is_tool_auto_approved(PermissionLevel::ReadOnly, tool_name) {\n          Ok(())\n      } else {\n          Err(format!(\"{tool_name} tool denied by Ask Fabro tool policy\"))\n      }\n  })\n  ```\n- [ ] Rename `build_ask_fabro_tool_approval` comment / any \"read-only policy\" wording — the session is no longer read-only (it can control its run via the API).\n- [ ] Tests: `fabro_run_interact` and `fabro_run_events` approved; `write_file` and shell denied; `read_file` approved.\n- [ ] `cargo +nightly-2026-04-14 fmt --all && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- [ ] `cargo nextest run -p fabro-server --features test-support api::sessions`.\n- [ ] Commit: `feat(fabro-server): allow run tools through the Ask Fabro session gate`.\n\n### Task 4 — E2E coverage\n\n- [ ] E2E test (twin), mirroring `tests/it/api/sessions.rs`: create a run with a sandbox, open an Ask Fabro session, submit a turn asking about run stages — assert the agent calls a run tool and the turn completes. Add a second case: a turn that triggers a mutating `fabro_run_interact` action (e.g. `questions`/`answer` against a run with a pending question) succeeds.\n- [ ] Cross-run guard test: a tool call with a different `run_id` is rejected (worker-token scope).\n- [ ] `cargo nextest run -p fabro-server --features test-support --test it api::sessions`.\n- [ ] Commit: `test(fabro-server): Ask Fabro run-tool E2E coverage`.\n\n---\n\n## Phase 2: Wire the sidebar\n\n### Task 5 — Real session adapter\n\n**Files:** Create `apps/fabro-web/app/lib/ask-fabro-runtime.ts`\n\n- [ ] assistant-ui adapter parameterized by `runId`:\n  - First turn: `sessionsApi.createRunSession(runId, { model })` (model from `run.ask_fabro.default_model`); persist session id in `sessionStorage` keyed by `runId` so reopen resumes.\n  - Open with existing session id: `sessionsApi.getSession(id)` → render `SessionDetail.messages`, then `attachSessionEvents(id, { sinceSeq: last_seq })`.\n  - Send: `streamSessionTurn(id, { input })`; map streamed `EventEnvelope`s (incl. `run.session.*` tool-call events) to assistant-ui messages.\n- [ ] Route tool-call events through the existing `tool-fallback.tsx` renderer.\n- [ ] `bun test app/lib/ask-fabro-runtime.test.ts` (mock SSE as `session-stream.test.ts` does).\n- [ ] Commit: `feat(web): real session adapter for Ask Fabro sidebar`.\n\n### Task 6 — Sidebar uses the adapter\n\n- [ ] `ask-fabro-sidebar.tsx`: accept a `runId` prop; replace `createScriptedAdapter` with `ask-fabro-runtime`; remove `EMPTY_CHAT`/`scriptIndexRef`.\n- [ ] `rg createScriptedAdapter` — if `chats-script.ts`/scripted paths are orphaned, delete them.\n- [ ] `bun run typecheck`.\n- [ ] Commit: `feat(web): drive Ask Fabro sidebar from session API`.\n\n### Task 7 — Drop `?ask=1`, gate on readiness\n\n- [ ] `run-detail.tsx`: remove `askEnabled`/`searchParams.get(\"ask\")` (lines ~363-368, 635-648, 724-730).\n- [ ] Render the Ask Fabro button always; `disabled={!run.ask_fabro.available}`. Disabled tooltip from `unavailable_reason`: `feature_disabled` → \"Ask Fabro is disabled\"; `no_sandbox`/`sandbox_not_ready` → \"Run sandbox isn't ready\"; `llm_unconfigured` → \"No LLM configured\".\n- [ ] Pass `runId={params.id}` to `<AskFabroSidebar>`.\n- [ ] `bun run typecheck && bun test`.\n- [ ] Commit: `feat(web): enable Ask Fabro sidebar on run pages`.\n\n---\n\n## Tests to run before each PR\n\n- Rust: `cargo +nightly-2026-04-14 fmt --check --all` · `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` · `cargo build --workspace` · `cargo nextest run -p fabro-server -p fabro-workflow`\n- Web: `cd apps/fabro-web && bun run typecheck && bun test`\n\n## Unresolved questions\n\n1. **`interact:get` payload size** — `get` may return a large `RunProjection` (all stage data). If it blows agent context, consider a trimmed projection. Verify before Task 4.\n2. **Server self-base-URL** — does `AppState` already expose its bound loopback address? If not, Task 2 must add an accessor. Confirm the server always binds a loopback-reachable addr (vs. a unix socket only — see `server.listen`).\n3. **Session reuse** — one Ask Fabro session per run reused across sidebar opens (plan assumes this via `sessionStorage`), or fresh each open?\n4. **Capability scope** — Ask Fabro can now cancel/archive/steer/answer its run. Confirm that's the intended product surface; consider whether `archive`/`unarchive` should be excluded even though `interact` is otherwise full-access.\n5. **Phase split** — Phase 1 + 2 as two PRs (Phase 2 works without 1; agent just lacks run tools), or ship together so the feature only appears once useful?\n",
+          "outcome": "succeeded",
+          "thread.start.current_node": "toolchain",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "current_node": "preflight_compile",
+          "internal.run_id": "01KS7S3QZC8GKYVCH0EXN4Q0E9",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "internal.thread_id": "toolchain",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.start": 0,
+          "internal.retry_count.toolchain": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "failure_signature": "",
+          "failure_class": ""
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "bd63aac57f8ea2bc5b1cfdf89fba396bbc2c9cbf",
+        "node_visits": {
+          "preflight_compile": 1,
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-22T12:08:44.387154Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
           "failure_class": "",
           "outcome": "succeeded",
-          "internal.thread_id": "toolchain",
+          "internal.thread_id": "preflight_compile",
           "internal.node_visit_count": 1,
           "internal.retry_count.start": 0,
           "thread.toolchain.current_node": "preflight_compile",
           "internal.retry_count.preflight_compile": 0,
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.run_id": "01KS7S3QZC8GKYVCH0EXN4Q0E9",
+          "thread.preflight_compile.current_node": "preflight_lint",
           "graph.rankdir": "LR",
           "internal.retry_count.toolchain": 0,
           "internal.fidelity": "compact",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "current_node": "preflight_compile",
+          "current_node": "preflight_lint",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "failure_signature": "",
           "thread.start.current_node": "toolchain",
+          "internal.retry_count.preflight_lint": 0,
           "graph.goal": "# Ask Fabro Sidebar Wiring — Implementation Plan\n\n> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans. Steps use `- [ ]` checkboxes.\n\n**Goal:** Ship the Ask Fabro sidebar on run pages — wired to real session APIs, with the agent able to inspect *and control* its owning run.\n\n**Architecture:** Two phases. Phase 1 (Rust): give Ask Fabro agent sessions the full `fabro_run_interact` + `fabro_run_events` tools, scoped to the owning run, via the existing HTTP `FabroClient` backend. Phase 2 (web): replace the scripted sidebar adapter with real session calls; drop `?ask=1`, gate on `run.ask_fabro.available`.\n\n**Tech Stack:** Rust (fabro-server, fabro-workflow, fabro-tool), React 19 + assistant-ui (fabro-web), generated API clients.\n\n**Decisions locked:**\n- Reuse `fabro-tool` — no new tool.\n- Subset = `fabro_run_interact` + `fabro_run_events`, **full access** (incl. mutating actions: start/cancel/steer/archive/answer).\n- Backend = existing HTTP `FabroClient` (already implements all reads + mutations).\n- Scoped to owning run — enforced by a same-run worker token; the API 403s cross-run calls.\n- File/shell tools stay read-only in Ask Fabro sessions (only the two run tools get full access).\n- Gate the sidebar on `run.ask_fabro.available`; drop `?ask=1`.\n\n---\n\n## Background (current state)\n\n- API endpoints exist (`296fbddec`): `SessionDetail`, `/sessions/{id}/events`, `/sessions/{id}/attach`, turn submission w/ `x-fabro-turn-id`, `Run.ask_fabro` readiness. Web helpers exist: `session-stream.ts`, `sessionsApi`.\n- Sidebar (`ask-fabro-sidebar.tsx`) is a prototype: scripted adapter (`chats-runtime.ts`/`chats-script.ts`), no API calls, gated behind `?ask=1` (`run-detail.tsx:363`).\n- Ask Fabro sessions built by `build_agent_session` (`fabro-server/.../handler/sessions.rs:633`): profile + run sandbox + `ReadOnly` gate (`build_ask_fabro_tool_approval`, `sessions.rs:867`). **No `fabro_run_*` tools.**\n- `fabro-tool`: tools built on the `FabroToolBackend` trait. `fabro_client::FabroClient` is the HTTP impl — already implements every trait method (reads + mutations). `FabroRunToolServices`, `register_fabro_run_tools`, `execute_fabro_run_tool` live in `fabro-workflow` (`handler/llm/api.rs`, `services.rs`); `register_fabro_run_tools` registers all 5 tools.\n- Worker tokens: `worker_token.rs` — `issue_worker_token(keys, &run_id)` mints a base same-run token; `AppState::worker_token_keys()` exposes the keys. `server.rs` already mints tokens this way for dispatched workers.\n- `register_fabro_run_tools` is `pub(crate)`; `fabro-server` already depends on `fabro-workflow`.\n\n---\n\n## File structure\n\n**Phase 1 — Rust**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs` — make `register_fabro_run_tools` `pub`; add subset variant.\n- Modify: `lib/crates/fabro-server/src/server/handler/sessions.rs` — `build_profile` returns `Box`; mint worker token, build `FabroClient`, register subset; allowlist the two tools in the gate.\n\n**Phase 2 — Web**\n- Create: `apps/fabro-web/app/lib/ask-fabro-runtime.ts` — real session adapter.\n- Modify: `apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx` — use real adapter, take `runId`.\n- Modify: `apps/fabro-web/app/routes/run-detail.tsx` — drop `?ask=1`, gate on `run.ask_fabro`.\n- Delete (verify orphaned first): `apps/fabro-web/app/lib/chats-script.ts` + scripted paths in `chats-runtime.ts`.\n\n---\n\n## Phase 1: Run tools for Ask Fabro sessions\n\n### Task 1 — Make run-tool registration callable from fabro-server\n\n- [ ] In `fabro-workflow/src/handler/llm/api.rs`: change `register_fabro_run_tools` from `pub(crate)` to `pub`. Add a subset variant:\n  ```rust\n  pub fn register_fabro_run_tools_subset(\n      registry: &mut ToolRegistry,\n      services: &FabroRunToolServices,\n      only: &[&str],\n  ) {\n      for definition in fabro_tool::tool_definitions() {\n          if only.is_empty() || only.contains(&definition.name) {\n              registry.register(fabro_run_tool(definition, services.clone()));\n          }\n      }\n  }\n  ```\n  Refactor `register_fabro_run_tools` to call it with `&[]`. `fabro_run_tool` stays private.\n- [ ] Confirm `FabroRunToolServices` (`fabro-workflow/src/services.rs`) is `pub` — it is. No change.\n- [ ] `cargo build --workspace`; `cargo nextest run -p fabro-workflow agent_run`.\n- [ ] Commit: `refactor(fabro-workflow): expose run-tool registration with tool subset`.\n\n### Task 2 — Wire FabroClient + worker token into `build_agent_session`\n\nThe session's run-control backend is the HTTP `FabroClient` pointed at the server's own API, authed with a same-run worker token. The token enforces run scoping (cross-run calls 403).\n\n**Files:** `fabro-server/src/server/handler/sessions.rs`\n\n- [ ] Change `build_profile` to return `Box<dyn AgentProfile>` (currently `Arc`); the caller registers tools on `&mut` then `Arc::from`s.\n- [ ] In `build_agent_session`, after `build_profile`, before `Session::from_record`:\n  ```rust\n  let worker_token = issue_worker_token(state.worker_token_keys(), &run_id)\n      .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;\n  // fabro_client::Client = generated reqwest client from the `fabro-client` crate.\n  let api_client = fabro_client::Client::new_with_client(\n      &state.self_base_url(),                 // server's own loopback base URL\n      reqwest_client_with_bearer(&worker_token),\n  );\n  let backend = fabro_tool::fabro_client::FabroClient::new(Arc::new(api_client));\n  let services = FabroRunToolServices {\n      backend:            Arc::new(backend),\n      current_run_id:     run_id,\n      base_cwd:           PathBuf::new(),     // unused by events/interact\n      user_settings_path: PathBuf::new(),    // unused by events/interact\n  };\n  register_fabro_run_tools_subset(\n      profile.tool_registry_mut(),\n      &services,\n      &[fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME, fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME],\n  );\n  ```\n  Reference impls: the worker-token mint in `server.rs`; `FabroRunToolServices` construction in `fabro-cli/src/commands/run/runner.rs`.\n- [ ] Resolve `self_base_url()` — the server's own loopback address. If `AppState` doesn't already expose it, add an accessor from the bound listen addr (`http://127.0.0.1:<port>`). Local-only call; never the public URL.\n- [ ] Ensure the session prompt/context names the owning run id so the agent passes the correct `run_id` to the tools. (Backstop: wrong id → API 403, agent self-corrects.)\n- [ ] `cargo build --workspace`.\n- [ ] Commit: `feat(fabro-server): give Ask Fabro sessions run-control tools`.\n\n### Task 3 — Allowlist the two run tools in the session gate\n\n`build_ask_fabro_tool_approval` (`sessions.rs:867`) currently denies everything not `ReadOnly`-approved. The two run tools need full access; file/shell stay read-only.\n\n- [ ] Update the closure:\n  ```rust\n  Arc::new(move |tool_name: &str, _args: &Value| {\n      if matches!(tool_name, \"fabro_run_interact\" | \"fabro_run_events\") {\n          return Ok(()); // run-control tools: full access, scoped by worker token\n      }\n      if is_tool_auto_approved(PermissionLevel::ReadOnly, tool_name) {\n          Ok(())\n      } else {\n          Err(format!(\"{tool_name} tool denied by Ask Fabro tool policy\"))\n      }\n  })\n  ```\n- [ ] Rename `build_ask_fabro_tool_approval` comment / any \"read-only policy\" wording — the session is no longer read-only (it can control its run via the API).\n- [ ] Tests: `fabro_run_interact` and `fabro_run_events` approved; `write_file` and shell denied; `read_file` approved.\n- [ ] `cargo +nightly-2026-04-14 fmt --all && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- [ ] `cargo nextest run -p fabro-server --features test-support api::sessions`.\n- [ ] Commit: `feat(fabro-server): allow run tools through the Ask Fabro session gate`.\n\n### Task 4 — E2E coverage\n\n- [ ] E2E test (twin), mirroring `tests/it/api/sessions.rs`: create a run with a sandbox, open an Ask Fabro session, submit a turn asking about run stages — assert the agent calls a run tool and the turn completes. Add a second case: a turn that triggers a mutating `fabro_run_interact` action (e.g. `questions`/`answer` against a run with a pending question) succeeds.\n- [ ] Cross-run guard test: a tool call with a different `run_id` is rejected (worker-token scope).\n- [ ] `cargo nextest run -p fabro-server --features test-support --test it api::sessions`.\n- [ ] Commit: `test(fabro-server): Ask Fabro run-tool E2E coverage`.\n\n---\n\n## Phase 2: Wire the sidebar\n\n### Task 5 — Real session adapter\n\n**Files:** Create `apps/fabro-web/app/lib/ask-fabro-runtime.ts`\n\n- [ ] assistant-ui adapter parameterized by `runId`:\n  - First turn: `sessionsApi.createRunSession(runId, { model })` (model from `run.ask_fabro.default_model`); persist session id in `sessionStorage` keyed by `runId` so reopen resumes.\n  - Open with existing session id: `sessionsApi.getSession(id)` → render `SessionDetail.messages`, then `attachSessionEvents(id, { sinceSeq: last_seq })`.\n  - Send: `streamSessionTurn(id, { input })`; map streamed `EventEnvelope`s (incl. `run.session.*` tool-call events) to assistant-ui messages.\n- [ ] Route tool-call events through the existing `tool-fallback.tsx` renderer.\n- [ ] `bun test app/lib/ask-fabro-runtime.test.ts` (mock SSE as `session-stream.test.ts` does).\n- [ ] Commit: `feat(web): real session adapter for Ask Fabro sidebar`.\n\n### Task 6 — Sidebar uses the adapter\n\n- [ ] `ask-fabro-sidebar.tsx`: accept a `runId` prop; replace `createScriptedAdapter` with `ask-fabro-runtime`; remove `EMPTY_CHAT`/`scriptIndexRef`.\n- [ ] `rg createScriptedAdapter` — if `chats-script.ts`/scripted paths are orphaned, delete them.\n- [ ] `bun run typecheck`.\n- [ ] Commit: `feat(web): drive Ask Fabro sidebar from session API`.\n\n### Task 7 — Drop `?ask=1`, gate on readiness\n\n- [ ] `run-detail.tsx`: remove `askEnabled`/`searchParams.get(\"ask\")` (lines ~363-368, 635-648, 724-730).\n- [ ] Render the Ask Fabro button always; `disabled={!run.ask_fabro.available}`. Disabled tooltip from `unavailable_reason`: `feature_disabled` → \"Ask Fabro is disabled\"; `no_sandbox`/`sandbox_not_ready` → \"Run sandbox isn't ready\"; `llm_unconfigured` → \"No LLM configured\".\n- [ ] Pass `runId={params.id}` to `<AskFabroSidebar>`.\n- [ ] `bun run typecheck && bun test`.\n- [ ] Commit: `feat(web): enable Ask Fabro sidebar on run pages`.\n\n---\n\n## Tests to run before each PR\n\n- Rust: `cargo +nightly-2026-04-14 fmt --check --all` · `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` · `cargo build --workspace` · `cargo nextest run -p fabro-server -p fabro-workflow`\n- Web: `cd apps/fabro-web && bun run typecheck && bun test`\n\n## Unresolved questions\n\n1. **`interact:get` payload size** — `get` may return a large `RunProjection` (all stage data). If it blows agent context, consider a trimmed projection. Verify before Task 4.\n2. **Server self-base-URL** — does `AppState` already expose its bound loopback address? If not, Task 2 must add an accessor. Confirm the server always binds a loopback-reachable addr (vs. a unix socket only — see `server.listen`).\n3. **Session reuse** — one Ask Fabro session per run reused across sidebar opens (plan assumes this via `sessionStorage`), or fresh each open?\n4. **Capability scope** — Ask Fabro can now cancel/archive/steer/answer its run. Confirm that's the intended product surface; consider whether `archive`/`unarchive` should be excluded even though `interact` is otherwise full-access.\n5. **Phase split** — Phase 1 + 2 as two PRs (Phase 2 works without 1; agent just lacks run tools), or ship together so the feature only appears once useful?\n"
         },
         "node_outcomes": {
@@ -666,10 +738,19 @@
           "start": {
             "status": "succeeded",
             "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
+          "preflight_lint": 1,
           "toolchain": 1,
           "preflight_compile": 1,
           "start": 1
@@ -699,6 +780,115 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "preflight_compile@1": {
+      "first_event_seq": 30,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-22T12:06:17.545782Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 131357,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-22T12:04:06.182278Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 131363,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "start@1": {
+      "first_event_seq": 16,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-22T12:04:00.089606Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T12:04:00.088807Z",
+      "handler": "start",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 40,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-22T12:06:21.932944Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
     "toolchain@1": {
       "first_event_seq": 20,
       "prompt": null,
@@ -733,67 +923,6 @@
       "handler": "command",
       "timing": {
         "wall_time_ms": 1491,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "preflight_compile@1": {
-      "first_event_seq": 30,
-      "prompt": null,
-      "response": null,
-      "completion": null,
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
-        "language": "shell"
-      },
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-22T12:04:06.182278Z",
-      "handler": "command",
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "running"
-    },
-    "start@1": {
-      "first_event_seq": 16,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": null,
-        "failure_reason": null,
-        "timestamp": "2026-05-22T12:04:00.089606Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-22T12:04:00.088807Z",
-      "handler": "start",
-      "timing": {
-        "wall_time_ms": 0,
         "inference_time_ms": 0,
         "tool_time_ms": 0,
         "active_time_ms": 0
