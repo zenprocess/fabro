@@ -1,0 +1,2432 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c50b6c665..28b5f81e8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2603,6 +2603,7 @@ dependencies = [
+  "git2",
+  "hex",
+  "httpmock",
++ "jsonschema",
+  "md5",
+  "miette",
+  "mime_guess",
+diff --git a/docs/public/agents/outputs.mdx b/docs/public/agents/outputs.mdx
+index 1407f4db6..7467f050b 100644
+--- a/docs/public/agents/outputs.mdx
++++ b/docs/public/agents/outputs.mdx
+@@ -64,6 +64,23 @@ The test coverage is below the threshold.
+ 
+ JSON objects without recognized fields are ignored.
+ 
++### Validated routing output
++
++Set `output_schema="routing"` on an agent or prompt node to require Fabro's built-in routing directive schema:
++
++```dot
++review [
++  shape=tab,
++  prompt="Review the implementation and return routing JSON.",
++  output_schema="routing",
++  output_retries=2
++]
++```
++
++With `output_schema="routing"`, the routing JSON must be an object with at least one recognized routing field (`preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`) and those fields must have the expected types. Malformed routing JSON fails validation instead of being silently ignored.
++
++Fabro repairs invalid structured output inside the same LLM context before failing the node. For prompt nodes, Fabro appends the invalid assistant response and a corrective user message to the same message list. For agent nodes using the API backend, Fabro sends the corrective message to the same live agent session. `output_retries` controls these repair turns and defaults to `2`; `output_retries=0` validates once and fails without a repair turn. These repair turns are separate from workflow `max_retries` and do not consume node retry attempts.
++
+ ### Fallback: status.json file
+ 
+ If no routing directives are found in the response text, Fabro checks whether the agent wrote a `status.json` file into the sandbox working directory. If the file exists, Fabro extracts routing directives from it using the same logic. This is useful for agents that write structured output to files rather than including JSON in their response text.
+@@ -90,6 +107,35 @@ review -> fix     [label="Fix"]
+ review -> approve [label="Approve"]
+ ```
+ 
++## Custom structured outputs
++
++Agent and prompt nodes can also validate their final JSON object against a JSON Schema file:
++
++```dot
++audit [
++  shape=tab,
++  prompt="Audit the change and return JSON that matches the schema.",
++  output_schema="@schemas/audit-result.schema.json",
++  output_retries=2
++]
++```
++
++`output_schema="@path/to/schema.json"` uses the same workflow file-reference rules as prompt files: the schema is loaded relative to the workflow file and inlined before execution. The final JSON object in the LLM response is validated with `jsonschema`.
++
++When custom schema validation succeeds, Fabro stores the parsed JSON value in context at:
++
++| Key | Value |
++|---|---|
++| `output.{node_id}` | The parsed JSON object that matched the custom schema |
++
++For example, node `audit` writes its parsed custom output to `output.audit`. Fabro still stores the raw response text at `response.audit`.
++
++If custom schema validation fails, Fabro sends concise validation feedback to the same prompt conversation or agent session and asks for corrected JSON. After `output_retries` repair turns are exhausted, the node fails terminally with `output schema validation failed after N repair attempt(s)`.
++
++<Note>
++Structured output validation currently applies to agent and prompt nodes. `backend="acp"` does not support `output_schema` in this release. Custom schemas update `output.{node_id}`; routing schemas update routing fields and `context_updates` instead.
++</Note>
++
+ ## Output logging
+ 
+ Fabro writes several files per stage to `stages/{rank:03}-{node_id}@{visit}/` in metadata snapshots and `fabro dump` output:
+diff --git a/docs/public/reference/dot-language.mdx b/docs/public/reference/dot-language.mdx
+index 1c1656057..74a366632 100644
+--- a/docs/public/reference/dot-language.mdx
++++ b/docs/public/reference/dot-language.mdx
+@@ -206,10 +206,37 @@ Start nodes can also be identified by ID (`start` or `Start`). Exit nodes can be
+ | `model` | String | Explicit model ID (overrides stylesheet) |
+ | `provider` | String | Explicit provider name (overrides stylesheet). Auto-inferred from the model catalog when omitted. |
+ | `project_memory` | Boolean | When `true` (default), prompt nodes discover and include project docs (`AGENTS.md`, `CLAUDE.md`, etc.) as a system prompt. Set to `false` to disable. |
++| `output_schema` | String | Optional structured output validation. Use `routing` for Fabro's built-in routing directive schema, or `@path/to/schema.json` for a JSON Schema file. Supported on agent and prompt nodes. |
++| `output_retries` | Integer | Corrective structured-output turns inside the same prompt conversation or agent session. Default `2`; `0` validates once and fails without repair. Separate from `max_retries`. |
+ | `backend` | String | Agent execution backend: `api` (default) or `acp`. `api` runs Fabro's tool loop through provider APIs; `acp` runs an Agent Client Protocol stdio agent inside the active sandbox. Prompt nodes are API-only. See [Agents — Backends](/core-concepts/agents#backends). |
+ | `acp.command` | String | Shell command for nodes with `backend="acp"`. Mutually exclusive with `acp.config`. The value is always parsed as a command string, not JSON. |
+ | `acp.config` | String | JSON stdio ACP config for nodes with `backend="acp"`. Mutually exclusive with `acp.command`. |
+ 
++#### Structured output validation
++
++`output_schema` opts an agent or prompt node into strict JSON validation:
++
++```dot
++review [
++  shape=tab,
++  output_schema="routing",
++  output_retries=2
++]
++
++audit [
++  shape=tab,
++  output_schema="@schemas/audit-result.schema.json",
++  output_retries=2
++]
++```
++
++- `output_schema="routing"` requires a JSON object with at least one recognized routing field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.
++- `output_schema="@schemas/audit-result.schema.json"` loads a JSON Schema file using workflow file-reference rules and validates the final JSON object in the response text.
++- On validation failure, Fabro sends validation feedback to the same active context before failing: prompt nodes keep the prior assistant response in the message list, and API-backed agent nodes repair in the same live session.
++- `output_retries` defaults to `2` and controls only these corrective structured-output turns. It is not the same as `max_retries` and does not consume workflow retry attempts.
++- Custom schema output is stored in context at `output.{node_id}`. Routing schema output updates routing fields and any `context_updates`.
++- `backend="acp"` with `output_schema` is unsupported in this release.
++
+ ### Command nodes
+ 
+ | Attribute | Type | Description |
+@@ -331,15 +358,16 @@ gate -> v2 [condition="context.version matches ^v2\\."]
+ gate -> slow_path
+ ```
+ 
+-## Prompt file references
++## Prompt and schema file references
+ 
+-Instead of inlining long prompts, reference an external file:
++Instead of inlining long prompts or JSON Schemas, reference an external file:
+ 
+ ```dot
+ simplify [label="Simplify", prompt="@prompts/simplify.md"]
++audit [shape=tab, output_schema="@schemas/audit-result.schema.json"]
+ ```
+ 
+-The `@` prefix tells Fabro to load the prompt from a file path relative to the workflow file. Paths support `~` (home directory) and `..` (parent directory):
++The `@` prefix tells Fabro to load the referenced file relative to the workflow file. Paths support `~` (home directory) and `..` (parent directory):
+ 
+ ```dot
+ shared [prompt="@~/shared-prompts/review.md"]
+diff --git a/lib/crates/fabro-types/src/graph.rs b/lib/crates/fabro-types/src/graph.rs
+index 27344f8c9..7ef9bad99 100644
+--- a/lib/crates/fabro-types/src/graph.rs
++++ b/lib/crates/fabro-types/src/graph.rs
+@@ -168,6 +168,16 @@ impl Node {
+         self.str_attr("prompt")
+     }
+ 
++    #[must_use]
++    pub fn output_schema(&self) -> Option<&str> {
++        self.str_attr("output_schema")
++    }
++
++    #[must_use]
++    pub fn output_retries(&self) -> i64 {
++        self.int_attr("output_retries").unwrap_or(2).max(0)
++    }
++
+     #[must_use]
+     pub fn max_retries(&self) -> Option<i64> {
+         self.int_attr("max_retries")
+@@ -576,6 +586,8 @@ mod tests {
+         assert_eq!(node.shape(), "box");
+         assert_eq!(node.node_type(), None);
+         assert_eq!(node.prompt(), None);
++        assert_eq!(node.output_schema(), None);
++        assert_eq!(node.output_retries(), 2);
+         assert_eq!(node.max_retries(), None);
+         assert!(!node.goal_gate());
+         assert_eq!(node.retry_target(), None);
+@@ -602,6 +614,31 @@ mod tests {
+         assert!(!node.project_memory());
+     }
+ 
++    #[test]
++    fn node_output_retries_defaults_and_clamps_to_zero() {
++        let mut node = Node::new("x");
++        assert_eq!(node.output_retries(), 2);
++
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(0));
++        assert_eq!(node.output_retries(), 0);
++
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(-3));
++        assert_eq!(node.output_retries(), 0);
++    }
++
++    #[test]
++    fn node_output_schema_returns_string_attr() {
++        let mut node = Node::new("x");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++
++        assert_eq!(node.output_schema(), Some("routing"));
++    }
++
+     #[test]
+     fn node_with_attrs() {
+         let mut node = Node::new("plan");
+diff --git a/lib/crates/fabro-workflow/Cargo.toml b/lib/crates/fabro-workflow/Cargo.toml
+index d5025f1bd..6021bca4c 100644
+--- a/lib/crates/fabro-workflow/Cargo.toml
++++ b/lib/crates/fabro-workflow/Cargo.toml
+@@ -46,6 +46,7 @@ fabro-http.workspace = true
+ thiserror.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
++jsonschema.workspace = true
+ tokio.workspace = true
+ bytes.workspace = true
+ object_store.workspace = true
+diff --git a/lib/crates/fabro-workflow/src/error.rs b/lib/crates/fabro-workflow/src/error.rs
+index 6fcd565e3..4373a16db 100644
+--- a/lib/crates/fabro-workflow/src/error.rs
++++ b/lib/crates/fabro-workflow/src/error.rs
+@@ -304,6 +304,9 @@ pub enum Error {
+     #[error("Unsupported operation: {0}")]
+     Unsupported(String),
+ 
++    #[error("{0}")]
++    OutputSchemaValidation(String),
++
+     #[error("Pipeline cancelled")]
+     Cancelled,
+ }
+@@ -428,8 +431,8 @@ impl Error {
+     /// Retryable: Handler (transient handler failures), Engine (could be
+     /// transient),            Io (network/disk issues are often transient),
+     /// Llm (delegates to SdkError). Terminal:  Parse, Validation,
+-    /// Stylesheet (configuration errors),            Checkpoint (storage
+-    /// integrity), Cancelled (explicit cancellation).
++    /// OutputSchemaValidation, Stylesheet (configuration errors), Checkpoint
++    /// (storage integrity), Cancelled (explicit cancellation).
+     #[must_use]
+     pub fn is_retryable(&self) -> bool {
+         match self {
+@@ -444,6 +447,7 @@ impl Error {
+             | Self::Precondition(_)
+             | Self::RunNotFound(_)
+             | Self::Unsupported(_)
++            | Self::OutputSchemaValidation(_)
+             | Self::Cancelled => false,
+         }
+     }
+@@ -461,7 +465,8 @@ impl Error {
+             | Self::Template { .. }
+             | Self::Stylesheet(_)
+             | Self::Checkpoint(_)
+-            | Self::Unsupported(_) => FailureCategory::Deterministic,
++            | Self::Unsupported(_)
++            | Self::OutputSchemaValidation(_) => FailureCategory::Deterministic,
+             Self::Precondition(_) | Self::RunNotFound(_) => FailureCategory::Structural,
+             Self::Handler { failure_class, .. } | Self::Engine { failure_class, .. } => {
+                 *failure_class
+diff --git a/lib/crates/fabro-workflow/src/handler/agent.rs b/lib/crates/fabro-workflow/src/handler/agent.rs
+index 0788ee1e5..0f2118df8 100644
+--- a/lib/crates/fabro-workflow/src/handler/agent.rs
++++ b/lib/crates/fabro-workflow/src/handler/agent.rs
+@@ -2,20 +2,21 @@ use std::path::Path;
+ use std::sync::Arc;
+ 
+ use async_trait::async_trait;
+-use fabro_agent::Sandbox;
++use fabro_agent::{Sandbox, shell_quote};
+ use fabro_graphviz::graph::{Graph, Node};
+ use fabro_types::{RunId, StageModelUsage};
+ use tokio_util::sync::CancellationToken;
+ 
+ use super::llm::api::EffectiveRequestControls;
++use super::structured_output::{
++    self, OutputSchemaKind, StructuredOutputError, ValidatedStructuredOutput,
++};
+ use super::{EngineServices, Handler, NodeTimeoutPolicy};
+ use crate::context::{Context, WorkflowContext, keys};
+ use crate::error::Error;
+ use crate::event::{Emitter, Event, StageScope};
+ use crate::interview_runtime::WorkflowAgentQuestionRuntime;
+-use crate::outcome::{
+-    BilledModelUsage, FailureCategory, FailureDetail, Outcome, OutcomeExt, StageOutcome,
+-};
++use crate::outcome::{BilledModelUsage, Outcome, OutcomeExt};
+ 
+ /// Result from a `CodergenBackend` invocation.
+ pub enum CodergenResult {
+@@ -132,110 +133,65 @@ impl AgentHandler {
+     }
+ }
+ 
+-/// Status fields that indicate a JSON object contains routing directives.
+-const STATUS_FIELDS: &[&str] = &[
+-    "preferred_next_label",
+-    "outcome",
+-    "failure_reason",
+-    "suggested_next_ids",
+-    "context_updates",
+-];
+-
+-/// Find all balanced `{...}` JSON object substrings in the text.
+-fn find_json_objects(text: &str) -> Vec<&str> {
+-    let mut results = Vec::new();
+-    let bytes = text.as_bytes();
+-    let mut i = 0;
+-    while i < bytes.len() {
+-        if bytes[i] == b'{' {
+-            let start = i;
+-            let mut depth = 0;
+-            let mut in_string = false;
+-            let mut escape = false;
+-            let mut j = i;
+-            while j < bytes.len() {
+-                let c = bytes[j];
+-                if escape {
+-                    escape = false;
+-                } else if c == b'\\' && in_string {
+-                    escape = true;
+-                } else if c == b'"' {
+-                    in_string = !in_string;
+-                } else if !in_string {
+-                    if c == b'{' {
+-                        depth += 1;
+-                    } else if c == b'}' {
+-                        depth -= 1;
+-                        if depth == 0 {
+-                            results.push(&text[start..=j]);
+-                            break;
+-                        }
+-                    }
+-                }
+-                j += 1;
+-            }
+-        }
+-        i += 1;
+-    }
+-    results
+-}
+-
+ /// Extract routing directives from LLM response text.
+ ///
+ /// Searches for the last JSON object in the response that contains at least
+ /// one status field (`preferred_next_label`, `outcome`, `suggested_next_ids`,
+ /// `context_updates`). Merges extracted fields into the outcome.
+ pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
+-    let candidates = find_json_objects(text);
+-
+-    let parsed = candidates.iter().rev().find_map(|candidate| {
+-        let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+-        if let Some(obj) = value.as_object() {
+-            if STATUS_FIELDS.iter().any(|f| obj.contains_key(*f)) {
+-                return Some(value);
+-            }
+-        }
+-        None
+-    });
+-
+-    let Some(value) = parsed else { return false };
+-    let Some(obj) = value.as_object() else {
+-        return false;
+-    };
++    structured_output::extract_status_fields_loose(text, outcome)
++}
+ 
+-    if let Some(label) = obj.get("preferred_next_label").and_then(|v| v.as_str()) {
+-        outcome.preferred_label = Some(label.to_string());
++pub(crate) async fn validate_agent_output_sources(
++    schema: &OutputSchemaKind,
++    response_text: &str,
++    sandbox: &Arc<dyn Sandbox>,
++    last_file_touched: Option<&str>,
++) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
++    if !matches!(schema, OutputSchemaKind::Routing) {
++        return structured_output::validate_response_text(schema, response_text);
+     }
+ 
+-    if let Some(ids) = obj.get("suggested_next_ids").and_then(|v| v.as_array()) {
+-        let string_ids: Vec<String> = ids
+-            .iter()
+-            .filter_map(|v| v.as_str().map(String::from))
+-            .collect();
+-        if !string_ids.is_empty() {
+-            outcome.suggested_next_ids = string_ids;
+-        }
++    match structured_output::validate_response_text(schema, response_text) {
++        Ok(validated) => return Ok(validated),
++        Err(error) if error.allows_routing_fallback() => {}
++        Err(error) => return Err(error),
+     }
+ 
+-    if let Some(status_str) = obj.get("outcome").and_then(|v| v.as_str()) {
+-        if let Ok(status) = status_str.parse::<StageOutcome>() {
+-            outcome.status = status;
+-            if outcome.status.is_failure() {
+-                if let Some(reason) = obj.get("failure_reason").and_then(|v| v.as_str()) {
+-                    outcome.failure =
+-                        Some(FailureDetail::new(reason, FailureCategory::Deterministic));
+-                }
++    let mut fallback_error = None;
++    if let Some(status_json) = read_sandbox_file(sandbox, "status.json").await {
++        match structured_output::validate_response_text(schema, &status_json) {
++            Ok(validated) => return Ok(validated),
++            Err(error) if error.allows_routing_fallback() => {
++                fallback_error = Some(error);
+             }
++            Err(error) => return Err(error),
+         }
+     }
+ 
+-    if let Some(updates) = obj.get("context_updates").and_then(|v| v.as_object()) {
+-        for (key, val) in updates {
+-            outcome.context_updates.insert(key.clone(), val.clone());
++    if let Some(path) = last_file_touched {
++        if let Some(contents) = read_sandbox_file(sandbox, path).await {
++            return structured_output::validate_response_text(schema, &contents);
+         }
+     }
+ 
+-    true
++    Err(fallback_error.unwrap_or_else(|| {
++        structured_output::validate_response_text(schema, response_text)
++            .expect_err("response text should have failed routing validation")
++    }))
++}
++
++async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
++    let cmd = format!("cat {}", shell_quote(path));
++    let result = sandbox
++        .exec_command(&cmd, 5_000, None, None, None)
++        .await
++        .ok()?;
++    if result.is_success() {
++        Some(result.stdout)
++    } else {
++        None
++    }
+ }
+ 
+ /// Truncate a string to at most `max_chars` characters (char-boundary safe).
+@@ -416,34 +372,46 @@ impl Handler for AgentHandler {
+             serde_json::json!(&response_text),
+         );
+ 
+-        // 7b. Parse routing directives from response text, falling back to
+-        //     status.json written by the agent into the sandbox CWD, then to
+-        //     the last file the agent wrote.
+-        let found_in_response = extract_status_fields(&response_text, &mut outcome);
+-        if !found_in_response {
+-            let mut found_in_status_json = false;
+-            if let Ok(result) = services
+-                .run
+-                .sandbox
+-                .exec_command("cat status.json", 5_000, None, None, None)
+-                .await
++        if let Some(schema) = structured_output::parse_node_output_schema(node)? {
++            match validate_agent_output_sources(
++                &schema,
++                &response_text,
++                &services.run.sandbox,
++                last_file_touched.as_deref(),
++            )
++            .await
+             {
+-                if result.is_success() {
+-                    found_in_status_json = extract_status_fields(&result.stdout, &mut outcome);
++                Ok(validated) => {
++                    structured_output::apply_validated_output(
++                        node,
++                        &schema,
++                        &validated,
++                        &mut outcome,
++                    );
++                }
++                Err(_) => {
++                    return Ok(structured_output::exhausted_failure_outcome(
++                        node.output_retries(),
++                    ));
+                 }
+             }
+-            if !found_in_status_json {
+-                if let Some(ref path) = last_file_touched {
+-                    let quoted = shlex::try_quote(path).unwrap_or_else(|_| path.into());
+-                    let cmd = format!("cat {quoted}");
+-                    if let Ok(result) = services
+-                        .run
+-                        .sandbox
+-                        .exec_command(&cmd, 5_000, None, None, None)
+-                        .await
+-                    {
+-                        if result.is_success() {
+-                            extract_status_fields(&result.stdout, &mut outcome);
++        } else {
++            // 7b. Parse routing directives from response text, falling back to
++            //     status.json written by the agent into the sandbox CWD, then to
++            //     the last file the agent wrote.
++            let found_in_response = extract_status_fields(&response_text, &mut outcome);
++            if !found_in_response {
++                let mut found_in_status_json = false;
++                if let Some(status_json) =
++                    read_sandbox_file(&services.run.sandbox, "status.json").await
++                {
++                    found_in_status_json = extract_status_fields(&status_json, &mut outcome);
++                }
++                if !found_in_status_json {
++                    if let Some(ref path) = last_file_touched {
++                        if let Some(contents) = read_sandbox_file(&services.run.sandbox, path).await
++                        {
++                            extract_status_fields(&contents, &mut outcome);
+                         }
+                     }
+                 }
+@@ -795,6 +763,142 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn codergen_handler_output_schema_routing_uses_status_json_fallback_when_response_has_no_json()
++     {
++        let sandbox_dir = TempDir::new().unwrap();
++        std::fs::write(
++            sandbox_dir.path().join("status.json"),
++            r#"{"preferred_next_label": "review"}"#,
++        )
++        .unwrap();
++
++        let handler = AgentHandler::new(None);
++        let mut node = Node::new("step");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++        let context = test_context();
++        let graph = Graph::new("test");
++        let tmp = TempDir::new().unwrap();
++
++        let mut services = EngineServices::test_default();
++        services.run =
++            services
++                .run
++                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
++                    sandbox_dir.path().to_path_buf(),
++                )));
++
++        let outcome = handler
++            .execute(&node, &context, &graph, tmp.path(), &services)
++            .await
++            .unwrap();
++
++        assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
++        assert_eq!(outcome.preferred_label.as_deref(), Some("review"));
++    }
++
++    #[tokio::test]
++    async fn codergen_handler_output_schema_routing_rejects_malformed_response_before_status_json_fallback()
++     {
++        struct BadRoutingBackend;
++
++        #[async_trait]
++        impl CodergenBackend for BadRoutingBackend {
++            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
++                Ok(CodergenResult::Text {
++                    text:              r#"{"suggested_next_ids": [1]}"#.to_string(),
++                    usage:             None,
++                    files_touched:     Vec::new(),
++                    last_file_touched: None,
++                })
++            }
++        }
++
++        let sandbox_dir = TempDir::new().unwrap();
++        std::fs::write(
++            sandbox_dir.path().join("status.json"),
++            r#"{"preferred_next_label": "should_not_use"}"#,
++        )
++        .unwrap();
++
++        let handler = AgentHandler::new(Some(Box::new(BadRoutingBackend)));
++        let mut node = Node::new("step");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(0));
++        let context = test_context();
++        let graph = Graph::new("test");
++        let tmp = TempDir::new().unwrap();
++
++        let mut services = EngineServices::test_default();
++        services.run =
++            services
++                .run
++                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
++                    sandbox_dir.path().to_path_buf(),
++                )));
++
++        let outcome = handler
++            .execute(&node, &context, &graph, tmp.path(), &services)
++            .await
++            .unwrap();
++
++        assert_eq!(outcome.status, crate::outcome::StageOutcome::Failed {
++            retry_requested: false,
++        });
++        assert_eq!(
++            outcome.failure_reason(),
++            Some("output schema validation failed after 0 repair attempt(s)")
++        );
++        assert!(outcome.preferred_label.is_none());
++    }
++
++    #[tokio::test]
++    async fn codergen_handler_custom_output_schema_updates_output_context_key() {
++        struct CustomOutputBackend;
++
++        #[async_trait]
++        impl CodergenBackend for CustomOutputBackend {
++            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
++                Ok(CodergenResult::Text {
++                    text:              r#"{"passed": true}"#.to_string(),
++                    usage:             None,
++                    files_touched:     Vec::new(),
++                    last_file_touched: None,
++                })
++            }
++        }
++
++        let handler = AgentHandler::new(Some(Box::new(CustomOutputBackend)));
++        let mut node = Node::new("audit");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String(
++                r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
++                    .to_string(),
++            ),
++        );
++        let context = test_context();
++        let graph = Graph::new("test");
++        let tmp = TempDir::new().unwrap();
++
++        let outcome = handler
++            .execute(&node, &context, &graph, tmp.path(), &make_services())
++            .await
++            .unwrap();
++
++        assert_eq!(
++            outcome.context_updates.get("output.audit"),
++            Some(&serde_json::json!({"passed": true})),
++        );
++    }
++
+     #[tokio::test]
+     async fn codergen_handler_projects_provider_used_from_agent_session_events() {
+         struct ProviderEventBackend;
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/acp.rs b/lib/crates/fabro-workflow/src/handler/llm/acp.rs
+index 827f09e8a..3318c64ef 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/acp.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/acp.rs
+@@ -325,6 +325,11 @@ impl Default for AgentAcpBackend {
+ #[async_trait]
+ impl CodergenBackend for AgentAcpBackend {
+     async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
++        if request.node.output_schema().is_some() {
++            return Err(Error::Validation(
++                "output_schema is not supported with backend=\"acp\" in this release".to_string(),
++            ));
++        }
+         let stage_scope = StageScope::for_handler(request.context, &request.node.id);
+         self.run_turn(
+             request.node,
+@@ -476,6 +481,56 @@ mod tests {
+         assert_eq!(files_touched, vec!["hello.txt"]);
+     }
+ 
++    #[tokio::test]
++    async fn acp_backend_rejects_output_schema_without_launching_process() {
++        let tempdir = tempfile::tempdir().unwrap();
++        let launched_path = tempdir.path().join("launched");
++
++        let mut node = Node::new("work");
++        node.attrs
++            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
++        node.attrs.insert(
++            "acp.command".to_string(),
++            AttrValue::String("sh -c 'touch launched'".to_string()),
++        );
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++
++        let backend = AgentAcpBackend::new();
++        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
++        let emitter = Arc::new(Emitter::default());
++        let context = Context::new();
++        let result = backend
++            .run(CodergenRunRequest {
++                node:               &node,
++                prompt:             "write hello",
++                context:            &context,
++                thread_id:          None,
++                emitter:            &emitter,
++                sandbox:            &sandbox,
++                tool_hooks:         None,
++                cancel_token:       CancellationToken::new(),
++                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
++            })
++            .await;
++
++        let Err(error) = result else {
++            panic!("expected output_schema guardrail error");
++        };
++        assert!(
++            error
++                .to_string()
++                .contains("output_schema is not supported with backend=\"acp\" in this release"),
++            "unexpected error: {error}",
++        );
++        assert!(
++            !launched_path.exists(),
++            "ACP process should not launch when output_schema is present",
++        );
++    }
++
+     #[tokio::test]
+     async fn acp_backend_accepts_steer_and_incorporates_followup_result() {
+         let tempdir = tempfile::tempdir().unwrap();
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index 8da02640d..22d08dc4b 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -13,7 +13,8 @@ use fabro_auth::{CredentialSource, EnvCredentialSource};
+ use fabro_graphviz::graph::{AttrValue, Node};
+ use fabro_llm::client::Client;
+ use fabro_llm::types::{
+-    Message, ReasoningEffort, Request, Speed, TokenCounts, ToolDefinition as LlmToolDefinition,
++    Message, ReasoningEffort, Request, Response, Speed, TokenCounts,
++    ToolDefinition as LlmToolDefinition,
+ };
+ use fabro_mcp::config::McpServerSettings;
+ #[cfg(test)]
+@@ -26,7 +27,11 @@ use tokio::sync::Mutex as TokioMutex;
+ use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
+ 
+-use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
++use super::super::agent::{
++    CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest,
++    validate_agent_output_sources,
++};
++use super::super::structured_output;
+ use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
+ use super::routing;
+ use super::routing::ProviderContext;
+@@ -460,6 +465,32 @@ fn track_file_event(event: &AgentEvent, state: &mut FileTracking) {
+     }
+ }
+ 
++fn file_tracking_snapshot(
++    file_tracking: &Arc<Mutex<FileTracking>>,
++) -> (Vec<String>, Option<String>) {
++    let state = file_tracking.lock().unwrap();
++    let mut files: Vec<String> = state.touched.iter().cloned().collect();
++    files.sort();
++    (files, state.last.clone())
++}
++
++fn last_assistant_response(session: &Session) -> String {
++    session
++        .history()
++        .turns()
++        .iter()
++        .rev()
++        .find_map(|turn| {
++            if let AgentMessage::Assistant { content, .. } = turn {
++                if !content.is_empty() {
++                    return Some(content.clone());
++                }
++            }
++            None
++        })
++        .unwrap_or_default()
++}
++
+ /// Spawn a task that subscribes to session events and:
+ /// 1. Tracks file changes (write_file/edit_file tool calls) into shared state.
+ /// 2. Forwards non-streaming agent events to the pipeline emitter.
+@@ -521,6 +552,13 @@ pub struct AgentApiBackend {
+     fabro_run_tools:    Option<FabroRunToolServices>,
+ }
+ 
++struct OneShotCompletion {
++    response:        Response,
++    actual_model:    String,
++    actual_provider: String,
++    actual_speed:    Option<Speed>,
++}
++
+ impl AgentApiBackend {
+     #[must_use]
+     pub fn new(
+@@ -812,71 +850,18 @@ impl AgentApiBackend {
+             }
+         }
+     }
+-}
+-
+-#[async_trait]
+-impl CodergenBackend for AgentApiBackend {
+-    async fn shutdown(&self, emitter: &Arc<Emitter>) {
+-        self.shutdown_cached_sessions(emitter);
+-    }
+-
+-    fn effective_request_controls(&self, node: &Node) -> Result<EffectiveRequestControls, Error> {
+-        self.resolve_effective_request_controls(node)
+-    }
+-
+-    async fn one_shot(&self, request: OneShotRequest<'_>) -> Result<CodergenResult, Error> {
+-        let node = request.node;
+-        let prompt = request.prompt;
+-        let system_prompt = request.system_prompt;
+-        let emitter = request.emitter;
+-        let stage_scope = request.stage_scope;
+-
+-        let client = Client::from_source(self.source.as_ref(), Arc::clone(&self.catalog))
+-            .await
+-            .map_err(|e| Error::handler_with_source("Failed to create LLM client", e))?;
+-
+-        let model = node.model().unwrap_or(&self.model);
+-        let provider = self.resolve_provider_context(model, node.provider())?;
+-        let provider_id = provider.provider_id.to_string();
+-        let controls = self.resolve_effective_request_controls(node)?;
+-
+-        let max_tokens = node
+-            .max_tokens()
+-            .or_else(|| self.catalog.get(model).and_then(|m| m.limits.max_output));
+-
+-        let mut messages = Vec::new();
+-        if let Some(sys) = system_prompt {
+-            messages.push(Message::system(sys));
+-        }
+-        messages.push(Message::user(prompt));
+-
+-        let request = Request {
+-            model: model.to_string(),
+-            messages,
+-            provider: Some(provider_id),
+-            reasoning_effort: controls.reasoning_effort,
+-            speed: controls.speed,
+-            tools: None,
+-            tool_choice: None,
+-            response_format: None,
+-            temperature: None,
+-            top_p: None,
+-            max_tokens,
+-            stop_sequences: None,
+-            metadata: None,
+-            provider_options: None,
+-        };
+-
+-        // Build per-request fallback chain: if the node overrides the provider,
+-        // no failover is available; otherwise use the backend's.
+-        let fallback_chain: &[FallbackTarget] = if node.provider().is_some() {
+-            &[]
+-        } else {
+-            &self.fallback_chain
+-        };
+-
+-        let result = client.complete(&request).await;
+ 
++    async fn complete_one_shot_request(
++        &self,
++        client: &Client,
++        node: &Node,
++        emitter: &Arc<Emitter>,
++        stage_scope: &StageScope,
++        request: &Request,
++        controls: EffectiveRequestControls,
++        fallback_chain: &[FallbackTarget],
++    ) -> Result<OneShotCompletion, Error> {
++        let result = client.complete(request).await;
+         let default_provider = self.provider_id.to_string();
+ 
+         let (response, actual_model, actual_provider, actual_speed) = match result {
+@@ -916,7 +901,7 @@ impl CodergenBackend for AgentApiBackend {
+                     let max_tokens = node.max_tokens().or_else(|| {
+                         self.catalog
+                             .get(&target.model)
+-                            .and_then(|m| m.limits.max_output)
++                            .and_then(|model| model.limits.max_output)
+                     });
+ 
+                     let fallback_request = Request {
+@@ -930,12 +915,12 @@ impl CodergenBackend for AgentApiBackend {
+ 
+                     match client.complete(&fallback_request).await {
+                         Ok(resp) => {
+-                            found = Some((
+-                                resp,
+-                                target.model.clone(),
+-                                target.provider.clone(),
+-                                controls.speed,
+-                            ));
++                            found = Some(OneShotCompletion {
++                                response:        resp,
++                                actual_model:    target.model.clone(),
++                                actual_provider: target.provider.clone(),
++                                actual_speed:    controls.speed,
++                            });
+                             break;
+                         }
+                         Err(err) if err.failover_eligible() => {
+@@ -946,30 +931,144 @@ impl CodergenBackend for AgentApiBackend {
+                 }
+ 
+                 match found {
+-                    Some(triple) => triple,
++                    Some(completion) => return Ok(completion),
+                     None => return Err(Error::Llm(last_err)),
+                 }
+             }
+             Err(sdk_err) => return Err(Error::Llm(sdk_err)),
+         };
+ 
+-        let stage_usage = billed_model_usage_from_llm(
+-            self.catalog.as_ref(),
+-            &ModelRef {
+-                provider: ProviderId::from(actual_provider),
+-                model_id: actual_model,
+-                speed:    actual_speed,
+-            },
+-            &response.usage,
+-        )?;
+-
+-        Ok(CodergenResult::Text {
+-            text:              response.text(),
+-            usage:             Some(stage_usage),
+-            files_touched:     Vec::new(),
+-            last_file_touched: None,
++        Ok(OneShotCompletion {
++            response,
++            actual_model,
++            actual_provider,
++            actual_speed,
+         })
+     }
++}
++
++#[async_trait]
++impl CodergenBackend for AgentApiBackend {
++    async fn shutdown(&self, emitter: &Arc<Emitter>) {
++        self.shutdown_cached_sessions(emitter);
++    }
++
++    fn effective_request_controls(&self, node: &Node) -> Result<EffectiveRequestControls, Error> {
++        self.resolve_effective_request_controls(node)
++    }
++
++    async fn one_shot(&self, request: OneShotRequest<'_>) -> Result<CodergenResult, Error> {
++        let node = request.node;
++        let prompt = request.prompt;
++        let system_prompt = request.system_prompt;
++        let emitter = request.emitter;
++        let stage_scope = request.stage_scope;
++
++        let client = Client::from_source(self.source.as_ref(), Arc::clone(&self.catalog))
++            .await
++            .map_err(|e| Error::handler_with_source("Failed to create LLM client", e))?;
++
++        let model = node.model().unwrap_or(&self.model);
++        let provider = self.resolve_provider_context(model, node.provider())?;
++        let provider_id = provider.provider_id.to_string();
++        let controls = self.resolve_effective_request_controls(node)?;
++
++        let max_tokens = node
++            .max_tokens()
++            .or_else(|| self.catalog.get(model).and_then(|m| m.limits.max_output));
++
++        let mut messages = Vec::new();
++        if let Some(sys) = system_prompt {
++            messages.push(Message::system(sys));
++        }
++        messages.push(Message::user(prompt));
++
++        // Build per-request fallback chain: if the node overrides the provider,
++        // no failover is available; otherwise use the backend's.
++        let fallback_chain: &[FallbackTarget] = if node.provider().is_some() {
++            &[]
++        } else {
++            &self.fallback_chain
++        };
++
++        let output_schema = structured_output::parse_node_output_schema(node)?;
++        let response_format = output_schema
++            .as_ref()
++            .map(structured_output::prompt_response_format);
++        let mut repair_attempts = 0_i64;
++        let mut total_usage = TokenCounts::default();
++
++        loop {
++            let request = Request {
++                model: model.to_string(),
++                messages: messages.clone(),
++                provider: Some(provider_id.clone()),
++                reasoning_effort: controls.reasoning_effort,
++                speed: controls.speed,
++                tools: None,
++                tool_choice: None,
++                response_format: response_format.clone(),
++                temperature: None,
++                top_p: None,
++                max_tokens,
++                stop_sequences: None,
++                metadata: None,
++                provider_options: None,
++            };
++
++            let completion = self
++                .complete_one_shot_request(
++                    &client,
++                    node,
++                    emitter,
++                    stage_scope,
++                    &request,
++                    controls,
++                    fallback_chain,
++                )
++                .await?;
++            total_usage += completion.response.usage.clone();
++            let response_text = completion.response.text();
++
++            let validation_error = if let Some(schema) = &output_schema {
++                match structured_output::validate_response_text(schema, &response_text) {
++                    Ok(_) => None,
++                    Err(error) => Some((schema, error)),
++                }
++            } else {
++                None
++            };
++
++            if let Some((schema, error)) = validation_error {
++                if repair_attempts >= node.output_retries() {
++                    return Err(Error::OutputSchemaValidation(
++                        structured_output::exhausted_failure_reason(node.output_retries()),
++                    ));
++                }
++                messages.push(Message::assistant(response_text));
++                messages.push(Message::user(error.repair_message(schema)));
++                repair_attempts += 1;
++                continue;
++            }
++
++            let stage_usage = billed_model_usage_from_llm(
++                self.catalog.as_ref(),
++                &ModelRef {
++                    provider: ProviderId::from(completion.actual_provider),
++                    model_id: completion.actual_model,
++                    speed:    completion.actual_speed,
++                },
++                &total_usage,
++            )?;
++
++            return Ok(CodergenResult::Text {
++                text:              response_text,
++                usage:             Some(stage_usage),
++                files_touched:     Vec::new(),
++                last_file_touched: None,
++            });
++        }
++    }
+ 
+     async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+         let node = request.node;
+@@ -981,6 +1080,7 @@ impl CodergenBackend for AgentApiBackend {
+         let tool_hooks = request.tool_hooks;
+         let cancel_token = request.cancel_token;
+         let agent_tool_runtime = request.agent_tool_runtime;
++        let output_schema = structured_output::parse_node_output_schema(node)?;
+ 
+         let fidelity = context.fidelity();
+         let reuse_key = if fidelity == Fidelity::Full {
+@@ -1258,8 +1358,59 @@ impl CodergenBackend for AgentApiBackend {
+             return Err(err);
+         }
+ 
++        let mut response = last_assistant_response(&session);
++        if let Some(schema) = &output_schema {
++            let mut repair_attempts = 0_i64;
++            loop {
++                let (_, last_file_touched) = file_tracking_snapshot(&file_tracking);
++                match validate_agent_output_sources(
++                    schema,
++                    &response,
++                    sandbox,
++                    last_file_touched.as_deref(),
++                )
++                .await
++                {
++                    Ok(_) => break,
++                    Err(error) => {
++                        if repair_attempts >= node.output_retries() {
++                            bridge.abort();
++                            discard_session(&mut session, &mut lease, emitter);
++                            return Err(Error::OutputSchemaValidation(
++                                structured_output::exhausted_failure_reason(node.output_retries()),
++                            ));
++                        }
++                        let repair_message = error.repair_message(schema);
++                        match session.process_input(&repair_message).await {
++                            Ok(()) => {
++                                repair_attempts += 1;
++                                response = last_assistant_response(&session);
++                            }
++                            Err(err) => match classify_agent_error(err, false) {
++                                AgentApiErrorDisposition::Cancelled => {
++                                    bridge.abort();
++                                    discard_session(&mut session, &mut lease, emitter);
++                                    return Err(Error::Cancelled);
++                                }
++                                AgentApiErrorDisposition::Terminal(err) => {
++                                    bridge.abort();
++                                    discard_session(&mut session, &mut lease, emitter);
++                                    return Err(err);
++                                }
++                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
++                                    bridge.abort();
++                                    discard_session(&mut session, &mut lease, emitter);
++                                    return Err(Error::Llm(sdk_err));
++                                }
++                            },
++                        }
++                    }
++                }
++            }
++        }
++
+         // Aggregate token usage only from new turns (prevents double-counting on
+-        // reuse).
++        // reuse), including any output-schema repair turns.
+         let mut total_usage = TokenCounts::default();
+         for turn in &session.history().turns()[turns_before..] {
+             if let AgentMessage::Assistant { usage, .. } = turn {
+@@ -1278,29 +1429,8 @@ impl CodergenBackend for AgentApiBackend {
+             &total_usage,
+         )?;
+ 
+-        // Extract last assistant response from the session history.
+-        let response = session
+-            .history()
+-            .turns()
+-            .iter()
+-            .rev()
+-            .find_map(|turn| {
+-                if let AgentMessage::Assistant { content, .. } = turn {
+-                    if !content.is_empty() {
+-                        return Some(content.clone());
+-                    }
+-                }
+-                None
+-            })
+-            .unwrap_or_default();
+-
+         // Collect files_touched from the shared tracking state.
+-        let (files_touched, last_file_touched) = {
+-            let s = file_tracking.lock().unwrap();
+-            let mut v: Vec<String> = s.touched.iter().cloned().collect();
+-            v.sort();
+-            (v, s.last.clone())
+-        };
++        let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);
+ 
+         if let Some(lease) = lease.take() {
+             lease.release();
+@@ -1376,10 +1506,13 @@ mod tests {
+     };
+     use fabro_vault::{SecretType, Vault};
+     use futures::stream;
++    use httpmock::Method::POST;
++    use httpmock::MockServer;
+     use tokio::sync::RwLock as AsyncRwLock;
+     use tokio_util::sync::CancellationToken;
+ 
+     use super::*;
++    use crate::context::Context;
+     use crate::services::FabroRunToolServices;
+ 
+     struct ShutdownTestProfile {
+@@ -1447,6 +1580,109 @@ mod tests {
+         }
+     }
+ 
++    fn mock_llm_catalog(server: &MockServer) -> Arc<Catalog> {
++        let settings: LlmCatalogSettings = toml::from_str(&format!(
++            r#"
++[providers.mock]
++adapter = "openai_compatible"
++agent_profile = "openai"
++base_url = "{}"
++
++[providers.mock.auth]
++credentials = ["env:MOCK_API_KEY"]
++
++[models.mock-model]
++provider = "mock"
++display_name = "Mock Model"
++family = "mock"
++default = true
++
++[models.mock-model.limits]
++context_window = 8192
++max_output = 1024
++
++[models.mock-model.features]
++tools = true
++vision = false
++reasoning = false
++"#,
++            server.base_url()
++        ))
++        .unwrap();
++        Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap())
++    }
++
++    fn mock_api_backend(server: &MockServer) -> AgentApiBackend {
++        let source = EnvCredentialSource::with_env_lookup(Arc::new(|name| {
++            if name == "MOCK_API_KEY" {
++                Some("sk-test".to_string())
++            } else {
++                None
++            }
++        }));
++        AgentApiBackend::new_with_catalog(
++            "mock-model".to_string(),
++            ProviderId::from("mock"),
++            Vec::new(),
++            Arc::new(source),
++            SteeringHub::for_tests(),
++            mock_llm_catalog(server),
++        )
++    }
++
++    fn chat_completion_response(
++        text: &str,
++        input_tokens: i64,
++        output_tokens: i64,
++    ) -> serde_json::Value {
++        serde_json::json!({
++            "id": uuid::Uuid::new_v4().to_string(),
++            "model": "mock-model",
++            "choices": [{
++                "message": {
++                    "content": text
++                },
++                "finish_reason": "stop"
++            }],
++            "usage": {
++                "prompt_tokens": input_tokens,
++                "completion_tokens": output_tokens,
++                "total_tokens": input_tokens + output_tokens
++            }
++        })
++    }
++
++    fn chat_completion_stream(text: &str, input_tokens: i64, output_tokens: i64) -> String {
++        let text_chunk = serde_json::json!({
++            "id": uuid::Uuid::new_v4().to_string(),
++            "model": "mock-model",
++            "choices": [{
++                "delta": {
++                    "content": text
++                },
++                "finish_reason": null
++            }]
++        });
++        let usage_chunk = serde_json::json!({
++            "id": uuid::Uuid::new_v4().to_string(),
++            "model": "mock-model",
++            "choices": [],
++            "usage": {
++                "prompt_tokens": input_tokens,
++                "completion_tokens": output_tokens,
++                "total_tokens": input_tokens + output_tokens
++            }
++        });
++        format!("data: {text_chunk}\n\ndata: {usage_chunk}\n\ndata: [DONE]\n\n")
++    }
++
++    fn custom_output_schema_attr() -> AttrValue {
++        AttrValue::String(
++            r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
++                .to_string(),
++        )
++    }
++
+     #[test]
+     fn agent_backend_stores_config() {
+         let backend = AgentApiBackend::new_from_env(
+@@ -2212,6 +2448,127 @@ reasoning = false
+         assert_eq!(client.provider_names(), vec!["anthropic"]);
+     }
+ 
++    #[tokio::test]
++    async fn one_shot_repairs_custom_output_schema_with_previous_assistant_message() {
++        let server = MockServer::start();
++        let first = server.mock(|when, then| {
++            when.method(POST)
++                .path("/chat/completions")
++                .body_includes(r#""type":"json_schema""#)
++                .body_excludes(r#""role":"assistant""#);
++            then.status(200)
++                .header("content-type", "application/json")
++                .json_body(chat_completion_response("not json", 10, 1));
++        });
++        let repair = server.mock(|when, then| {
++            when.method(POST)
++                .path("/chat/completions")
++                .body_includes(r#""type":"json_schema""#)
++                .body_includes(r#""role":"assistant""#)
++                .body_includes("not json")
++                .body_includes("output_schema");
++            then.status(200)
++                .header("content-type", "application/json")
++                .json_body(chat_completion_response(r#"{"passed":true}"#, 11, 2));
++        });
++        let backend = mock_api_backend(&server);
++        let mut node = Node::new("audit");
++        node.attrs
++            .insert("output_schema".to_string(), custom_output_schema_attr());
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(1));
++        let context = Context::new();
++        let stage_scope = StageScope::for_handler(&context, &node.id);
++        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
++        let workspace = tempfile::tempdir().unwrap();
++        let sandbox: Arc<dyn fabro_agent::Sandbox> =
++            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
++
++        let result = backend
++            .one_shot(OneShotRequest {
++                node:          &node,
++                prompt:        "Audit the result",
++                system_prompt: None,
++                emitter:       &emitter,
++                stage_scope:   &stage_scope,
++                sandbox:       &sandbox,
++                cancel_token:  CancellationToken::new(),
++            })
++            .await
++            .unwrap();
++
++        first.assert_calls(1);
++        repair.assert_calls(1);
++        let CodergenResult::Text { text, usage, .. } = result else {
++            panic!("one_shot should return text");
++        };
++        assert_eq!(text, r#"{"passed":true}"#);
++        let usage = usage.expect("usage should be aggregated");
++        assert_eq!(usage.tokens().input_tokens, 21);
++        assert_eq!(usage.tokens().output_tokens, 3);
++    }
++
++    #[tokio::test]
++    async fn agent_run_repairs_custom_output_schema_in_same_session() {
++        let server = MockServer::start();
++        let first = server.mock(|when, then| {
++            when.method(POST)
++                .path("/chat/completions")
++                .body_includes(r#""stream":true"#)
++                .body_excludes(r#""role":"assistant""#);
++            then.status(200)
++                .header("content-type", "text/event-stream")
++                .body(chat_completion_stream("not json", 20, 3));
++        });
++        let repair = server.mock(|when, then| {
++            when.method(POST)
++                .path("/chat/completions")
++                .body_includes(r#""stream":true"#)
++                .body_includes(r#""role":"assistant""#)
++                .body_includes("not json")
++                .body_includes("output_schema");
++            then.status(200)
++                .header("content-type", "text/event-stream")
++                .body(chat_completion_stream(r#"{"passed":true}"#, 21, 4));
++        });
++        let backend = mock_api_backend(&server);
++        let mut node = Node::new("audit");
++        node.attrs
++            .insert("output_schema".to_string(), custom_output_schema_attr());
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(1));
++        let context = Context::new();
++        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
++        let workspace = tempfile::tempdir().unwrap();
++        let sandbox: Arc<dyn fabro_agent::Sandbox> =
++            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
++
++        let result = backend
++            .run(CodergenRunRequest {
++                node:               &node,
++                prompt:             "Audit the result",
++                context:            &context,
++                thread_id:          None,
++                emitter:            &emitter,
++                sandbox:            &sandbox,
++                tool_hooks:         None,
++                cancel_token:       CancellationToken::new(),
++                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
++            })
++            .await
++            .unwrap();
++
++        first.assert_calls(1);
++        repair.assert_calls(1);
++        let CodergenResult::Text { text, usage, .. } = result else {
++            panic!("run should return text");
++        };
++        assert_eq!(text, r#"{"passed":true}"#);
++        let usage = usage.expect("usage should be aggregated");
++        assert_eq!(usage.tokens().input_tokens, 41);
++        assert_eq!(usage.tokens().output_tokens, 7);
++    }
++
+     #[tokio::test]
+     async fn api_backend_shutdown_closes_cached_sessions_once() {
+         let backend = AgentApiBackend::new_from_env(
+diff --git a/lib/crates/fabro-workflow/src/handler/mod.rs b/lib/crates/fabro-workflow/src/handler/mod.rs
+index 675f24b39..bc94af3b8 100644
+--- a/lib/crates/fabro-workflow/src/handler/mod.rs
++++ b/lib/crates/fabro-workflow/src/handler/mod.rs
+@@ -9,6 +9,7 @@ pub mod manager_loop;
+ pub mod parallel;
+ pub mod prompt;
+ pub mod start;
++pub mod structured_output;
+ pub mod wait;
+ 
+ use std::any::Any;
+diff --git a/lib/crates/fabro-workflow/src/handler/prompt.rs b/lib/crates/fabro-workflow/src/handler/prompt.rs
+index 6dbc0576d..27b9fa524 100644
+--- a/lib/crates/fabro-workflow/src/handler/prompt.rs
++++ b/lib/crates/fabro-workflow/src/handler/prompt.rs
+@@ -10,7 +10,7 @@ use super::agent::{
+     truncate,
+ };
+ use super::llm::routing;
+-use super::{EngineServices, Handler};
++use super::{EngineServices, Handler, structured_output};
+ use crate::context::{Context, WorkflowContext, keys};
+ use crate::error::Error;
+ use crate::event::{Emitter, Event};
+@@ -191,7 +191,25 @@ impl Handler for PromptHandler {
+             serde_json::json!(&response_text),
+         );
+ 
+-        extract_status_fields(&response_text, &mut outcome);
++        if let Some(schema) = structured_output::parse_node_output_schema(node)? {
++            match structured_output::validate_response_text(&schema, &response_text) {
++                Ok(validated) => {
++                    structured_output::apply_validated_output(
++                        node,
++                        &schema,
++                        &validated,
++                        &mut outcome,
++                    );
++                }
++                Err(_) => {
++                    return Ok(structured_output::exhausted_failure_outcome(
++                        node.output_retries(),
++                    ));
++                }
++            }
++        } else {
++            extract_status_fields(&response_text, &mut outcome);
++        }
+         outcome.usage = stage_usage;
+         outcome.files_touched = backend_files_touched;
+ 
+@@ -214,6 +232,7 @@ mod tests {
+     use super::*;
+     use crate::event::Emitter;
+     use crate::handler::agent::CodergenRunRequest;
++    use crate::outcome::OutcomeExt;
+ 
+     fn make_services() -> EngineServices {
+         EngineServices::test_default()
+@@ -368,6 +387,102 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn prompt_handler_custom_output_schema_updates_output_context_key() {
++        struct CustomOutputBackend;
++
++        #[async_trait]
++        impl CodergenBackend for CustomOutputBackend {
++            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
++                panic!("run() should not be called for prompt handler");
++            }
++
++            async fn one_shot(
++                &self,
++                _request: OneShotRequest<'_>,
++            ) -> Result<CodergenResult, Error> {
++                Ok(CodergenResult::Text {
++                    text:              r#"{"passed": true}"#.to_string(),
++                    usage:             None,
++                    files_touched:     Vec::new(),
++                    last_file_touched: None,
++                })
++            }
++        }
++
++        let handler = PromptHandler::new(Some(Box::new(CustomOutputBackend)));
++        let mut node = Node::new("audit");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String(
++                r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
++                    .to_string(),
++            ),
++        );
++        let context = Context::new();
++        let graph = Graph::new("test");
++        let tmp = TempDir::new().unwrap();
++
++        let outcome = handler
++            .execute(&node, &context, &graph, tmp.path(), &make_services())
++            .await
++            .unwrap();
++
++        assert_eq!(
++            outcome.context_updates.get("output.audit"),
++            Some(&serde_json::json!({"passed": true})),
++        );
++    }
++
++    #[tokio::test]
++    async fn prompt_handler_routing_output_schema_requires_valid_routing_json() {
++        struct BadRoutingBackend;
++
++        #[async_trait]
++        impl CodergenBackend for BadRoutingBackend {
++            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
++                panic!("run() should not be called for prompt handler");
++            }
++
++            async fn one_shot(
++                &self,
++                _request: OneShotRequest<'_>,
++            ) -> Result<CodergenResult, Error> {
++                Ok(CodergenResult::Text {
++                    text:              r#"{"outcome": 123}"#.to_string(),
++                    usage:             None,
++                    files_touched:     Vec::new(),
++                    last_file_touched: None,
++                })
++            }
++        }
++
++        let handler = PromptHandler::new(Some(Box::new(BadRoutingBackend)));
++        let mut node = Node::new("route");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++        node.attrs
++            .insert("output_retries".to_string(), AttrValue::Integer(0));
++        let context = Context::new();
++        let graph = Graph::new("test");
++        let tmp = TempDir::new().unwrap();
++
++        let outcome = handler
++            .execute(&node, &context, &graph, tmp.path(), &make_services())
++            .await
++            .unwrap();
++
++        assert_eq!(outcome.status, crate::outcome::StageOutcome::Failed {
++            retry_requested: false,
++        });
++        assert_eq!(
++            outcome.failure_reason(),
++            Some("output schema validation failed after 0 repair attempt(s)")
++        );
++    }
++
+     #[tokio::test]
+     async fn prompt_handler_projects_provider_used_from_prompt_events() {
+         struct ProviderOneShotBackend;
+diff --git a/lib/crates/fabro-workflow/src/handler/structured_output.rs b/lib/crates/fabro-workflow/src/handler/structured_output.rs
+new file mode 100644
+index 000000000..d98a42afb
+--- /dev/null
++++ b/lib/crates/fabro-workflow/src/handler/structured_output.rs
+@@ -0,0 +1,608 @@
++use fabro_graphviz::graph::Node;
++use fabro_llm::types::{ResponseFormat, ResponseFormatType};
++use serde_json::Value;
++
++use crate::error::Error;
++use crate::outcome::{FailureCategory, FailureDetail, Outcome, StageOutcome};
++
++pub(crate) const ROUTING_STATUS_FIELDS: &[&str] = &[
++    "preferred_next_label",
++    "outcome",
++    "failure_reason",
++    "suggested_next_ids",
++    "context_updates",
++];
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) enum OutputSchemaKind {
++    Routing,
++    JsonSchema { schema: Value },
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum StructuredOutputErrorKind {
++    NoJsonObject,
++    NoRelevantJsonObject,
++    InvalidJson,
++    SchemaValidation,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct StructuredOutputError {
++    kind:     StructuredOutputErrorKind,
++    messages: Vec<String>,
++}
++
++impl StructuredOutputError {
++    fn new(kind: StructuredOutputErrorKind, message: impl Into<String>) -> Self {
++        Self {
++            kind,
++            messages: vec![message.into()],
++        }
++    }
++
++    fn validation(messages: Vec<String>) -> Self {
++        Self {
++            kind: StructuredOutputErrorKind::SchemaValidation,
++            messages,
++        }
++    }
++
++    #[cfg(test)]
++    #[must_use]
++    pub(crate) fn kind(&self) -> StructuredOutputErrorKind {
++        self.kind
++    }
++
++    #[cfg(test)]
++    #[must_use]
++    pub(crate) fn messages(&self) -> &[String] {
++        &self.messages
++    }
++
++    #[must_use]
++    pub(crate) fn allows_routing_fallback(&self) -> bool {
++        matches!(
++            self.kind,
++            StructuredOutputErrorKind::NoJsonObject
++                | StructuredOutputErrorKind::NoRelevantJsonObject
++        )
++    }
++
++    #[must_use]
++    pub(crate) fn repair_message(&self, schema: &OutputSchemaKind) -> String {
++        let expectation = match schema {
++            OutputSchemaKind::Routing => format!(
++                "Return a single JSON object with at least one routing field: {}.",
++                ROUTING_STATUS_FIELDS.join(", ")
++            ),
++            OutputSchemaKind::JsonSchema { .. } => {
++                "Return a single JSON object that satisfies the configured JSON Schema.".to_string()
++            }
++        };
++        let errors = self
++            .messages
++            .iter()
++            .map(|message| format!("- {message}"))
++            .collect::<Vec<_>>()
++            .join("\n");
++        format!(
++            "Your previous response did not satisfy the node's output_schema.\n\n\
++             Validation errors:\n{errors}\n\n\
++             {expectation}\n\
++             Do not include Markdown fences or explanatory prose; reply only with the corrected JSON object."
++        )
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct ValidatedStructuredOutput {
++    pub(crate) value: Value,
++}
++
++#[must_use]
++pub(crate) fn output_key(node_id: &str) -> String {
++    format!("output.{node_id}")
++}
++
++#[must_use]
++pub(crate) fn exhausted_failure_reason(repair_attempts: i64) -> String {
++    format!("output schema validation failed after {repair_attempts} repair attempt(s)")
++}
++
++#[must_use]
++pub(crate) fn exhausted_failure_outcome(repair_attempts: i64) -> Outcome {
++    Outcome {
++        status: StageOutcome::Failed {
++            retry_requested: false,
++        },
++        failure: Some(FailureDetail::new(
++            exhausted_failure_reason(repair_attempts),
++            FailureCategory::Deterministic,
++        )),
++        ..Outcome::default()
++    }
++}
++
++pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchemaKind>, Error> {
++    let Some(raw) = node.output_schema() else {
++        return Ok(None);
++    };
++    let value = raw.trim();
++    if value.is_empty() {
++        return Err(Error::Validation(format!(
++            "Invalid output_schema for node \"{}\": value must not be empty",
++            node.id
++        )));
++    }
++    if value == "routing" {
++        return Ok(Some(OutputSchemaKind::Routing));
++    }
++    if value.starts_with('@') {
++        return Err(Error::Validation(format!(
++            "Invalid output_schema for node \"{}\": unresolved file reference {value}",
++            node.id
++        )));
++    }
++
++    let schema = serde_json::from_str::<Value>(value).map_err(|err| {
++        Error::Validation(format!(
++            "Invalid output_schema for node \"{}\": expected \"routing\" or a JSON Schema object: {err}",
++            node.id
++        ))
++    })?;
++    compile_schema(&schema).map_err(|err| {
++        Error::Validation(format!(
++            "Invalid output_schema for node \"{}\": {err}",
++            node.id
++        ))
++    })?;
++    Ok(Some(OutputSchemaKind::JsonSchema { schema }))
++}
++
++#[must_use]
++pub(crate) fn prompt_response_format(schema: &OutputSchemaKind) -> ResponseFormat {
++    match schema {
++        OutputSchemaKind::Routing => ResponseFormat {
++            kind:        ResponseFormatType::JsonObject,
++            json_schema: None,
++            strict:      false,
++        },
++        OutputSchemaKind::JsonSchema { schema } => ResponseFormat {
++            kind:        ResponseFormatType::JsonSchema,
++            json_schema: Some(schema.clone()),
++            strict:      true,
++        },
++    }
++}
++
++pub(crate) fn validate_response_text(
++    schema: &OutputSchemaKind,
++    text: &str,
++) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
++    match schema {
++        OutputSchemaKind::Routing => validate_routing_response_text(text),
++        OutputSchemaKind::JsonSchema { schema } => validate_custom_response_text(schema, text),
++    }
++}
++
++pub(crate) fn apply_validated_output(
++    node: &Node,
++    schema: &OutputSchemaKind,
++    validated: &ValidatedStructuredOutput,
++    outcome: &mut Outcome,
++) {
++    match schema {
++        OutputSchemaKind::Routing => apply_routing_fields(&validated.value, outcome),
++        OutputSchemaKind::JsonSchema { .. } => {
++            outcome
++                .context_updates
++                .insert(output_key(&node.id), validated.value.clone());
++        }
++    }
++}
++
++/// Find all balanced `{...}` JSON object substrings in the text.
++pub(crate) fn find_json_objects(text: &str) -> Vec<&str> {
++    let mut results = Vec::new();
++    let bytes = text.as_bytes();
++    let mut i = 0;
++    while i < bytes.len() {
++        if bytes[i] == b'{' {
++            let start = i;
++            let mut depth = 0;
++            let mut in_string = false;
++            let mut escape = false;
++            let mut j = i;
++            while j < bytes.len() {
++                let c = bytes[j];
++                if escape {
++                    escape = false;
++                } else if c == b'\\' && in_string {
++                    escape = true;
++                } else if c == b'"' {
++                    in_string = !in_string;
++                } else if !in_string {
++                    if c == b'{' {
++                        depth += 1;
++                    } else if c == b'}' {
++                        depth -= 1;
++                        if depth == 0 {
++                            results.push(&text[start..=j]);
++                            break;
++                        }
++                    }
++                }
++                j += 1;
++            }
++        }
++        i += 1;
++    }
++    results
++}
++
++pub(crate) fn extract_status_fields_loose(text: &str, outcome: &mut Outcome) -> bool {
++    let candidates = find_json_objects(text);
++
++    let parsed = candidates.iter().rev().find_map(|candidate| {
++        let value: Value = serde_json::from_str(candidate).ok()?;
++        if value.as_object().is_some_and(contains_routing_field) {
++            Some(value)
++        } else {
++            None
++        }
++    });
++
++    let Some(value) = parsed else { return false };
++    apply_routing_fields(&value, outcome);
++    true
++}
++
++fn validate_routing_response_text(
++    text: &str,
++) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
++    let candidates = find_json_objects(text);
++    if candidates.is_empty() {
++        return Err(StructuredOutputError::new(
++            StructuredOutputErrorKind::NoJsonObject,
++            "no JSON object found in response",
++        ));
++    }
++
++    for candidate in candidates.iter().rev() {
++        let parsed = match serde_json::from_str::<Value>(candidate) {
++            Ok(value) => value,
++            Err(err) if raw_mentions_routing_field(candidate) => {
++                return Err(StructuredOutputError::new(
++                    StructuredOutputErrorKind::InvalidJson,
++                    format!("invalid routing JSON object: {err}"),
++                ));
++            }
++            Err(_) => continue,
++        };
++        let Some(obj) = parsed.as_object() else {
++            continue;
++        };
++        if !contains_routing_field(obj) {
++            continue;
++        }
++        validate_value_against_schema(&routing_schema(), &parsed)?;
++        return Ok(ValidatedStructuredOutput { value: parsed });
++    }
++
++    Err(StructuredOutputError::new(
++        StructuredOutputErrorKind::NoRelevantJsonObject,
++        format!(
++            "no JSON object contained any recognized routing field ({})",
++            ROUTING_STATUS_FIELDS.join(", ")
++        ),
++    ))
++}
++
++fn validate_custom_response_text(
++    schema: &Value,
++    text: &str,
++) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
++    let candidates = find_json_objects(text);
++    let Some(candidate) = candidates.last() else {
++        return Err(StructuredOutputError::new(
++            StructuredOutputErrorKind::NoJsonObject,
++            "no JSON object found in response",
++        ));
++    };
++    let parsed = serde_json::from_str::<Value>(candidate).map_err(|err| {
++        StructuredOutputError::new(
++            StructuredOutputErrorKind::InvalidJson,
++            format!("invalid JSON object: {err}"),
++        )
++    })?;
++    validate_value_against_schema(schema, &parsed)?;
++    Ok(ValidatedStructuredOutput { value: parsed })
++}
++
++fn validate_value_against_schema(
++    schema: &Value,
++    value: &Value,
++) -> Result<(), StructuredOutputError> {
++    let validator = compile_schema(schema).map_err(|err| {
++        StructuredOutputError::new(
++            StructuredOutputErrorKind::SchemaValidation,
++            format!("invalid JSON Schema: {err}"),
++        )
++    })?;
++    let errors = validator
++        .iter_errors(value)
++        .map(|error| error.to_string())
++        .take(5)
++        .collect::<Vec<_>>();
++    if errors.is_empty() {
++        Ok(())
++    } else {
++        Err(StructuredOutputError::validation(errors))
++    }
++}
++
++fn compile_schema(
++    schema: &Value,
++) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {
++    jsonschema::validator_for(schema)
++}
++
++fn contains_routing_field(obj: &serde_json::Map<String, Value>) -> bool {
++    ROUTING_STATUS_FIELDS
++        .iter()
++        .any(|field| obj.contains_key(*field))
++}
++
++fn raw_mentions_routing_field(candidate: &str) -> bool {
++    ROUTING_STATUS_FIELDS
++        .iter()
++        .any(|field| candidate.contains(&format!("\"{field}\"")))
++}
++
++fn routing_schema() -> Value {
++    serde_json::json!({
++        "type": "object",
++        "additionalProperties": true,
++        "properties": {
++            "preferred_next_label": { "type": "string" },
++            "outcome": {
++                "type": "string",
++                "enum": ["succeeded", "partially_succeeded", "failed", "skipped"]
++            },
++            "failure_reason": { "type": "string" },
++            "suggested_next_ids": {
++                "type": "array",
++                "items": { "type": "string" }
++            },
++            "context_updates": { "type": "object" }
++        },
++        "anyOf": ROUTING_STATUS_FIELDS
++            .iter()
++            .map(|field| serde_json::json!({ "required": [field] }))
++            .collect::<Vec<_>>()
++    })
++}
++
++fn apply_routing_fields(value: &Value, outcome: &mut Outcome) {
++    let Some(obj) = value.as_object() else {
++        return;
++    };
++
++    if let Some(label) = obj.get("preferred_next_label").and_then(Value::as_str) {
++        outcome.preferred_label = Some(label.to_string());
++    }
++
++    if let Some(ids) = obj.get("suggested_next_ids").and_then(Value::as_array) {
++        let string_ids: Vec<String> = ids
++            .iter()
++            .filter_map(|value| value.as_str().map(String::from))
++            .collect();
++        if !string_ids.is_empty() {
++            outcome.suggested_next_ids = string_ids;
++        }
++    }
++
++    if let Some(status_str) = obj.get("outcome").and_then(Value::as_str) {
++        if let Ok(status) = status_str.parse::<StageOutcome>() {
++            outcome.status = status;
++            if outcome.status.is_failure() {
++                if let Some(reason) = obj.get("failure_reason").and_then(Value::as_str) {
++                    outcome.failure =
++                        Some(FailureDetail::new(reason, FailureCategory::Deterministic));
++                }
++            }
++        }
++    }
++
++    if let Some(updates) = obj.get("context_updates").and_then(Value::as_object) {
++        for (key, value) in updates {
++            outcome.context_updates.insert(key.clone(), value.clone());
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use fabro_graphviz::graph::{AttrValue, Node};
++
++    use super::*;
++
++    fn routing() -> OutputSchemaKind {
++        OutputSchemaKind::Routing
++    }
++
++    fn schema(value: Value) -> OutputSchemaKind {
++        OutputSchemaKind::JsonSchema { schema: value }
++    }
++
++    #[test]
++    fn validates_routing_json_and_applies_fields() {
++        let validated = validate_response_text(
++            &routing(),
++            r#"done {"outcome":"failed","failure_reason":"tests failed","preferred_next_label":"fix","suggested_next_ids":["a"],"context_updates":{"verified":true}}"#,
++        )
++        .unwrap();
++        let mut outcome = Outcome::success();
++
++        apply_routing_fields(&validated.value, &mut outcome);
++
++        assert_eq!(outcome.status, StageOutcome::Failed {
++            retry_requested: false,
++        });
++        assert_eq!(
++            outcome.failure.as_ref().map(|f| f.message.as_str()),
++            Some("tests failed")
++        );
++        assert_eq!(outcome.preferred_label.as_deref(), Some("fix"));
++        assert_eq!(outcome.suggested_next_ids, vec!["a".to_string()]);
++        assert_eq!(
++            outcome.context_updates.get("verified"),
++            Some(&serde_json::json!(true)),
++        );
++    }
++
++    #[test]
++    fn routing_json_missing_routing_fields_is_invalid() {
++        let error = validate_response_text(&routing(), r#"{"summary":"ok"}"#).unwrap_err();
++
++        assert_eq!(
++            error.kind(),
++            StructuredOutputErrorKind::NoRelevantJsonObject
++        );
++        assert!(error.messages()[0].contains("recognized routing field"));
++    }
++
++    #[test]
++    fn routing_json_with_wrong_field_type_is_invalid() {
++        let error =
++            validate_response_text(&routing(), r#"{"suggested_next_ids":[1]}"#).unwrap_err();
++
++        assert_eq!(error.kind(), StructuredOutputErrorKind::SchemaValidation);
++        assert!(
++            error
++                .messages()
++                .iter()
++                .any(|message| message.contains("string")),
++            "unexpected messages: {:?}",
++            error.messages(),
++        );
++    }
++
++    #[test]
++    fn validates_custom_schema_against_last_json_object() {
++        let schema = schema(serde_json::json!({
++            "type": "object",
++            "required": ["passed"],
++            "properties": {
++                "passed": { "type": "boolean" }
++            }
++        }));
++
++        let validated =
++            validate_response_text(&schema, r#"ignore {"other":1} final {"passed":true}"#).unwrap();
++
++        assert_eq!(validated.value, serde_json::json!({"passed": true}));
++    }
++
++    #[test]
++    fn custom_schema_validation_errors_are_reported() {
++        let schema = schema(serde_json::json!({
++            "type": "object",
++            "required": ["passed"],
++            "properties": {
++                "passed": { "type": "boolean" }
++            }
++        }));
++
++        let error = validate_response_text(&schema, r#"{"passed":"yes"}"#).unwrap_err();
++
++        assert_eq!(error.kind(), StructuredOutputErrorKind::SchemaValidation);
++        assert!(
++            error
++                .messages()
++                .iter()
++                .any(|message| message.contains("boolean")),
++            "unexpected messages: {:?}",
++            error.messages(),
++        );
++    }
++
++    #[test]
++    fn invalid_custom_schema_is_rejected_when_parsing_node_attr() {
++        let mut node = Node::new("audit");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String(r#"{"type": 5}"#.to_string()),
++        );
++
++        let error = parse_node_output_schema(&node).unwrap_err();
++
++        assert!(
++            error.to_string().contains("Invalid output_schema"),
++            "unexpected error: {error}",
++        );
++    }
++
++    #[test]
++    fn invalid_json_candidate_is_reported_for_custom_schema() {
++        let schema = schema(serde_json::json!({"type": "object"}));
++
++        let error = validate_response_text(&schema, r"{not json}").unwrap_err();
++
++        assert_eq!(error.kind(), StructuredOutputErrorKind::InvalidJson);
++        assert!(error.messages()[0].contains("invalid JSON object"));
++    }
++
++    #[test]
++    fn no_json_object_is_reported() {
++        let error = validate_response_text(&routing(), "plain text only").unwrap_err();
++
++        assert_eq!(error.kind(), StructuredOutputErrorKind::NoJsonObject);
++        assert!(error.messages()[0].contains("no JSON object"));
++    }
++
++    #[test]
++    fn parse_node_output_schema_accepts_builtin_routing_keyword() {
++        let mut node = Node::new("route");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++
++        let parsed = parse_node_output_schema(&node).unwrap();
++
++        assert_eq!(parsed, Some(OutputSchemaKind::Routing));
++    }
++
++    #[test]
++    fn prompt_response_format_uses_json_schema_for_custom_schema() {
++        let schema = schema(serde_json::json!({"type": "object"}));
++
++        let format = prompt_response_format(&schema);
++
++        assert_eq!(format.kind, ResponseFormatType::JsonSchema);
++        assert_eq!(
++            format.json_schema,
++            Some(serde_json::json!({"type": "object"}))
++        );
++        assert!(format.strict);
++    }
++
++    #[test]
++    fn apply_validated_custom_output_updates_output_context_key() {
++        let node = Node::new("audit");
++        let schema = schema(serde_json::json!({"type": "object"}));
++        let validated = ValidatedStructuredOutput {
++            value: serde_json::json!({"passed": true}),
++        };
++        let mut outcome = Outcome::success();
++
++        apply_validated_output(&node, &schema, &validated, &mut outcome);
++
++        assert_eq!(
++            outcome.context_updates.get("output.audit"),
++            Some(&serde_json::json!({"passed": true})),
++        );
++    }
++}
+diff --git a/lib/crates/fabro-workflow/src/static_reference.rs b/lib/crates/fabro-workflow/src/static_reference.rs
+index 276cf37c1..af83539eb 100644
+--- a/lib/crates/fabro-workflow/src/static_reference.rs
++++ b/lib/crates/fabro-workflow/src/static_reference.rs
+@@ -87,9 +87,57 @@ pub fn reference_kind_for_attribute(
+         "goal" if matches!(scope, AttributeScope::Graph) && value.starts_with('@') => {
+             Some(ReferenceKind::GraphGoalFile)
+         }
+-        "prompt" if matches!(scope, AttributeScope::Node) && value.starts_with('@') => {
++        "prompt" | "output_schema"
++            if matches!(scope, AttributeScope::Node) && value.starts_with('@') =>
++        {
+             Some(ReferenceKind::FileInline)
+         }
+         _ => None,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn output_schema_at_value_is_file_inline_reference() {
++        assert_eq!(
++            reference_kind_for_attribute(
++                AttributeScope::Node,
++                "output_schema",
++                "@schemas/result.schema.json",
++            ),
++            Some(ReferenceKind::FileInline),
++        );
++    }
++
++    #[test]
++    fn output_schema_builtin_keyword_is_not_file_inline_reference() {
++        assert_eq!(
++            reference_kind_for_attribute(AttributeScope::Node, "output_schema", "routing"),
++            None,
++        );
++    }
++
++    #[test]
++    fn output_schema_reference_rejects_template_syntax() {
++        let error = reference_kind_for_attribute(
++            AttributeScope::Node,
++            "output_schema",
++            "@schemas/{{ inputs.schema }}.json",
++        )
++        .expect("output_schema @ references should be static references")
++        .validate("@schemas/{{ inputs.schema }}.json")
++        .unwrap_err();
++
++        assert_eq!(error.kind(), ReferenceKind::FileInline);
++        assert_eq!(error.value(), "@schemas/{{ inputs.schema }}.json");
++        assert!(
++            error
++                .to_string()
++                .contains("templates are not supported in file inline references"),
++            "unexpected error: {error}",
++        );
++    }
++}
+diff --git a/lib/crates/fabro-workflow/src/transforms/file_inlining.rs b/lib/crates/fabro-workflow/src/transforms/file_inlining.rs
+index 1e71699b1..942ba4af6 100644
+--- a/lib/crates/fabro-workflow/src/transforms/file_inlining.rs
++++ b/lib/crates/fabro-workflow/src/transforms/file_inlining.rs
+@@ -192,33 +192,46 @@ impl FileInliningTransform {
+             .with_inputs(self.inputs.clone());
+ 
+         for (node_id, node) in &mut graph.nodes {
+-            let Some(AttrValue::String(prompt)) = node.attrs.get("prompt") else {
+-                continue;
+-            };
+-            let target = TemplateRenderTarget::node_attr(
+-                self.source_name.clone(),
+-                node_id.clone(),
+-                "prompt",
+-            )
+-            .with_source_origin(self.source_text.as_deref(), prompt)
+-            .with_template_store(template_render_store(
+-                &self.current_dir,
+-                Arc::clone(&self.resolver),
+-                self.source_name.as_deref(),
+-                prompt,
+-            )?);
+-            let rendered = render_template_for_target(
+-                prompt,
+-                &ctx,
+-                self.render_mode,
+-                &target,
+-                &mut diagnostics,
+-            )?;
+-            let value = self
+-                .render_resolved_file_ref(&rendered, &ctx, target, &mut diagnostics)?
+-                .unwrap_or(rendered);
+-            node.attrs
+-                .insert("prompt".to_string(), AttrValue::String(value));
++            for attr_name in ["prompt", "output_schema"] {
++                let Some(AttrValue::String(attr_value)) = node.attrs.get(attr_name) else {
++                    continue;
++                };
++                let target = TemplateRenderTarget::node_attr(
++                    self.source_name.clone(),
++                    node_id.clone(),
++                    attr_name,
++                )
++                .with_source_origin(self.source_text.as_deref(), attr_value)
++                .with_template_store(template_render_store(
++                    &self.current_dir,
++                    Arc::clone(&self.resolver),
++                    self.source_name.as_deref(),
++                    attr_value,
++                )?);
++                let rendered = render_template_for_target(
++                    attr_value,
++                    &ctx,
++                    self.render_mode,
++                    &target,
++                    &mut diagnostics,
++                )?;
++                let value = match self.render_resolved_file_ref(
++                    &rendered,
++                    &ctx,
++                    target,
++                    &mut diagnostics,
++                )? {
++                    Some(value) => value,
++                    None if attr_name == "output_schema" && rendered.starts_with('@') => {
++                        return Err(Error::Validation(format!(
++                            "node '{node_id}' output_schema has unresolved file reference: {rendered}"
++                        )));
++                    }
++                    None => rendered,
++                };
++                node.attrs
++                    .insert(attr_name.to_string(), AttrValue::String(value));
++            }
+         }
+ 
+         Ok((graph, diagnostics))
+@@ -465,6 +478,90 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn file_inlining_transform_inlines_output_schema_reference() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::create_dir_all(dir.path().join("schemas")).unwrap();
++        std::fs::write(
++            dir.path().join("schemas/audit-result.schema.json"),
++            r#"{"type":"object","required":["passed"]}"#,
++        )
++        .unwrap();
++
++        let mut graph = Graph::new("test");
++        let mut node = Node::new("audit");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("@schemas/audit-result.schema.json".to_string()),
++        );
++        graph.nodes.insert("audit".to_string(), node);
++
++        let transform = FileInliningTransform::new(
++            dir.path().to_path_buf(),
++            Arc::new(FilesystemFileResolver::new(None)),
++        );
++        let graph = transform.apply(graph).unwrap();
++
++        assert_eq!(
++            graph.nodes["audit"]
++                .attrs
++                .get("output_schema")
++                .and_then(AttrValue::as_str),
++            Some(r#"{"type":"object","required":["passed"]}"#)
++        );
++    }
++
++    #[test]
++    fn file_inlining_transform_leaves_routing_output_schema_keyword_unchanged() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut graph = Graph::new("test");
++        let mut node = Node::new("route");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("routing".to_string()),
++        );
++        graph.nodes.insert("route".to_string(), node);
++
++        let transform = FileInliningTransform::new(
++            dir.path().to_path_buf(),
++            Arc::new(FilesystemFileResolver::new(None)),
++        );
++        let graph = transform.apply(graph).unwrap();
++
++        assert_eq!(
++            graph.nodes["route"]
++                .attrs
++                .get("output_schema")
++                .and_then(AttrValue::as_str),
++            Some("routing")
++        );
++    }
++
++    #[test]
++    fn file_inlining_transform_reports_unresolved_output_schema_reference() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut graph = Graph::new("test");
++        let mut node = Node::new("audit");
++        node.attrs.insert(
++            "output_schema".to_string(),
++            AttrValue::String("@schemas/missing.schema.json".to_string()),
++        );
++        graph.nodes.insert("audit".to_string(), node);
++
++        let transform = FileInliningTransform::new(
++            dir.path().to_path_buf(),
++            Arc::new(FilesystemFileResolver::new(None)),
++        );
++        let error = transform.apply(graph).unwrap_err();
++
++        assert!(
++            error.to_string().contains(
++                "node 'audit' output_schema has unresolved file reference: @schemas/missing.schema.json"
++            ),
++            "unexpected error: {error}",
++        );
++    }
++
+     #[test]
+     fn file_inlining_transform_resolves_minijinja_includes_for_prompts_and_goal() {
+         let dir = tempfile::tempdir().unwrap();
