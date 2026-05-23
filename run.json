@@ -492,7 +492,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T19:56:01.493793Z",
-  "last_event_at": "2026-05-23T19:56:08.964228Z",
+  "last_event_at": "2026-05-23T19:58:28.549765Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -590,9 +590,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 38,
       "checkpoint": {
-        "timestamp": "2026-05-23T19:58:25.135018Z",
+        "timestamp": "2026-05-23T19:58:28.547196Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -601,7 +601,77 @@
         ],
         "node_retries": {},
         "context_values": {
+          "failure_signature": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "graph.goal": "# Output Schema Validation Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `output_schema` validation for agent and prompt nodes, with context-preserving repair turns when structured output does not validate.\n\n**Architecture:** Introduce a small structured-output layer in `fabro-workflow` that resolves node-level schema declarations, extracts JSON output, validates it, and produces either routing side effects or a parsed custom output context update. Agent and prompt execution must perform schema repair inside the active LLM conversation instead of using the workflow executor retry path.\n\n**Tech Stack:** Rust, Graphviz workflow attrs, `serde_json`, workspace `jsonschema`, existing `fabro-llm::ResponseFormat`, Fabro agent sessions, `cargo nextest`.\n\n---\n\n## Public Interface\n\nWorkflow authors can opt in on agent and prompt nodes:\n\n```dot\nreview [\n  shape=tab,\n  output_schema=\"routing\",\n  output_retries=2\n]\n\naudit [\n  shape=tab,\n  output_schema=\"@schemas/audit-result.schema.json\",\n  output_retries=2\n]\n```\n\n- `output_schema=\"routing\"` uses Fabro's built-in routing directive schema.\n- `output_schema=\"@path/to/schema.json\"` loads a JSON Schema file through existing workflow file-reference rules.\n- `output_retries` controls corrective turns inside the same node execution. Default: `2`. `0` means validate once and fail without a repair turn.\n- Schema failures are terminal node failures after `output_retries` is exhausted. They are not `retry_requested` outcomes and do not consume `max_retries`.\n- `backend=\"acp\"` with `output_schema` is unsupported in v1 and returns a clear validation error.\n\n## Implementation Tasks\n\n### Task 1: Node Attributes And File Reference Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/graph.rs`\n- Modify: `lib/crates/fabro-workflow/src/static_reference.rs`\n- Modify: `lib/crates/fabro-workflow/src/transforms/file_inlining.rs`\n- Test: existing unit tests in those files\n\n- [ ] Add `Node::output_schema(&self) -> Option<&str>` next to other agent/prompt attrs.\n- [ ] Add `Node::output_retries(&self) -> i64` returning `self.int_attr(\"output_retries\").unwrap_or(2).max(0)`.\n- [ ] Teach static reference validation that node attr `output_schema` values starting with `@` are file inline references.\n- [ ] Extend file inlining so `output_schema=\"@schemas/foo.json\"` is replaced with the schema file contents before execution, while `output_schema=\"routing\"` stays unchanged.\n- [ ] Add tests for absent attrs, default retries, zero retries, file inlining, and unresolved schema reference diagnostics.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference\n```\n\nExpected: targeted tests pass.\n\n### Task 2: Structured Output Module\n\n**Files:**\n- Create: `lib/crates/fabro-workflow/src/handler/structured_output.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/mod.rs`\n- Modify: `lib/crates/fabro-workflow/Cargo.toml`\n- Test: unit tests in `structured_output.rs`\n\n- [ ] Add `jsonschema.workspace = true` to `fabro-workflow` dependencies.\n- [ ] Define `OutputSchemaKind` with `Routing` and `JsonSchema { schema: serde_json::Value }`.\n- [ ] Parse `node.output_schema()` into `None`, `Routing`, or custom JSON Schema. Treat literal `routing` as the only built-in keyword.\n- [ ] Add a built-in routing schema requiring an object with at least one recognized field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.\n- [ ] Reuse balanced-object scanning semantics for response text: validate the last JSON object that is relevant to the selected schema.\n- [ ] Return a structured validation result containing the parsed JSON object, concise error messages, and enough information to build a repair prompt.\n- [ ] Add tests for valid routing JSON, missing routing fields, wrong routing field types, valid custom schema, invalid custom schema, invalid JSON, and no JSON object.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow structured_output\n```\n\nExpected: structured-output unit tests pass.\n\n### Task 3: Routing Extraction Compatibility\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: existing agent handler unit tests\n\n- [ ] Keep the loose default unchanged when `output_schema` is absent.\n- [ ] Move current `STATUS_FIELDS`, balanced JSON scanning, and routing-field application behind reusable functions in `structured_output.rs` or call the new module from `agent.rs`.\n- [ ] For `output_schema=\"routing\"`, require schema-valid routing JSON and surface validation failures for repair instead of silently ignoring bad candidates.\n- [ ] Preserve existing routing fallback priority for agent nodes: response text first, then `status.json`, then last file touched.\n- [ ] Keep prompt-node routing behavior response-only unless later tasks explicitly add prompt `status.json` support.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent\n```\n\nExpected: existing loose routing tests still pass, plus new strict routing tests pass.\n\n### Task 4: Prompt Node Same-Context Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/prompt.rs`\n- Test: prompt/API backend tests in those files\n\n- [ ] In `AgentApiBackend::one_shot`, keep `messages` mutable across attempts.\n- [ ] When a prompt node has a custom JSON Schema, set `response_format=JsonSchema` on the initial and repair LLM requests. For `routing`, use `JsonObject` or no provider-native schema if provider behavior would conflict with Fabro's routing extraction.\n- [ ] After each LLM response, validate according to `output_schema`.\n- [ ] On validation failure with repair attempts remaining, append `Message::assistant(response.text())`, then append a corrective `Message::user(repair_message)`, and call `client.complete` again with the same messages.\n- [ ] On success, return the validated response text and aggregate usage across all attempts.\n- [ ] On exhaustion, return a terminal failed outcome with failure reason `output schema validation failed after N repair attempt(s)`.\n- [ ] Update `PromptHandler` so validated custom output is added to `context_updates[\"output.{node_id}\"]`; routing output still updates outcome routing fields.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::prompt handler::llm::api\n```\n\nExpected: prompt repair keeps previous assistant output in the message list and succeeds after a corrective response.\n\n### Task 5: Agent Node Same-Session Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: agent/API backend tests in those files\n\n- [ ] In `AgentApiBackend::run`, validate the final assistant response before releasing, closing, or caching the session.\n- [ ] On validation failure with repair attempts remaining, call `session.process_input(repair_message)` on the same `Session`.\n- [ ] Recompute the final assistant response after each repair turn from `session.history()`.\n- [ ] Aggregate usage across all new assistant turns, including repair turns, without double-counting reused session history.\n- [ ] Do not set provider-native `response_format` for agent sessions in v1, because agent sessions may need normal tool-use messages before final output.\n- [ ] Return terminal failure after exhaustion; do not return a retryable backend error and do not request workflow node retry.\n- [ ] Update `AgentHandler` to apply validated routing/custom output to the final `Outcome`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent handler::llm::api\n```\n\nExpected: agent repair sends a second `process_input` to the same session and final validated output drives outcome/context updates.\n\n### Task 6: ACP Guardrail\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/acp.rs`\n- Test: ACP backend tests in that file\n\n- [ ] At the start of `AgentAcpBackend::run`, reject nodes where `node.output_schema().is_some()`.\n- [ ] Use a clear error message: `output_schema is not supported with backend=\"acp\" in this release`.\n- [ ] Add a test proving the ACP backend does not launch a process when `output_schema` is present.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::llm::acp\n```\n\nExpected: ACP guardrail test passes.\n\n### Task 7: Docs\n\n**Files:**\n- Modify: `docs/public/agents/outputs.mdx`\n- Modify: `docs/public/reference/dot-language.mdx`\n\n- [ ] Document `output_schema=\"routing\"` and `output_schema=\"@schema.json\"` under routing/structured outputs.\n- [ ] Document same-context repair behavior explicitly: Fabro sends validation feedback to the same agent/prompt context before failing.\n- [ ] Document `output_retries`, default `2`, and distinction from `max_retries`.\n- [ ] Document v1 scope: agent/prompt nodes only; ACP unsupported; custom schema output stored at `output.{node_id}`.\n\nRun:\n\n```bash\nrg -n \"output_schema|output_retries|output\\\\.\" docs/public/agents/outputs.mdx docs/public/reference/dot-language.mdx\n```\n\nExpected: docs mention the new attrs and storage behavior.\n\n### Task 8: Full Verification\n\n**Files:**\n- No new files beyond prior tasks\n\n- [ ] Run focused workflow tests:\n\n```bash\ncargo nextest run -p fabro-workflow\n```\n\n- [ ] Run formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] If snapshots change, inspect before accepting:\n\n```bash\ncargo insta pending-snapshots\n```\n\nOnly run `cargo insta accept` after verifying every pending snapshot is expected.\n\n## Acceptance Criteria\n\n- Existing workflows without `output_schema` behave exactly as before.\n- `output_schema=\"routing\"` prevents malformed/missing routing JSON from silently falling through to normal edge selection.\n- Invalid structured output results in a corrective LLM turn in the same context window.\n- Prompt repair preserves previous assistant output in the message list.\n- Agent repair preserves the same live session and does not re-run the node from scratch.\n- Exhausted output repair attempts produce a clear terminal failure.\n- Custom schema output is available to downstream nodes at `output.{node_id}`.\n- Docs clearly distinguish `output_retries` from `max_retries`.\n\n## Assumptions\n\n- `output_retries=2` is the default.\n- Custom schema validation targets the final JSON object in the response text.\n- `status.json` fallback remains routing-specific.\n- Provider-native response schema is used for prompt nodes only where it is safe.\n- ACP support can be added later after there is a guaranteed context-preserving repair mechanism.\n",
+          "outcome": "succeeded",
+          "internal.retry_count.toolchain": 0,
+          "internal.fidelity": "compact",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.thread_id": "toolchain",
+          "current_node": "preflight_compile",
+          "graph.rankdir": "LR",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "internal.run_id": "01KSB6GTZ00T5V6BNMXN3SPKZF",
+          "thread.start.current_node": "toolchain",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "failure_class": "",
+          "internal.retry_count.preflight_compile": 0,
+          "thread.toolchain.current_node": "preflight_compile"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "ef2a1e5f1310ca17fa225f7ad2d0ae56b073c8de",
+        "node_visits": {
+          "preflight_compile": 1,
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T20:00:57.006215Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.thread_id": "preflight_compile",
           "failure_class": "",
           "graph.goal": "# Output Schema Validation Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `output_schema` validation for agent and prompt nodes, with context-preserving repair turns when structured output does not validate.\n\n**Architecture:** Introduce a small structured-output layer in `fabro-workflow` that resolves node-level schema declarations, extracts JSON output, validates it, and produces either routing side effects or a parsed custom output context update. Agent and prompt execution must perform schema repair inside the active LLM conversation instead of using the workflow executor retry path.\n\n**Tech Stack:** Rust, Graphviz workflow attrs, `serde_json`, workspace `jsonschema`, existing `fabro-llm::ResponseFormat`, Fabro agent sessions, `cargo nextest`.\n\n---\n\n## Public Interface\n\nWorkflow authors can opt in on agent and prompt nodes:\n\n```dot\nreview [\n  shape=tab,\n  output_schema=\"routing\",\n  output_retries=2\n]\n\naudit [\n  shape=tab,\n  output_schema=\"@schemas/audit-result.schema.json\",\n  output_retries=2\n]\n```\n\n- `output_schema=\"routing\"` uses Fabro's built-in routing directive schema.\n- `output_schema=\"@path/to/schema.json\"` loads a JSON Schema file through existing workflow file-reference rules.\n- `output_retries` controls corrective turns inside the same node execution. Default: `2`. `0` means validate once and fail without a repair turn.\n- Schema failures are terminal node failures after `output_retries` is exhausted. They are not `retry_requested` outcomes and do not consume `max_retries`.\n- `backend=\"acp\"` with `output_schema` is unsupported in v1 and returns a clear validation error.\n\n## Implementation Tasks\n\n### Task 1: Node Attributes And File Reference Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/graph.rs`\n- Modify: `lib/crates/fabro-workflow/src/static_reference.rs`\n- Modify: `lib/crates/fabro-workflow/src/transforms/file_inlining.rs`\n- Test: existing unit tests in those files\n\n- [ ] Add `Node::output_schema(&self) -> Option<&str>` next to other agent/prompt attrs.\n- [ ] Add `Node::output_retries(&self) -> i64` returning `self.int_attr(\"output_retries\").unwrap_or(2).max(0)`.\n- [ ] Teach static reference validation that node attr `output_schema` values starting with `@` are file inline references.\n- [ ] Extend file inlining so `output_schema=\"@schemas/foo.json\"` is replaced with the schema file contents before execution, while `output_schema=\"routing\"` stays unchanged.\n- [ ] Add tests for absent attrs, default retries, zero retries, file inlining, and unresolved schema reference diagnostics.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference\n```\n\nExpected: targeted tests pass.\n\n### Task 2: Structured Output Module\n\n**Files:**\n- Create: `lib/crates/fabro-workflow/src/handler/structured_output.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/mod.rs`\n- Modify: `lib/crates/fabro-workflow/Cargo.toml`\n- Test: unit tests in `structured_output.rs`\n\n- [ ] Add `jsonschema.workspace = true` to `fabro-workflow` dependencies.\n- [ ] Define `OutputSchemaKind` with `Routing` and `JsonSchema { schema: serde_json::Value }`.\n- [ ] Parse `node.output_schema()` into `None`, `Routing`, or custom JSON Schema. Treat literal `routing` as the only built-in keyword.\n- [ ] Add a built-in routing schema requiring an object with at least one recognized field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.\n- [ ] Reuse balanced-object scanning semantics for response text: validate the last JSON object that is relevant to the selected schema.\n- [ ] Return a structured validation result containing the parsed JSON object, concise error messages, and enough information to build a repair prompt.\n- [ ] Add tests for valid routing JSON, missing routing fields, wrong routing field types, valid custom schema, invalid custom schema, invalid JSON, and no JSON object.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow structured_output\n```\n\nExpected: structured-output unit tests pass.\n\n### Task 3: Routing Extraction Compatibility\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: existing agent handler unit tests\n\n- [ ] Keep the loose default unchanged when `output_schema` is absent.\n- [ ] Move current `STATUS_FIELDS`, balanced JSON scanning, and routing-field application behind reusable functions in `structured_output.rs` or call the new module from `agent.rs`.\n- [ ] For `output_schema=\"routing\"`, require schema-valid routing JSON and surface validation failures for repair instead of silently ignoring bad candidates.\n- [ ] Preserve existing routing fallback priority for agent nodes: response text first, then `status.json`, then last file touched.\n- [ ] Keep prompt-node routing behavior response-only unless later tasks explicitly add prompt `status.json` support.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent\n```\n\nExpected: existing loose routing tests still pass, plus new strict routing tests pass.\n\n### Task 4: Prompt Node Same-Context Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/prompt.rs`\n- Test: prompt/API backend tests in those files\n\n- [ ] In `AgentApiBackend::one_shot`, keep `messages` mutable across attempts.\n- [ ] When a prompt node has a custom JSON Schema, set `response_format=JsonSchema` on the initial and repair LLM requests. For `routing`, use `JsonObject` or no provider-native schema if provider behavior would conflict with Fabro's routing extraction.\n- [ ] After each LLM response, validate according to `output_schema`.\n- [ ] On validation failure with repair attempts remaining, append `Message::assistant(response.text())`, then append a corrective `Message::user(repair_message)`, and call `client.complete` again with the same messages.\n- [ ] On success, return the validated response text and aggregate usage across all attempts.\n- [ ] On exhaustion, return a terminal failed outcome with failure reason `output schema validation failed after N repair attempt(s)`.\n- [ ] Update `PromptHandler` so validated custom output is added to `context_updates[\"output.{node_id}\"]`; routing output still updates outcome routing fields.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::prompt handler::llm::api\n```\n\nExpected: prompt repair keeps previous assistant output in the message list and succeeds after a corrective response.\n\n### Task 5: Agent Node Same-Session Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: agent/API backend tests in those files\n\n- [ ] In `AgentApiBackend::run`, validate the final assistant response before releasing, closing, or caching the session.\n- [ ] On validation failure with repair attempts remaining, call `session.process_input(repair_message)` on the same `Session`.\n- [ ] Recompute the final assistant response after each repair turn from `session.history()`.\n- [ ] Aggregate usage across all new assistant turns, including repair turns, without double-counting reused session history.\n- [ ] Do not set provider-native `response_format` for agent sessions in v1, because agent sessions may need normal tool-use messages before final output.\n- [ ] Return terminal failure after exhaustion; do not return a retryable backend error and do not request workflow node retry.\n- [ ] Update `AgentHandler` to apply validated routing/custom output to the final `Outcome`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent handler::llm::api\n```\n\nExpected: agent repair sends a second `process_input` to the same session and final validated output drives outcome/context updates.\n\n### Task 6: ACP Guardrail\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/acp.rs`\n- Test: ACP backend tests in that file\n\n- [ ] At the start of `AgentAcpBackend::run`, reject nodes where `node.output_schema().is_some()`.\n- [ ] Use a clear error message: `output_schema is not supported with backend=\"acp\" in this release`.\n- [ ] Add a test proving the ACP backend does not launch a process when `output_schema` is present.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::llm::acp\n```\n\nExpected: ACP guardrail test passes.\n\n### Task 7: Docs\n\n**Files:**\n- Modify: `docs/public/agents/outputs.mdx`\n- Modify: `docs/public/reference/dot-language.mdx`\n\n- [ ] Document `output_schema=\"routing\"` and `output_schema=\"@schema.json\"` under routing/structured outputs.\n- [ ] Document same-context repair behavior explicitly: Fabro sends validation feedback to the same agent/prompt context before failing.\n- [ ] Document `output_retries`, default `2`, and distinction from `max_retries`.\n- [ ] Document v1 scope: agent/prompt nodes only; ACP unsupported; custom schema output stored at `output.{node_id}`.\n\nRun:\n\n```bash\nrg -n \"output_schema|output_retries|output\\\\.\" docs/public/agents/outputs.mdx docs/public/reference/dot-language.mdx\n```\n\nExpected: docs mention the new attrs and storage behavior.\n\n### Task 8: Full Verification\n\n**Files:**\n- No new files beyond prior tasks\n\n- [ ] Run focused workflow tests:\n\n```bash\ncargo nextest run -p fabro-workflow\n```\n\n- [ ] Run formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] If snapshots change, inspect before accepting:\n\n```bash\ncargo insta pending-snapshots\n```\n\nOnly run `cargo insta accept` after verifying every pending snapshot is expected.\n\n## Acceptance Criteria\n\n- Existing workflows without `output_schema` behave exactly as before.\n- `output_schema=\"routing\"` prevents malformed/missing routing JSON from silently falling through to normal edge selection.\n- Invalid structured output results in a corrective LLM turn in the same context window.\n- Prompt repair preserves previous assistant output in the message list.\n- Agent repair preserves the same live session and does not re-run the node from scratch.\n- Exhausted output repair attempts produce a clear terminal failure.\n- Custom schema output is available to downstream nodes at `output.{node_id}`.\n- Docs clearly distinguish `output_retries` from `max_retries`.\n\n## Assumptions\n\n- `output_retries=2` is the default.\n- Custom schema validation targets the final JSON object in the response text.\n- `status.json` fallback remains routing-specific.\n- Provider-native response schema is used for prompt nodes only where it is safe.\n- ACP support can be added later after there is a guaranteed context-preserving repair mechanism.\n",
           "failure_signature": "",
@@ -609,12 +679,14 @@
           "internal.run_id": "01KSB6GTZ00T5V6BNMXN3SPKZF",
           "internal.retry_count.start": 0,
           "graph.rankdir": "LR",
-          "current_node": "preflight_compile",
+          "current_node": "preflight_lint",
           "thread.start.current_node": "toolchain",
           "thread.toolchain.current_node": "preflight_compile",
           "internal.node_visit_count": 1,
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "internal.retry_count.preflight_compile": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.retry_count.preflight_lint": 0,
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.fidelity": "compact",
@@ -640,12 +712,21 @@
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
           "preflight_compile": 1,
           "start": 1,
+          "preflight_lint": 1,
           "toolchain": 1
         }
       },
@@ -724,7 +805,12 @@
       "first_event_seq": 31,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T19:58:25.133947Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -732,10 +818,53 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 136162,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-23T19:56:08.963894Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 136168,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 41,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-23T19:56:08.963894Z",
+      "started_at": "2026-05-23T19:58:28.549421Z",
       "handler": "command",
       "usage": {
         "input_tokens": 0,
