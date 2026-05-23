@@ -521,7 +521,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T10:02:04.125640Z",
-  "last_event_at": "2026-05-23T10:04:13.440780Z",
+  "last_event_at": "2026-05-23T10:43:18.890629Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -688,9 +688,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 48,
       "checkpoint": {
-        "timestamp": "2026-05-23T10:06:22.042693Z",
+        "timestamp": "2026-05-23T10:06:27.780900Z",
         "current_node": "preflight_lint",
         "completed_nodes": [
           "start",
@@ -700,24 +700,111 @@
         ],
         "node_retries": {},
         "context_values": {
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "graph.goal": "---\ntitle: Add Manual Run Retry\ntype: feat\nstatus: active\ndate: 2026-05-23\n---\n\n# Add Manual Run Retry\n\n## Summary\n\nAdd a **Retry** action for failed Fabro runs that creates and immediately starts a new run from the failed run's captured run definition. The new run is independent runtime state, records `retried_from: <source_run_id>`, and leaves the source run unchanged.\n\nThis is a fresh run, not resume/fork/rewind. It should copy the source run's durable definition and settings, but not checkpoints, stage state, sandbox state, PR links, billing, questions, conclusions, or pending controls.\n\n## Key Changes\n\n- Add `retried_from` as a nullable public field on `Run`.\n  - Store it on the new run only.\n  - Do not add a reverse `retried_by` field in v1.\n  - Preserve backward compatibility with old events by defaulting to `null`.\n\n- Add `POST /api/v1/runs/{id}/retry`.\n  - Response: `201` with the newly created/queued `Run`.\n  - Eligible source states: `failed` except `reason=cancelled`, and `dead`.\n  - Reject active, succeeded, cancelled, archived, and missing runs with existing API error patterns.\n  - The new run should use the current authenticated actor as `created_by`.\n  - The new run should preserve the source run's current `parent_id`, title, labels, workflow graph/source, resolved settings, git context, manifest/definition blob refs, and `fork_source_ref` if present.\n\n- Implement retry using a workflow operation similar in shape to `fork`, but without replaying checkpoint/runtime events.\n  - Create a new run store.\n  - Append `run.created` with `retried_from`.\n  - Append `run.submitted`.\n  - Queue/start it through the same internal start path used by `POST /runs/{id}/start`.\n\n- Update OpenAPI and generated clients.\n  - Edit `docs/public/api-reference/fabro-api.yaml`.\n  - Regenerate Rust API types through `cargo build -p fabro-api`.\n  - Regenerate TypeScript client in `lib/packages/fabro-api-client`.\n\n- Update the web UI.\n  - Add `Retry` to the run action menu for eligible failed/dead runs.\n  - Disable the action while pending.\n  - On success, navigate to the new run page and refresh run/list caches.\n  - Add a compact \"Retried from\" link in the run summary panel when `retried_from` is present.\n  - Add demo-mode support or hide the action in demo mode so the button never navigates to a missing demo run.\n\n## Test Plan\n\n- Rust workflow/store tests:\n  - `run.created` serializes/deserializes `retried_from`.\n  - Old `run.created` events project with `retried_from = None`.\n  - Retry creates a new run with a different ID, copied durable definition, no runtime state, and `retried_from` set.\n  - Retry preserves current `parent_id`, title, labels, git context, settings, and `fork_source_ref`.\n  - Retry rejects succeeded, active, cancelled, and archived source runs.\n\n- Rust server/API tests:\n  - `POST /runs/{id}/retry` on a failed run returns `201`, a new run ID, `retried_from`, and queued/started lifecycle state.\n  - Source run remains unchanged.\n  - `404` for unknown run.\n  - `409` for non-retryable status.\n  - Generated Rust API compiles against the updated OpenAPI contract.\n\n- Web tests:\n  - `canRetry` returns true for failed/dead, false for cancelled/succeeded/active/archived.\n  - Action menu renders `Retry` only when eligible.\n  - Successful retry calls the generated client and navigates to `/runs/:newId`.\n  - Retry errors show a useful toast/message.\n  - Run summary panel renders the `Retried from` link when present.\n  - Typecheck passes with regenerated client types.\n\n## Assumptions\n\n- V1 does not add a CLI `fabro retry` command.\n- V1 does not add automatic retry attempts, retry counts, or idempotency keys.\n- Multiple manual clicks after the first request completes may create multiple retry runs.\n- \"Same settings\" means the source run's captured durable definition/settings, not latest local files from the user's machine.\n- Cancelled runs are excluded because cancellation is user intent, not execution failure.\n",
+          "internal.retry_count.preflight_compile": 0,
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.retry_count.toolchain": 0,
           "internal.thread_id": "preflight_compile",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.start": 0,
+          "graph.rankdir": "LR",
+          "failure_signature": "",
+          "internal.node_visit_count": 1,
+          "current_node": "preflight_lint",
+          "failure_class": "",
+          "internal.fidelity": "compact",
+          "internal.run_id": "01KSA4H7JHBRPXZM3XTJ4SD9QA",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "outcome": "succeeded",
+          "thread.start.current_node": "toolchain",
+          "internal.retry_count.preflight_lint": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "implement",
+        "git_commit_sha": "0fad47fb171ba34cdabe06a802a4e97240045b93",
+        "node_visits": {
+          "start": 1,
+          "preflight_lint": 1,
+          "toolchain": 1,
+          "preflight_compile": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T10:43:19.417237Z",
+        "current_node": "implement",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.thread_id": "preflight_lint",
           "thread.preflight_compile.current_node": "preflight_lint",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.retry_count.start": 0,
           "failure_signature": "",
+          "last_stage": "implement",
+          "internal.retry_count.implement": 0,
           "internal.run_id": "01KSA4H7JHBRPXZM3XTJ4SD9QA",
           "internal.retry_count.preflight_lint": 0,
           "internal.node_visit_count": 1,
           "graph.goal": "---\ntitle: Add Manual Run Retry\ntype: feat\nstatus: active\ndate: 2026-05-23\n---\n\n# Add Manual Run Retry\n\n## Summary\n\nAdd a **Retry** action for failed Fabro runs that creates and immediately starts a new run from the failed run's captured run definition. The new run is independent runtime state, records `retried_from: <source_run_id>`, and leaves the source run unchanged.\n\nThis is a fresh run, not resume/fork/rewind. It should copy the source run's durable definition and settings, but not checkpoints, stage state, sandbox state, PR links, billing, questions, conclusions, or pending controls.\n\n## Key Changes\n\n- Add `retried_from` as a nullable public field on `Run`.\n  - Store it on the new run only.\n  - Do not add a reverse `retried_by` field in v1.\n  - Preserve backward compatibility with old events by defaulting to `null`.\n\n- Add `POST /api/v1/runs/{id}/retry`.\n  - Response: `201` with the newly created/queued `Run`.\n  - Eligible source states: `failed` except `reason=cancelled`, and `dead`.\n  - Reject active, succeeded, cancelled, archived, and missing runs with existing API error patterns.\n  - The new run should use the current authenticated actor as `created_by`.\n  - The new run should preserve the source run's current `parent_id`, title, labels, workflow graph/source, resolved settings, git context, manifest/definition blob refs, and `fork_source_ref` if present.\n\n- Implement retry using a workflow operation similar in shape to `fork`, but without replaying checkpoint/runtime events.\n  - Create a new run store.\n  - Append `run.created` with `retried_from`.\n  - Append `run.submitted`.\n  - Queue/start it through the same internal start path used by `POST /runs/{id}/start`.\n\n- Update OpenAPI and generated clients.\n  - Edit `docs/public/api-reference/fabro-api.yaml`.\n  - Regenerate Rust API types through `cargo build -p fabro-api`.\n  - Regenerate TypeScript client in `lib/packages/fabro-api-client`.\n\n- Update the web UI.\n  - Add `Retry` to the run action menu for eligible failed/dead runs.\n  - Disable the action while pending.\n  - On success, navigate to the new run page and refresh run/list caches.\n  - Add a compact \"Retried from\" link in the run summary panel when `retried_from` is present.\n  - Add demo-mode support or hide the action in demo mode so the button never navigates to a missing demo run.\n\n## Test Plan\n\n- Rust workflow/store tests:\n  - `run.created` serializes/deserializes `retried_from`.\n  - Old `run.created` events project with `retried_from = None`.\n  - Retry creates a new run with a different ID, copied durable definition, no runtime state, and `retried_from` set.\n  - Retry preserves current `parent_id`, title, labels, git context, settings, and `fork_source_ref`.\n  - Retry rejects succeeded, active, cancelled, and archived source runs.\n\n- Rust server/API tests:\n  - `POST /runs/{id}/retry` on a failed run returns `201`, a new run ID, `retried_from`, and queued/started lifecycle state.\n  - Source run remains unchanged.\n  - `404` for unknown run.\n  - `409` for non-retryable status.\n  - Generated Rust API compiles against the updated OpenAPI contract.\n\n- Web tests:\n  - `canRetry` returns true for failed/dead, false for cancelled/succeeded/active/archived.\n  - Action menu renders `Retry` only when eligible.\n  - Successful retry calls the generated client and navigates to `/runs/:newId`.\n  - Retry errors show a useful toast/message.\n  - Run summary panel renders the `Retried from` link when present.\n  - Typecheck passes with regenerated client types.\n\n## Assumptions\n\n- V1 does not add a CLI `fabro retry` command.\n- V1 does not add automatic retry attempts, retry counts, or idempotency keys.\n- Multiple manual clicks after the first request completes may create multiple retry runs.\n- \"Same settings\" means the source run's captured durable definition/settings, not latest local files from the user's machine.\n- Cancelled runs are excluded because cancellation is user intent, not execution failure.\n",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "response.implement": "Implemented manual run retry end-to-end.\n\nSummary:\n- Added `retried_from` to:\n  - `Run`\n  - `RunProjection`\n  - `run.created` event props\n  - OpenAPI `Run` / `RunProjection`\n  - generated TS API client models\n- Added workflow retry operation:\n  - Creates a fresh run store\n  - Copies durable definition/settings/source/git/labels/title/current parent/fork source/blob refs\n  - Sets new `created_by` via provenance\n  - Sets `retried_from`\n  - Does not copy checkpoints/runtime/sandbox runtime/PR/conclusion/questions/pending controls\n  - Rejects succeeded, active, cancelled, archived, and missing runs\n- Added `POST /api/v1/runs/{id}/retry`:\n  - Returns `201` with the new queued `Run`\n  - Queues via the same internal start path used by `POST /runs/{id}/start`\n  - Leaves source run unchanged\n- Updated web UI:\n  - Added `Retry` action for eligible failed/dead runs, hidden in demo mode\n  - Disables while pending\n  - Calls generated client, refreshes caches, and navigates to the new run on success\n  - Shows retry errors via toast\n  - Adds compact `Retried from` link in run summary panel\n- Regenerated Rust API and TypeScript Axios client.\n\nValidation run:\n- `cargo build -q -p fabro-api`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cargo test -q -p fabro-api`\n- `cargo test -q -p fabro-store legacy_run_created_projects_retried_from_none --lib`\n- `cargo test -q -p fabro-workflow retry_ --lib`\n- `cargo test -q -p fabro-server retry_ --lib`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun test app/lib/run-actions.test.ts app/components/run-summary-panel.test.tsx app/routes/run-detail.test.ts`\n\nNote: I also attempted the full `cd apps/fabro-web && bun test`; it still reports unrelated test-isolation failures around shared `generatedAxios.defaults.adapter` state plus an existing run-detail dock assertion, while the focused retry/UI tests above pass.",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "graph.rankdir": "LR",
           "internal.retry_count.preflight_compile": 0,
           "internal.fidelity": "compact",
           "failure_class": "",
-          "current_node": "preflight_lint",
+          "current_node": "implement",
           "thread.start.current_node": "toolchain",
           "internal.retry_count.toolchain": 0,
+          "thread.preflight_lint.current_node": "implement",
+          "last_response": "Implemented manual run retry end-to-end.\n\nSummary:\n- Added `retried_from` to:\n  - `Run`\n  - `RunProjection`\n  - `run.created` event props\n  - OpenAPI `Run` / `RunProjection`\n  - generated TS API clien",
           "outcome": "succeeded",
           "thread.toolchain.current_node": "preflight_compile"
         },
@@ -725,6 +812,39 @@
           "start": {
             "status": "succeeded",
             "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "response.implement": "Implemented manual run retry end-to-end.\n\nSummary:\n- Added `retried_from` to:\n  - `Run`\n  - `RunProjection`\n  - `run.created` event props\n  - OpenAPI `Run` / `RunProjection`\n  - generated TS API client models\n- Added workflow retry operation:\n  - Creates a fresh run store\n  - Copies durable definition/settings/source/git/labels/title/current parent/fork source/blob refs\n  - Sets new `created_by` via provenance\n  - Sets `retried_from`\n  - Does not copy checkpoints/runtime/sandbox runtime/PR/conclusion/questions/pending controls\n  - Rejects succeeded, active, cancelled, archived, and missing runs\n- Added `POST /api/v1/runs/{id}/retry`:\n  - Returns `201` with the new queued `Run`\n  - Queues via the same internal start path used by `POST /runs/{id}/start`\n  - Leaves source run unchanged\n- Updated web UI:\n  - Added `Retry` action for eligible failed/dead runs, hidden in demo mode\n  - Disables while pending\n  - Calls generated client, refreshes caches, and navigates to the new run on success\n  - Shows retry errors via toast\n  - Adds compact `Retried from` link in run summary panel\n- Regenerated Rust API and TypeScript Axios client.\n\nValidation run:\n- `cargo build -q -p fabro-api`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cargo test -q -p fabro-api`\n- `cargo test -q -p fabro-store legacy_run_created_projects_retried_from_none --lib`\n- `cargo test -q -p fabro-workflow retry_ --lib`\n- `cargo test -q -p fabro-server retry_ --lib`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun test app/lib/run-actions.test.ts app/components/run-summary-panel.test.tsx app/routes/run-detail.test.ts`\n\nNote: I also attempted the full `cd apps/fabro-web && bun test`; it still reports unrelated test-isolation failures around shared `generatedAxios.defaults.adapter` state plus an existing run-detail dock assertion, while the focused retry/UI tests above pass.",
+              "last_response": "Implemented manual run retry end-to-end.\n\nSummary:\n- Added `retried_from` to:\n  - `Run`\n  - `RunProjection`\n  - `run.created` event props\n  - OpenAPI `Run` / `RunProjection`\n  - generated TS API clien"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 463085,
+                    "output_tokens": 38427,
+                    "reasoning_tokens": 17656,
+                    "cache_read_tokens": 64124928,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 36060379
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/operations/retry.rs"
+            ]
           },
           "preflight_compile": {
             "status": "succeeded",
@@ -751,8 +871,9 @@
             "usage": null
           }
         },
-        "next_node_id": "implement",
+        "next_node_id": "simplify_opus",
         "node_visits": {
+          "implement": 1,
           "start": 1,
           "toolchain": 1,
           "preflight_compile": 1,
@@ -782,6 +903,50 @@
   "pull_request": null,
   "superseded_by": null,
   "pending_interviews": {},
+  "todos_by_list": {
+    "openai_plan:cecb4510-1e92-4fc6-951f-4d2dd388df2c": {
+      "kind": "openai_plan",
+      "list_id": "openai_plan:cecb4510-1e92-4fc6-951f-4d2dd388df2c",
+      "items": [
+        {
+          "id": "5bfbe83815228890",
+          "status": "completed",
+          "order": 0,
+          "subject": "Add failing tests for retried_from event/projection, workflow retry, API route, and web retry behavior"
+        },
+        {
+          "id": "91d422010e08c1ff",
+          "status": "completed",
+          "order": 1,
+          "subject": "Implement retried_from storage/projection and workflow retry operation"
+        },
+        {
+          "id": "31ed94a53e879d25",
+          "status": "completed",
+          "order": 2,
+          "subject": "Add server retry route and queue it through shared start path"
+        },
+        {
+          "id": "8efdc5d417f38d9a",
+          "status": "completed",
+          "order": 3,
+          "subject": "Update OpenAPI and regenerate Rust/TypeScript clients"
+        },
+        {
+          "id": "718273ceae9b8e78",
+          "status": "completed",
+          "order": 4,
+          "subject": "Update web actions/UI for retry and Retried from link"
+        },
+        {
+          "id": "2d39696180781943",
+          "status": "completed",
+          "order": 5,
+          "subject": "Run targeted Rust and web tests, then broader type/build checks as feasible"
+        }
+      ]
+    }
+  },
   "stages": {
     "toolchain@1": {
       "first_event_seq": 20,
@@ -835,7 +1000,12 @@
       "first_event_seq": 41,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T10:06:22.042089Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -843,11 +1013,27 @@
         "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 128590,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-23T10:04:13.440467Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 128595,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -856,7 +1042,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_compile@1": {
       "first_event_seq": 30,
@@ -905,6 +1091,38 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "implement@1": {
+      "first_event_seq": 51,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T10:06:27.782388Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 463085,
+        "output_tokens": 38427,
+        "total_tokens": 64644096,
+        "reasoning_tokens": 17656,
+        "cache_read_tokens": 64124928,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 36060379
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "state": "running"
     },
     "start@1": {
       "first_event_seq": 16,
