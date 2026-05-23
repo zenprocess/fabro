@@ -524,7 +524,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T15:18:59.041899Z",
-  "last_event_at": "2026-05-23T15:19:08.365039Z",
+  "last_event_at": "2026-05-23T15:21:07.027271Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -622,9 +622,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 37,
       "checkpoint": {
-        "timestamp": "2026-05-23T15:21:01.215015Z",
+        "timestamp": "2026-05-23T15:21:07.025743Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -633,24 +633,24 @@
         ],
         "node_retries": {},
         "context_values": {
-          "outcome": "succeeded",
-          "failure_class": "",
-          "internal.retry_count.preflight_compile": 0,
-          "internal.node_visit_count": 1,
-          "internal.retry_count.start": 0,
-          "internal.retry_count.toolchain": 0,
-          "failure_signature": "",
-          "graph.rankdir": "LR",
-          "thread.start.current_node": "toolchain",
           "graph.goal": "# Small Default Models and Generated Run Titles\n\n## Summary\n\nAdd a model-level `small_default = true` catalog role, make it easy for Rust call sites to resolve the small default model for a configured provider set, and use that model to generate workflow run titles from the workflow and run inputs.\n\nRuns should still be created immediately. If the create request does not include an explicit `RunManifest.title`, the server persists the existing deterministic inferred title first, then asynchronously asks the small default model for a better title and emits `run.title.updated` if generation succeeds.\n\n## Goals\n\n- Let each provider identify one small/cheap/default utility model without changing its normal `default = true` model.\n- Keep normal model selection and workflow execution precedence unchanged.\n- Give code a direct helper for \"the small default model for these configured providers.\"\n- Generate useful run titles from workflow context, `goal`, and input overrides.\n- Preserve existing explicit title behavior for API callers that already send `RunManifest.title`.\n- Keep run creation reliable when no LLM provider is configured or title generation fails.\n\n## Non-Goals\n\n- Do not add a `fabro run --title` CLI flag in this change.\n- Do not add title generation to post-create `PATCH /runs/{id}` edits.\n- Do not add a multi-provider fallback chain for failed title-generation requests.\n- Do not redact workflow inputs before sending them to the title-generation model.\n\n## Current Behavior\n\n- `RunManifest.title` already exists on the create-run API. The server trims it, rejects blank/control/newline/over-100-character values, and stores it on `run.created`.\n- The regular CLI run path does not expose a `--title` flag today, and the Fabro tool create schema does not expose a `title` field today.\n- If `RunManifest.title` is absent, `fabro_workflow::operations::create` stores `fabro_types::infer_run_title(record.graph.goal())`.\n- Users can later edit titles through `PATCH /api/v1/runs/{id}`, which appends `run.title.updated`.\n\n## Catalog Changes\n\n- Add `small_default: Option<bool>` to `ModelCatalogSettings` and merge it the same way `default` and `probe` are merged.\n- Add `small_default: bool` to the public `Model` type so model-list APIs and generated clients can show the role.\n- Add `small_default: bool` to `CatalogModelSettings` if that keeps role checks consistent with existing `probe` handling.\n- Add a `CatalogBuildError::MultipleProviderSmallDefaults` validation error when a provider has more than one model with `small_default = true`.\n- Allow zero small defaults for a provider. The lookup helper must fall back to that provider's normal default.\n- Allow a higher-precedence catalog layer to clear an inherited small default with `small_default = false`.\n\nBuilt-in small defaults:\n\n- Anthropic: `claude-haiku-4-5`\n- OpenAI: `gpt-5.4-mini`\n- Gemini: `gemini-3.1-flash-lite-preview`\n\n## Catalog Helpers\n\nAdd helpers on `Catalog`:\n\n- `small_default_for_provider(&ProviderId) -> Option<&Model>`\n  - Resolve provider aliases the same way `default_for_provider` does.\n  - Return the provider's `small_default = true` model when present.\n  - Otherwise return `default_for_provider(provider_id)`.\n\n- `small_default_for_configured_ids(&[ProviderId]) -> &Model`\n  - Mirror `default_for_configured_ids`.\n  - If the list is empty, return the global default model.\n  - Otherwise choose the highest-priority configured provider, then return `small_default_for_provider` for that provider.\n  - If that provider has no explicit small default, use its regular default.\n\nExisting `default_for_provider`, `default_for_configured_ids`, and `probe_for_provider` behavior must remain unchanged.\n\n## Title Generation\n\nAdd a workflow/server helper for generated run titles.\n\nInputs to the helper:\n\n- Run ID.\n- Current deterministic title.\n- Workflow target/path/name where available.\n- Workflow goal from the materialized graph.\n- Run input overrides/settings relevant to the workflow.\n- A compact workflow summary, such as stage IDs, labels, and handler types.\n- Selected small-default model ID.\n- LLM credential source/client dependencies already used by server-side LLM calls.\n\nPrompt behavior:\n\n- Ask for a concise human-readable title for the run.\n- Base the title on the workflow identity, goal, and provided inputs.\n- Include input values as-is. Do not call `fabro_redact` and do not redact secrets for this feature.\n- Bound prompt size by truncating large serialized workflow/input sections if necessary.\n- Request structured output with one field: `{ \"title\": \"...\" }`.\n\nGeneration behavior:\n\n- Use the selected small default model.\n- Use a short response budget, for example `max_tokens(64)`.\n- Use a short timeout and low retry count so title generation cannot stall run creation follow-up work.\n- Normalize generated output by trimming, rejecting blank/control/newline output, and truncating generated titles to the existing 100-character title limit.\n- If output is invalid or generation fails, leave the deterministic title unchanged.\n\n## Server Integration\n\n- In the create-run handler, compute whether the request supplied an explicit `RunManifest.title` before creation.\n- Always call existing create logic first so run creation remains synchronous and reliable.\n- If `RunManifest.title` was present, do not generate a title. The API caller intentionally supplied one.\n- If `RunManifest.title` was absent and there is at least one ready configured LLM provider, spawn an asynchronous title-generation task after the run is persisted.\n- Select the model with `catalog.small_default_for_configured_ids(&configured_provider_ids)`.\n- On successful generated title:\n  - Re-read the run summary/projection.\n  - Append `run.title.updated` with the system actor only if the current title still equals the deterministic title stored at creation.\n  - This prevents overwriting a user title edit made through `PATCH /runs/{id}` while generation was in flight.\n- If no providers are configured, or title generation fails, append no event and keep the deterministic title.\n\n## Public Interfaces\n\n- OpenAPI `Model` schema gains required `small_default: boolean`.\n- Generated Rust API types continue reusing the canonical `fabro_model::Model`.\n- Generated TypeScript API client gains `small_default` on `Model`.\n- User configuration docs document `small_default = true` alongside `default` and `probe`.\n- Create-run API semantics remain compatible:\n  - `RunManifest.title` still means \"caller-provided explicit title.\"\n  - Generated titles only apply when `RunManifest.title` is absent.\n\n## Test Plan\n\nCatalog tests:\n\n- Built-in Anthropic small default is `claude-haiku-4-5`.\n- Built-in OpenAI small default is `gpt-5.4-mini`.\n- Built-in Gemini small default is `gemini-3.1-flash-lite-preview`.\n- `small_default_for_provider` returns an explicit small default when configured.\n- `small_default_for_provider` falls back to provider default when no small default exists.\n- Provider aliases resolve for small-default lookup.\n- Multiple small defaults for one provider fail catalog build.\n- Higher-precedence `small_default = false` clears an inherited small default.\n- Existing default/probe tests still pass unchanged.\n\nAPI/client tests:\n\n- Update `fabro-api` model round-trip tests to include `small_default`.\n- Regenerate OpenAPI-derived Rust and TypeScript clients.\n\nTitle-generation tests:\n\n- Prompt construction includes workflow goal and input values without redaction.\n- Prompt construction bounds very large input/workflow sections.\n- Valid generated title is normalized and returned.\n- Blank, newline/control-containing, or invalid generated title falls back to deterministic title.\n- Over-100-character generated title is truncated to the existing title limit.\n- Helper uses the supplied small-default model ID.\n\nServer tests:\n\n- Create without `RunManifest.title` returns the deterministic title immediately, then emits `run.title.updated` when mock title generation succeeds.\n- Create with `RunManifest.title` skips generated title work.\n- No ready LLM providers skips generated title work.\n- LLM title-generation failure leaves deterministic title unchanged.\n- A user `PATCH /runs/{id}` title update made before async generation completes is not overwritten.\n\nSuggested targeted commands:\n\n- `cargo nextest run -p fabro-model`\n- `cargo nextest run -p fabro-workflow`\n- `cargo nextest run -p fabro-server`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\n## Assumptions\n\n- \"Latest Haiku\" means the latest Haiku model already present in the built-in catalog: `claude-haiku-4-5`.\n- `gpt-5.4-mini` and `gemini-3.1-flash-lite-preview` are sensible small defaults because they are the small/low-cost current variants in the local provider catalogs.\n- Generated title work is best-effort metadata enrichment, not part of run creation success.\n- Raw run inputs may be sent to the configured LLM provider for title generation.\n",
-          "current_node": "preflight_compile",
-          "internal.run_id": "01KSAPNHN9QC70047ACRGFKPPY",
           "thread.toolchain.current_node": "preflight_compile",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "current_node": "preflight_compile",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "failure_signature": "",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.run_id": "01KSAPNHN9QC70047ACRGFKPPY",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.start": 0,
+          "graph.rankdir": "LR",
+          "internal.node_visit_count": 1,
+          "thread.start.current_node": "toolchain",
+          "outcome": "succeeded",
           "internal.fidelity": "compact",
-          "internal.thread_id": "toolchain"
+          "internal.thread_id": "toolchain",
+          "internal.retry_count.toolchain": 0,
+          "failure_class": ""
         },
         "node_outcomes": {
           "preflight_compile": {
@@ -659,6 +659,86 @@
               "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "6f96770651253a30f7983e6716fa5fed70b02e66",
+        "node_visits": {
+          "toolchain": 1,
+          "preflight_compile": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T15:23:12.275718Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "outcome": "succeeded",
+          "failure_class": "",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.preflight_compile": 0,
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "internal.retry_count.toolchain": 0,
+          "failure_signature": "",
+          "graph.rankdir": "LR",
+          "thread.start.current_node": "toolchain",
+          "graph.goal": "# Small Default Models and Generated Run Titles\n\n## Summary\n\nAdd a model-level `small_default = true` catalog role, make it easy for Rust call sites to resolve the small default model for a configured provider set, and use that model to generate workflow run titles from the workflow and run inputs.\n\nRuns should still be created immediately. If the create request does not include an explicit `RunManifest.title`, the server persists the existing deterministic inferred title first, then asynchronously asks the small default model for a better title and emits `run.title.updated` if generation succeeds.\n\n## Goals\n\n- Let each provider identify one small/cheap/default utility model without changing its normal `default = true` model.\n- Keep normal model selection and workflow execution precedence unchanged.\n- Give code a direct helper for \"the small default model for these configured providers.\"\n- Generate useful run titles from workflow context, `goal`, and input overrides.\n- Preserve existing explicit title behavior for API callers that already send `RunManifest.title`.\n- Keep run creation reliable when no LLM provider is configured or title generation fails.\n\n## Non-Goals\n\n- Do not add a `fabro run --title` CLI flag in this change.\n- Do not add title generation to post-create `PATCH /runs/{id}` edits.\n- Do not add a multi-provider fallback chain for failed title-generation requests.\n- Do not redact workflow inputs before sending them to the title-generation model.\n\n## Current Behavior\n\n- `RunManifest.title` already exists on the create-run API. The server trims it, rejects blank/control/newline/over-100-character values, and stores it on `run.created`.\n- The regular CLI run path does not expose a `--title` flag today, and the Fabro tool create schema does not expose a `title` field today.\n- If `RunManifest.title` is absent, `fabro_workflow::operations::create` stores `fabro_types::infer_run_title(record.graph.goal())`.\n- Users can later edit titles through `PATCH /api/v1/runs/{id}`, which appends `run.title.updated`.\n\n## Catalog Changes\n\n- Add `small_default: Option<bool>` to `ModelCatalogSettings` and merge it the same way `default` and `probe` are merged.\n- Add `small_default: bool` to the public `Model` type so model-list APIs and generated clients can show the role.\n- Add `small_default: bool` to `CatalogModelSettings` if that keeps role checks consistent with existing `probe` handling.\n- Add a `CatalogBuildError::MultipleProviderSmallDefaults` validation error when a provider has more than one model with `small_default = true`.\n- Allow zero small defaults for a provider. The lookup helper must fall back to that provider's normal default.\n- Allow a higher-precedence catalog layer to clear an inherited small default with `small_default = false`.\n\nBuilt-in small defaults:\n\n- Anthropic: `claude-haiku-4-5`\n- OpenAI: `gpt-5.4-mini`\n- Gemini: `gemini-3.1-flash-lite-preview`\n\n## Catalog Helpers\n\nAdd helpers on `Catalog`:\n\n- `small_default_for_provider(&ProviderId) -> Option<&Model>`\n  - Resolve provider aliases the same way `default_for_provider` does.\n  - Return the provider's `small_default = true` model when present.\n  - Otherwise return `default_for_provider(provider_id)`.\n\n- `small_default_for_configured_ids(&[ProviderId]) -> &Model`\n  - Mirror `default_for_configured_ids`.\n  - If the list is empty, return the global default model.\n  - Otherwise choose the highest-priority configured provider, then return `small_default_for_provider` for that provider.\n  - If that provider has no explicit small default, use its regular default.\n\nExisting `default_for_provider`, `default_for_configured_ids`, and `probe_for_provider` behavior must remain unchanged.\n\n## Title Generation\n\nAdd a workflow/server helper for generated run titles.\n\nInputs to the helper:\n\n- Run ID.\n- Current deterministic title.\n- Workflow target/path/name where available.\n- Workflow goal from the materialized graph.\n- Run input overrides/settings relevant to the workflow.\n- A compact workflow summary, such as stage IDs, labels, and handler types.\n- Selected small-default model ID.\n- LLM credential source/client dependencies already used by server-side LLM calls.\n\nPrompt behavior:\n\n- Ask for a concise human-readable title for the run.\n- Base the title on the workflow identity, goal, and provided inputs.\n- Include input values as-is. Do not call `fabro_redact` and do not redact secrets for this feature.\n- Bound prompt size by truncating large serialized workflow/input sections if necessary.\n- Request structured output with one field: `{ \"title\": \"...\" }`.\n\nGeneration behavior:\n\n- Use the selected small default model.\n- Use a short response budget, for example `max_tokens(64)`.\n- Use a short timeout and low retry count so title generation cannot stall run creation follow-up work.\n- Normalize generated output by trimming, rejecting blank/control/newline output, and truncating generated titles to the existing 100-character title limit.\n- If output is invalid or generation fails, leave the deterministic title unchanged.\n\n## Server Integration\n\n- In the create-run handler, compute whether the request supplied an explicit `RunManifest.title` before creation.\n- Always call existing create logic first so run creation remains synchronous and reliable.\n- If `RunManifest.title` was present, do not generate a title. The API caller intentionally supplied one.\n- If `RunManifest.title` was absent and there is at least one ready configured LLM provider, spawn an asynchronous title-generation task after the run is persisted.\n- Select the model with `catalog.small_default_for_configured_ids(&configured_provider_ids)`.\n- On successful generated title:\n  - Re-read the run summary/projection.\n  - Append `run.title.updated` with the system actor only if the current title still equals the deterministic title stored at creation.\n  - This prevents overwriting a user title edit made through `PATCH /runs/{id}` while generation was in flight.\n- If no providers are configured, or title generation fails, append no event and keep the deterministic title.\n\n## Public Interfaces\n\n- OpenAPI `Model` schema gains required `small_default: boolean`.\n- Generated Rust API types continue reusing the canonical `fabro_model::Model`.\n- Generated TypeScript API client gains `small_default` on `Model`.\n- User configuration docs document `small_default = true` alongside `default` and `probe`.\n- Create-run API semantics remain compatible:\n  - `RunManifest.title` still means \"caller-provided explicit title.\"\n  - Generated titles only apply when `RunManifest.title` is absent.\n\n## Test Plan\n\nCatalog tests:\n\n- Built-in Anthropic small default is `claude-haiku-4-5`.\n- Built-in OpenAI small default is `gpt-5.4-mini`.\n- Built-in Gemini small default is `gemini-3.1-flash-lite-preview`.\n- `small_default_for_provider` returns an explicit small default when configured.\n- `small_default_for_provider` falls back to provider default when no small default exists.\n- Provider aliases resolve for small-default lookup.\n- Multiple small defaults for one provider fail catalog build.\n- Higher-precedence `small_default = false` clears an inherited small default.\n- Existing default/probe tests still pass unchanged.\n\nAPI/client tests:\n\n- Update `fabro-api` model round-trip tests to include `small_default`.\n- Regenerate OpenAPI-derived Rust and TypeScript clients.\n\nTitle-generation tests:\n\n- Prompt construction includes workflow goal and input values without redaction.\n- Prompt construction bounds very large input/workflow sections.\n- Valid generated title is normalized and returned.\n- Blank, newline/control-containing, or invalid generated title falls back to deterministic title.\n- Over-100-character generated title is truncated to the existing title limit.\n- Helper uses the supplied small-default model ID.\n\nServer tests:\n\n- Create without `RunManifest.title` returns the deterministic title immediately, then emits `run.title.updated` when mock title generation succeeds.\n- Create with `RunManifest.title` skips generated title work.\n- No ready LLM providers skips generated title work.\n- LLM title-generation failure leaves deterministic title unchanged.\n- A user `PATCH /runs/{id}` title update made before async generation completes is not overwritten.\n\nSuggested targeted commands:\n\n- `cargo nextest run -p fabro-model`\n- `cargo nextest run -p fabro-workflow`\n- `cargo nextest run -p fabro-server`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\n## Assumptions\n\n- \"Latest Haiku\" means the latest Haiku model already present in the built-in catalog: `claude-haiku-4-5`.\n- `gpt-5.4-mini` and `gemini-3.1-flash-lite-preview` are sensible small defaults because they are the small/low-cost current variants in the local provider catalogs.\n- Generated title work is best-effort metadata enrichment, not part of run creation success.\n- Raw run inputs may be sent to the configured LLM provider for title generation.\n",
+          "current_node": "preflight_lint",
+          "internal.run_id": "01KSAPNHN9QC70047ACRGFKPPY",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "internal.thread_id": "preflight_compile",
+          "thread.preflight_compile.current_node": "preflight_lint"
+        },
+        "node_outcomes": {
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
             "usage": null
           },
           "start": {
@@ -674,11 +754,12 @@
             "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
+          "toolchain": 1,
           "preflight_compile": 1,
           "start": 1,
-          "toolchain": 1
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -705,6 +786,33 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "preflight_lint@1": {
+      "first_event_seq": 40,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T15:21:07.027034Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
     "toolchain@1": {
       "first_event_seq": 20,
       "prompt": null,
@@ -791,7 +899,12 @@
       "first_event_seq": 30,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T15:21:01.214310Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -799,11 +912,27 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 112842,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-23T15:19:08.364304Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 112849,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -812,7 +941,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     }
   }
 }
