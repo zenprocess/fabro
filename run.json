@@ -524,7 +524,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T15:20:09.659052Z",
-  "last_event_at": "2026-05-23T15:20:19.859094Z",
+  "last_event_at": "2026-05-23T15:22:17.485460Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -622,9 +622,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 37,
       "checkpoint": {
-        "timestamp": "2026-05-23T15:22:12.181664Z",
+        "timestamp": "2026-05-23T15:22:17.483909Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -633,17 +633,89 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.node_visit_count": 1,
+          "internal.retry_count.preflight_compile": 0,
+          "internal.run_id": "01KSAPQQSVK4FY3CWHYVZYD7T6",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "current_node": "preflight_compile",
+          "graph.rankdir": "LR",
+          "internal.retry_count.start": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "failure_signature": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.thread_id": "toolchain",
+          "outcome": "succeeded",
+          "internal.retry_count.toolchain": 0,
+          "thread.start.current_node": "toolchain",
+          "internal.fidelity": "compact",
+          "failure_class": "",
+          "graph.goal": "# Agent Compaction API Usage Baseline Plan\n\nDate: 2026-05-23\n\n## Summary\n\nChange Fabro's agent compaction trigger from a whole-history `chars / 4`\nestimate to a Claude Code-style hot-path estimate: use the latest real\nassistant response's stored `usage.total_tokens()` as the baseline, then add\nlocal estimates for turns appended after that response. This avoids token-count\nprovider API calls while making compaction sensitive to actual\nprovider-reported context usage, including cache and reasoning tokens.\n\nNo provider token-count API calls should be added in this change.\n\n## Key Changes\n\n- Replace the current compaction estimate in `fabro-agent` with a new\n  active-context estimator.\n- Find the newest assistant turn whose `usage.total_tokens() > 0`.\n- Use that `usage.total_tokens()` as the baseline.\n- Add local estimates only for turns after that assistant turn.\n- If no usable assistant usage exists, fall back to the existing local\n  whole-history estimate.\n- Reuse a shared per-turn local estimate helper so fallback and post-baseline\n  delta counting stay consistent.\n- Keep the estimator local and in-process. Do not call\n  `llm_client.count_input_tokens()` from `compact_if_needed()`.\n\n## Implementation Details\n\n- Update `lib/crates/fabro-agent/src/compaction.rs`:\n  - Add an estimator that returns both token count and method, for example\n    `ApiUsagePlusLocalDelta` or `LocalEstimate`.\n  - Make `check_context_usage()` use the new estimator and include the method\n    in warning `details`.\n  - Make `compact_context()` report the same improved estimate in\n    `CompactionStarted`.\n  - Move `CompactionStarted` emission after the\n    `original_turn_count <= preserve_count` no-op check, so a no-op compact\n    cannot emit started without completed.\n- Update `lib/crates/fabro-agent/src/history.rs`:\n  - In `History::compact()`, invalidate preserved assistant usage by replacing\n    preserved assistant `usage` with `TokenCounts::default()`.\n  - Keep provider parts, response IDs, text, and tool calls unchanged.\n  - Rationale: preserved assistant usage reflects the pre-compaction context and\n    must not become the next baseline. Billing remains available from emitted\n    run events, so mutable runtime history should prefer compaction correctness.\n- Leave public run event names and schemas unchanged:\n  - `agent.compaction.started`\n  - `agent.compaction.completed`\n  - Existing warning event remains a warning with richer `details`.\n\n## Test Plan\n\n- Add unit coverage in `lib/crates/fabro-agent/src/compaction.rs`:\n  - No assistant usage: estimator matches current local whole-history behavior.\n  - Latest assistant usage present: estimator uses `usage.total_tokens()` plus\n    only later tool/user/steering turns.\n  - Usage fields include cache and reasoning through `TokenCounts::total_tokens()`.\n  - Earlier assistant usage is ignored when a later assistant usage exists.\n- Add unit coverage in `lib/crates/fabro-agent/src/history.rs`:\n  - `History::compact()` preserves assistant content, tool calls, and provider\n    parts, but resets preserved assistant usage to default.\n  - Existing OpenAI opaque stripping and Anthropic thinking preservation tests\n    still pass.\n- Add session coverage in `lib/crates/fabro-agent/src/session.rs`:\n  - A short assistant response with high `usage.total_tokens()` triggers\n    compaction even when text length is small.\n  - A compact no-op due to `turns.len() <= preserve_count` does not emit\n    `CompactionStarted`.\n  - Compaction disabled still prevents compaction even if the API usage\n    baseline exceeds threshold.\n- Run targeted verification:\n  - `cargo nextest run -p fabro-agent compaction`\n  - `cargo nextest run -p fabro-agent history`\n  - If those pass, run `cargo nextest run -p fabro-agent`.\n\n## Assumptions\n\n- Runtime/session `Message::Assistant.usage` is safe to invalidate after\n  compaction because authoritative billing comes from emitted workflow/run\n  events, not preserved mutable agent history.\n- A zero-token `TokenCounts::default()` should be treated as no usable API\n  baseline.\n- Provider token-count APIs remain available for future near-threshold\n  confirmation, but are intentionally out of scope for this change.\n"
+        },
+        "node_outcomes": {
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "9663109f79132d7f609ae1955a30f92aadca7101",
+        "node_visits": {
+          "start": 1,
+          "toolchain": 1,
+          "preflight_compile": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T15:24:23.940428Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "thread.preflight_compile.current_node": "preflight_lint",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "thread.toolchain.current_node": "preflight_compile",
-          "current_node": "preflight_compile",
+          "current_node": "preflight_lint",
           "graph.rankdir": "LR",
           "internal.run_id": "01KSAPQQSVK4FY3CWHYVZYD7T6",
           "outcome": "succeeded",
-          "internal.thread_id": "toolchain",
+          "internal.thread_id": "preflight_compile",
           "thread.start.current_node": "toolchain",
           "internal.retry_count.toolchain": 0,
           "internal.node_visit_count": 1,
           "failure_class": "",
+          "internal.retry_count.preflight_lint": 0,
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "internal.retry_count.start": 0,
           "internal.fidelity": "compact",
@@ -672,13 +744,22 @@
           "start": {
             "status": "succeeded",
             "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
           "toolchain": 1,
           "preflight_compile": 1,
-          "start": 1
+          "start": 1,
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -705,6 +786,33 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "preflight_lint@1": {
+      "first_event_seq": 40,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T15:22:17.485222Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
     "start@1": {
       "first_event_seq": 16,
       "prompt": null,
@@ -791,7 +899,12 @@
       "first_event_seq": 30,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T15:22:12.180967Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -799,11 +912,27 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 112316,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-23T15:20:19.858560Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 112321,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -812,7 +941,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     }
   }
 }
