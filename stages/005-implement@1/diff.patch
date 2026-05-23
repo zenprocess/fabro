@@ -1,0 +1,3819 @@
+diff --git a/apps/fabro-web/app/lib/queries.ts b/apps/fabro-web/app/lib/queries.ts
+index 187ae38ac..28e1d3565 100644
+--- a/apps/fabro-web/app/lib/queries.ts
++++ b/apps/fabro-web/app/lib/queries.ts
+@@ -25,6 +25,7 @@ import type {
+   SandboxFileListResponse,
+   SandboxServiceListResponse,
+   ServerSettings,
++  StageContextWindow,
+   SystemInfoResponse,
+   SystemResourcesResponse,
+   VncPreviewResponse,
+@@ -350,6 +351,16 @@ export function useRunStageEvents(id: string | undefined, stageId: string | unde
+   );
+ }
+ 
++export function useRunStageContextWindow(
++  id: string | undefined,
++  stageId: string | undefined,
++) {
++  return useSWR<StageContextWindow | null>(
++    id && stageId ? queryKeys.runs.stageContextWindow(id, stageId) : null,
++    () => apiNullableData(() => runInternalsApi.getRunStageContextWindow(id!, stageId!)),
++  );
++}
++
+ export function useRunEventsList(id: string | undefined) {
+   return useSWR<EventEnvelope[]>(
+     id ? queryKeys.runs.events(id, 1000) : null,
+diff --git a/apps/fabro-web/app/lib/query-keys.test.ts b/apps/fabro-web/app/lib/query-keys.test.ts
+index 3ad519dc7..c5ac22a03 100644
+--- a/apps/fabro-web/app/lib/query-keys.test.ts
++++ b/apps/fabro-web/app/lib/query-keys.test.ts
+@@ -43,6 +43,12 @@ describe("queryKeys", () => {
+       "run 1",
+       "build step",
+     ]);
++    expect(queryKeys.runs.stageContextWindow("run 1", "build step@2")).toEqual([
++      "runs",
++      "stage-context-window",
++      "run 1",
++      "build step@2",
++    ]);
+     expect(queryKeys.runs.sandbox("run 1")).toEqual(["runs", "sandbox", "run 1"]);
+     expect(queryKeys.system.attachUrl()).toBe("/api/v1/attach");
+     expect(queryKeys.runs.attachUrl("run 1")).toBe("/api/v1/runs/run%201/attach");
+@@ -63,6 +69,7 @@ describe("queryKeys", () => {
+       queryKeys.runs.graph("run-1", "TB"),
+       queryKeys.runs.detail("run-1"),
+       queryKeys.runs.stageEvents("run-1", "stage-1"),
++      queryKeys.runs.stageContextWindow("run-1", "stage-1"),
+     ]);
+     expect(queryKeysForRunEvent("run-1", "run.title.updated")).toEqual([
+       queryKeys.runs.detail("run-1"),
+@@ -80,10 +87,21 @@ describe("queryKeys", () => {
+     ]) {
+       expect(queryKeysForRunEvent("run-1", event, "stage-1")).toEqual([
+         queryKeys.runs.stageEvents("run-1", "stage-1"),
++        queryKeys.runs.stageContextWindow("run-1", "stage-1"),
+       ]);
+     }
+   });
+ 
++  test("context-window snapshot invalidates context window, run events, and stage events", () => {
++    expect(
++      queryKeysForRunEvent("run-1", "agent.context_window.snapshot", "stage-1"),
++    ).toEqual([
++      queryKeys.runs.events("run-1", 1000),
++      queryKeys.runs.stageEvents("run-1", "stage-1"),
++      queryKeys.runs.stageContextWindow("run-1", "stage-1"),
++    ]);
++  });
++
+   test("agent activity events without a node_id invalidate nothing", () => {
+     expect(queryKeysForRunEvent("run-1", "agent.message")).toEqual([]);
+   });
+diff --git a/apps/fabro-web/app/lib/query-keys.ts b/apps/fabro-web/app/lib/query-keys.ts
+index da551a33f..b5f068190 100644
+--- a/apps/fabro-web/app/lib/query-keys.ts
++++ b/apps/fabro-web/app/lib/query-keys.ts
+@@ -66,6 +66,8 @@ export const queryKeys = {
+     events: (id: string, limit = 1000) => ["runs", "events", id, limit] as const,
+     stageEvents: (id: string, stageId: string) =>
+       ["runs", "stage-events", id, stageId] as const,
++    stageContextWindow: (id: string, stageId: string) =>
++      ["runs", "stage-context-window", id, stageId] as const,
+     stageLog: (id: string, stageId: string, offset = 0, limit = 65_536) =>
+       ["runs", "stage-log", id, stageId, offset, limit] as const,
+     sandbox: (id: string) => ["runs", "sandbox", id] as const,
+diff --git a/apps/fabro-web/app/lib/run-events.test.tsx b/apps/fabro-web/app/lib/run-events.test.tsx
+index fd74f40b7..306ddf6b1 100644
+--- a/apps/fabro-web/app/lib/run-events.test.tsx
++++ b/apps/fabro-web/app/lib/run-events.test.tsx
+@@ -61,6 +61,7 @@ describe("queryKeysForRunEvent", () => {
+       queryKeys.runs.graph("run-1", "TB"),
+       queryKeys.runs.detail("run-1"),
+       queryKeys.runs.stageEvents("run-1", "verify@2"),
++      queryKeys.runs.stageContextWindow("run-1", "verify@2"),
+     ]);
+   });
+ 
+@@ -68,6 +69,7 @@ describe("queryKeysForRunEvent", () => {
+     expect(queryKeysForRunEvent("run-1", "agent.session.activated", "agent@1")).toEqual([
+       queryKeys.runs.events("run-1", 1000),
+       queryKeys.runs.stageEvents("run-1", "agent@1"),
++      queryKeys.runs.stageContextWindow("run-1", "agent@1"),
+     ]);
+   });
+ 
+@@ -75,15 +77,28 @@ describe("queryKeysForRunEvent", () => {
+     expect(queryKeysForRunEvent("run-1", "agent.interrupt.injected", "nap@1")).toEqual([
+       queryKeys.runs.events("run-1", 1000),
+       queryKeys.runs.stageEvents("run-1", "nap@1"),
++      queryKeys.runs.stageContextWindow("run-1", "nap@1"),
+     ]);
+   });
+ 
+   test("pair messages invalidate the stage events query", () => {
+     expect(queryKeysForRunEvent("run-1", "agent.pair.user_message", "nap@1")).toEqual([
+       queryKeys.runs.stageEvents("run-1", "nap@1"),
++      queryKeys.runs.stageContextWindow("run-1", "nap@1"),
+     ]);
+     expect(queryKeysForRunEvent("run-1", "agent.pair.system_message", "nap@1")).toEqual([
+       queryKeys.runs.stageEvents("run-1", "nap@1"),
++      queryKeys.runs.stageContextWindow("run-1", "nap@1"),
++    ]);
++  });
++
++  test("context-window snapshots invalidate context window, run events, and stage events", () => {
++    expect(
++      queryKeysForRunEvent("run-1", "agent.context_window.snapshot", "agent@1"),
++    ).toEqual([
++      queryKeys.runs.events("run-1", 1000),
++      queryKeys.runs.stageEvents("run-1", "agent@1"),
++      queryKeys.runs.stageContextWindow("run-1", "agent@1"),
+     ]);
+   });
+ 
+@@ -101,6 +116,7 @@ describe("queryKeysForRunEvent", () => {
+       queryKeys.runs.state("run-1"),
+       queryKeys.runs.events("run-1", 1000),
+       queryKeys.runs.stageEvents("run-1", "code@1"),
++      queryKeys.runs.stageContextWindow("run-1", "code@1"),
+     ]);
+   });
+ });
+@@ -391,4 +407,4 @@ async function waitFor(condition: () => boolean, timeoutMs = 200) {
+     await new Promise((resolve) => setTimeout(resolve, 2));
+   }
+   throw new Error("condition did not become true before timeout");
+-}
+\ No newline at end of file
++}
+diff --git a/apps/fabro-web/app/lib/run-events.ts b/apps/fabro-web/app/lib/run-events.ts
+index 7ba5dd48b..7c8898257 100644
+--- a/apps/fabro-web/app/lib/run-events.ts
++++ b/apps/fabro-web/app/lib/run-events.ts
+@@ -107,6 +107,7 @@ const TODO_EVENTS = new Set([
+   "todo.updated",
+   "todo.deleted",
+ ]);
++const CONTEXT_WINDOW_SNAPSHOT_EVENT = "agent.context_window.snapshot";
+ 
+ export function queryKeysForRunEvent(
+   runId: string,
+@@ -154,6 +155,7 @@ export function queryKeysForRunEvent(
+     ];
+     if (stageId) {
+       keys.push(queryKeys.runs.stageEvents(runId, stageId));
++      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+     }
+     return keys;
+   }
+@@ -162,12 +164,27 @@ export function queryKeysForRunEvent(
+     const keys: Key[] = [queryKeys.runs.events(runId, 1000)];
+     if (stageId) {
+       keys.push(queryKeys.runs.stageEvents(runId, stageId));
++      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
++    }
++    return keys;
++  }
++
++  if (event === CONTEXT_WINDOW_SNAPSHOT_EVENT) {
++    const keys: Key[] = [queryKeys.runs.events(runId, 1000)];
++    if (stageId) {
++      keys.push(queryKeys.runs.stageEvents(runId, stageId));
++      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+     }
+     return keys;
+   }
+ 
+   if (STAGE_ACTIVITY_EVENTS.has(event)) {
+-    return stageId ? [queryKeys.runs.stageEvents(runId, stageId)] : [];
++    return stageId
++      ? [
++          queryKeys.runs.stageEvents(runId, stageId),
++          queryKeys.runs.stageContextWindow(runId, stageId),
++        ]
++      : [];
+   }
+ 
+   if (TODO_EVENTS.has(event)) {
+@@ -177,6 +194,7 @@ export function queryKeysForRunEvent(
+     ];
+     if (stageId) {
+       keys.push(queryKeys.runs.stageEvents(runId, stageId));
++      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+     }
+     return keys;
+   }
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index e10d6077f..7094c1ca5 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -3067,6 +3067,34 @@ paths:
+               schema:
+                 $ref: "#/components/schemas/ErrorResponse"
+ 
++  /api/v1/runs/{id}/stages/{stageId}/context-window:
++    get:
++      operationId: getRunStageContextWindow
++      tags: [Run Internals]
++      summary: Get Stage Context Window
++      description: |
++        Returns the latest best-effort model-visible context-window usage snapshot for an agent stage.
++        Known stages without applicable or observed data return `available: false`; missing runs or stages return 404.
++      parameters:
++        - $ref: "#/components/parameters/RunId"
++        - $ref: "#/components/parameters/StageId"
++      responses:
++        "200":
++          description: Latest context-window snapshot or a typed unavailable state.
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/StageContextWindow"
++        "404":
++          description: Run or stage not found.
++          headers:
++            x-request-id:
++              $ref: "#/components/headers/XRequestId"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ErrorResponse"
++
+   /api/v1/runs/{id}/artifacts:
+     get:
+       operationId: listRunArtifacts
+@@ -7850,6 +7878,221 @@ components:
+           type: string
+           format: date-time
+ 
++    StageContextWindowCategory:
++      description: Category of model-visible input/context tokens.
++      type: string
++      enum:
++        - system_prompt
++        - tools
++        - mcp_tools
++        - skills
++        - memory
++        - conversation
++        - other
++
++    StageContextWindowCountMethod:
++      description: Method used to produce the context-window token total and breakdown.
++      type: string
++      enum:
++        - provider_api_scaled_breakdown
++        - response_usage_scaled_breakdown
++        - local_estimate
++
++    StageContextWindowStaleness:
++      description: Freshness of the returned context-window data.
++      type: string
++      enum:
++        - live
++        - stored
++        - unavailable
++
++    StageContextWindowUnavailableReason:
++      description: Why context-window data is unavailable for a known run stage.
++      type: string
++      enum:
++        - not_agent_stage
++        - not_observed
++        - provider_unconfigured
++
++    StageContextWindowWarning:
++      description: Content-free warning about context-window count quality or attribution.
++      type: object
++      required:
++        - code
++        - message
++      properties:
++        code:
++          type: string
++          description: Stable warning code.
++          example: provider_token_count_failed
++        message:
++          type: string
++          description: Human-readable warning that must not include prompt, memory, message, or tool-argument content.
++          example: provider input token counting failed; returned local estimate
++
++    StageContextWindowBreakdownItem:
++      description: Token usage for one content category.
++      type: object
++      required:
++        - category
++        - label
++        - tokens
++        - usage_percent
++        - source
++      properties:
++        category:
++          $ref: "#/components/schemas/StageContextWindowCategory"
++        label:
++          type: string
++          example: System prompt
++        tokens:
++          type: integer
++          format: uint64
++          minimum: 0
++          example: 30000
++        usage_percent:
++          type: number
++          format: double
++          minimum: 0
++          example: 7.5
++        source:
++          type: string
++          description: Content-free source label for the category count.
++          example: scaled_local_estimate
++
++    StageContextWindowProjection:
++      description: Durable content-free context-window snapshot projected onto an agent stage.
++      type: object
++      required:
++        - provider
++        - model
++        - context_window_tokens
++        - input_tokens
++        - usage_percent
++        - count_method
++        - staleness
++        - generated_at
++        - breakdown
++        - warnings
++      properties:
++        provider:
++          type: string
++          example: openai
++        model:
++          type: string
++          example: gpt-5.4
++        context_window_tokens:
++          type: integer
++          format: uint64
++          minimum: 0
++          example: 400000
++        input_tokens:
++          type: integer
++          format: uint64
++          minimum: 0
++          example: 123456
++        usage_percent:
++          type: number
++          format: double
++          minimum: 0
++          example: 30.86
++        count_method:
++          $ref: "#/components/schemas/StageContextWindowCountMethod"
++        staleness:
++          $ref: "#/components/schemas/StageContextWindowStaleness"
++        generated_at:
++          type: string
++          format: date-time
++          example: "2026-05-23T12:34:56Z"
++        event_seq:
++          type: ["integer", "null"]
++          format: uint32
++          minimum: 1
++          example: 42
++        breakdown:
++          type: array
++          items:
++            $ref: "#/components/schemas/StageContextWindowBreakdownItem"
++        warnings:
++          type: array
++          items:
++            $ref: "#/components/schemas/StageContextWindowWarning"
++
++    StageContextWindow:
++      description: Best-effort context-window usage for one agent stage.
++      type: object
++      required:
++        - stage_id
++        - available
++        - unavailable_reason
++        - provider
++        - model
++        - context_window_tokens
++        - input_tokens
++        - usage_percent
++        - count_method
++        - staleness
++        - generated_at
++        - event_seq
++        - breakdown
++        - warnings
++      properties:
++        stage_id:
++          type: string
++          description: Stage ID in `node@visit` form.
++          example: implement@1
++        available:
++          type: boolean
++          description: Whether context-window data is available for this known stage.
++        unavailable_reason:
++          oneOf:
++            - $ref: "#/components/schemas/StageContextWindowUnavailableReason"
++            - type: "null"
++        provider:
++          type: ["string", "null"]
++          example: openai
++        model:
++          type: ["string", "null"]
++          example: gpt-5.4
++        context_window_tokens:
++          type: ["integer", "null"]
++          format: uint64
++          minimum: 0
++          example: 400000
++        input_tokens:
++          type: ["integer", "null"]
++          format: uint64
++          minimum: 0
++          example: 123456
++        usage_percent:
++          type: ["number", "null"]
++          format: double
++          minimum: 0
++          example: 30.86
++        count_method:
++          oneOf:
++            - $ref: "#/components/schemas/StageContextWindowCountMethod"
++            - type: "null"
++        staleness:
++          $ref: "#/components/schemas/StageContextWindowStaleness"
++        generated_at:
++          type: ["string", "null"]
++          format: date-time
++          example: "2026-05-23T12:34:56Z"
++        event_seq:
++          type: ["integer", "null"]
++          format: uint32
++          minimum: 1
++          example: 42
++        breakdown:
++          type: array
++          items:
++            $ref: "#/components/schemas/StageContextWindowBreakdownItem"
++        warnings:
++          type: array
++          items:
++            $ref: "#/components/schemas/StageContextWindowWarning"
++
+     StageProjection:
+       description: Observable projection data for one workflow stage execution.
+       type: object
+@@ -7934,6 +8177,11 @@ components:
+           description: MCP servers observed by this stage.
+           items:
+             $ref: "#/components/schemas/McpServerProjection"
++        context_window:
++          oneOf:
++            - $ref: "#/components/schemas/StageContextWindowProjection"
++            - type: "null"
++          description: Latest content-free context-window snapshot for this agent stage.
+         state:
+           $ref: "#/components/schemas/StageState"
+           description: Lifecycle state of the stage projection.
+diff --git a/lib/crates/fabro-agent/src/apply_patch.rs b/lib/crates/fabro-agent/src/apply_patch.rs
+index 7e06e6a89..331accdd5 100644
+--- a/lib/crates/fabro-agent/src/apply_patch.rs
++++ b/lib/crates/fabro-agent/src/apply_patch.rs
+@@ -8,7 +8,7 @@ use std::sync::Arc;
+ use fabro_llm::types::ToolDefinition;
+ 
+ use crate::sandbox::Sandbox;
+-use crate::tool_registry::RegisteredTool;
++use crate::tool_registry::{RegisteredTool, ToolSource};
+ 
+ const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("apply_patch.lark");
+ 
+@@ -494,6 +494,7 @@ pub fn make_apply_patch_tool() -> RegisteredTool {
+                 apply_patch_operations(&ops, ctx.env.as_ref()).await
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/context_window.rs b/lib/crates/fabro-agent/src/context_window.rs
+new file mode 100644
+index 000000000..cb9e1dd51
+--- /dev/null
++++ b/lib/crates/fabro-agent/src/context_window.rs
+@@ -0,0 +1,484 @@
++use std::collections::BTreeMap;
++
++use chrono::Utc;
++use fabro_llm::token_count::{
++    estimate_message_tokens, estimate_request_control_tokens, estimate_text_tokens,
++    estimate_tool_definition_tokens,
++};
++use fabro_llm::types::{Request, Role, Warning as LlmWarning};
++use fabro_types::{
++    StageContextWindowBreakdownProjection, StageContextWindowCategory,
++    StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
++    StageContextWindowWarning,
++};
++
++use crate::memory::MemoryDocument;
++use crate::skills::{Skill, format_skills_prompt_section};
++use crate::tool_registry::{ToolDefinitionWithSource, ToolSource};
++
++const LOCAL_BREAKDOWN_SOURCE: &str = "local_estimate";
++const SCALED_BREAKDOWN_SOURCE: &str = "scaled_local_estimate";
++
++#[derive(Clone, Copy)]
++pub(crate) struct ContextWindowSnapshotInput<'a> {
++    pub request: &'a Request,
++    pub tools: &'a [ToolDefinitionWithSource],
++    pub system_prompt: &'a str,
++    pub memory: &'a [MemoryDocument],
++    pub skills: &'a [Skill],
++    pub activated_skill_context_observed: bool,
++    pub provider: &'a str,
++    pub model: &'a str,
++    pub context_window_tokens: usize,
++}
++
++#[must_use]
++pub(crate) fn build_local_snapshot(
++    input: ContextWindowSnapshotInput<'_>,
++) -> StageContextWindowProjection {
++    let mut builder = BreakdownBuilder::default();
++    let mut warnings = Vec::new();
++
++    add_message_breakdown(&mut builder, &mut warnings, &input);
++    add_tool_breakdown(&mut builder, input.tools);
++    add_request_control_breakdown(&mut builder, &mut warnings, input.request);
++
++    if input.activated_skill_context_observed {
++        warnings.push(StageContextWindowWarning {
++            code:    "activated_skill_context_counted_as_conversation".to_string(),
++            message: "Activated skill instructions are counted as conversation in this version."
++                .to_string(),
++        });
++    }
++
++    builder.into_snapshot(SnapshotMeta {
++        provider: input.provider.to_string(),
++        model: input.model.to_string(),
++        context_window_tokens: u64::try_from(input.context_window_tokens).unwrap_or(u64::MAX),
++        count_method: StageContextWindowCountMethod::LocalEstimate,
++        staleness: StageContextWindowStaleness::Live,
++        breakdown_source: LOCAL_BREAKDOWN_SOURCE,
++        warnings,
++    })
++}
++
++#[must_use]
++pub(crate) fn scaled_snapshot(
++    local: &StageContextWindowProjection,
++    input_tokens: u64,
++    count_method: StageContextWindowCountMethod,
++    warnings: Vec<StageContextWindowWarning>,
++) -> StageContextWindowProjection {
++    let breakdown = scale_breakdown(&local.breakdown, input_tokens, local.context_window_tokens);
++    StageContextWindowProjection {
++        provider: local.provider.clone(),
++        model: local.model.clone(),
++        context_window_tokens: local.context_window_tokens,
++        input_tokens,
++        usage_percent: usage_percent(input_tokens, local.context_window_tokens),
++        count_method,
++        staleness: StageContextWindowStaleness::Live,
++        generated_at: Utc::now(),
++        event_seq: None,
++        breakdown,
++        warnings,
++    }
++}
++
++#[must_use]
++pub(crate) fn warnings_from_llm(warnings: &[LlmWarning]) -> Vec<StageContextWindowWarning> {
++    warnings
++        .iter()
++        .map(|warning| StageContextWindowWarning {
++            code:    warning
++                .code
++                .clone()
++                .unwrap_or_else(|| "token_count_warning".to_string()),
++            message: warning.message.clone(),
++        })
++        .collect()
++}
++
++#[must_use]
++pub(crate) fn warning(code: &str, message: &str) -> StageContextWindowWarning {
++    StageContextWindowWarning {
++        code:    code.to_string(),
++        message: message.to_string(),
++    }
++}
++
++fn add_message_breakdown(
++    builder: &mut BreakdownBuilder,
++    warnings: &mut Vec<StageContextWindowWarning>,
++    input: &ContextWindowSnapshotInput<'_>,
++) {
++    let memory_text = memory_prompt_suffix(input.memory);
++    let skills_text = skills_prompt_suffix(input.skills);
++    let memory_tokens = estimate_text_tokens(&memory_text);
++    let skills_tokens = estimate_text_tokens(&skills_text);
++    let mut system_parts_seen = false;
++
++    for message in &input.request.messages {
++        let estimate = estimate_message_tokens(message);
++        warnings.extend(warnings_from_llm(&estimate.warnings));
++        if message.role == Role::System
++            && !system_parts_seen
++            && message.text() == input.system_prompt
++        {
++            system_parts_seen = true;
++            let attributed_suffix = memory_tokens.saturating_add(skills_tokens);
++            builder.add(
++                StageContextWindowCategory::SystemPrompt,
++                estimate.tokens.saturating_sub(attributed_suffix),
++            );
++            builder.add(StageContextWindowCategory::Memory, memory_tokens);
++            builder.add(StageContextWindowCategory::Skills, skills_tokens);
++        } else {
++            builder.add(StageContextWindowCategory::Conversation, estimate.tokens);
++        }
++    }
++}
++
++fn add_tool_breakdown(builder: &mut BreakdownBuilder, tools: &[ToolDefinitionWithSource]) {
++    for tool in tools {
++        let tokens = estimate_tool_definition_tokens(&tool.definition);
++        match &tool.source {
++            ToolSource::Native => builder.add(StageContextWindowCategory::Tools, tokens),
++            ToolSource::Mcp { .. } => builder.add(StageContextWindowCategory::McpTools, tokens),
++            ToolSource::Skill => builder.add(StageContextWindowCategory::Skills, tokens),
++        }
++    }
++}
++
++fn add_request_control_breakdown(
++    builder: &mut BreakdownBuilder,
++    warnings: &mut Vec<StageContextWindowWarning>,
++    request: &Request,
++) {
++    let estimate = estimate_request_control_tokens(request);
++    warnings.extend(warnings_from_llm(&estimate.warnings));
++    builder.add(StageContextWindowCategory::Other, estimate.tokens);
++}
++
++fn memory_prompt_suffix(memory: &[MemoryDocument]) -> String {
++    if memory.is_empty() {
++        String::new()
++    } else {
++        format!(
++            "\n\n{}",
++            memory
++                .iter()
++                .map(|document| document.content.as_str())
++                .collect::<Vec<_>>()
++                .join("\n\n")
++        )
++    }
++}
++
++fn skills_prompt_suffix(skills: &[Skill]) -> String {
++    let section = format_skills_prompt_section(skills);
++    if section.is_empty() {
++        String::new()
++    } else {
++        format!("\n\n{section}")
++    }
++}
++
++#[derive(Default)]
++struct BreakdownBuilder {
++    tokens: BTreeMap<StageContextWindowCategory, u64>,
++}
++
++impl BreakdownBuilder {
++    fn add(&mut self, category: StageContextWindowCategory, tokens: usize) {
++        if tokens == 0 {
++            return;
++        }
++        let tokens = u64::try_from(tokens).unwrap_or(u64::MAX);
++        self.tokens
++            .entry(category)
++            .and_modify(|existing| *existing = existing.saturating_add(tokens))
++            .or_insert(tokens);
++    }
++
++    fn into_snapshot(self, meta: SnapshotMeta) -> StageContextWindowProjection {
++        let input_tokens = self.tokens.values().copied().sum::<u64>();
++        let breakdown = self
++            .tokens
++            .into_iter()
++            .map(|(category, tokens)| StageContextWindowBreakdownProjection {
++                category,
++                label: category_label(category).to_string(),
++                tokens,
++                usage_percent: usage_percent(tokens, meta.context_window_tokens),
++                source: meta.breakdown_source.to_string(),
++            })
++            .collect();
++        StageContextWindowProjection {
++            provider: meta.provider,
++            model: meta.model,
++            context_window_tokens: meta.context_window_tokens,
++            input_tokens,
++            usage_percent: usage_percent(input_tokens, meta.context_window_tokens),
++            count_method: meta.count_method,
++            staleness: meta.staleness,
++            generated_at: Utc::now(),
++            event_seq: None,
++            breakdown,
++            warnings: meta.warnings,
++        }
++    }
++}
++
++struct SnapshotMeta {
++    provider:              String,
++    model:                 String,
++    context_window_tokens: u64,
++    count_method:          StageContextWindowCountMethod,
++    staleness:             StageContextWindowStaleness,
++    breakdown_source:      &'static str,
++    warnings:              Vec<StageContextWindowWarning>,
++}
++
++fn scale_breakdown(
++    breakdown: &[StageContextWindowBreakdownProjection],
++    target_total: u64,
++    context_window_tokens: u64,
++) -> Vec<StageContextWindowBreakdownProjection> {
++    let local_total = breakdown.iter().map(|item| item.tokens).sum::<u64>();
++    if target_total == local_total {
++        return breakdown
++            .iter()
++            .cloned()
++            .map(|mut item| {
++                item.source = SCALED_BREAKDOWN_SOURCE.to_string();
++                item
++            })
++            .collect();
++    }
++    if breakdown.is_empty() || local_total == 0 {
++        return (target_total > 0)
++            .then(|| StageContextWindowBreakdownProjection {
++                category:      StageContextWindowCategory::Other,
++                label:         category_label(StageContextWindowCategory::Other).to_string(),
++                tokens:        target_total,
++                usage_percent: usage_percent(target_total, context_window_tokens),
++                source:        SCALED_BREAKDOWN_SOURCE.to_string(),
++            })
++            .into_iter()
++            .collect();
++    }
++
++    let mut scaled = Vec::with_capacity(breakdown.len());
++    let mut allocated = 0u64;
++    let mut remainders = Vec::with_capacity(breakdown.len());
++    let local_total_u128 = u128::from(local_total);
++    for (index, item) in breakdown.iter().enumerate() {
++        let numerator = u128::from(item.tokens).saturating_mul(u128::from(target_total));
++        let tokens = u64::try_from(numerator / local_total_u128).unwrap_or(u64::MAX);
++        allocated = allocated.saturating_add(tokens);
++        remainders.push((index, numerator % local_total_u128));
++        scaled.push(StageContextWindowBreakdownProjection {
++            category: item.category,
++            label: item.label.clone(),
++            tokens,
++            usage_percent: 0.0,
++            source: SCALED_BREAKDOWN_SOURCE.to_string(),
++        });
++    }
++
++    let mut remaining = target_total.saturating_sub(allocated);
++    remainders.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
++    for (index, _) in remainders {
++        if remaining == 0 {
++            break;
++        }
++        scaled[index].tokens = scaled[index].tokens.saturating_add(1);
++        remaining -= 1;
++    }
++    for item in &mut scaled {
++        item.usage_percent = usage_percent(item.tokens, context_window_tokens);
++    }
++    scaled
++}
++
++fn category_label(category: StageContextWindowCategory) -> &'static str {
++    match category {
++        StageContextWindowCategory::SystemPrompt => "System prompt",
++        StageContextWindowCategory::Tools => "Tools",
++        StageContextWindowCategory::McpTools => "MCP tools",
++        StageContextWindowCategory::Skills => "Skills",
++        StageContextWindowCategory::Memory => "Memory",
++        StageContextWindowCategory::Conversation => "Conversation",
++        StageContextWindowCategory::Other => "Other",
++    }
++}
++
++fn usage_percent(tokens: u64, denominator: u64) -> f64 {
++    if denominator == 0 {
++        0.0
++    } else {
++        (tokens as f64) * 100.0 / (denominator as f64)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use fabro_llm::types::{Message as LlmMessage, Request, ToolChoice, ToolDefinition};
++
++    use super::*;
++    use crate::tool_registry::ToolDefinitionWithSource;
++
++    fn request(messages: Vec<LlmMessage>, tools: Vec<ToolDefinition>) -> Request {
++        Request {
++            model: "model-a".to_string(),
++            messages,
++            provider: Some("test".to_string()),
++            tools: (!tools.is_empty()).then_some(tools),
++            tool_choice: Some(ToolChoice::Auto),
++            response_format: None,
++            temperature: None,
++            top_p: None,
++            max_tokens: None,
++            stop_sequences: None,
++            reasoning_effort: None,
++            speed: None,
++            metadata: None,
++            provider_options: None,
++        }
++    }
++
++    fn tool(name: &str, source: ToolSource) -> ToolDefinitionWithSource {
++        ToolDefinitionWithSource {
++            definition: ToolDefinition::function(
++                name,
++                format!("{name} description"),
++                serde_json::json!({"type": "object"}),
++            ),
++            source,
++        }
++    }
++
++    #[test]
++    fn local_breakdown_buckets_system_memory_skills_tools_and_conversation() {
++        let memory = vec![MemoryDocument {
++            path:         "/repo/AGENTS.md".to_string(),
++            content:      "memory instructions".to_string(),
++            byte_count:   19,
++            loaded_bytes: 19,
++            truncated:    false,
++        }];
++        let skills = vec![Skill {
++            name:        "commit".to_string(),
++            description: "Commit changes".to_string(),
++            template:    "commit template".to_string(),
++        }];
++        let system_prompt = format!(
++            "core prompt{}{}",
++            memory_prompt_suffix(&memory),
++            skills_prompt_suffix(&skills)
++        );
++        let tools = vec![
++            tool("read_file", ToolSource::Native),
++            tool("mcp__server__search", ToolSource::Mcp {
++                server_name: "server".to_string(),
++            }),
++            tool("use_skill", ToolSource::Skill),
++        ];
++        let req = request(
++            vec![
++                LlmMessage::system(system_prompt.clone()),
++                LlmMessage::user("hello"),
++            ],
++            tools.iter().map(|tool| tool.definition.clone()).collect(),
++        );
++
++        let snapshot = build_local_snapshot(ContextWindowSnapshotInput {
++            request: &req,
++            tools: &tools,
++            system_prompt: &system_prompt,
++            memory: &memory,
++            skills: &skills,
++            activated_skill_context_observed: true,
++            provider: "test",
++            model: "model-a",
++            context_window_tokens: 100_000,
++        });
++
++        let categories = snapshot
++            .breakdown
++            .iter()
++            .map(|item| item.category)
++            .collect::<Vec<_>>();
++        assert!(categories.contains(&StageContextWindowCategory::SystemPrompt));
++        assert!(categories.contains(&StageContextWindowCategory::Memory));
++        assert!(categories.contains(&StageContextWindowCategory::Skills));
++        assert!(categories.contains(&StageContextWindowCategory::Tools));
++        assert!(categories.contains(&StageContextWindowCategory::McpTools));
++        assert!(categories.contains(&StageContextWindowCategory::Conversation));
++        assert_eq!(
++            snapshot
++                .breakdown
++                .iter()
++                .map(|item| item.tokens)
++                .sum::<u64>(),
++            snapshot.input_tokens
++        );
++        assert!(
++            snapshot.warnings.iter().any(|warning| {
++                warning.code == "activated_skill_context_counted_as_conversation"
++            })
++        );
++    }
++
++    #[test]
++    fn scaled_breakdown_totals_provider_count() {
++        let local = StageContextWindowProjection {
++            provider:              "test".to_string(),
++            model:                 "model-a".to_string(),
++            context_window_tokens: 1000,
++            input_tokens:          30,
++            usage_percent:         3.0,
++            count_method:          StageContextWindowCountMethod::LocalEstimate,
++            staleness:             StageContextWindowStaleness::Live,
++            generated_at:          Utc::now(),
++            event_seq:             None,
++            breakdown:             vec![
++                StageContextWindowBreakdownProjection {
++                    category:      StageContextWindowCategory::SystemPrompt,
++                    label:         "System prompt".to_string(),
++                    tokens:        10,
++                    usage_percent: 0.0,
++                    source:        LOCAL_BREAKDOWN_SOURCE.to_string(),
++                },
++                StageContextWindowBreakdownProjection {
++                    category:      StageContextWindowCategory::Conversation,
++                    label:         "Conversation".to_string(),
++                    tokens:        20,
++                    usage_percent: 0.0,
++                    source:        LOCAL_BREAKDOWN_SOURCE.to_string(),
++                },
++            ],
++            warnings:              Vec::new(),
++        };
++
++        let scaled = scaled_snapshot(
++            &local,
++            101,
++            StageContextWindowCountMethod::ProviderApiScaledBreakdown,
++            Vec::new(),
++        );
++
++        assert_eq!(scaled.input_tokens, 101);
++        assert_eq!(
++            scaled.breakdown.iter().map(|item| item.tokens).sum::<u64>(),
++            101
++        );
++        assert!(
++            scaled
++                .breakdown
++                .iter()
++                .all(|item| item.source == SCALED_BREAKDOWN_SOURCE)
++        );
++    }
++}
+diff --git a/lib/crates/fabro-agent/src/lib.rs b/lib/crates/fabro-agent/src/lib.rs
+index 010004694..4ebc19fe6 100644
+--- a/lib/crates/fabro-agent/src/lib.rs
++++ b/lib/crates/fabro-agent/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod apply_patch;
+ pub mod cli;
+ pub mod compaction;
+ pub mod config;
++pub(crate) mod context_window;
+ pub mod error;
+ pub mod event;
+ pub mod file_tracker;
+diff --git a/lib/crates/fabro-agent/src/mcp_integration.rs b/lib/crates/fabro-agent/src/mcp_integration.rs
+index 982e2cf06..e839ef4e3 100644
+--- a/lib/crates/fabro-agent/src/mcp_integration.rs
++++ b/lib/crates/fabro-agent/src/mcp_integration.rs
+@@ -3,7 +3,7 @@ use std::sync::Arc;
+ use fabro_llm::types::ToolDefinition;
+ use fabro_mcp::connection_manager::{McpConnectionManager, call_result_to_string};
+ 
+-use crate::tool_registry::RegisteredTool;
++use crate::tool_registry::{RegisteredTool, ToolSource};
+ 
+ /// Create `RegisteredTool` instances for every tool exposed by connected MCP
+ /// servers.
+@@ -14,6 +14,7 @@ pub fn make_mcp_tools(manager: &Arc<McpConnectionManager>) -> Vec<RegisteredTool
+         .map(|(qualified_name, info)| {
+             let mgr = Arc::clone(manager);
+             let name = qualified_name.clone();
++            let server_name = info.server_name.clone();
+             let tool_timeout = std::time::Duration::from_mins(2);
+ 
+             RegisteredTool {
+@@ -34,6 +35,7 @@ pub fn make_mcp_tools(manager: &Arc<McpConnectionManager>) -> Vec<RegisteredTool
+                         call_result_to_string(&result)
+                     })
+                 }),
++                source:     ToolSource::Mcp { server_name },
+             }
+         })
+         .collect()
+diff --git a/lib/crates/fabro-agent/src/question_tools.rs b/lib/crates/fabro-agent/src/question_tools.rs
+index d8351d67d..102eee803 100644
+--- a/lib/crates/fabro-agent/src/question_tools.rs
++++ b/lib/crates/fabro-agent/src/question_tools.rs
+@@ -12,7 +12,7 @@ use serde::Deserialize;
+ use serde_json::json;
+ use tokio_util::sync::CancellationToken;
+ 
+-use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
++use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+ 
+ tokio::task_local! {
+     static CURRENT_AGENT_TOOL_RUNTIME: AgentToolRuntime;
+@@ -209,6 +209,7 @@ fn make_openai_question_tool() -> RegisteredTool {
+                 format_openai_answers(&answers)
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -257,6 +258,7 @@ fn make_anthropic_question_tool() -> RegisteredTool {
+                 format_anthropic_answers(&answers)
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/session.rs b/lib/crates/fabro-agent/src/session.rs
+index de822bbbd..5ad7824a7 100644
+--- a/lib/crates/fabro-agent/src/session.rs
++++ b/lib/crates/fabro-agent/src/session.rs
+@@ -1,4 +1,5 @@
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::hash::{Hash, Hasher};
+ use std::sync::{Arc, Mutex, RwLock};
+ use std::time::SystemTime;
+ 
+@@ -7,9 +8,10 @@ use fabro_llm::client::Client;
+ use fabro_llm::error::ProviderErrorKind;
+ use fabro_llm::generate::StreamAccumulator;
+ use fabro_llm::provider::StreamEventStream;
++use fabro_llm::token_count::{InputTokenCountMethod, InputTokenCountPreference};
+ use fabro_llm::types::{
+     ContentPart, Message as LlmMessage, ReasoningEffort, Request, RetryPolicy, StreamEvent,
+-    ToolChoice,
++    TokenCounts, ToolChoice,
+ };
+ use fabro_llm::{Error as LlmError, retry};
+ use fabro_mcp::config::{McpServerSettings, McpTransport};
+@@ -25,6 +27,9 @@ use tracing::{debug, info, warn};
+ use crate::agent_profile::AgentProfile;
+ use crate::compaction::{check_context_usage, compact_context};
+ use crate::config::SessionOptions;
++use crate::context_window::{
++    ContextWindowSnapshotInput, build_local_snapshot, scaled_snapshot, warning, warnings_from_llm,
++};
+ use crate::error::{Error, InterruptReason};
+ use crate::event::Emitter;
+ use crate::file_tracker::FileTracker;
+@@ -39,6 +44,7 @@ use crate::skills::{
+ };
+ use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentManager};
+ use crate::tool_execution::execute_tool_calls;
++use crate::tool_registry::ToolDefinitionWithSource;
+ use crate::types::{
+     AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
+     SkillActivationSource, SkillSummary,
+@@ -295,33 +301,41 @@ impl ToolEnvProvider for StaticEnvProvider {
+     }
+ }
+ 
++struct BuiltRequest {
++    request: Request,
++    tools:   Vec<ToolDefinitionWithSource>,
++}
++
+ pub struct Session {
+-    id:                     String,
++    id: String,
+     /// Root agent session ID for this session's agent tree. A root session
+     /// uses its own `id`; a subagent session inherits its parent's
+     /// `root_session_id` so todo tools that scope by root (Anthropic tasks)
+     /// share one list across all subagents.
+-    root_session_id:        String,
+-    config:                 SessionOptions,
+-    history:                History,
+-    event_emitter:          Emitter,
+-    state:                  SessionState,
+-    llm_client:             Client,
+-    provider_profile:       Arc<dyn AgentProfile>,
+-    sandbox:                Arc<dyn Sandbox>,
+-    control_state:          Arc<Mutex<ControlState>>,
+-    control_notify:         Arc<Notify>,
+-    followup_queue:         Arc<Mutex<VecDeque<String>>>,
+-    cancel_token:           CancellationToken,
+-    round_token:            Arc<RwLock<CancellationToken>>,
+-    interrupt_reason:       Arc<Mutex<Option<InterruptReason>>>,
+-    memory:                 Vec<MemoryDocument>,
+-    env_context:            EnvContext,
+-    skills:                 Vec<Skill>,
+-    system_prompt:          String,
+-    file_tracker:           FileTracker,
+-    tool_env_provider:      Option<Arc<dyn ToolEnvProvider>>,
+-    subagent_manager:       Option<Arc<AsyncMutex<SubAgentManager>>>,
++    root_session_id: String,
++    config: SessionOptions,
++    history: History,
++    event_emitter: Emitter,
++    state: SessionState,
++    llm_client: Client,
++    provider_profile: Arc<dyn AgentProfile>,
++    sandbox: Arc<dyn Sandbox>,
++    control_state: Arc<Mutex<ControlState>>,
++    control_notify: Arc<Notify>,
++    followup_queue: Arc<Mutex<VecDeque<String>>>,
++    cancel_token: CancellationToken,
++    close_token: CancellationToken,
++    round_token: Arc<RwLock<CancellationToken>>,
++    interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
++    memory: Vec<MemoryDocument>,
++    env_context: EnvContext,
++    skills: Vec<Skill>,
++    system_prompt: String,
++    activated_skill_context_observed: bool,
++    context_window_counted_fingerprints: HashSet<u64>,
++    file_tracker: FileTracker,
++    tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
++    subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
+ }
+ 
+@@ -349,12 +363,15 @@ impl Session {
+             control_notify: Arc::new(Notify::new()),
+             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
+             cancel_token: CancellationToken::new(),
++            close_token: CancellationToken::new(),
+             round_token: Arc::new(RwLock::new(CancellationToken::new())),
+             interrupt_reason: Arc::new(Mutex::new(None)),
+             memory: Vec::new(),
+             env_context: EnvContext::default(),
+             skills: Vec::new(),
+             system_prompt: String::new(),
++            activated_skill_context_observed: false,
++            context_window_counted_fingerprints: HashSet::new(),
+             file_tracker: FileTracker::default(),
+             tool_env_provider: None,
+             subagent_manager,
+@@ -1103,6 +1120,7 @@ impl Session {
+ 
+     pub fn close(&mut self) -> bool {
+         let was_open = self.state != SessionState::Closed;
++        self.close_token.cancel();
+         self.transition(SessionState::Closed);
+         was_open
+     }
+@@ -1215,6 +1233,7 @@ impl Session {
+             expand_skill(&self.skills, input).map_err(Error::InvalidState)?
+         };
+         if let Some(ref name) = expanded.skill_name {
++            self.activated_skill_context_observed = true;
+             self.event_emitter
+                 .emit(self.id.clone(), AgentEvent::SkillActivated {
+                     skill_name: name.clone(),
+@@ -1300,7 +1319,9 @@ impl Session {
+             self.inject_task_reminder_if_needed();
+ 
+             // Build request
+-            let request = self.build_request();
++            let built_request = self.build_request();
++            let context_window_snapshot = self.emit_context_window_snapshots(&built_request);
++            let request = built_request.request;
+ 
+             // Emit AssistantTextStart before LLM call
+             self.event_emitter
+@@ -1570,6 +1591,9 @@ impl Session {
+                 .cloned()
+                 .collect();
+             let usage = response.usage.clone();
++            if let Some(local_snapshot) = context_window_snapshot.as_ref() {
++                self.emit_response_usage_context_window_snapshot(local_snapshot, &usage);
++            }
+ 
+             self.history.push(Message::Assistant {
+                 content: text.clone(),
+@@ -1651,6 +1675,12 @@ impl Session {
+             )
+             .await;
+             composite_watcher.abort();
++            if tool_calls
++                .iter()
++                .any(|tool_call| tool_call.name == "use_skill")
++            {
++                self.activated_skill_context_observed = true;
++            }
+ 
+             // Track file operations from tool calls
+             self.file_tracker
+@@ -1694,6 +1724,108 @@ impl Session {
+         Ok(())
+     }
+ 
++    fn emit_context_window_snapshots(
++        &mut self,
++        built_request: &BuiltRequest,
++    ) -> Option<fabro_types::StageContextWindowProjection> {
++        let provider = self.provider_profile.provider_id().to_string();
++        let model = self.provider_profile.model().to_string();
++        let local_snapshot = build_local_snapshot(ContextWindowSnapshotInput {
++            request: &built_request.request,
++            tools: &built_request.tools,
++            system_prompt: &self.system_prompt,
++            memory: &self.memory,
++            skills: &self.skills,
++            activated_skill_context_observed: self.activated_skill_context_observed,
++            provider: &provider,
++            model: &model,
++            context_window_tokens: self.provider_profile.context_window_size(),
++        });
++        self.event_emitter.emit(
++            self.id.clone(),
++            AgentEvent::ContextWindowSnapshot(local_snapshot.clone()),
++        );
++
++        let fingerprint = request_fingerprint(&built_request.request)?;
++        if !self.context_window_counted_fingerprints.insert(fingerprint) {
++            return Some(local_snapshot);
++        }
++
++        let client = self.llm_client.clone();
++        let request = built_request.request.clone();
++        let session_id = self.id.clone();
++        let emitter = self.event_emitter.clone();
++        let local_for_count = local_snapshot.clone();
++        let close_token = self.close_token.clone();
++        tokio::spawn(async move {
++            let count_result = tokio::select! {
++                biased;
++                () = close_token.cancelled() => return,
++                result = client.count_input_tokens(&request, InputTokenCountPreference::PreferProvider) => result,
++            };
++            if close_token.is_cancelled() {
++                return;
++            }
++            let snapshot = match count_result {
++                Ok(count) if count.method == InputTokenCountMethod::ProviderApi => {
++                    let input_tokens = u64::try_from(count.input_tokens.max(0)).unwrap_or(u64::MAX);
++                    scaled_snapshot(
++                        &local_for_count,
++                        input_tokens,
++                        fabro_types::StageContextWindowCountMethod::ProviderApiScaledBreakdown,
++                        warnings_from_llm(&count.warnings),
++                    )
++                }
++                Ok(count) => {
++                    let mut warnings = local_for_count.warnings.clone();
++                    warnings.extend(warnings_from_llm(&count.warnings));
++                    let input_tokens = u64::try_from(count.input_tokens.max(0)).unwrap_or(u64::MAX);
++                    scaled_snapshot(
++                        &local_for_count,
++                        input_tokens,
++                        fabro_types::StageContextWindowCountMethod::LocalEstimate,
++                        warnings,
++                    )
++                }
++                Err(_) => {
++                    let mut warnings = local_for_count.warnings.clone();
++                    warnings.push(warning(
++                        "provider_token_count_unavailable",
++                        "provider input token counting was unavailable; retained local estimate",
++                    ));
++                    let mut snapshot = local_for_count.clone();
++                    snapshot.warnings = warnings;
++                    snapshot
++                }
++            };
++            emitter.emit(session_id, AgentEvent::ContextWindowSnapshot(snapshot));
++        });
++
++        Some(local_snapshot)
++    }
++
++    fn emit_response_usage_context_window_snapshot(
++        &self,
++        local_snapshot: &fabro_types::StageContextWindowProjection,
++        usage: &TokenCounts,
++    ) {
++        let input_tokens = usage
++            .input_tokens
++            .saturating_add(usage.cache_read_tokens)
++            .saturating_add(usage.cache_write_tokens);
++        if input_tokens <= 0 {
++            return;
++        }
++        let snapshot = scaled_snapshot(
++            local_snapshot,
++            u64::try_from(input_tokens).unwrap_or(u64::MAX),
++            fabro_types::StageContextWindowCountMethod::ResponseUsageScaledBreakdown,
++            local_snapshot.warnings.clone(),
++        );
++        self.event_emitter
++            .emit(self.id.clone(), AgentEvent::ContextWindowSnapshot(snapshot));
++    }
++
+     async fn compact_if_needed(&mut self) {
+         let Some(estimate) = check_context_usage(
+             &self.system_prompt,
+@@ -1788,23 +1920,27 @@ impl Session {
+         }
+     }
+ 
+-    fn build_request(&self) -> Request {
++    fn build_request(&self) -> BuiltRequest {
+         let mut messages = Vec::new();
+         if !self.system_prompt.trim().is_empty() {
+             messages.push(LlmMessage::system(self.system_prompt.clone()));
+         }
+         messages.extend(self.history.convert_to_messages());
+ 
+-        let tools = self
++        let tools_with_source = self
+             .provider_profile
+             .tool_registry()
+-            .definitions_for_policy(
++            .definitions_with_source_for_policy(
+                 self.config.tool_access_policy.as_deref(),
+                 self.config.tool_exposure_mode,
+             );
++        let tools: Vec<_> = tools_with_source
++            .iter()
++            .map(|tool| tool.definition.clone())
++            .collect();
+         let has_tools = !tools.is_empty();
+ 
+-        Request {
++        let request = Request {
+             model: self.provider_profile.model().to_string(),
+             messages,
+             provider: Some(self.provider_profile.provider_id().to_string()),
+@@ -1826,6 +1962,10 @@ impl Session {
+             speed: self.config.speed,
+             metadata: None,
+             provider_options: None,
++        };
++        BuiltRequest {
++            request,
++            tools: tools_with_source,
+         }
+     }
+ 
+@@ -1854,6 +1994,13 @@ const fn is_auth_error(err: &LlmError) -> bool {
+     )
+ }
+ 
++fn request_fingerprint(request: &Request) -> Option<u64> {
++    let bytes = serde_json::to_vec(request).ok()?;
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    bytes.hash(&mut hasher);
++    Some(hasher.finish())
++}
++
+ /// Best-effort kill of a sandbox MCP server process group. Used when
+ /// `start_sandbox_mcp_server` is cancelled after spawning a detached
+ /// `setsid` child but before reporting readiness. Errors from the sandbox
+@@ -1892,7 +2039,7 @@ mod tests {
+     use crate::skills::{Skill, make_use_skill_tool};
+     use crate::subagent::SubAgentStatus;
+     use crate::test_support::*;
+-    use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
++    use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+ 
+     struct NamedToolAccessPolicy {
+         decisions: Vec<(&'static str, ToolAccess)>,
+@@ -1921,6 +2068,7 @@ mod tests {
+                 parameters:  serde_json::json!({"type": "object"}),
+             },
+             executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("ok".to_string()) })),
++            source:     ToolSource::Native,
+         }
+     }
+ 
+@@ -2118,6 +2266,7 @@ mod tests {
+                     Ok("recorded".to_string())
+                 })
+             }),
++            source:     ToolSource::Native,
+         };
+ 
+         let mut registry = ToolRegistry::new();
+@@ -2568,6 +2717,7 @@ mod tests {
+                     Ok("done".to_string())
+                 })
+             }),
++            source:     ToolSource::Native,
+         };
+ 
+         let mut registry = ToolRegistry::new();
+@@ -2844,6 +2994,7 @@ mod tests {
+             executor:   Arc::new(|_args, _ctx| {
+                 Box::pin(async move { Ok("should not reach".to_string()) })
+             }),
++            source:     ToolSource::Native,
+         });
+ 
+         let responses = vec![
+@@ -2885,6 +3036,7 @@ mod tests {
+             executor:   Arc::new(|_args, _ctx| {
+                 Box::pin(async move { Ok("tool executed".to_string()) })
+             }),
++            source:     ToolSource::Native,
+         });
+ 
+         let responses = vec![
+@@ -4001,7 +4153,7 @@ mod tests {
+     async fn compaction_includes_structured_prompt_and_file_tracking() {
+         use fabro_llm::types::ToolDefinition;
+ 
+-        use crate::tool_registry::RegisteredTool;
++        use crate::tool_registry::{RegisteredTool, ToolSource};
+ 
+         // Provider that captures complete() requests (compaction) while returning
+         // canned responses for stream() calls.
+@@ -4043,6 +4195,7 @@ mod tests {
+             executor:   Arc::new(|_args, _ctx| {
+                 Box::pin(async move { Ok("file contents".to_string()) })
+             }),
++            source:     ToolSource::Native,
+         };
+ 
+         let mut registry = ToolRegistry::new();
+@@ -4277,6 +4430,7 @@ mod tests {
+                     Ok("cancelled".to_string())
+                 })
+             }),
++            source:     ToolSource::Native,
+         };
+         let mut registry = ToolRegistry::new();
+         registry.register(slow_tool);
+diff --git a/lib/crates/fabro-agent/src/skills.rs b/lib/crates/fabro-agent/src/skills.rs
+index 98ac6def2..fe380bb28 100644
+--- a/lib/crates/fabro-agent/src/skills.rs
++++ b/lib/crates/fabro-agent/src/skills.rs
+@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
+ 
+ use crate::error::{Error, InterruptReason};
+ use crate::sandbox::Sandbox;
+-use crate::tool_registry::RegisteredTool;
++use crate::tool_registry::{RegisteredTool, ToolSource};
+ use crate::tools::required_str;
+ use crate::types::{AgentEvent, SkillActivationSource};
+ 
+@@ -192,6 +192,7 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
+                 Ok(skill.template.clone())
+             })
+         }),
++        source:     ToolSource::Skill,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/subagent.rs b/lib/crates/fabro-agent/src/subagent.rs
+index 10318fbe3..0c68694c4 100644
+--- a/lib/crates/fabro-agent/src/subagent.rs
++++ b/lib/crates/fabro-agent/src/subagent.rs
+@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
+ 
+ use crate::error::Error;
+ use crate::session::Session;
+-use crate::tool_registry::RegisteredTool;
++use crate::tool_registry::{RegisteredTool, ToolSource};
+ use crate::tools::required_str;
+ use crate::types::{AgentEvent, Message, SessionEvent};
+ 
+@@ -359,6 +359,7 @@ pub fn make_spawn_agent_tool(
+                     .map_err(|e| e.to_string())
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -394,6 +395,7 @@ pub fn make_send_input_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regist
+                 Ok(format!("Message sent to agent {agent_id}"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -426,6 +428,7 @@ pub fn make_wait_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTo
+                 ))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -455,6 +458,7 @@ pub fn make_close_agent_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regis
+                 Ok(format!("Agent {agent_id} closed"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/test_support.rs b/lib/crates/fabro-agent/src/test_support.rs
+index 4d2d4cf46..51aac4233 100644
+--- a/lib/crates/fabro-agent/src/test_support.rs
++++ b/lib/crates/fabro-agent/src/test_support.rs
+@@ -19,7 +19,7 @@ use crate::profiles::EnvContext;
+ use crate::sandbox::*;
+ use crate::session::Session;
+ use crate::skills::{Skill, format_skills_prompt_section};
+-use crate::tool_registry::{RegisteredTool, ToolRegistry};
++use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
+ 
+ // --- TestProfile ---
+ 
+@@ -283,6 +283,7 @@ pub fn make_echo_tool() -> RegisteredTool {
+                 Ok(format!("echo: {text}"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -297,6 +298,7 @@ pub fn make_error_tool() -> RegisteredTool {
+         executor:   Arc::new(|_args, _ctx| {
+             Box::pin(async move { Err("tool execution failed".to_string()) })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/todo_tools.rs b/lib/crates/fabro-agent/src/todo_tools.rs
+index 3fac8de10..b6bc87421 100644
+--- a/lib/crates/fabro-agent/src/todo_tools.rs
++++ b/lib/crates/fabro-agent/src/todo_tools.rs
+@@ -17,7 +17,7 @@ use fabro_types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps};
+ use serde_json::Value;
+ 
+ use crate::todo_runtime::TodoRuntime;
+-use crate::tool_registry::{RegisteredTool, ToolContext};
++use crate::tool_registry::{RegisteredTool, ToolContext, ToolSource};
+ 
+ /// Compute the OpenAI plan scope (`openai_plan:<session_id>`). Returns an
+ /// error string the model can see if no session ID is bound to the call.
+@@ -207,6 +207,7 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+                 Ok("Plan updated".to_string())
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -331,6 +332,7 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+                 Ok(format!("Task #{task_id} created successfully: {subject}"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -399,6 +401,7 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+                 }
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -435,6 +438,7 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+                 Ok(format_task_details(todo))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -489,6 +493,7 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+                 Ok(out.trim_end().to_string())
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/tool_execution.rs b/lib/crates/fabro-agent/src/tool_execution.rs
+index c55b9ce3d..2c77b3a43 100644
+--- a/lib/crates/fabro-agent/src/tool_execution.rs
++++ b/lib/crates/fabro-agent/src/tool_execution.rs
+@@ -571,7 +571,7 @@ mod tests {
+     };
+     use crate::read_before_write_sandbox::ReadBeforeWriteSandbox;
+     use crate::test_support::MutableMockSandbox;
+-    use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
++    use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+     use crate::tools::{
+         make_edit_file_tool, make_grep_tool, make_read_file_tool, make_write_file_tool,
+     };
+@@ -619,6 +619,7 @@ mod tests {
+                     Ok(format!("echo: {text}"))
+                 })
+             }),
++            source:     ToolSource::Native,
+         }
+     }
+ 
+@@ -632,6 +633,7 @@ mod tests {
+             executor:   Arc::new(|_args: serde_json::Value, _ctx: ToolContext| {
+                 Box::pin(async move { Err("tool failed".to_string()) })
+             }),
++            source:     ToolSource::Native,
+         }
+     }
+ 
+@@ -994,6 +996,7 @@ mod tests {
+                     Ok("wrote".to_string())
+                 })
+             }),
++            source:     ToolSource::Native,
+         });
+         let config = SessionOptions {
+             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
+@@ -1048,6 +1051,7 @@ mod tests {
+                     Ok("ran".to_string())
+                 })
+             }),
++            source:     ToolSource::Native,
+         });
+         let config = SessionOptions {
+             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
+diff --git a/lib/crates/fabro-agent/src/tool_registry.rs b/lib/crates/fabro-agent/src/tool_registry.rs
+index c4b3837e9..df2be273e 100644
+--- a/lib/crates/fabro-agent/src/tool_registry.rs
++++ b/lib/crates/fabro-agent/src/tool_registry.rs
+@@ -65,6 +65,23 @@ pub type ToolExecutor = Arc<
+ pub struct RegisteredTool {
+     pub definition: ToolDefinition,
+     pub executor:   ToolExecutor,
++    pub source:     ToolSource,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub enum ToolSource {
++    #[default]
++    Native,
++    Mcp {
++        server_name: String,
++    },
++    Skill,
++}
++
++#[derive(Clone)]
++pub struct ToolDefinitionWithSource {
++    pub definition: ToolDefinition,
++    pub source:     ToolSource,
+ }
+ 
+ pub struct ToolRegistry {
+@@ -97,6 +114,17 @@ impl ToolRegistry {
+         self.tools.values().map(|t| t.definition.clone()).collect()
+     }
+ 
++    #[must_use]
++    pub fn definitions_with_source(&self) -> Vec<ToolDefinitionWithSource> {
++        self.tools
++            .values()
++            .map(|tool| ToolDefinitionWithSource {
++                definition: tool.definition.clone(),
++                source:     tool.source.clone(),
++            })
++            .collect()
++    }
++
+     #[must_use]
+     pub fn definitions_for_policy(
+         &self,
+@@ -118,6 +146,30 @@ impl ToolRegistry {
+             .collect()
+     }
+ 
++    #[must_use]
++    pub fn definitions_with_source_for_policy(
++        &self,
++        policy: Option<&dyn ToolAccessPolicy>,
++        exposure_mode: ToolExposureMode,
++    ) -> Vec<ToolDefinitionWithSource> {
++        let Some(policy) = policy else {
++            return self.definitions_with_source();
++        };
++
++        self.tools
++            .values()
++            .filter(|tool| {
++                policy
++                    .access_for_tool(&tool.definition.name)
++                    .is_exposed(exposure_mode)
++            })
++            .map(|tool| ToolDefinitionWithSource {
++                definition: tool.definition.clone(),
++                source:     tool.source.clone(),
++            })
++            .collect()
++    }
++
+     #[must_use]
+     pub fn names(&self) -> Vec<String> {
+         self.tools.keys().cloned().collect()
+@@ -169,6 +221,7 @@ mod tests {
+                 parameters:  serde_json::json!({"type": "object"}),
+             },
+             executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("ok".into()) })),
++            source:     ToolSource::Native,
+         }
+     }
+ 
+@@ -213,6 +266,7 @@ mod tests {
+                 parameters:  serde_json::json!({}),
+             },
+             executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("v1".into()) })),
++            source:     ToolSource::Native,
+         });
+         registry.register(RegisteredTool {
+             definition: ToolDefinition {
+@@ -221,6 +275,7 @@ mod tests {
+                 parameters:  serde_json::json!({}),
+             },
+             executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("v2".into()) })),
++            source:     ToolSource::Native,
+         });
+ 
+         let tool = registry.get("tool_a").unwrap();
+diff --git a/lib/crates/fabro-agent/src/tools.rs b/lib/crates/fabro-agent/src/tools.rs
+index 352cf0965..2f032a2b6 100644
+--- a/lib/crates/fabro-agent/src/tools.rs
++++ b/lib/crates/fabro-agent/src/tools.rs
+@@ -10,7 +10,7 @@ use futures::{StreamExt, stream};
+ 
+ use crate::config::SessionOptions;
+ use crate::sandbox::GrepOptions;
+-use crate::tool_registry::{RegisteredTool, ToolRegistry};
++use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
+ 
+ const MAX_WEB_FETCH_BYTES: usize = 100 * 1024;
+ const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
+@@ -111,6 +111,7 @@ pub fn make_read_file_tool() -> RegisteredTool {
+                 Ok(content)
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -141,6 +142,7 @@ pub fn make_write_file_tool() -> RegisteredTool {
+                 Ok(format!("Successfully wrote to {file_path}"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -200,6 +202,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
+                 Ok(format!("Successfully edited {file_path}"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -270,6 +273,7 @@ pub fn make_shell_tool_with_config(config: &SessionOptions) -> RegisteredTool {
+                 Ok(output)
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -334,6 +338,7 @@ pub fn make_grep_tool() -> RegisteredTool {
+                 Ok(results.join("\n"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -365,6 +370,7 @@ pub fn make_glob_tool() -> RegisteredTool {
+                 Ok(results.join("\n"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -426,6 +432,7 @@ pub(crate) fn make_read_many_files_tool() -> RegisteredTool {
+                 Ok(output)
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -467,6 +474,7 @@ pub(crate) fn make_list_dir_tool() -> RegisteredTool {
+                 Ok(lines.join("\n"))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -578,6 +586,7 @@ fn make_web_search_tool_with_api_key(api_key: Option<String>) -> RegisteredTool
+                 Ok(format_brave_results(&body))
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+@@ -679,6 +688,7 @@ pub(crate) fn make_web_fetch_tool(summarizer: Option<WebFetchSummarizer>) -> Reg
+                 }
+             })
+         }),
++        source: ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-agent/src/types.rs b/lib/crates/fabro-agent/src/types.rs
+index a15b8ae20..9aa1a014c 100644
+--- a/lib/crates/fabro-agent/src/types.rs
++++ b/lib/crates/fabro-agent/src/types.rs
+@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
+ use fabro_llm::Error as LlmError;
+ use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
+ use fabro_model::ModelRef;
+-use fabro_types::SessionMessage;
++use fabro_types::{SessionMessage, StageContextWindowProjection};
+ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize};
+ 
+@@ -304,6 +304,7 @@ pub enum AgentEvent {
+         delay_secs: f64,
+         error:      LlmError,
+     },
++    ContextWindowSnapshot(StageContextWindowProjection),
+     SubAgentSpawned {
+         agent_id: String,
+         depth:    usize,
+@@ -503,6 +504,17 @@ impl AgentEvent {
+                     "LLM request failed, retrying"
+                 );
+             }
++            Self::ContextWindowSnapshot(snapshot) => {
++                debug!(
++                    session_id,
++                    provider = snapshot.provider.as_str(),
++                    model = snapshot.model.as_str(),
++                    input_tokens = snapshot.input_tokens,
++                    context_window_tokens = snapshot.context_window_tokens,
++                    count_method = %snapshot.count_method,
++                    "Context window snapshot"
++                );
++            }
+             Self::SubAgentSpawned {
+                 agent_id,
+                 depth,
+diff --git a/lib/crates/fabro-api/build.rs b/lib/crates/fabro-api/build.rs
+index 0998e3c31..ba908a05b 100644
+--- a/lib/crates/fabro-api/build.rs
++++ b/lib/crates/fabro-api/build.rs
+@@ -371,6 +371,42 @@ fn main() {
+             "fabro_types::AgentMcpToolSummary",
+             &[],
+         ),
++        ("StageContextWindow", "fabro_types::StageContextWindow", &[]),
++        (
++            "StageContextWindowProjection",
++            "fabro_types::StageContextWindowProjection",
++            &[],
++        ),
++        (
++            "StageContextWindowBreakdownItem",
++            "fabro_types::StageContextWindowBreakdownItem",
++            &[],
++        ),
++        (
++            "StageContextWindowCategory",
++            "fabro_types::StageContextWindowCategory",
++            &[],
++        ),
++        (
++            "StageContextWindowCountMethod",
++            "fabro_types::StageContextWindowCountMethod",
++            &[],
++        ),
++        (
++            "StageContextWindowStaleness",
++            "fabro_types::StageContextWindowStaleness",
++            &[],
++        ),
++        (
++            "StageContextWindowUnavailableReason",
++            "fabro_types::StageContextWindowUnavailableReason",
++            &[],
++        ),
++        (
++            "StageContextWindowWarning",
++            "fabro_types::StageContextWindowWarning",
++            &[],
++        ),
+         ("SecretMetadata", "fabro_types::SecretMetadata", &[]),
+         ("InterviewOption", "fabro_types::InterviewOption", &[]),
+         (
+diff --git a/lib/crates/fabro-api/src/lib.rs b/lib/crates/fabro-api/src/lib.rs
+index c08f1d182..346d0f036 100644
+--- a/lib/crates/fabro-api/src/lib.rs
++++ b/lib/crates/fabro-api/src/lib.rs
+@@ -49,9 +49,13 @@ pub mod types {
+         SandboxService, SandboxServiceListResponse, SandboxState, SandboxTimestamps,
+         SecretMetadata, SecretType, ServerSettings, SessionDetail, SessionId, SessionMessage,
+         SessionRecord, SessionStatus, SessionSummary, SessionTurn, SkillsProjection,
+-        StageCompletion, StageHandler, StageModelUsage, StageOutcome, StageProjection, StageState,
+-        SubAgentProjection, SubAgentStatus, SystemActorKind, TodoListProjection, TurnId,
+-        UserPrincipal, WorkflowSettings,
++        StageCompletion, StageContextWindow, StageContextWindowBreakdownItem,
++        StageContextWindowBreakdownProjection, StageContextWindowCategory,
++        StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
++        StageContextWindowUnavailableReason, StageContextWindowWarning, StageHandler,
++        StageModelUsage, StageOutcome, StageProjection, StageState, SubAgentProjection,
++        SubAgentStatus, SystemActorKind, TodoListProjection, TurnId, UserPrincipal,
++        WorkflowSettings,
+     };
+ 
+     pub use crate::generated::types::*;
+diff --git a/lib/crates/fabro-api/tests/stage_projection_round_trip.rs b/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
+index 87f9afd95..ff27814d8 100644
+--- a/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
++++ b/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
+@@ -5,13 +5,24 @@ use fabro_api::types::{
+     AgentSkillActivationSource as ApiAgentSkillActivationSource,
+     AgentSkillSummary as ApiAgentSkillSummary, McpServerProjection as ApiMcpServerProjection,
+     McpServerStatus as ApiMcpServerStatus, SkillsProjection as ApiSkillsProjection,
++    StageContextWindow as ApiStageContextWindow,
++    StageContextWindowBreakdownItem as ApiStageContextWindowBreakdownItem,
++    StageContextWindowCategory as ApiStageContextWindowCategory,
++    StageContextWindowCountMethod as ApiStageContextWindowCountMethod,
++    StageContextWindowProjection as ApiStageContextWindowProjection,
++    StageContextWindowStaleness as ApiStageContextWindowStaleness,
++    StageContextWindowUnavailableReason as ApiStageContextWindowUnavailableReason,
++    StageContextWindowWarning as ApiStageContextWindowWarning,
+     StageProjection as ApiStageProjection, SubAgentProjection as ApiSubAgentProjection,
+     SubAgentStatus as ApiSubAgentStatus, TodoListProjection as ApiTodoListProjection,
+ };
+ use fabro_types::{
+     ActivatedSkill, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
+-    McpServerProjection, McpServerStatus, SkillsProjection, StageProjection, SubAgentProjection,
+-    SubAgentStatus, TodoListKind, TodoListProjection,
++    McpServerProjection, McpServerStatus, SkillsProjection, StageContextWindow,
++    StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
++    StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
++    StageContextWindowWarning, StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind,
++    TodoListProjection,
+ };
+ use serde_json::json;
+ 
+@@ -32,6 +43,15 @@ fn stage_projection_reuses_nested_agent_state_types() {
+     assert_same_type::<ApiMcpServerProjection, McpServerProjection>();
+     assert_same_type::<ApiMcpServerStatus, McpServerStatus>();
+     assert_same_type::<ApiAgentMcpToolSummary, AgentMcpToolSummary>();
++    assert_same_type::<ApiStageContextWindow, StageContextWindow>();
++    assert_same_type::<ApiStageContextWindowProjection, StageContextWindowProjection>();
++    assert_same_type::<ApiStageContextWindowBreakdownItem, StageContextWindowBreakdownItem>();
++    assert_same_type::<ApiStageContextWindowCategory, StageContextWindowCategory>();
++    assert_same_type::<ApiStageContextWindowCountMethod, StageContextWindowCountMethod>();
++    assert_same_type::<ApiStageContextWindowStaleness, StageContextWindowStaleness>();
++    assert_same_type::<ApiStageContextWindowUnavailableReason, StageContextWindowUnavailableReason>(
++    );
++    assert_same_type::<ApiStageContextWindowWarning, StageContextWindowWarning>();
+ }
+ 
+ #[test]
+@@ -128,6 +148,27 @@ fn stage_projection_round_trips_representative_json() {
+                 }
+             }
+         ],
++        "context_window": {
++            "provider": "openai",
++            "model": "gpt-5.4",
++            "context_window_tokens": 400000,
++            "input_tokens": 123456,
++            "usage_percent": 30.864,
++            "count_method": "provider_api_scaled_breakdown",
++            "staleness": "live",
++            "generated_at": "2026-05-23T12:34:56Z",
++            "event_seq": 42,
++            "breakdown": [
++                {
++                    "category": "system_prompt",
++                    "label": "System prompt",
++                    "tokens": 30000,
++                    "usage_percent": 7.5,
++                    "source": "scaled_local_estimate"
++                }
++            ],
++            "warnings": []
++        },
+         "state": "succeeded"
+     });
+ 
+@@ -135,6 +176,44 @@ fn stage_projection_round_trips_representative_json() {
+     assert_eq!(serde_json::to_value(state).unwrap(), value);
+ }
+ 
++#[test]
++fn stage_context_window_response_round_trips_representative_json() {
++    let value = json!({
++        "stage_id": "implement@1",
++        "available": true,
++        "unavailable_reason": null,
++        "provider": "openai",
++        "model": "gpt-5.4",
++        "context_window_tokens": 400000,
++        "input_tokens": 123456,
++        "usage_percent": 30.864,
++        "count_method": "provider_api_scaled_breakdown",
++        "staleness": "live",
++        "generated_at": "2026-05-23T12:34:56Z",
++        "event_seq": 42,
++        "breakdown": [
++            {
++                "category": "system_prompt",
++                "label": "System prompt",
++                "tokens": 30000,
++                "usage_percent": 7.5,
++                "source": "scaled_local_estimate"
++            }
++        ],
++        "warnings": [
++            {
++                "code": "local_token_estimate",
++                "message": "input token count is a local estimate"
++            }
++        ]
++    });
++
++    let response: StageContextWindow = serde_json::from_value(value.clone()).unwrap();
++    let api_response: ApiStageContextWindow = serde_json::from_value(value.clone()).unwrap();
++    assert_eq!(api_response, response);
++    assert_eq!(serde_json::to_value(response).unwrap(), value);
++}
++
+ #[test]
+ fn nested_agent_state_types_match_openapi_json_shape() {
+     let todo_list = TodoListProjection::new(TodoListKind::OpenAiPlan, "openai_plan:ses_root");
+diff --git a/lib/crates/fabro-llm/src/token_count.rs b/lib/crates/fabro-llm/src/token_count.rs
+index 46fb12f2c..e3bd8445b 100644
+--- a/lib/crates/fabro-llm/src/token_count.rs
++++ b/lib/crates/fabro-llm/src/token_count.rs
+@@ -37,52 +37,26 @@ pub struct InputTokenCount {
+     pub warnings:     Vec<Warning>,
+ }
+ 
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct LocalTokenEstimate {
++    pub tokens:   usize,
++    pub warnings: Vec<Warning>,
++}
++
+ #[must_use]
+ pub fn estimate_input_tokens(request: &Request, provider: impl Into<String>) -> InputTokenCount {
+     let mut estimator = Estimator::default();
+     let mut tokens = 0usize;
+ 
+     for message in &request.messages {
+-        tokens += 4;
+-        tokens += estimate_text_tokens(message.role_name());
+-        if let Some(name) = &message.name {
+-            tokens += estimate_text_tokens(name);
+-        }
+-        if let Some(tool_call_id) = &message.tool_call_id {
+-            tokens += estimate_text_tokens(tool_call_id);
+-        }
+-        for part in &message.content {
+-            tokens += 1 + estimator.estimate_content_part(part);
+-        }
++        tokens += estimator.estimate_message(message);
+     }
+ 
+     if let Some(tools) = &request.tools {
+         tokens += tools.iter().map(estimate_tool).sum::<usize>();
+     }
+ 
+-    if let Some(tool_choice) = &request.tool_choice {
+-        if let Ok(value) = serde_json::to_value(tool_choice) {
+-            tokens += estimate_json_tokens(&value);
+-        }
+-    }
+-
+-    if let Some(response_format) = &request.response_format {
+-        if let Ok(value) = serde_json::to_value(response_format) {
+-            tokens += estimate_json_tokens(&value);
+-        }
+-    }
+-
+-    if let Some(reasoning_effort) = request.reasoning_effort {
+-        tokens += estimate_text_tokens(reasoning_effort.to_string().as_str());
+-    }
+-
+-    if let Some(provider_options) = &request.provider_options {
+-        tokens += estimate_json_tokens(provider_options);
+-        estimator.warn(
+-            PROVIDER_OPTIONS_ESTIMATE_WARNING,
+-            "provider options estimated from JSON",
+-        );
+-    }
++    tokens += estimator.estimate_request_controls(request);
+ 
+     estimator.warn(
+         LOCAL_ESTIMATE_WARNING,
+@@ -108,6 +82,41 @@ pub fn estimate_json_tokens(value: &serde_json::Value) -> usize {
+     serde_json::to_string(value).map_or(0, |json| json.len().div_ceil(4))
+ }
+ 
++#[must_use]
++pub fn estimate_message_tokens(message: &Message) -> LocalTokenEstimate {
++    let mut estimator = Estimator::default();
++    let tokens = estimator.estimate_message(message);
++    LocalTokenEstimate {
++        tokens,
++        warnings: estimator.warnings,
++    }
++}
++
++#[must_use]
++pub fn estimate_content_part_tokens(part: &ContentPart) -> LocalTokenEstimate {
++    let mut estimator = Estimator::default();
++    let tokens = estimator.estimate_content_part(part);
++    LocalTokenEstimate {
++        tokens,
++        warnings: estimator.warnings,
++    }
++}
++
++#[must_use]
++pub fn estimate_tool_definition_tokens(tool: &ToolDefinition) -> usize {
++    estimate_tool(tool)
++}
++
++#[must_use]
++pub fn estimate_request_control_tokens(request: &Request) -> LocalTokenEstimate {
++    let mut estimator = Estimator::default();
++    let tokens = estimator.estimate_request_controls(request);
++    LocalTokenEstimate {
++        tokens,
++        warnings: estimator.warnings,
++    }
++}
++
+ #[derive(Default)]
+ struct Estimator {
+     warnings:   Vec<Warning>,
+@@ -115,6 +124,48 @@ struct Estimator {
+ }
+ 
+ impl Estimator {
++    fn estimate_message(&mut self, message: &Message) -> usize {
++        let mut tokens = 4 + estimate_text_tokens(message.role_name());
++        if let Some(name) = &message.name {
++            tokens += estimate_text_tokens(name);
++        }
++        if let Some(tool_call_id) = &message.tool_call_id {
++            tokens += estimate_text_tokens(tool_call_id);
++        }
++        for part in &message.content {
++            tokens += 1 + self.estimate_content_part(part);
++        }
++        tokens
++    }
++
++    fn estimate_request_controls(&mut self, request: &Request) -> usize {
++        let mut tokens = 0;
++        if let Some(tool_choice) = &request.tool_choice {
++            if let Ok(value) = serde_json::to_value(tool_choice) {
++                tokens += estimate_json_tokens(&value);
++            }
++        }
++
++        if let Some(response_format) = &request.response_format {
++            if let Ok(value) = serde_json::to_value(response_format) {
++                tokens += estimate_json_tokens(&value);
++            }
++        }
++
++        if let Some(reasoning_effort) = request.reasoning_effort {
++            tokens += estimate_text_tokens(reasoning_effort.to_string().as_str());
++        }
++
++        if let Some(provider_options) = &request.provider_options {
++            tokens += estimate_json_tokens(provider_options);
++            self.warn(
++                PROVIDER_OPTIONS_ESTIMATE_WARNING,
++                "provider options estimated from JSON",
++            );
++        }
++        tokens
++    }
++
+     fn estimate_content_part(&mut self, part: &ContentPart) -> usize {
+         match part {
+             ContentPart::Text(text) => estimate_text_tokens(text),
+diff --git a/lib/crates/fabro-server/src/server/handler/mod.rs b/lib/crates/fabro-server/src/server/handler/mod.rs
+index a99ccfce4..2f07ff0bf 100644
+--- a/lib/crates/fabro-server/src/server/handler/mod.rs
++++ b/lib/crates/fabro-server/src/server/handler/mod.rs
+@@ -65,6 +65,10 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
+             "/runs/{id}/stages/{stageId}/events",
+             get(demo::get_stage_events),
+         )
++        .route(
++            "/runs/{id}/stages/{stageId}/context-window",
++            get(not_implemented),
++        )
+         .route(
+             "/runs/{id}/stages/{stageId}/artifacts",
+             get(not_implemented).post(not_implemented),
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index fcf6e5a09..a8aff0c48 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -20,8 +20,9 @@ use fabro_config::Storage;
+ use fabro_interview::AnswerSubmission;
+ use fabro_llm::client::Client as LlmClient;
+ use fabro_types::{
+-    Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance, SystemActorKind,
+-    parse_blob_ref,
++    Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance, StageContextWindow,
++    StageContextWindowStaleness, StageContextWindowUnavailableReason, StageHandler,
++    StageModelUsage, StageProjection, StageState, SystemActorKind, parse_blob_ref,
+ };
+ use fabro_util::version::FABRO_VERSION;
+ use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
+@@ -33,13 +34,13 @@ use tracing::info;
+ use super::super::{
+     AppState, ListResponse, PaginationParams, RunExecutionMode, answer_from_request,
+     api_question_from_pending_interview, default_page_limit, delete_run_internal,
+-    load_pending_interview, managed_run, paginate_items, parse_run_id_path, reject_if_archived,
+-    resolve_interp_string, submit_pending_interview_answer, workflow_event,
++    load_pending_interview, managed_run, paginate_items, parse_run_id_path, parse_stage_id_path,
++    reject_if_archived, resolve_interp_string, submit_pending_interview_answer, workflow_event,
+ };
+ use crate::error::ApiError;
+ use crate::principal_middleware::{
+-    RequireCommandLog, RequireRunScoped, RequireRunScopedOrRunTools, RequiredRunToolActor,
+-    RequiredUser,
++    RequireCommandLog, RequireRunScoped, RequireRunScopedOrRunTools, RequireRunStageScoped,
++    RequiredRunToolActor, RequiredUser,
+ };
+ use crate::run_files::{list_run_commits, list_run_files};
+ use crate::run_manifest;
+@@ -73,6 +74,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
+             "/runs/{id}/stages/{stageId}/logs/output",
+             get(get_run_stage_command_log),
+         )
++        .route(
++            "/runs/{id}/stages/{stageId}/context-window",
++            get(get_run_stage_context_window),
++        )
+         .route("/runs/{id}/settings", get(get_run_settings))
+         .route("/runs/{id}/files", get(list_run_files))
+         .route("/runs/{id}/commits", get(list_run_commits))
+@@ -1015,6 +1020,70 @@ async fn get_run_logs(
+     }
+ }
+ 
++async fn get_run_stage_context_window(
++    RequireRunStageScoped(id, raw_stage_id): RequireRunStageScoped,
++    State(state): State<Arc<AppState>>,
++) -> Response {
++    let stage_id = match parse_stage_id_path(&raw_stage_id) {
++        Ok(stage_id) => stage_id,
++        Err(response) => return response,
++    };
++    let cached = match state.store.get_cached_run(&id).await {
++        Ok(Some(cached)) => cached,
++        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
++        Err(err) => {
++            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
++                .into_response();
++        }
++    };
++    let Some(stage) = cached.projection.stage(&stage_id) else {
++        return ApiError::not_found("Stage not found.").into_response();
++    };
++
++    if !is_agent_context_window_stage(stage) {
++        return Json(StageContextWindow::unavailable(
++            stage_id,
++            StageContextWindowUnavailableReason::NotAgentStage,
++            "Context-window data is only available for agent stages.",
++        ))
++        .into_response();
++    }
++
++    let Some(snapshot) = stage.context_window.as_ref() else {
++        return Json(StageContextWindow::unavailable(
++            stage_id,
++            StageContextWindowUnavailableReason::NotObserved,
++            "No context-window snapshot has been observed for this stage.",
++        ))
++        .into_response();
++    };
++
++    let mut response = StageContextWindow::available(stage_id, snapshot);
++    if !is_live_stage(stage.state) {
++        response.staleness = StageContextWindowStaleness::Stored;
++    }
++    Json(response).into_response()
++}
++
++fn is_agent_context_window_stage(stage: &StageProjection) -> bool {
++    if stage.context_window.is_some() {
++        return true;
++    }
++    if stage.handler == Some(StageHandler::Agent) {
++        return true;
++    }
++    stage.provider_used.as_ref().is_some_and(|usage| {
++        usage.mode == StageModelUsage::MODE_AGENT || usage.mode == StageModelUsage::MODE_ACP
++    })
++}
++
++fn is_live_stage(state: StageState) -> bool {
++    matches!(
++        state,
++        StageState::Pending | StageState::Running | StageState::Retrying
++    )
++}
++
+ async fn get_run_stage_command_log(
+     RequireCommandLog(id, stage_id): RequireCommandLog,
+     State(state): State<Arc<AppState>>,
+diff --git a/lib/crates/fabro-server/src/server/handler/sessions.rs b/lib/crates/fabro-server/src/server/handler/sessions.rs
+index eaaac824e..f9c5d11b6 100644
+--- a/lib/crates/fabro-server/src/server/handler/sessions.rs
++++ b/lib/crates/fabro-server/src/server/handler/sessions.rs
+@@ -1502,7 +1502,7 @@ mod tests {
+     use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+     use fabro_agent::config::ToolAccess;
+-    use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
++    use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+     use fabro_llm::types::{ToolCall, ToolDefinition};
+ 
+     use super::*;
+@@ -1517,6 +1517,7 @@ mod tests {
+             executor:   Arc::new(|_args, _ctx: ToolContext| {
+                 Box::pin(async { Ok("ok".to_string()) })
+             }),
++            source:     ToolSource::Native,
+         }
+     }
+ 
+@@ -1785,6 +1786,7 @@ mod tests {
+                         Ok("executed".to_string())
+                     })
+                 }),
++                source:     ToolSource::Native,
+             });
+         }
+         let config = SessionOptions {
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index 2861a6bec..19bbfca35 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -21,7 +21,10 @@ use fabro_types::settings::ServerAuthMethod;
+ use fabro_types::{
+     AgentBackend, AttrValue, AuthMethod, CommandTermination, FailureCategory, FailureDetail, Graph,
+     InterviewQuestionRecord, Node, Outcome, QuestionType, RunBlobId, RunId, RunSpec,
+-    SandboxProvider, StageModelUsage, SuccessReason, SystemActorKind, WorkflowSettings, fixtures,
++    SandboxProvider, StageContextWindowBreakdownProjection, StageContextWindowCategory,
++    StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
++    StageContextWindowWarning, StageModelUsage, StageTiming, SuccessReason, SystemActorKind,
++    WorkflowSettings, fixtures,
+ };
+ use fabro_util::check_report::CheckStatus;
+ use httpmock::Method::{GET, POST};
+@@ -2947,6 +2950,106 @@ async fn create_durable_run_with_events(
+     }
+ }
+ 
++fn stage_started_event(node_id: &str, handler_type: &str) -> workflow_event::Event {
++    workflow_event::Event::StageStarted {
++        node_id:      node_id.to_string(),
++        name:         node_id.to_string(),
++        index:        1,
++        handler_type: handler_type.to_string(),
++        attempt:      1,
++        max_attempts: 1,
++    }
++}
++
++fn command_started_event(node_id: &str) -> workflow_event::Event {
++    workflow_event::Event::CommandStarted {
++        node_id:    node_id.to_string(),
++        script:     "echo ok".to_string(),
++        command:    "echo ok".to_string(),
++        language:   "shell".to_string(),
++        timeout_ms: None,
++    }
++}
++
++fn agent_session_activated_event(node_id: &str, visit: u32) -> workflow_event::Event {
++    workflow_event::Event::AgentSessionActivated {
++        node_id: node_id.to_string(),
++        visit,
++        session_id: "session-1".to_string(),
++        thread_id: None,
++        provider: Some("openai".to_string()),
++        model: Some("gpt-5.4".to_string()),
++        reasoning_effort: None,
++        speed: None,
++        capabilities: Vec::new(),
++    }
++}
++
++fn stage_completed_event(node_id: &str) -> workflow_event::Event {
++    workflow_event::Event::StageCompleted {
++        node_id: node_id.to_string(),
++        name: node_id.to_string(),
++        index: 1,
++        timing: StageTiming::wall_only(42),
++        status: "succeeded".to_string(),
++        preferred_label: None,
++        suggested_next_ids: Vec::new(),
++        billing: None,
++        failure: None,
++        notes: None,
++        files_touched: Vec::new(),
++        context_updates: None,
++        jump_to_node: None,
++        context_values: None,
++        node_visits: None,
++        loop_failure_signatures: None,
++        restart_failure_signatures: None,
++        response: None,
++        attempt: 1,
++        max_attempts: 1,
++    }
++}
++
++fn context_window_event(
++    stage: &str,
++    visit: u32,
++    snapshot: StageContextWindowProjection,
++) -> workflow_event::Event {
++    workflow_event::Event::Agent {
++        stage: stage.to_string(),
++        visit,
++        event: fabro_agent::AgentEvent::ContextWindowSnapshot(snapshot),
++        session_id: Some("session-1".to_string()),
++        parent_session_id: None,
++        tool_call_id: None,
++    }
++}
++
++fn context_window_snapshot(
++    input_tokens: u64,
++    warnings: Vec<StageContextWindowWarning>,
++) -> StageContextWindowProjection {
++    StageContextWindowProjection {
++        provider: "openai".to_string(),
++        model: "gpt-5.4".to_string(),
++        context_window_tokens: 400_000,
++        input_tokens,
++        usage_percent: input_tokens as f64 * 100.0 / 400_000.0,
++        count_method: StageContextWindowCountMethod::ProviderApiScaledBreakdown,
++        staleness: StageContextWindowStaleness::Live,
++        generated_at: Utc::now(),
++        event_seq: None,
++        breakdown: vec![StageContextWindowBreakdownProjection {
++            category:      StageContextWindowCategory::Conversation,
++            label:         "Conversation".to_string(),
++            tokens:        input_tokens,
++            usage_percent: input_tokens as f64 * 100.0 / 400_000.0,
++            source:        "scaled_local_estimate".to_string(),
++        }],
++        warnings,
++    }
++}
++
+ async fn append_default_run_created(run_store: &fabro_store::RunDatabase, run_id: RunId) {
+     workflow_event::append_event(run_store, &run_id, &workflow_event::Event::RunCreated {
+         run_id,
+@@ -6273,6 +6376,244 @@ async fn get_run_stage_command_log_returns_not_found_for_missing_stage() {
+     assert_status!(response, StatusCode::NOT_FOUND).await;
+ }
+ 
++#[tokio::test]
++async fn get_run_stage_context_window_returns_not_found_for_missing_run() {
++    let app = crate::test_support::build_test_router(test_app_state_with_isolated_storage());
++    let run_id = RunId::new();
++
++    let response = app
++        .oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/agent@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap();
++
++    assert_status!(response, StatusCode::NOT_FOUND).await;
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_returns_not_found_for_missing_stage() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[workflow_event::Event::RunSubmitted {
++        definition_blob: None,
++    }])
++    .await;
++
++    let response = app
++        .oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/missing@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap();
++
++    assert_status!(response, StatusCode::NOT_FOUND).await;
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_returns_unavailable_for_non_agent_stage() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[
++        workflow_event::Event::RunSubmitted {
++            definition_blob: None,
++        },
++        stage_started_event("script_node", "command"),
++        command_started_event("script_node"),
++    ])
++    .await;
++
++    let body = response_json!(
++        app.oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/script_node@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap(),
++        StatusCode::OK
++    )
++    .await;
++
++    assert_eq!(body["available"], false);
++    assert_eq!(body["unavailable_reason"], "not_agent_stage");
++    assert_eq!(body["breakdown"], json!([]));
++    assert_eq!(body["staleness"], "unavailable");
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_returns_not_observed_for_agent_stage_without_snapshot() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[
++        workflow_event::Event::RunSubmitted {
++            definition_blob: None,
++        },
++        agent_session_activated_event("agent_node", 1),
++    ])
++    .await;
++
++    let body = response_json!(
++        app.oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/agent_node@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap(),
++        StatusCode::OK
++    )
++    .await;
++
++    assert_eq!(body["available"], false);
++    assert_eq!(body["unavailable_reason"], "not_observed");
++    assert_eq!(body["input_tokens"], serde_json::Value::Null);
++    assert!(!body["warnings"].as_array().unwrap().is_empty());
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_returns_live_projected_snapshot() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[
++        workflow_event::Event::RunSubmitted {
++            definition_blob: None,
++        },
++        stage_started_event("agent_node", "agent"),
++        context_window_event(
++            "agent_node",
++            1,
++            context_window_snapshot(123_456, Vec::new()),
++        ),
++    ])
++    .await;
++
++    let body = response_json!(
++        app.oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/agent_node@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap(),
++        StatusCode::OK
++    )
++    .await;
++
++    assert_eq!(body["stage_id"], "agent_node@1");
++    assert_eq!(body["available"], true);
++    assert_eq!(body["provider"], "openai");
++    assert_eq!(body["count_method"], "provider_api_scaled_breakdown");
++    assert_eq!(body["staleness"], "live");
++    assert_eq!(body["input_tokens"], 123_456);
++    assert_eq!(body["breakdown"][0]["category"], "conversation");
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_marks_completed_stage_snapshot_stored() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[
++        workflow_event::Event::RunSubmitted {
++            definition_blob: None,
++        },
++        stage_started_event("agent_node", "agent"),
++        context_window_event("agent_node", 1, context_window_snapshot(100, Vec::new())),
++        stage_completed_event("agent_node"),
++    ])
++    .await;
++
++    let body = response_json!(
++        app.oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/agent_node@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap(),
++        StatusCode::OK
++    )
++    .await;
++
++    assert_eq!(body["available"], true);
++    assert_eq!(body["staleness"], "stored");
++    assert_eq!(body["input_tokens"], 100);
++}
++
++#[tokio::test]
++async fn get_run_stage_context_window_returns_projected_warnings() {
++    let state = test_app_state_with_isolated_storage();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let run_id = RunId::new();
++    create_durable_run_with_events(&state, run_id, &[
++        workflow_event::Event::RunSubmitted {
++            definition_blob: None,
++        },
++        stage_started_event("agent_node", "agent"),
++        context_window_event(
++            "agent_node",
++            1,
++            context_window_snapshot(100, vec![StageContextWindowWarning {
++                code:    "provider_token_count_failed".to_string(),
++                message: "provider input token counting failed; returned local estimate"
++                    .to_string(),
++            }]),
++        ),
++    ])
++    .await;
++
++    let body = response_json!(
++        app.oneshot(
++            Request::builder()
++                .method("GET")
++                .uri(api(&format!(
++                    "/runs/{run_id}/stages/agent_node@1/context-window"
++                )))
++                .body(Body::empty())
++                .unwrap(),
++        )
++        .await
++        .unwrap(),
++        StatusCode::OK
++    )
++    .await;
++
++    assert_eq!(body["warnings"][0]["code"], "provider_token_count_failed");
++}
++
+ #[tokio::test]
+ async fn get_run_pull_request_returns_live_detail_from_github() {
+     let github = MockServer::start();
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index f30e10598..9cd2a3716 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -585,6 +585,15 @@ impl RunProjectionReducer for RunProjection {
+                     },
+                 });
+             }
++            EventBody::AgentContextWindowSnapshot(props) => {
++                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
++                else {
++                    return Ok(());
++                };
++                let mut snapshot = props.snapshot.clone();
++                snapshot.event_seq = Some(event.seq);
++                stage.context_window = Some(snapshot);
++            }
+             _ => {}
+         }
+ 
+@@ -1093,22 +1102,24 @@ mod tests {
+     use fabro_types::run_event::run::RunFailedProps;
+     use fabro_types::run_event::{
+         AgentAcpCancelledProps, AgentAcpCompletedProps, AgentAcpStartedProps,
+-        AgentAcpTimedOutProps, AgentMcpFailedProps, AgentMcpReadyProps, AgentMcpToolSummary,
+-        AgentMessageProps, AgentSessionActivatedProps, AgentSessionEndedProps,
+-        AgentSessionStartedProps, AgentSkillActivatedProps, AgentSkillActivationSource,
+-        AgentSkillSummary, AgentSkillsDiscoveredProps, AgentSubClosedProps, AgentSubCompletedProps,
+-        AgentSubFailedProps, AgentSubSpawnedProps, CheckpointCompletedProps,
+-        InterviewCompletedProps, InterviewOption, InterviewStartedProps, RunCompletedProps,
+-        RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
+-        StageRetryingProps, StageStartedProps,
++        AgentAcpTimedOutProps, AgentContextWindowSnapshotProps, AgentMcpFailedProps,
++        AgentMcpReadyProps, AgentMcpToolSummary, AgentMessageProps, AgentSessionActivatedProps,
++        AgentSessionEndedProps, AgentSessionStartedProps, AgentSkillActivatedProps,
++        AgentSkillActivationSource, AgentSkillSummary, AgentSkillsDiscoveredProps,
++        AgentSubClosedProps, AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps,
++        CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
++        RunCompletedProps, RunControlEffectProps, StageCompletedProps, StageFailedProps,
++        StagePromptProps, StageRetryingProps, StageStartedProps,
+     };
+     use fabro_types::{
+         AgentBackend, BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint,
+         CheckpointRecord, CommandTermination, EventBody, FailureCategory, FailureDetail,
+         FailureReason, Graph, McpServerStatus, Outcome, PendingReason, PullRequestLink,
+         QuestionType, ReasoningEffort, RunApprovalState, RunBlobId, RunControlAction, RunDiff,
+-        RunEvent, RunSize, RunSpec, RunStatus, Speed, StageModelUsage, StageOutcome, StageState,
+-        SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
++        RunEvent, RunSize, RunSpec, RunStatus, Speed, StageContextWindowBreakdownProjection,
++        StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
++        StageContextWindowStaleness, StageContextWindowWarning, StageModelUsage, StageOutcome,
++        StageState, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+     };
+     use serde_json::json;
+ 
+@@ -4108,5 +4119,88 @@ mod tests {
+                 error: "missing token".to_string(),
+             });
+         }
++
++        #[test]
++        fn context_window_snapshots_replace_latest_for_matching_stage() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++            let first = context_window_snapshot(10);
++            let second = context_window_snapshot(20);
++
++            state
++                .apply_event(&test_stage_event(
++                    7,
++                    EventBody::AgentContextWindowSnapshot(AgentContextWindowSnapshotProps {
++                        stage_id: stage_id.clone(),
++                        visit:    1,
++                        snapshot: first,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++            state
++                .apply_event(&test_stage_event(
++                    8,
++                    EventBody::AgentContextWindowSnapshot(AgentContextWindowSnapshotProps {
++                        stage_id: stage_id.clone(),
++                        visit:    1,
++                        snapshot: second,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            let stage = state.stage(&stage_id).unwrap();
++            let snapshot = stage.context_window.as_ref().unwrap();
++            assert_eq!(snapshot.input_tokens, 20);
++            assert_eq!(snapshot.event_seq, Some(8));
++        }
++
++        #[test]
++        fn context_window_snapshot_does_not_update_other_stage() {
++            let mut state = initialized_projection();
++            let target = stage_id();
++            let other = StageId::new("review", 1);
++
++            state
++                .apply_event(&test_stage_event(
++                    7,
++                    EventBody::AgentContextWindowSnapshot(AgentContextWindowSnapshotProps {
++                        stage_id: target.clone(),
++                        visit:    1,
++                        snapshot: context_window_snapshot(10),
++                    }),
++                    target.clone(),
++                ))
++                .unwrap();
++
++            assert!(state.stage(&target).unwrap().context_window.is_some());
++            assert!(state.stage(&other).is_none());
++        }
++
++        fn context_window_snapshot(input_tokens: u64) -> StageContextWindowProjection {
++            StageContextWindowProjection {
++                provider: "openai".to_string(),
++                model: "gpt-5.4".to_string(),
++                context_window_tokens: 400_000,
++                input_tokens,
++                usage_percent: input_tokens as f64 * 100.0 / 400_000.0,
++                count_method: StageContextWindowCountMethod::LocalEstimate,
++                staleness: StageContextWindowStaleness::Live,
++                generated_at: Utc::now(),
++                event_seq: None,
++                breakdown: vec![StageContextWindowBreakdownProjection {
++                    category:      StageContextWindowCategory::Conversation,
++                    label:         "Conversation".to_string(),
++                    tokens:        input_tokens,
++                    usage_percent: input_tokens as f64 * 100.0 / 400_000.0,
++                    source:        "local_estimate".to_string(),
++                }],
++                warnings: vec![StageContextWindowWarning {
++                    code:    "local_token_estimate".to_string(),
++                    message: "input token count is a local estimate".to_string(),
++                }],
++            }
++        }
+     }
+ }
+diff --git a/lib/crates/fabro-types/src/lib.rs b/lib/crates/fabro-types/src/lib.rs
+index 3d2b64954..9f3104e6d 100644
+--- a/lib/crates/fabro-types/src/lib.rs
++++ b/lib/crates/fabro-types/src/lib.rs
+@@ -104,8 +104,11 @@ pub use run_failure::RunFailure;
+ pub use run_id::{RunId, fixtures};
+ pub use run_projection::{
+     ActivatedSkill, CheckpointRecord, McpServerProjection, McpServerStatus, PendingInterviewRecord,
+-    RunProjection, SkillsProjection, StageModelUsage, StageProjection, SubAgentProjection,
+-    SubAgentStatus, first_event_seq,
++    RunProjection, SkillsProjection, StageContextWindow, StageContextWindowBreakdownItem,
++    StageContextWindowBreakdownProjection, StageContextWindowCategory,
++    StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
++    StageContextWindowUnavailableReason, StageContextWindowWarning, StageModelUsage,
++    StageProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
+ };
+ pub use run_sandbox::{RunSandbox, RunSandboxRuntime};
+ pub use run_summary::{
+diff --git a/lib/crates/fabro-types/src/run_event/agent.rs b/lib/crates/fabro-types/src/run_event/agent.rs
+index cbf865496..81dbe0cd9 100644
+--- a/lib/crates/fabro-types/src/run_event/agent.rs
++++ b/lib/crates/fabro-types/src/run_event/agent.rs
+@@ -4,7 +4,10 @@ use serde_json::Value;
+ 
+ use super::BilledTokenCounts;
+ use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
+-use crate::{MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind, TurnId};
++use crate::{
++    MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind,
++    StageContextWindowProjection, StageId, TurnId,
++};
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentSessionStartedProps {
+@@ -213,6 +216,14 @@ pub struct AgentLlmRetryProps {
+     pub visit:      u32,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AgentContextWindowSnapshotProps {
++    pub stage_id: StageId,
++    pub visit:    u32,
++    #[serde(flatten)]
++    pub snapshot: StageContextWindowProjection,
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentSubSpawnedProps {
+     pub agent_id: String,
+diff --git a/lib/crates/fabro-types/src/run_event/mod.rs b/lib/crates/fabro-types/src/run_event/mod.rs
+index 34ceb861b..35e8e72b7 100644
+--- a/lib/crates/fabro-types/src/run_event/mod.rs
++++ b/lib/crates/fabro-types/src/run_event/mod.rs
+@@ -238,6 +238,8 @@ pub enum EventBody {
+     AgentCompactionCompleted(AgentCompactionCompletedProps),
+     #[serde(rename = "agent.llm.retry")]
+     AgentLlmRetry(AgentLlmRetryProps),
++    #[serde(rename = "agent.context_window.snapshot")]
++    AgentContextWindowSnapshot(AgentContextWindowSnapshotProps),
+     #[serde(rename = "agent.sub.spawned")]
+     AgentSubSpawned(AgentSubSpawnedProps),
+     #[serde(rename = "agent.sub.completed")]
+@@ -518,6 +520,7 @@ impl EventBody {
+             Self::AgentCompactionStarted(_) => "agent.compaction.started",
+             Self::AgentCompactionCompleted(_) => "agent.compaction.completed",
+             Self::AgentLlmRetry(_) => "agent.llm.retry",
++            Self::AgentContextWindowSnapshot(_) => "agent.context_window.snapshot",
+             Self::AgentSubSpawned(_) => "agent.sub.spawned",
+             Self::AgentSubCompleted(_) => "agent.sub.completed",
+             Self::AgentSubFailed(_) => "agent.sub.failed",
+@@ -699,6 +702,7 @@ fn is_known_event_name(event: &str) -> bool {
+             | "agent.compaction.started"
+             | "agent.compaction.completed"
+             | "agent.llm.retry"
++            | "agent.context_window.snapshot"
+             | "agent.sub.spawned"
+             | "agent.sub.completed"
+             | "agent.sub.failed"
+@@ -2151,6 +2155,48 @@ mod tests {
+         assert_eq!(value["properties"]["source"], "tool");
+     }
+ 
++    #[test]
++    fn agent_context_window_snapshot_serializes_with_canonical_name() {
++        let body = EventBody::AgentContextWindowSnapshot(AgentContextWindowSnapshotProps {
++            stage_id: crate::StageId::new("implement", 1),
++            visit:    1,
++            snapshot: crate::StageContextWindowProjection {
++                provider:              "openai".to_string(),
++                model:                 "gpt-5.4".to_string(),
++                context_window_tokens: 400_000,
++                input_tokens:          123_456,
++                usage_percent:         30.864,
++                count_method:
++                    crate::StageContextWindowCountMethod::ProviderApiScaledBreakdown,
++                staleness:             crate::StageContextWindowStaleness::Live,
++                generated_at:          DateTime::parse_from_rfc3339("2026-05-23T12:34:56Z")
++                    .unwrap()
++                    .with_timezone(&Utc),
++                event_seq:             None,
++                breakdown:             vec![crate::StageContextWindowBreakdownProjection {
++                    category:      crate::StageContextWindowCategory::SystemPrompt,
++                    label:         "System prompt".to_string(),
++                    tokens:        30_000,
++                    usage_percent: 7.5,
++                    source:        "scaled_local_estimate".to_string(),
++                }],
++                warnings:              vec![crate::StageContextWindowWarning {
++                    code:    "local_token_estimate".to_string(),
++                    message: "input token count is a local estimate".to_string(),
++                }],
++            },
++        });
++        let value = serde_json::to_value(&body).unwrap();
++        assert_eq!(value["event"], "agent.context_window.snapshot");
++        assert_eq!(value["properties"]["stage_id"], "implement@1");
++        assert_eq!(
++            value["properties"]["breakdown"][0]["category"],
++            "system_prompt"
++        );
++        let parsed: EventBody = serde_json::from_value(value).unwrap();
++        assert_eq!(parsed.event_name(), "agent.context_window.snapshot");
++    }
++
+     #[test]
+     fn agent_mcp_ready_deserializes_legacy_payload_without_tools() {
+         let value = json!({
+diff --git a/lib/crates/fabro-types/src/run_projection.rs b/lib/crates/fabro-types/src/run_projection.rs
+index 1f0aa11d5..46c13a4b1 100644
+--- a/lib/crates/fabro-types/src/run_projection.rs
++++ b/lib/crates/fabro-types/src/run_projection.rs
+@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
+ 
+ use chrono::{DateTime, Utc};
+ use fabro_model::{ReasoningEffort, Speed};
++use strum::{Display, EnumString, IntoStaticStr};
+ 
+ use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
+ use crate::{
+@@ -117,6 +118,210 @@ impl StageModelUsage {
+     }
+ }
+ 
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    PartialOrd,
++    Ord,
++    Hash,
++    serde::Serialize,
++    serde::Deserialize,
++    Display,
++    EnumString,
++    IntoStaticStr,
++)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum StageContextWindowCategory {
++    SystemPrompt,
++    Tools,
++    McpTools,
++    Skills,
++    Memory,
++    Conversation,
++    Other,
++}
++
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    Hash,
++    serde::Serialize,
++    serde::Deserialize,
++    Display,
++    EnumString,
++    IntoStaticStr,
++)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum StageContextWindowCountMethod {
++    ProviderApiScaledBreakdown,
++    ResponseUsageScaledBreakdown,
++    LocalEstimate,
++}
++
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    Hash,
++    serde::Serialize,
++    serde::Deserialize,
++    Display,
++    EnumString,
++    IntoStaticStr,
++)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum StageContextWindowStaleness {
++    Live,
++    Stored,
++    Unavailable,
++}
++
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    Hash,
++    serde::Serialize,
++    serde::Deserialize,
++    Display,
++    EnumString,
++    IntoStaticStr,
++)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum StageContextWindowUnavailableReason {
++    NotAgentStage,
++    NotObserved,
++    ProviderUnconfigured,
++}
++
++#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct StageContextWindowWarning {
++    pub code:    String,
++    pub message: String,
++}
++
++#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct StageContextWindowBreakdownProjection {
++    pub category:      StageContextWindowCategory,
++    pub label:         String,
++    pub tokens:        u64,
++    pub usage_percent: f64,
++    pub source:        String,
++}
++
++pub type StageContextWindowBreakdownItem = StageContextWindowBreakdownProjection;
++
++#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct StageContextWindowProjection {
++    pub provider:              String,
++    pub model:                 String,
++    pub context_window_tokens: u64,
++    pub input_tokens:          u64,
++    pub usage_percent:         f64,
++    pub count_method:          StageContextWindowCountMethod,
++    pub staleness:             StageContextWindowStaleness,
++    pub generated_at:          DateTime<Utc>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub event_seq:             Option<u32>,
++    #[serde(default)]
++    pub breakdown:             Vec<StageContextWindowBreakdownProjection>,
++    #[serde(default)]
++    pub warnings:              Vec<StageContextWindowWarning>,
++}
++
++#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct StageContextWindow {
++    pub stage_id:              StageId,
++    pub available:             bool,
++    #[serde(default)]
++    pub unavailable_reason:    Option<StageContextWindowUnavailableReason>,
++    #[serde(default)]
++    pub provider:              Option<String>,
++    #[serde(default)]
++    pub model:                 Option<String>,
++    #[serde(default)]
++    pub context_window_tokens: Option<u64>,
++    #[serde(default)]
++    pub input_tokens:          Option<u64>,
++    #[serde(default)]
++    pub usage_percent:         Option<f64>,
++    #[serde(default)]
++    pub count_method:          Option<StageContextWindowCountMethod>,
++    pub staleness:             StageContextWindowStaleness,
++    #[serde(default)]
++    pub generated_at:          Option<DateTime<Utc>>,
++    #[serde(default)]
++    pub event_seq:             Option<u32>,
++    #[serde(default)]
++    pub breakdown:             Vec<StageContextWindowBreakdownProjection>,
++    #[serde(default)]
++    pub warnings:              Vec<StageContextWindowWarning>,
++}
++
++impl StageContextWindow {
++    #[must_use]
++    pub fn available(stage_id: StageId, snapshot: &StageContextWindowProjection) -> Self {
++        Self {
++            stage_id,
++            available: true,
++            unavailable_reason: None,
++            provider: Some(snapshot.provider.clone()),
++            model: Some(snapshot.model.clone()),
++            context_window_tokens: Some(snapshot.context_window_tokens),
++            input_tokens: Some(snapshot.input_tokens),
++            usage_percent: Some(snapshot.usage_percent),
++            count_method: Some(snapshot.count_method),
++            staleness: snapshot.staleness,
++            generated_at: Some(snapshot.generated_at),
++            event_seq: snapshot.event_seq,
++            breakdown: snapshot.breakdown.clone(),
++            warnings: snapshot.warnings.clone(),
++        }
++    }
++
++    #[must_use]
++    pub fn unavailable(
++        stage_id: StageId,
++        reason: StageContextWindowUnavailableReason,
++        warning: impl Into<String>,
++    ) -> Self {
++        let message = warning.into();
++        Self {
++            stage_id,
++            available: false,
++            unavailable_reason: Some(reason),
++            provider: None,
++            model: None,
++            context_window_tokens: None,
++            input_tokens: None,
++            usage_percent: None,
++            count_method: None,
++            staleness: StageContextWindowStaleness::Unavailable,
++            generated_at: None,
++            event_seq: None,
++            breakdown: Vec::new(),
++            warnings: vec![StageContextWindowWarning {
++                code: reason.to_string(),
++                message,
++            }],
++        }
++    }
++}
++
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+ pub struct StageProjection {
+     pub first_event_seq:   NonZeroU32,
+@@ -158,6 +363,8 @@ pub struct StageProjection {
+     pub skills:            SkillsProjection,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub mcp_servers:       Vec<McpServerProjection>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub context_window:    Option<StageContextWindowProjection>,
+     pub state:             StageState,
+ }
+ 
+@@ -233,6 +440,7 @@ impl StageProjection {
+             subagents: Vec::new(),
+             skills: SkillsProjection::default(),
+             mcp_servers: Vec::new(),
++            context_window: None,
+             provider_used: None,
+             diff: None,
+             script_invocation: None,
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index 2deda7c35..84383d46a 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -590,7 +590,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
+             provider: provider.clone(),
+             billing:  billing.clone(),
+         }),
+-        Event::Agent { visit, event, .. } => match event {
++        Event::Agent {
++            stage,
++            visit,
++            event,
++            ..
++        } => match event {
+             AgentEvent::ProcessingEnd => {
+                 EventBody::AgentProcessingEnd(fabro_types::AgentProcessingEndProps {
+                     visit: *visit,
+@@ -706,6 +711,13 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                 error:      serde_json::to_value(error).expect("serializable sdk error"),
+                 visit:      *visit,
+             }),
++            AgentEvent::ContextWindowSnapshot(snapshot) => EventBody::AgentContextWindowSnapshot(
++                fabro_types::AgentContextWindowSnapshotProps {
++                    stage_id: ::fabro_types::StageId::new(stage.clone(), *visit),
++                    visit:    *visit,
++                    snapshot: snapshot.clone(),
++                },
++            ),
+             AgentEvent::SubAgentSpawned {
+                 agent_id,
+                 depth,
+diff --git a/lib/crates/fabro-workflow/src/event/names.rs b/lib/crates/fabro-workflow/src/event/names.rs
+index c4d19d832..958f8fdeb 100644
+--- a/lib/crates/fabro-workflow/src/event/names.rs
++++ b/lib/crates/fabro-workflow/src/event/names.rs
+@@ -86,6 +86,7 @@ pub fn event_name(event: &Event) -> &'static str {
+             AgentEvent::CompactionStarted { .. } => "agent.compaction.started",
+             AgentEvent::CompactionCompleted { .. } => "agent.compaction.completed",
+             AgentEvent::LlmRetry { .. } => "agent.llm.retry",
++            AgentEvent::ContextWindowSnapshot(_) => "agent.context_window.snapshot",
+             AgentEvent::SubAgentSpawned { .. } => "agent.sub.spawned",
+             AgentEvent::SubAgentCompleted { .. } => "agent.sub.completed",
+             AgentEvent::SubAgentFailed { .. } => "agent.sub.failed",
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index 8da02640d..7c2a90ad6 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
+ 
+ use async_trait::async_trait;
+ use fabro_agent::subagent::{SessionFactory, SubAgentManager};
+-use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry};
++use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+ use fabro_agent::{
+     AgentEvent, AgentProfile, AnthropicProfile, CompletionCoordinator, GeminiProfile,
+     Message as AgentMessage, OpenAiProfile, Sandbox, Session, SessionOptions, StaticEnvProvider,
+@@ -233,6 +233,7 @@ fn fabro_run_tool(
+                     .map_err(|err| err.to_string())
+             })
+         }),
++        source:     ToolSource::Native,
+     }
+ }
+ 
+diff --git a/lib/packages/fabro-api-client/src/api/run-internals-api.ts b/lib/packages/fabro-api-client/src/api/run-internals-api.ts
+index 2ef4dbd6a..e46c2805f 100644
+--- a/lib/packages/fabro-api-client/src/api/run-internals-api.ts
++++ b/lib/packages/fabro-api-client/src/api/run-internals-api.ts
+@@ -44,6 +44,8 @@ import type { RunEventDetailResponse } from '../models';
+ // @ts-ignore
+ import type { RunProjection } from '../models';
+ // @ts-ignore
++import type { StageContextWindow } from '../models';
++// @ts-ignore
+ import type { WorkflowSettings } from '../models';
+ // @ts-ignore
+ import type { WriteBlobResponse } from '../models';
+@@ -287,6 +289,50 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
+                 options: localVarRequestOptions,
+             };
+         },
++        /**
++         * Returns the latest best-effort model-visible context-window usage snapshot for an agent stage.
++         * @summary Get Stage Context Window
++         * @param {string} id Unique run identifier (ULID).
++         * @param {string} stageId Identifier of a stage within a run\&#39;s workflow graph, serialized as &#x60;node_id@visit&#x60;.
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        getRunStageContextWindow: async (id: string, stageId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
++            // verify required parameter 'id' is not null or undefined
++            assertParamExists('getRunStageContextWindow', 'id', id)
++            // verify required parameter 'stageId' is not null or undefined
++            assertParamExists('getRunStageContextWindow', 'stageId', stageId)
++            const localVarPath = `/api/v1/runs/{id}/stages/{stageId}/context-window`
++                .replace(`{${"id"}}`, encodeURIComponent(String(id)))
++                .replace(`{${"stageId"}}`, encodeURIComponent(String(stageId)));
++            // use dummy base URL string because the URL constructor only accepts absolute URLs.
++            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
++            let baseOptions;
++            if (configuration) {
++                baseOptions = configuration.baseOptions;
++            }
++
++            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
++            const localVarHeaderParameter = {} as any;
++            const localVarQueryParameter = {} as any;
++
++            // authentication SessionCookie required
++
++            // authentication BearerAuth required
++            // http bearer authentication required
++            await setBearerAuthToObject(localVarHeaderParameter, configuration)
++
++            localVarHeaderParameter['Accept'] = 'application/json';
++
++            setSearchParams(localVarUrlObj, localVarQueryParameter);
++            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
++            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
++
++            return {
++                url: toPathString(localVarUrlObj),
++                options: localVarRequestOptions,
++            };
++        },
+         /**
+          * Returns the internal event-sourced run projection. This is not a stable public contract.
+          * @summary Get Run State
+@@ -934,6 +980,20 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
+             const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.getRunStageCommandLog']?.[localVarOperationServerIndex]?.url;
+             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+         },
++        /**
++         * Returns the latest best-effort model-visible context-window usage snapshot for an agent stage.
++         * @summary Get Stage Context Window
++         * @param {string} id Unique run identifier (ULID).
++         * @param {string} stageId Identifier of a stage within a run\&#39;s workflow graph, serialized as &#x60;node_id@visit&#x60;.
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        async getRunStageContextWindow(id: string, stageId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<StageContextWindow>> {
++            const localVarAxiosArgs = await localVarAxiosParamCreator.getRunStageContextWindow(id, stageId, options);
++            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
++            const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.getRunStageContextWindow']?.[localVarOperationServerIndex]?.url;
++            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
++        },
+         /**
+          * Returns the internal event-sourced run projection. This is not a stable public contract.
+          * @summary Get Run State
+@@ -1173,6 +1233,17 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
+         getRunStageCommandLog(id: string, stageId: string, offset?: number, limit?: number, options?: RawAxiosRequestConfig): AxiosPromise<CommandLogResponse> {
+             return localVarFp.getRunStageCommandLog(id, stageId, offset, limit, options).then((request) => request(axios, basePath));
+         },
++        /**
++         * Returns the latest best-effort model-visible context-window usage snapshot for an agent stage.
++         * @summary Get Stage Context Window
++         * @param {string} id Unique run identifier (ULID).
++         * @param {string} stageId Identifier of a stage within a run\&#39;s workflow graph, serialized as &#x60;node_id@visit&#x60;.
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        getRunStageContextWindow(id: string, stageId: string, options?: RawAxiosRequestConfig): AxiosPromise<StageContextWindow> {
++            return localVarFp.getRunStageContextWindow(id, stageId, options).then((request) => request(axios, basePath));
++        },
+         /**
+          * Returns the internal event-sourced run projection. This is not a stable public contract.
+          * @summary Get Run State
+@@ -1379,6 +1450,18 @@ export class RunInternalsApi extends BaseAPI {
+         return RunInternalsApiFp(this.configuration).getRunStageCommandLog(id, stageId, offset, limit, options).then((request) => request(this.axios, this.basePath));
+     }
+ 
++    /**
++     * Returns the latest best-effort model-visible context-window usage snapshot for an agent stage.
++     * @summary Get Stage Context Window
++     * @param {string} id Unique run identifier (ULID).
++     * @param {string} stageId Identifier of a stage within a run\&#39;s workflow graph, serialized as &#x60;node_id@visit&#x60;.
++     * @param {*} [options] Override http request option.
++     * @throws {RequiredError}
++     */
++    public getRunStageContextWindow(id: string, stageId: string, options?: RawAxiosRequestConfig) {
++        return RunInternalsApiFp(this.configuration).getRunStageContextWindow(id, stageId, options).then((request) => request(this.axios, this.basePath));
++    }
++
+     /**
+      * Returns the internal event-sourced run projection. This is not a stable public contract.
+      * @summary Get Run State
+diff --git a/lib/packages/fabro-api-client/src/models/index.ts b/lib/packages/fabro-api-client/src/models/index.ts
+index 4ea2bd295..513de50bc 100644
+--- a/lib/packages/fabro-api-client/src/models/index.ts
++++ b/lib/packages/fabro-api-client/src/models/index.ts
+@@ -371,6 +371,14 @@ export * from './slack-integration-settings';
+ export * from './ssh-access-request';
+ export * from './ssh-access-response';
+ export * from './stage-completion';
++export * from './stage-context-window';
++export * from './stage-context-window-breakdown-item';
++export * from './stage-context-window-category';
++export * from './stage-context-window-count-method';
++export * from './stage-context-window-projection';
++export * from './stage-context-window-staleness';
++export * from './stage-context-window-unavailable-reason';
++export * from './stage-context-window-warning';
+ export * from './stage-handler';
+ export * from './stage-model-usage';
+ export * from './stage-outcome';
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-breakdown-item.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-breakdown-item.ts
+new file mode 100644
+index 000000000..0798a16d5
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-breakdown-item.ts
+@@ -0,0 +1,31 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowCategory } from './stage-context-window-category';
++
++/**
++ * Token usage for one content category.
++ */
++export interface StageContextWindowBreakdownItem {
++    'category': StageContextWindowCategory;
++    'label': string;
++    'tokens': number;
++    'usage_percent': number;
++    /**
++     * Content-free source label for the category count.
++     */
++    'source': string;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-category.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-category.ts
+new file mode 100644
+index 000000000..76db9bbb3
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-category.ts
+@@ -0,0 +1,28 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++/**
++ * Category of model-visible input/context tokens.
++ */
++export const StageContextWindowCategory = {
++    SYSTEM_PROMPT: 'system_prompt',
++    TOOLS: 'tools',
++    MCP_TOOLS: 'mcp_tools',
++    SKILLS: 'skills',
++    MEMORY: 'memory',
++    CONVERSATION: 'conversation',
++    OTHER: 'other'
++} as const;
++
++export type StageContextWindowCategory = typeof StageContextWindowCategory[keyof typeof StageContextWindowCategory];
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-count-method.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-count-method.ts
+new file mode 100644
+index 000000000..c699d08dc
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-count-method.ts
+@@ -0,0 +1,24 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++/**
++ * Method used to produce the context-window token total and breakdown.
++ */
++export const StageContextWindowCountMethod = {
++    PROVIDER_API_SCALED_BREAKDOWN: 'provider_api_scaled_breakdown',
++    RESPONSE_USAGE_SCALED_BREAKDOWN: 'response_usage_scaled_breakdown',
++    LOCAL_ESTIMATE: 'local_estimate'
++} as const;
++
++export type StageContextWindowCountMethod = typeof StageContextWindowCountMethod[keyof typeof StageContextWindowCountMethod];
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-projection.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-projection.ts
+new file mode 100644
+index 000000000..888e002cc
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-projection.ts
+@@ -0,0 +1,43 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowBreakdownItem } from './stage-context-window-breakdown-item';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowCountMethod } from './stage-context-window-count-method';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowStaleness } from './stage-context-window-staleness';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowWarning } from './stage-context-window-warning';
++
++/**
++ * Durable content-free context-window snapshot projected onto an agent stage.
++ */
++export interface StageContextWindowProjection {
++    'provider': string;
++    'model': string;
++    'context_window_tokens': number;
++    'input_tokens': number;
++    'usage_percent': number;
++    'count_method': StageContextWindowCountMethod;
++    'staleness': StageContextWindowStaleness;
++    'generated_at': string;
++    'event_seq'?: number | null;
++    'breakdown': Array<StageContextWindowBreakdownItem>;
++    'warnings': Array<StageContextWindowWarning>;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-staleness.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-staleness.ts
+new file mode 100644
+index 000000000..6c00de7a3
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-staleness.ts
+@@ -0,0 +1,24 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++/**
++ * Freshness of the returned context-window data.
++ */
++export const StageContextWindowStaleness = {
++    LIVE: 'live',
++    STORED: 'stored',
++    UNAVAILABLE: 'unavailable'
++} as const;
++
++export type StageContextWindowStaleness = typeof StageContextWindowStaleness[keyof typeof StageContextWindowStaleness];
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-unavailable-reason.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-unavailable-reason.ts
+new file mode 100644
+index 000000000..218f03a9e
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-unavailable-reason.ts
+@@ -0,0 +1,24 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++/**
++ * Why context-window data is unavailable for a known run stage.
++ */
++export const StageContextWindowUnavailableReason = {
++    NOT_AGENT_STAGE: 'not_agent_stage',
++    NOT_OBSERVED: 'not_observed',
++    PROVIDER_UNCONFIGURED: 'provider_unconfigured'
++} as const;
++
++export type StageContextWindowUnavailableReason = typeof StageContextWindowUnavailableReason[keyof typeof StageContextWindowUnavailableReason];
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window-warning.ts b/lib/packages/fabro-api-client/src/models/stage-context-window-warning.ts
+new file mode 100644
+index 000000000..8e60ec2bf
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window-warning.ts
+@@ -0,0 +1,27 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++/**
++ * Content-free warning about context-window count quality or attribution.
++ */
++export interface StageContextWindowWarning {
++    /**
++     * Stable warning code.
++     */
++    'code': string;
++    /**
++     * Human-readable warning that must not include prompt, memory, message, or tool-argument content.
++     */
++    'message': string;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/stage-context-window.ts b/lib/packages/fabro-api-client/src/models/stage-context-window.ts
+new file mode 100644
+index 000000000..0d7905c50
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/stage-context-window.ts
+@@ -0,0 +1,55 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowBreakdownItem } from './stage-context-window-breakdown-item';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowCountMethod } from './stage-context-window-count-method';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowStaleness } from './stage-context-window-staleness';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowUnavailableReason } from './stage-context-window-unavailable-reason';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { StageContextWindowWarning } from './stage-context-window-warning';
++
++/**
++ * Best-effort context-window usage for one agent stage.
++ */
++export interface StageContextWindow {
++    /**
++     * Stage ID in `node@visit` form.
++     */
++    'stage_id': string;
++    /**
++     * Whether context-window data is available for this known stage.
++     */
++    'available': boolean;
++    'unavailable_reason': StageContextWindowUnavailableReason | null;
++    'provider': string | null;
++    'model': string | null;
++    'context_window_tokens': number | null;
++    'input_tokens': number | null;
++    'usage_percent': number | null;
++    'count_method': StageContextWindowCountMethod | null;
++    'staleness': StageContextWindowStaleness;
++    'generated_at': string | null;
++    'event_seq': number | null;
++    'breakdown': Array<StageContextWindowBreakdownItem>;
++    'warnings': Array<StageContextWindowWarning>;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/stage-projection.ts b/lib/packages/fabro-api-client/src/models/stage-projection.ts
+index cdec8e984..b4a29b6ce 100644
+--- a/lib/packages/fabro-api-client/src/models/stage-projection.ts
++++ b/lib/packages/fabro-api-client/src/models/stage-projection.ts
+@@ -33,6 +33,9 @@ import type { SkillsProjection } from './skills-projection';
+ import type { StageCompletion } from './stage-completion';
+ // May contain unused imports in some cases
+ // @ts-ignore
++import type { StageContextWindowProjection } from './stage-context-window-projection';
++// May contain unused imports in some cases
++// @ts-ignore
+ import type { StageModelUsage } from './stage-model-usage';
+ // May contain unused imports in some cases
+ // @ts-ignore
+@@ -93,6 +96,10 @@ export interface StageProjection {
+      * MCP servers observed by this stage.
+      */
+     'mcp_servers'?: Array<McpServerProjection>;
++    /**
++     * Latest content-free context-window snapshot for this agent stage.
++     */
++    'context_window'?: StageContextWindowProjection | null;
+     /**
+      * Lifecycle state of the stage projection.
+      */
