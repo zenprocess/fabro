@@ -521,7 +521,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T10:01:40.641007Z",
-  "last_event_at": "2026-05-23T10:35:38.855649Z",
+  "last_event_at": "2026-05-23T10:35:45.800827Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1049,9 +1049,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1092,
       "checkpoint": {
-        "timestamp": "2026-05-23T10:35:39.114581Z",
+        "timestamp": "2026-05-23T10:35:45.796065Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1064,13 +1064,210 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.node_visit_count": 1,
+          "response.implement": "Implemented live `Run.timing` for in-flight runs.\n\nSummary:\n- Added `RunProjection::live_run_timing(now)` in `fabro-types`.\n  - Returns `None` before `run.started`.\n  - Derives live wall time from `now - start.start_time`, saturating at 0.\n  - Sums completed-stage inference/tool time and builds via `RunTiming::new`.\n  - Includes the documented limitation that active timing only advances when stages complete.\n- Kept `build_summary` unchanged and deterministic.\n- Updated `RunProjectionCache::list` and `get_summary` to accept `now` and overlay live timing only on cloned returned summaries when cached `summary.timing` is `None`.\n- Propagated `now` through `fabro-store` list/summary accessors and all affected workspace call sites.\n- Updated server run summary/list/board handlers to pass `Utc::now()`.\n- Added tests:\n  - `live_run_timing_returns_none_before_run_starts`\n  - `live_run_timing_derives_wall_and_completed_stage_active_for_in_flight_run`\n  - `live_run_timing_matches_conclusion_timing_at_conclusion_moment`\n  - `cached_summary_overlays_live_timing_without_mutating_cached_snapshot`\n\nTDD/validation:\n- Red phase: `cargo nextest run -p fabro-store live_run_timing` initially failed with missing `live_run_timing`.\n- Green/final checks:\n  - `cargo nextest run -p fabro-store live_run_timing`\n  - `cargo nextest run -p fabro-store cached_summary_overlays_live_timing`\n  - `cargo check -q --workspace`\n  - `cargo +nightly-2026-04-14 fmt --check --all`\n  - `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n\nAll passed.",
+          "internal.retry_count.preflight_lint": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "internal.retry_count.toolchain": 0,
+          "thread.preflight_lint.current_node": "implement",
+          "thread.preflight_compile.current_node": "preflight_lint",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "thread.implement.current_node": "simplify_opus",
+          "failure_signature": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "internal.retry_count.start": 0,
+          "response.simplify_opus": "Confirmed: all 3 failures are pre-existing (graph rendering subprocess issue) and unrelated to my changes.\n\n## Summary\n\nRan three parallel review agents (reuse, quality, efficiency) on the live-timing change and applied the highest-leverage fixes:\n\n**Fixed**\n\n1. **`live_run_timing` body** (`fabro-types/src/run_projection.rs`) — replaced the hand-rolled `(u64, u64)` tuple fold with the existing primitives `RunTiming::from(StageTiming)` + `RunTiming::saturating_add` + `RunTiming::with_wall_time`, matching how `billing_rollup` already aggregates stage timings. Also removed the dead `unwrap_or(0)` (the `.max(0)` clamp guarantees the conversion can't fail).\n\n2. **DRY in `RunProjectionCache`** (`fabro-store/src/slate/projection_cache.rs`) — `get_summary` no longer inlines its own children-count + timing overlay; both `list` and `get_summary` now share a single `apply_read_overlays` helper and a single `with_children_count` helper.\n\n3. **Encapsulation: overlay condition** — switched from `summary.timing.is_none()` to `projection.conclusion.is_none()`. This expresses the actual intent (\"apply live overlay only when the run has not concluded\") instead of inferring it from a derived value, and stops coupling the cache to `build_summary`'s internal contract.\n\n4. **Efficiency: overlay no longer runs under the cache mutex** — the timing computation now runs on the cloned `CachedRunProjection` Vec after the mutex is released, so `live_run_timing(now)` iteration no longer contends with the event-ingest hot path.\n\n5. **Deleted a tautological test** — `live_run_timing_matches_conclusion_timing_at_conclusion_moment` constructed both sides of its equality by hand; it exercised nothing the other two tests didn't already cover.\n\n**Skipped (deliberately)**\n\n- The biggest single finding was parameter sprawl: `now: DateTime<Utc>` threaded through 6 store APIs. The original plan explicitly directed this design, so reversing it is out of scope for a cleanup pass.\n- Moving `live_run_timing` from `fabro-types` to `fabro-store` was also explicitly directed by the plan.\n\n**Verification**\n\n- `cargo check --workspace` — clean\n- `cargo clippy --workspace --all-targets -- -D warnings` (nightly-2026-04-14) — clean\n- `cargo fmt --all` — clean\n- `cargo nextest run -p fabro-store -p fabro-types` — 432/432 pass\n- `cargo nextest run -p fabro-server` — 583/586 pass; the 3 failures are pre-existing graph-rendering subprocess issues (verified by stashing my changes and reproducing the same 3 failures on the parent commit).",
+          "graph.rankdir": "LR",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.simplify_gpt": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "internal.thread_id": "simplify_opus",
+          "last_stage": "simplify_gpt",
+          "graph.goal": "# Plan: Live `Run.timing` for in-flight runs\n\n## Context\n\n`Run.timing` is only populated for terminal runs, because `build_summary` reads it solely from `state.conclusion.timing`. As a result, the duration chip in the run-detail header (and the new duration popover) is hidden for every queued/running/blocked run — and the same blank state shows up wherever else the UI reads `Run.timing` (runs list, board, billing summary).\n\nThe data needed to populate timing for an in-flight run is already on the projection:\n\n- `RunProjection.start.start_time` — set at `RunStarted`.\n- Per-stage `StageProjection.timing: Option<StageTiming>` — set at `StageSucceeded` / `StageFailed`.\n\nThe fix is to derive a best-effort `RunTiming` at read time for any started-but-not-terminal run and overlay it onto the cached summary, leaving the event-sourced `Conclusion.timing` snapshot untouched.\n\n## Design\n\n`build_summary` stays deterministic and pure (no `now` argument). The cached `Run.summary` in `CachedRunProjection` keeps current behavior: `timing` is `Some(conclusion.timing)` for terminal runs and `None` otherwise.\n\nLive derivation happens at cache read time. Two cache accessors take a `now: DateTime<Utc>` and, when `summary.timing.is_none()`, fill it in from the cached projection.\n\n### Derivation rule (`RunProjection::live_run_timing(now)`)\n\n- If `self.start.is_none()` → return `None` (run hasn't started; chip stays hidden, matching today's UX for queued).\n- Otherwise:\n  - `wall_time_ms = now - start.start_time` (saturating to 0).\n  - `inference_time_ms = sum over stages where timing.is_some() of timing.inference_time_ms`.\n  - `tool_time_ms = sum the same way`.\n  - Build via `RunTiming::new(wall, inference, tool)` so `active_time_ms` is the derived `inference + tool`.\n\n**Known limitation (call out in code comment and PR description):** `StageProjection` does not track live inference/tool times during a stage — those fields land only at stage completion. So `active_time_ms` for an in-flight run reflects work through the last *completed* stage, and steps forward each time a stage finishes, while `wall_time_ms` ticks continuously. This is acceptable; the popover row reads \"Active (inference + tools)\" which matches the semantics (sum of completed inference + tool time). Adding live tracking is out of scope for this change.\n\n## Critical files\n\n- **`lib/crates/fabro-types/src/run_projection.rs`** — add `RunProjection::live_run_timing(&self, now: DateTime<Utc>) -> Option<RunTiming>`. This mirrors the existing `StageProjection::live_wall_time_ms(now)` pattern (same file, lines 141-153) and reuses `RunTiming::new` from `lib/crates/fabro-types/src/timing.rs:92`.\n\n- **`lib/crates/fabro-store/src/slate/projection_cache.rs`** — change `RunProjectionCache::get_summary` and `list` signatures to take `now: DateTime<Utc>`. When the cached `entry.summary.timing.is_none()`, call `entry.projection.live_run_timing(now)` and assign the result to `summary.timing` on a cloned copy before returning.\n\n- **`lib/crates/fabro-store/src/slate/mod.rs:255,297`** — propagate the `now` parameter through `Slate::list` and `Slate::get_summary`. Update callers in the same file (`get_run`, etc., around line 291).\n\n- **`lib/crates/fabro-server/src/`** — at the HTTP handler call sites (the GET `/runs/{id}` summary and the runs list endpoints), pass `Utc::now()`. There are only a handful of these; grep for `slate.get_summary(` and `slate.list(`.\n\n- **`lib/crates/fabro-store/src/run_state.rs`** tests (around line 942 onward) — add unit tests for `RunProjection::live_run_timing`:\n  - returns `None` when `start` is `None`\n  - returns `Some` with derived wall + active from completed stages when started and in-flight\n  - matches `conclusion.timing` semantics when called at the conclusion moment (sanity check)\n\n## What does NOT change\n\n- `Conclusion.timing` stays as the event-sourced terminal snapshot. All five internal readers (`run_state.rs:670`, `cli/output.rs:208`, `pipeline/finalize.rs:588`, `operations/start.rs:1771`, `pipeline/pull_request.rs:175`) continue to use it untouched. They semantically want \"timing as of conclusion,\" which is what they get.\n- `build_summary` signature stays the same — no `now` argument, no test churn from the existing 13+ test call sites.\n- The web client. The duration chip and `DurationPopover` already render whenever `summary.timing` is non-null. Once the server overlays live timing on in-flight runs, the chip appears and the popover shows real values. The popover's \"Wall-clock since created\" remains client-computed from `now - created_at` (intentionally different from `wall_time_ms`, which excludes queue time).\n\n## Verification\n\n1. **Unit tests** in `fabro-store`: `cargo nextest run -p fabro-store live_run_timing`.\n\n2. **API smoke test**: `cargo build --workspace` and start the server. With an in-flight run, hit `GET /api/v1/runs/{id}` twice ~5s apart and confirm `timing.wall_time_ms` increases between requests while `timing.active_time_ms` stays equal to the sum of completed stages' active times.\n\n3. **Manual UI check** against an in-flight run (e.g. `http://127.0.0.1:32276/runs/01KSA36AH4GPG3D8P1EP0HBG7X`):\n   - Run-detail header now shows the duration chip.\n   - Hover reveals the popover with both rows populated.\n   - \"Wall-clock since created\" > `wall_time_ms` (because it includes queue/setup time) — sanity check.\n   - \"Active\" stays flat while a stage runs, then jumps when the stage completes. Verify this matches the documented behavior, not a bug.\n   - Runs list and board show ticking durations for in-flight rows.\n\n4. **Terminal-run regression check**: open a previously-completed run and confirm timing values are byte-identical to before this change (cached `Conclusion.timing` still wins because `summary.timing.is_some()`, so the overlay is skipped).\n",
+          "current_node": "simplify_gpt",
+          "last_response": "Review/cleanup complete.\n\nFixed:\n- `projection_cache.rs`\n  - Changed read-time overlay condition to match the design: only derive live timing when `summary.timing.is_none()`, so cached terminal `Concl",
+          "internal.node_visit_count": 1,
+          "failure_class": "",
+          "internal.retry_count.implement": 0,
+          "internal.retry_count.preflight_compile": 0,
+          "thread.start.current_node": "toolchain",
+          "internal.run_id": "01KSA4GEA6WRWTV4JT19VYJRYD",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "outcome": "succeeded",
+          "response.simplify_gpt": "Review/cleanup complete.\n\nFixed:\n- `projection_cache.rs`\n  - Changed read-time overlay condition to match the design: only derive live timing when `summary.timing.is_none()`, so cached terminal `Conclusion.timing` always wins.\n  - Moved live overlay work until after list date filtering, avoiding unnecessary stage timing aggregation for entries that will be filtered out.\n  - Removed an unnecessary `mut`.\n\n- `run_state.rs`\n  - Added the missing sanity unit test: `live_run_timing_matches_conclusion_timing_at_conclusion_moment`.\n\nValidated:\n- `cargo nextest run -p fabro-store live_run_timing` ✅\n- `cargo check -q -p fabro-store` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-store --all-targets -- -D warnings` ✅\n- `cargo +nightly-2026-04-14 fmt --all` ✅\n\nWorking tree now has only these cleanup edits:\n- `lib/crates/fabro-store/src/run_state.rs`\n- `lib/crates/fabro-store/src/slate/projection_cache.rs`"
+        },
+        "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Review/cleanup complete.\n\nFixed:\n- `projection_cache.rs`\n  - Changed read-time overlay condition to match the design: only derive live timing when `summary.timing.is_none()`, so cached terminal `Concl",
+              "response.simplify_gpt": "Review/cleanup complete.\n\nFixed:\n- `projection_cache.rs`\n  - Changed read-time overlay condition to match the design: only derive live timing when `summary.timing.is_none()`, so cached terminal `Conclusion.timing` always wins.\n  - Moved live overlay work until after list date filtering, avoiding unnecessary stage timing aggregation for entries that will be filtered out.\n  - Removed an unnecessary `mut`.\n\n- `run_state.rs`\n  - Added the missing sanity unit test: `live_run_timing_matches_conclusion_timing_at_conclusion_moment`.\n\nValidated:\n- `cargo nextest run -p fabro-store live_run_timing` ✅\n- `cargo check -q -p fabro-store` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-store --all-targets -- -D warnings` ✅\n- `cargo +nightly-2026-04-14 fmt --all` ✅\n\nWorking tree now has only these cleanup edits:\n- `lib/crates/fabro-store/src/run_state.rs`\n- `lib/crates/fabro-store/src/slate/projection_cache.rs`",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 86297,
+                    "output_tokens": 5272,
+                    "reasoning_tokens": 2860,
+                    "cache_read_tokens": 1968128,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 1659509
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Confirmed: all 3 failures are pre-existing (graph rendering subprocess issue) and unrelated to my changes.\n\n## Summary\n\nRan three parallel review agents (reuse, quality, efficiency) on the live-timing",
+              "response.simplify_opus": "Confirmed: all 3 failures are pre-existing (graph rendering subprocess issue) and unrelated to my changes.\n\n## Summary\n\nRan three parallel review agents (reuse, quality, efficiency) on the live-timing change and applied the highest-leverage fixes:\n\n**Fixed**\n\n1. **`live_run_timing` body** (`fabro-types/src/run_projection.rs`) — replaced the hand-rolled `(u64, u64)` tuple fold with the existing primitives `RunTiming::from(StageTiming)` + `RunTiming::saturating_add` + `RunTiming::with_wall_time`, matching how `billing_rollup` already aggregates stage timings. Also removed the dead `unwrap_or(0)` (the `.max(0)` clamp guarantees the conversion can't fail).\n\n2. **DRY in `RunProjectionCache`** (`fabro-store/src/slate/projection_cache.rs`) — `get_summary` no longer inlines its own children-count + timing overlay; both `list` and `get_summary` now share a single `apply_read_overlays` helper and a single `with_children_count` helper.\n\n3. **Encapsulation: overlay condition** — switched from `summary.timing.is_none()` to `projection.conclusion.is_none()`. This expresses the actual intent (\"apply live overlay only when the run has not concluded\") instead of inferring it from a derived value, and stops coupling the cache to `build_summary`'s internal contract.\n\n4. **Efficiency: overlay no longer runs under the cache mutex** — the timing computation now runs on the cloned `CachedRunProjection` Vec after the mutex is released, so `live_run_timing(now)` iteration no longer contends with the event-ingest hot path.\n\n5. **Deleted a tautological test** — `live_run_timing_matches_conclusion_timing_at_conclusion_moment` constructed both sides of its equality by hand; it exercised nothing the other two tests didn't already cover.\n\n**Skipped (deliberately)**\n\n- The biggest single finding was parameter sprawl: `now: DateTime<Utc>` threaded through 6 store APIs. The original plan explicitly directed this design, so reversing it is out of scope for a cleanup pass.\n- Moving `live_run_timing` from `fabro-types` to `fabro-store` was also explicitly directed by the plan.\n\n**Verification**\n\n- `cargo check --workspace` — clean\n- `cargo clippy --workspace --all-targets -- -D warnings` (nightly-2026-04-14) — clean\n- `cargo fmt --all` — clean\n- `cargo nextest run -p fabro-store -p fabro-types` — 432/432 pass\n- `cargo nextest run -p fabro-server` — 583/586 pass; the 3 failures are pre-existing graph-rendering subprocess issues (verified by stashing my changes and reproducing the same 3 failures on the parent commit).",
+              "last_stage": "simplify_opus"
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 49716,
+                    "output_tokens": 14482,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 1364739,
+                    "cache_write_tokens": 190122
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 190122,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 2481261
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-store/src/run_state.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-store/src/slate/projection_cache.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_projection.rs"
+            ]
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "last_response": "Implemented live `Run.timing` for in-flight runs.\n\nSummary:\n- Added `RunProjection::live_run_timing(now)` in `fabro-types`.\n  - Returns `None` before `run.started`.\n  - Derives live wall time from `no",
+              "response.implement": "Implemented live `Run.timing` for in-flight runs.\n\nSummary:\n- Added `RunProjection::live_run_timing(now)` in `fabro-types`.\n  - Returns `None` before `run.started`.\n  - Derives live wall time from `now - start.start_time`, saturating at 0.\n  - Sums completed-stage inference/tool time and builds via `RunTiming::new`.\n  - Includes the documented limitation that active timing only advances when stages complete.\n- Kept `build_summary` unchanged and deterministic.\n- Updated `RunProjectionCache::list` and `get_summary` to accept `now` and overlay live timing only on cloned returned summaries when cached `summary.timing` is `None`.\n- Propagated `now` through `fabro-store` list/summary accessors and all affected workspace call sites.\n- Updated server run summary/list/board handlers to pass `Utc::now()`.\n- Added tests:\n  - `live_run_timing_returns_none_before_run_starts`\n  - `live_run_timing_derives_wall_and_completed_stage_active_for_in_flight_run`\n  - `live_run_timing_matches_conclusion_timing_at_conclusion_moment`\n  - `cached_summary_overlays_live_timing_without_mutating_cached_snapshot`\n\nTDD/validation:\n- Red phase: `cargo nextest run -p fabro-store live_run_timing` initially failed with missing `live_run_timing`.\n- Green/final checks:\n  - `cargo nextest run -p fabro-store live_run_timing`\n  - `cargo nextest run -p fabro-store cached_summary_overlays_live_timing`\n  - `cargo check -q --workspace`\n  - `cargo +nightly-2026-04-14 fmt --check --all`\n  - `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n\nAll passed."
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 173045,
+                    "output_tokens": 12425,
+                    "reasoning_tokens": 8585,
+                    "cache_read_tokens": 9430016,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 6210533
+            }
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "35affc480c0513f02799bde88d52168fb988d8d4",
+        "node_visits": {
+          "simplify_gpt": 1,
+          "toolchain": 1,
+          "simplify_opus": 1,
+          "start": 1,
+          "implement": 1,
+          "preflight_compile": 1,
+          "preflight_lint": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs\nindex 304acf8cc..72105abdd 100644\n--- a/lib/crates/fabro-store/src/run_state.rs\n+++ b/lib/crates/fabro-store/src/run_state.rs\n@@ -949,9 +949,9 @@ mod tests {\n         AgentAcpCancelledProps, AgentAcpCompletedProps, AgentAcpStartedProps,\n         AgentAcpTimedOutProps, AgentMessageProps, AgentSessionActivatedProps,\n         AgentSessionEndedProps, AgentSessionStartedProps, CheckpointCompletedProps,\n-        InterviewCompletedProps, InterviewOption, InterviewStartedProps, RunControlEffectProps,\n-        StageCompletedProps, StageFailedProps, StagePromptProps, StageRetryingProps,\n-        StageStartedProps,\n+        InterviewCompletedProps, InterviewOption, InterviewStartedProps, RunCompletedProps,\n+        RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,\n+        StageRetryingProps, StageStartedProps,\n     };\n     use fabro_types::{\n         AgentBackend, BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint,\n@@ -1127,6 +1127,81 @@ mod tests {\n         );\n     }\n \n+    #[test]\n+    fn live_run_timing_matches_conclusion_timing_at_conclusion_moment() {\n+        let mut state = initialized_projection();\n+        let started_at = test_dt(\"2026-04-07T12:00:00Z\");\n+        let completed_at = test_dt(\"2026-04-07T12:00:10Z\");\n+        state\n+            .apply_event(&test_raw_event_at(\n+                1,\n+                \"2026-04-07T12:00:00Z\",\n+                \"run.started\",\n+                &json!({ \"name\": \"Test run\" }),\n+                None,\n+            ))\n+            .unwrap();\n+        state\n+            .apply_event(&test_raw_event_at(\n+                2,\n+                \"2026-04-07T12:00:00Z\",\n+                \"run.starting\",\n+                &json!({}),\n+                None,\n+            ))\n+            .unwrap();\n+        state\n+            .apply_event(&test_raw_event_at(\n+                3,\n+                \"2026-04-07T12:00:01Z\",\n+                \"run.running\",\n+                &json!({}),\n+                None,\n+            ))\n+            .unwrap();\n+        state.stage_entry(\"plan\", 1, first_event_seq(4)).timing =\n+            Some(fabro_types::StageTiming::new(2_000, 700, 300));\n+        state.stage_entry(\"code\", 1, first_event_seq(5)).timing =\n+            Some(fabro_types::StageTiming::new(3_000, 50, 200));\n+\n+        let conclusion_timing = fabro_types::RunTiming::new(\n+            u64::try_from(\n+                completed_at\n+                    .signed_duration_since(started_at)\n+                    .num_milliseconds(),\n+            )\n+            .unwrap(),\n+            750,\n+            500,\n+        );\n+        let mut completed = test_event(\n+            6,\n+            EventBody::RunCompleted(RunCompletedProps {\n+                timing:               conclusion_timing,\n+                artifact_count:       0,\n+                status:               \"succeeded\".to_string(),\n+                reason:               SuccessReason::Completed,\n+                total_usd_micros:     None,\n+                final_git_commit_sha: None,\n+                final_patch:          None,\n+                diff_summary:         None,\n+                billing:              None,\n+            }),\n+            None,\n+        );\n+        completed.event.ts = completed_at;\n+        state.apply_event(&completed).unwrap();\n+\n+        assert_eq!(\n+            state\n+                .conclusion\n+                .as_ref()\n+                .map(|conclusion| conclusion.timing),\n+            Some(conclusion_timing)\n+        );\n+        assert_eq!(state.live_run_timing(completed_at), Some(conclusion_timing));\n+    }\n+\n     #[test]\n     fn last_event_at_tracks_most_recent_event_timestamp() {\n         let mut state = initialized_projection();\ndiff --git a/lib/crates/fabro-store/src/slate/projection_cache.rs b/lib/crates/fabro-store/src/slate/projection_cache.rs\nindex 9e4f41a34..aa4974c2f 100644\n--- a/lib/crates/fabro-store/src/slate/projection_cache.rs\n+++ b/lib/crates/fabro-store/src/slate/projection_cache.rs\n@@ -96,9 +96,10 @@ impl RunProjectionCacheState {\n /// Apply read-time overlays to a cached entry. Pure: does not touch the cache\n /// state, so it can run outside the cache mutex.\n fn apply_read_overlays(entry: &mut CachedRunProjection, now: DateTime<Utc>) {\n-    // `Conclusion::timing` is the authoritative terminal snapshot; only fill\n-    // in a derived live timing for runs that have not yet concluded.\n-    if entry.projection.conclusion.is_none() {\n+    // `Conclusion::timing` is the authoritative terminal snapshot and is\n+    // already present in cached terminal summaries. Only fill missing timing\n+    // with the best-effort live projection.\n+    if entry.summary.timing.is_none() {\n         entry.summary.timing = entry.projection.live_run_timing(now);\n     }\n }\n@@ -117,7 +118,7 @@ impl RunProjectionCache {\n         query: &ListRunsQuery,\n         now: DateTime<Utc>,\n     ) -> Vec<CachedRunProjection> {\n-        let mut entries = {\n+        let entries = {\n             let state = self.state.lock().await;\n             let raw = match query.parent_id {\n                 Some(parent_id) => state\n@@ -133,10 +134,6 @@ impl RunProjectionCache {\n                 .map(|entry| state.with_children_count(entry))\n                 .collect::<Vec<_>>()\n         };\n-        // Apply per-entry live overlays outside the cache mutex.\n-        for entry in &mut entries {\n-            apply_read_overlays(entry, now);\n-        }\n         let mut entries = entries\n             .into_iter()\n             .filter(|entry| {\n@@ -150,6 +147,11 @@ impl RunProjectionCache {\n                 true\n             })\n             .collect::<Vec<_>>();\n+        // Apply per-entry live overlays outside the cache mutex, after any\n+        // date filtering so skipped entries do not sum stage timings.\n+        for entry in &mut entries {\n+            apply_read_overlays(entry, now);\n+        }\n         entries.sort_by(|left, right| {\n             right\n                 .run_id\n",
+        "summary": {
+          "files_changed": 12,
+          "additions": 389,
+          "deletions": 116
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T10:39:55.075265Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.node_visit_count": 1,
+          "command.output": "blob://sha256/f58e8f8d37fc709036b8e6dda3777d3d9f474c5cd0b5512017948be1595488d2",
           "outcome": "succeeded",
           "internal.run_id": "01KSA4GEA6WRWTV4JT19VYJRYD",
           "thread.implement.current_node": "simplify_opus",
           "thread.simplify_opus.current_node": "simplify_gpt",
-          "internal.thread_id": "simplify_opus",
+          "internal.thread_id": "simplify_gpt",
           "thread.start.current_node": "toolchain",
           "internal.retry_count.simplify_gpt": 0,
           "failure_class": "",
@@ -1084,16 +1281,18 @@
           "internal.retry_count.simplify_opus": 0,
           "failure_signature": "",
           "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.verify": 0,
           "thread.preflight_lint.current_node": "implement",
           "thread.toolchain.current_node": "preflight_compile",
           "internal.fidelity": "compact",
           "last_stage": "simplify_gpt",
+          "thread.simplify_gpt.current_node": "verify",
           "response.simplify_opus": "Confirmed: all 3 failures are pre-existing (graph rendering subprocess issue) and unrelated to my changes.\n\n## Summary\n\nRan three parallel review agents (reuse, quality, efficiency) on the live-timing change and applied the highest-leverage fixes:\n\n**Fixed**\n\n1. **`live_run_timing` body** (`fabro-types/src/run_projection.rs`) — replaced the hand-rolled `(u64, u64)` tuple fold with the existing primitives `RunTiming::from(StageTiming)` + `RunTiming::saturating_add` + `RunTiming::with_wall_time`, matching how `billing_rollup` already aggregates stage timings. Also removed the dead `unwrap_or(0)` (the `.max(0)` clamp guarantees the conversion can't fail).\n\n2. **DRY in `RunProjectionCache`** (`fabro-store/src/slate/projection_cache.rs`) — `get_summary` no longer inlines its own children-count + timing overlay; both `list` and `get_summary` now share a single `apply_read_overlays` helper and a single `with_children_count` helper.\n\n3. **Encapsulation: overlay condition** — switched from `summary.timing.is_none()` to `projection.conclusion.is_none()`. This expresses the actual intent (\"apply live overlay only when the run has not concluded\") instead of inferring it from a derived value, and stops coupling the cache to `build_summary`'s internal contract.\n\n4. **Efficiency: overlay no longer runs under the cache mutex** — the timing computation now runs on the cloned `CachedRunProjection` Vec after the mutex is released, so `live_run_timing(now)` iteration no longer contends with the event-ingest hot path.\n\n5. **Deleted a tautological test** — `live_run_timing_matches_conclusion_timing_at_conclusion_moment` constructed both sides of its equality by hand; it exercised nothing the other two tests didn't already cover.\n\n**Skipped (deliberately)**\n\n- The biggest single finding was parameter sprawl: `now: DateTime<Utc>` threaded through 6 store APIs. The original plan explicitly directed this design, so reversing it is out of scope for a cleanup pass.\n- Moving `live_run_timing` from `fabro-types` to `fabro-store` was also explicitly directed by the plan.\n\n**Verification**\n\n- `cargo check --workspace` — clean\n- `cargo clippy --workspace --all-targets -- -D warnings` (nightly-2026-04-14) — clean\n- `cargo fmt --all` — clean\n- `cargo nextest run -p fabro-store -p fabro-types` — 432/432 pass\n- `cargo nextest run -p fabro-server` — 583/586 pass; the 3 failures are pre-existing graph-rendering subprocess issues (verified by stashing my changes and reproducing the same 3 failures on the parent commit).",
           "response.simplify_gpt": "Review/cleanup complete.\n\nFixed:\n- `projection_cache.rs`\n  - Changed read-time overlay condition to match the design: only derive live timing when `summary.timing.is_none()`, so cached terminal `Conclusion.timing` always wins.\n  - Moved live overlay work until after list date filtering, avoiding unnecessary stage timing aggregation for entries that will be filtered out.\n  - Removed an unnecessary `mut`.\n\n- `run_state.rs`\n  - Added the missing sanity unit test: `live_run_timing_matches_conclusion_timing_at_conclusion_moment`.\n\nValidated:\n- `cargo nextest run -p fabro-store live_run_timing` ✅\n- `cargo check -q -p fabro-store` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-store --all-targets -- -D warnings` ✅\n- `cargo +nightly-2026-04-14 fmt --all` ✅\n\nWorking tree now has only these cleanup edits:\n- `lib/crates/fabro-store/src/run_state.rs`\n- `lib/crates/fabro-store/src/slate/projection_cache.rs`",
           "graph.rankdir": "LR",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.retry_count.preflight_compile": 0,
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "internal.retry_count.implement": 0
         },
         "node_outcomes": {
@@ -1206,6 +1405,14 @@
             "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
             "usage": null
           },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/f58e8f8d37fc709036b8e6dda3777d3d9f474c5cd0b5512017948be1595488d2"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+            "usage": null
+          },
           "toolchain": {
             "status": "succeeded",
             "context_updates": {
@@ -1223,13 +1430,14 @@
             "usage": null
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "fmt",
         "node_visits": {
           "toolchain": 1,
+          "start": 1,
           "preflight_compile": 1,
           "simplify_opus": 1,
+          "verify": 1,
           "simplify_gpt": 1,
-          "start": 1,
           "preflight_lint": 1,
           "implement": 1
         }
@@ -1379,87 +1587,23 @@
       },
       "state": "succeeded"
     },
-    "simplify_opus@1": {
-      "first_event_seq": 424,
+    "verify@1": {
+      "first_event_seq": 1095,
       "prompt": null,
       "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Stage completed: simplify_opus",
-        "failure_reason": null,
-        "timestamp": "2026-05-23T10:31:12.275605Z"
-      },
-      "provider_used": {
-        "mode": "agent",
-        "provider": "anthropic",
-        "model": "claude-opus-4-7"
-      },
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-23T10:18:00.203426Z",
-      "handler": "agent",
-      "timing": {
-        "wall_time_ms": 792066,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 49716,
-        "output_tokens": 14482,
-        "total_tokens": 1619059,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 1364739,
-        "cache_write_tokens": 190122,
-        "total_usd_micros": 2481261
-      },
-      "model": {
-        "provider": "anthropic",
-        "model_id": "claude-opus-4-7"
-      },
-      "state": "succeeded"
-    },
-    "preflight_compile@1": {
-      "first_event_seq": 30,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo check -q --workspace 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-23T10:03:55.835548Z"
-      },
+      "completion": null,
       "provider_used": null,
       "diff": null,
       "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1 && cargo dev docs refresh 2>&1 && cargo dev docs check 2>&1",
         "language": "shell"
       },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 124841,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
+      "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-23T10:01:50.988474Z",
+      "started_at": "2026-05-23T10:35:45.800367Z",
       "handler": "command",
-      "timing": {
-        "wall_time_ms": 124846,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -1467,38 +1611,6 @@
         "reasoning_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "simplify_gpt@1": {
-      "first_event_seq": 826,
-      "prompt": null,
-      "response": null,
-      "completion": null,
-      "provider_used": {
-        "mode": "agent",
-        "provider": "openai",
-        "model": "gpt-5.5"
-      },
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-23T10:31:18.123298Z",
-      "handler": "agent",
-      "usage": {
-        "input_tokens": 86297,
-        "output_tokens": 5272,
-        "total_tokens": 2062557,
-        "reasoning_tokens": 2860,
-        "cache_read_tokens": 1968128,
-        "cache_write_tokens": 0,
-        "total_usd_micros": 1659509
-      },
-      "model": {
-        "provider": "openai",
-        "model_id": "gpt-5.5"
       },
       "state": "running"
     },
@@ -1584,6 +1696,140 @@
       "handler": "command",
       "timing": {
         "wall_time_ms": 140080,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "simplify_opus@1": {
+      "first_event_seq": 424,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_opus",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T10:31:12.275605Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "anthropic",
+        "model": "claude-opus-4-7"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T10:18:00.203426Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 792066,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 49716,
+        "output_tokens": 14482,
+        "total_tokens": 1619059,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 1364739,
+        "cache_write_tokens": 190122,
+        "total_usd_micros": 2481261
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-opus-4-7"
+      },
+      "state": "succeeded"
+    },
+    "simplify_gpt@1": {
+      "first_event_seq": 826,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_gpt",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T10:35:39.112641Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T10:31:18.123298Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 260987,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 86297,
+        "output_tokens": 5272,
+        "total_tokens": 2062557,
+        "reasoning_tokens": 2860,
+        "cache_read_tokens": 1968128,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 1659509
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "state": "succeeded"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 30,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T10:03:55.835548Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 124841,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-23T10:01:50.988474Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 124846,
         "inference_time_ms": 0,
         "tool_time_ms": 0,
         "active_time_ms": 0
