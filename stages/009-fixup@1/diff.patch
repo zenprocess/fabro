@@ -1,0 +1,165 @@
+diff --git a/apps/fabro-web/app/routes/runs.tsx b/apps/fabro-web/app/routes/runs.tsx
+index 6a1d6f47c..a1cd5b441 100644
+--- a/apps/fabro-web/app/routes/runs.tsx
++++ b/apps/fabro-web/app/routes/runs.tsx
+@@ -585,7 +585,7 @@ function parseView(raw: string | null): ViewMode {
+   return raw === "list" ? "list" : "columns";
+ }
+ 
+-const SORT_KEYS = ["created_at", "updated_at", "status", "elapsed"] as const satisfies readonly ListRunsSortEnum[];
++const SORT_KEYS = ["created_at", "updated_at", "status", "elapsed", "repo", "title", "workflow", "changes"] as const satisfies readonly ListRunsSortEnum[];
+ 
+ function parseSort(raw: string | null): ListRunsSortEnum {
+   return (SORT_KEYS as readonly string[]).includes(raw ?? "")
+@@ -645,6 +645,10 @@ const sortColumnLabels: Record<ListRunsSortEnum, string> = {
+   updated_at: "Updated",
+   status:     "Status",
+   elapsed:    "Elapsed",
++  repo:       "Repo",
++  title:      "Title",
++  workflow:   "Workflow",
++  changes:    "Changes",
+ };
+ 
+ function createdCutoffMsFor(filter: CreatedFilter): number | null {
+@@ -952,11 +956,11 @@ function RunsListView({
+                   <SortHeader label="Elapsed" sortKey="elapsed" activeSort={sort} direction={direction} onClick={onSortClick} />
+                 )}
+                 {show("repo") && (
+-                  <th scope="col" className="whitespace-nowrap px-3 py-2.5 text-left font-medium">Repo</th>
++                  <SortHeader label="Repo" sortKey="repo" activeSort={sort} direction={direction} onClick={onSortClick} />
+                 )}
+-                <th scope="col" className="whitespace-nowrap px-3 py-2.5 text-left font-medium">Title</th>
++                <SortHeader label="Title" sortKey="title" activeSort={sort} direction={direction} onClick={onSortClick} />
+                 {show("workflow") && (
+-                  <th scope="col" className="whitespace-nowrap px-3 py-2.5 text-left font-medium">Workflow</th>
++                  <SortHeader label="Workflow" sortKey="workflow" activeSort={sort} direction={direction} onClick={onSortClick} />
+                 )}
+                 {show("created") && (
+                   <SortHeader label="Created" sortKey="created_at" activeSort={sort} direction={direction} onClick={onSortClick} />
+@@ -965,7 +969,7 @@ function RunsListView({
+                   <SortHeader label="Updated" sortKey="updated_at" activeSort={sort} direction={direction} align="right" onClick={onSortClick} />
+                 )}
+                 {show("changes") && (
+-                  <th scope="col" className="whitespace-nowrap px-3 py-2.5 text-right font-medium">Changes</th>
++                  <SortHeader label="Changes" sortKey="changes" activeSort={sort} direction={direction} align="right" onClick={onSortClick} />
+                 )}
+                 {show("pr") && (
+                   <th scope="col" className="whitespace-nowrap px-3 py-2.5 text-right font-medium">PR</th>
+@@ -992,15 +996,17 @@ function RunsListView({
+           />
+         </div>
+       )}
+-      <ListPager
+-        page={page}
+-        pageSize={pageSize}
+-        pageCount={pageCount}
+-        hasMore={hasMore}
+-        disabled={isLoading}
+-        onPageChange={onPageChange}
+-        onPageSizeChange={onPageSizeChange}
+-      />
++      {(total == null || total >= 25) && (
++        <ListPager
++          page={page}
++          pageSize={pageSize}
++          pageCount={pageCount}
++          hasMore={hasMore}
++          disabled={isLoading}
++          onPageChange={onPageChange}
++          onPageSizeChange={onPageSizeChange}
++        />
++      )}
+     </div>
+   );
+ }
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index 3ed205878..e10d6077f 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -4578,7 +4578,7 @@ components:
+       description: Field to sort by. Defaults to `created_at`.
+       schema:
+         type: string
+-        enum: [created_at, updated_at, status, elapsed]
++        enum: [created_at, updated_at, status, elapsed, repo, title, workflow, changes]
+         default: created_at
+       example: created_at
+ 
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index dfcfa7fc4..fcf6e5a09 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -87,6 +87,10 @@ enum RunsSortKey {
+     UpdatedAt,
+     Status,
+     Elapsed,
++    Repo,
++    Title,
++    Workflow,
++    Changes,
+ }
+ 
+ #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+@@ -180,6 +184,10 @@ fn sort_runs(runs: &mut [fabro_types::Run], key: RunsSortKey, direction: RunsSor
+                 ac.cmp(&bc)
+             }
+             RunsSortKey::Elapsed => run_elapsed_ms(a, now).cmp(&run_elapsed_ms(b, now)),
++            RunsSortKey::Repo => run_repo_key(a).cmp(&run_repo_key(b)),
++            RunsSortKey::Title => run_title_key(a).cmp(&run_title_key(b)),
++            RunsSortKey::Workflow => run_workflow_key(a).cmp(&run_workflow_key(b)),
++            RunsSortKey::Changes => run_changes_total(a).cmp(&run_changes_total(b)),
+         };
+         let primary = if asc { primary } else { primary.reverse() };
+         // Stable tiebreak: newer ULIDs (and thus newer runs) first.
+@@ -187,6 +195,33 @@ fn sort_runs(runs: &mut [fabro_types::Run], key: RunsSortKey, direction: RunsSor
+     });
+ }
+ 
++fn run_repo_key(run: &fabro_types::Run) -> String {
++    run.repository
++        .as_ref()
++        .map(|repo| repo.name.to_lowercase())
++        .unwrap_or_default()
++}
++
++fn run_title_key(run: &fabro_types::Run) -> String {
++    run.title.trim().to_lowercase()
++}
++
++fn run_workflow_key(run: &fabro_types::Run) -> String {
++    let wf = &run.workflow;
++    wf.name
++        .as_deref()
++        .or(wf.graph_name.as_deref())
++        .or(wf.slug.as_deref())
++        .map(str::to_lowercase)
++        .unwrap_or_default()
++}
++
++fn run_changes_total(run: &fabro_types::Run) -> i64 {
++    run.diff
++        .as_ref()
++        .map_or(0, |diff| diff.additions + diff.deletions)
++}
++
+ async fn link_run_parent(
+     RequireRunScopedOrRunTools(child_id, actor): RequireRunScopedOrRunTools,
+     State(state): State<Arc<AppState>>,
+diff --git a/lib/packages/fabro-api-client/src/api/runs-api.ts b/lib/packages/fabro-api-client/src/api/runs-api.ts
+index 7e1ad25ca..9a9d2ad2e 100644
+--- a/lib/packages/fabro-api-client/src/api/runs-api.ts
++++ b/lib/packages/fabro-api-client/src/api/runs-api.ts
+@@ -2536,7 +2536,11 @@ export const ListRunsSortEnum = {
+     CREATED_AT: 'created_at',
+     UPDATED_AT: 'updated_at',
+     STATUS: 'status',
+-    ELAPSED: 'elapsed'
++    ELAPSED: 'elapsed',
++    REPO: 'repo',
++    TITLE: 'title',
++    WORKFLOW: 'workflow',
++    CHANGES: 'changes'
+ } as const;
+ export type ListRunsSortEnum = typeof ListRunsSortEnum[keyof typeof ListRunsSortEnum];
+ export const ListRunsDirectionEnum = {
