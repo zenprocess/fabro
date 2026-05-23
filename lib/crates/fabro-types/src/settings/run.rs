@@ -13,7 +13,6 @@ use std::time::Duration as StdDuration;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
-use super::environment::EnvironmentSettings;
 use super::interp::InterpString;
 use super::model_ref::ModelRef;
 
@@ -32,15 +31,6 @@ pub struct RunNamespace {
     pub clone:         RunCloneSettings,
     pub run_branch:    RunBranchSettings,
     pub meta_branch:   RunMetaBranchSettings,
-    /// Slug of the selected environment from the top-level
-    /// `[environments]` catalog. Resolved together with `environment`.
-    pub environment_id: String,
-    /// Fully resolved environment for the run (provider + image + resources +
-    /// network + lifecycle + labels + volumes + env).
-    pub environment:   EnvironmentSettings,
-    /// Deprecated provider-tagged sandbox view. Populated during the
-    /// transition while consumers migrate to `environment`. New callers
-    /// should read `environment` instead.
     pub sandbox:       RunSandboxSettings,
     pub notifications: HashMap<String, NotificationRouteSettings>,
     pub interviews:    RunInterviewsSettings,
@@ -71,8 +61,6 @@ impl Default for RunNamespace {
             clone:         RunCloneSettings::default(),
             run_branch:    RunBranchSettings::default(),
             meta_branch:   RunMetaBranchSettings::default(),
-            environment_id: "default".to_string(),
-            environment:   EnvironmentSettings::default(),
             sandbox:       RunSandboxSettings::default(),
             notifications: HashMap::new(),
             interviews:    RunInterviewsSettings::default(),

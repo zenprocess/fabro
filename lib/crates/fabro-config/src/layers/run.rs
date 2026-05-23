@@ -9,7 +9,6 @@ use fabro_types::settings::{Duration, InterpString, ModelRef, Size};
 use serde::{Deserialize, Serialize};
 
 use super::combine::Combine;
-use super::environment::RunEnvironmentLayer;
 use super::maps::{MergeMap, ReplaceMap, StickyMap};
 use super::splice_array::SPLICE_MARKER;
 
@@ -44,10 +43,6 @@ pub struct RunLayer {
     pub meta_branch:   Option<RunMetaBranchLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox:       Option<RunSandboxLayer>,
-    /// `[run.environment]` — selection of a named environment and sparse
-    /// overlays for the selected environment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment:   Option<RunEnvironmentLayer>,
     #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
     pub notifications: MergeMap<NotificationRouteLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

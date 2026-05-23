@@ -11,7 +11,6 @@
 
 pub mod cli;
 pub mod duration;
-pub mod environment;
 pub mod interp;
 pub mod model_ref;
 pub mod project;
@@ -26,11 +25,6 @@ pub use cli::{
     CliLoggingSettings, CliNamespace, CliOutputSettings, CliTargetSettings, CliUpdatesSettings,
 };
 pub use duration::{Duration, ParseDurationError};
-pub use environment::{
-    EnvironmentImageSettings, EnvironmentLifecycleSettings, EnvironmentNetworkMode,
-    EnvironmentNetworkSettings, EnvironmentProvider, EnvironmentResourcesSettings,
-    EnvironmentSettings, EnvironmentVolumeSettings, RunEnvironmentSettings,
-};
 pub use interp::{InterpString, Provenance, ResolveEnvError, Resolved};
 pub use model_ref::{
     AmbiguousModelRef, ModelRef, ModelRegistry, ParseModelRefError, ResolvedModelRef,

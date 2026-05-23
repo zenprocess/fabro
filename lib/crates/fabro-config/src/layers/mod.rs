@@ -1,6 +1,5 @@
 mod cli;
 mod combine;
-mod environment;
 mod llm;
 mod log_filter;
 mod maps;
@@ -16,10 +15,6 @@ pub use cli::{
     CliOutputLayer, CliTargetLayer, CliUpdatesLayer,
 };
 pub(crate) use combine::Combine;
-pub use environment::{
-    EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer, EnvironmentNetworkLayer,
-    EnvironmentResourcesLayer, EnvironmentVolumeLayer, RunEnvironmentLayer,
-};
 pub use llm::{
     CostRates, CredentialRef, CredentialRefParseError, HeaderValueRef, LlmLayer, ModelControls,
     ModelCostTable, ModelFeatures as LlmModelFeatures, ModelLimits as LlmModelLimits,

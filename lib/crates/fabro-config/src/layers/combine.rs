@@ -49,12 +49,6 @@ impl Combine for Option<Vec<DaytonaVolumeLayer>> {
     }
 }
 
-impl Combine for Option<Vec<crate::EnvironmentVolumeLayer>> {
-    fn combine(self, other: Self) -> Self {
-        self.or(other)
-    }
-}
-
 macro_rules! impl_combine_or_option {
     ($($ty:ty),+ $(,)?) => {
         $(
