@@ -1,0 +1,427 @@
+diff --git a/lib/crates/fabro-workflow/src/handler/agent.rs b/lib/crates/fabro-workflow/src/handler/agent.rs
+index 0f2118df8..95bc502b4 100644
+--- a/lib/crates/fabro-workflow/src/handler/agent.rs
++++ b/lib/crates/fabro-workflow/src/handler/agent.rs
+@@ -2,9 +2,10 @@ use std::path::Path;
+ use std::sync::Arc;
+ 
+ use async_trait::async_trait;
+-use fabro_agent::{Sandbox, shell_quote};
++use fabro_agent::Sandbox;
+ use fabro_graphviz::graph::{Graph, Node};
+ use fabro_types::{RunId, StageModelUsage};
++pub(crate) use structured_output::extract_status_fields;
+ use tokio_util::sync::CancellationToken;
+ 
+ use super::llm::api::EffectiveRequestControls;
+@@ -133,15 +134,6 @@ impl AgentHandler {
+     }
+ }
+ 
+-/// Extract routing directives from LLM response text.
+-///
+-/// Searches for the last JSON object in the response that contains at least
+-/// one status field (`preferred_next_label`, `outcome`, `suggested_next_ids`,
+-/// `context_updates`). Merges extracted fields into the outcome.
+-pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
+-    structured_output::extract_status_fields_loose(text, outcome)
+-}
+-
+ pub(crate) async fn validate_agent_output_sources(
+     schema: &OutputSchemaKind,
+     response_text: &str,
+@@ -152,18 +144,18 @@ pub(crate) async fn validate_agent_output_sources(
+         return structured_output::validate_response_text(schema, response_text);
+     }
+ 
+-    match structured_output::validate_response_text(schema, response_text) {
++    let initial_error = match structured_output::validate_response_text(schema, response_text) {
+         Ok(validated) => return Ok(validated),
+-        Err(error) if error.allows_routing_fallback() => {}
++        Err(error) if error.allows_routing_fallback() => error,
+         Err(error) => return Err(error),
+-    }
++    };
+ 
+-    let mut fallback_error = None;
++    let mut fallback_error = initial_error;
+     if let Some(status_json) = read_sandbox_file(sandbox, "status.json").await {
+         match structured_output::validate_response_text(schema, &status_json) {
+             Ok(validated) => return Ok(validated),
+             Err(error) if error.allows_routing_fallback() => {
+-                fallback_error = Some(error);
++                fallback_error = error;
+             }
+             Err(error) => return Err(error),
+         }
+@@ -175,23 +167,11 @@ pub(crate) async fn validate_agent_output_sources(
+         }
+     }
+ 
+-    Err(fallback_error.unwrap_or_else(|| {
+-        structured_output::validate_response_text(schema, response_text)
+-            .expect_err("response text should have failed routing validation")
+-    }))
++    Err(fallback_error)
+ }
+ 
+ async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
+-    let cmd = format!("cat {}", shell_quote(path));
+-    let result = sandbox
+-        .exec_command(&cmd, 5_000, None, None, None)
+-        .await
+-        .ok()?;
+-    if result.is_success() {
+-        Some(result.stdout)
+-    } else {
+-        None
+-    }
++    sandbox.read_file_text(path).await.ok()
+ }
+ 
+ /// Truncate a string to at most `max_chars` characters (char-boundary safe).
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index 22d08dc4b..8a92973df 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -474,6 +474,10 @@ fn file_tracking_snapshot(
+     (files, state.last.clone())
+ }
+ 
++fn last_touched_file(file_tracking: &Arc<Mutex<FileTracking>>) -> Option<String> {
++    file_tracking.lock().unwrap().last.clone()
++}
++
+ fn last_assistant_response(session: &Session) -> String {
+     session
+         .history()
+@@ -553,10 +557,8 @@ pub struct AgentApiBackend {
+ }
+ 
+ struct OneShotCompletion {
+-    response:        Response,
+-    actual_model:    String,
+-    actual_provider: String,
+-    actual_speed:    Option<Speed>,
++    response: Response,
++    model:    ModelRef,
+ }
+ 
+ impl AgentApiBackend {
+@@ -864,16 +866,17 @@ impl AgentApiBackend {
+         let result = client.complete(request).await;
+         let default_provider = self.provider_id.to_string();
+ 
+-        let (response, actual_model, actual_provider, actual_speed) = match result {
+-            Ok(resp) => (
+-                resp,
+-                request.model.clone(),
+-                request
+-                    .provider
+-                    .clone()
+-                    .unwrap_or_else(|| default_provider.clone()),
+-                controls.speed,
+-            ),
++        let (response, model) = match result {
++            Ok(resp) => (resp, ModelRef {
++                provider: ProviderId::from(
++                    request
++                        .provider
++                        .clone()
++                        .unwrap_or_else(|| default_provider.clone()),
++                ),
++                model_id: request.model.clone(),
++                speed:    controls.speed,
++            }),
+             Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {
+                 let error_msg = sdk_err.to_string();
+                 let from_provider = request
+@@ -916,10 +919,12 @@ impl AgentApiBackend {
+                     match client.complete(&fallback_request).await {
+                         Ok(resp) => {
+                             found = Some(OneShotCompletion {
+-                                response:        resp,
+-                                actual_model:    target.model.clone(),
+-                                actual_provider: target.provider.clone(),
+-                                actual_speed:    controls.speed,
++                                response: resp,
++                                model:    ModelRef {
++                                    provider: ProviderId::from(target.provider.clone()),
++                                    model_id: target.model.clone(),
++                                    speed:    controls.speed,
++                                },
+                             });
+                             break;
+                         }
+@@ -938,12 +943,7 @@ impl AgentApiBackend {
+             Err(sdk_err) => return Err(Error::Llm(sdk_err)),
+         };
+ 
+-        Ok(OneShotCompletion {
+-            response,
+-            actual_model,
+-            actual_provider,
+-            actual_speed,
+-        })
++        Ok(OneShotCompletion { response, model })
+     }
+ }
+ 
+@@ -1053,11 +1053,7 @@ impl CodergenBackend for AgentApiBackend {
+ 
+             let stage_usage = billed_model_usage_from_llm(
+                 self.catalog.as_ref(),
+-                &ModelRef {
+-                    provider: ProviderId::from(completion.actual_provider),
+-                    model_id: completion.actual_model,
+-                    speed:    completion.actual_speed,
+-                },
++                &completion.model,
+                 &total_usage,
+             )?;
+ 
+@@ -1362,7 +1358,7 @@ impl CodergenBackend for AgentApiBackend {
+         if let Some(schema) = &output_schema {
+             let mut repair_attempts = 0_i64;
+             loop {
+-                let (_, last_file_touched) = file_tracking_snapshot(&file_tracking);
++                let last_file_touched = last_touched_file(&file_tracking);
+                 match validate_agent_output_sources(
+                     schema,
+                     &response,
+diff --git a/lib/crates/fabro-workflow/src/handler/structured_output.rs b/lib/crates/fabro-workflow/src/handler/structured_output.rs
+index d98a42afb..855d6e456 100644
+--- a/lib/crates/fabro-workflow/src/handler/structured_output.rs
++++ b/lib/crates/fabro-workflow/src/handler/structured_output.rs
+@@ -1,10 +1,15 @@
++use std::sync::{Arc, LazyLock};
++
+ use fabro_graphviz::graph::Node;
+ use fabro_llm::types::{ResponseFormat, ResponseFormatType};
++use jsonschema::Validator;
+ use serde_json::Value;
+ 
+ use crate::error::Error;
+ use crate::outcome::{FailureCategory, FailureDetail, Outcome, StageOutcome};
+ 
++pub(crate) const ROUTING_KEYWORD: &str = "routing";
++
+ pub(crate) const ROUTING_STATUS_FIELDS: &[&str] = &[
+     "preferred_next_label",
+     "outcome",
+@@ -13,10 +18,15 @@ pub(crate) const ROUTING_STATUS_FIELDS: &[&str] = &[
+     "context_updates",
+ ];
+ 
+-#[derive(Debug, Clone, PartialEq)]
++/// Parsed `output_schema` declaration with a precompiled validator so that
++/// repair turns don't recompile the schema on every iteration.
++#[derive(Debug, Clone)]
+ pub(crate) enum OutputSchemaKind {
+     Routing,
+-    JsonSchema { schema: Value },
++    JsonSchema {
++        schema:    Value,
++        validator: Arc<Validator>,
++    },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -135,7 +145,7 @@ pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchem
+             node.id
+         )));
+     }
+-    if value == "routing" {
++    if value == ROUTING_KEYWORD {
+         return Ok(Some(OutputSchemaKind::Routing));
+     }
+     if value.starts_with('@') {
+@@ -151,13 +161,16 @@ pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchem
+             node.id
+         ))
+     })?;
+-    compile_schema(&schema).map_err(|err| {
++    let validator = jsonschema::validator_for(&schema).map_err(|err| {
+         Error::Validation(format!(
+             "Invalid output_schema for node \"{}\": {err}",
+             node.id
+         ))
+     })?;
+-    Ok(Some(OutputSchemaKind::JsonSchema { schema }))
++    Ok(Some(OutputSchemaKind::JsonSchema {
++        schema,
++        validator: Arc::new(validator),
++    }))
+ }
+ 
+ #[must_use]
+@@ -168,7 +181,7 @@ pub(crate) fn prompt_response_format(schema: &OutputSchemaKind) -> ResponseForma
+             json_schema: None,
+             strict:      false,
+         },
+-        OutputSchemaKind::JsonSchema { schema } => ResponseFormat {
++        OutputSchemaKind::JsonSchema { schema, .. } => ResponseFormat {
+             kind:        ResponseFormatType::JsonSchema,
+             json_schema: Some(schema.clone()),
+             strict:      true,
+@@ -182,7 +195,9 @@ pub(crate) fn validate_response_text(
+ ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
+     match schema {
+         OutputSchemaKind::Routing => validate_routing_response_text(text),
+-        OutputSchemaKind::JsonSchema { schema } => validate_custom_response_text(schema, text),
++        OutputSchemaKind::JsonSchema { validator, .. } => {
++            validate_custom_response_text(validator, text)
++        }
+     }
+ }
+ 
+@@ -203,7 +218,7 @@ pub(crate) fn apply_validated_output(
+ }
+ 
+ /// Find all balanced `{...}` JSON object substrings in the text.
+-pub(crate) fn find_json_objects(text: &str) -> Vec<&str> {
++fn find_json_objects(text: &str) -> Vec<&str> {
+     let mut results = Vec::new();
+     let bytes = text.as_bytes();
+     let mut i = 0;
+@@ -241,7 +256,7 @@ pub(crate) fn find_json_objects(text: &str) -> Vec<&str> {
+     results
+ }
+ 
+-pub(crate) fn extract_status_fields_loose(text: &str, outcome: &mut Outcome) -> bool {
++pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
+     let candidates = find_json_objects(text);
+ 
+     let parsed = candidates.iter().rev().find_map(|candidate| {
+@@ -286,7 +301,7 @@ fn validate_routing_response_text(
+         if !contains_routing_field(obj) {
+             continue;
+         }
+-        validate_value_against_schema(&routing_schema(), &parsed)?;
++        validate_value_against_validator(routing_validator(), &parsed)?;
+         return Ok(ValidatedStructuredOutput { value: parsed });
+     }
+ 
+@@ -300,7 +315,7 @@ fn validate_routing_response_text(
+ }
+ 
+ fn validate_custom_response_text(
+-    schema: &Value,
++    validator: &Validator,
+     text: &str,
+ ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
+     let candidates = find_json_objects(text);
+@@ -316,20 +331,14 @@ fn validate_custom_response_text(
+             format!("invalid JSON object: {err}"),
+         )
+     })?;
+-    validate_value_against_schema(schema, &parsed)?;
++    validate_value_against_validator(validator, &parsed)?;
+     Ok(ValidatedStructuredOutput { value: parsed })
+ }
+ 
+-fn validate_value_against_schema(
+-    schema: &Value,
++fn validate_value_against_validator(
++    validator: &Validator,
+     value: &Value,
+ ) -> Result<(), StructuredOutputError> {
+-    let validator = compile_schema(schema).map_err(|err| {
+-        StructuredOutputError::new(
+-            StructuredOutputErrorKind::SchemaValidation,
+-            format!("invalid JSON Schema: {err}"),
+-        )
+-    })?;
+     let errors = validator
+         .iter_errors(value)
+         .map(|error| error.to_string())
+@@ -342,12 +351,6 @@ fn validate_value_against_schema(
+     }
+ }
+ 
+-fn compile_schema(
+-    schema: &Value,
+-) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {
+-    jsonschema::validator_for(schema)
+-}
+-
+ fn contains_routing_field(obj: &serde_json::Map<String, Value>) -> bool {
+     ROUTING_STATUS_FIELDS
+         .iter()
+@@ -360,28 +363,32 @@ fn raw_mentions_routing_field(candidate: &str) -> bool {
+         .any(|field| candidate.contains(&format!("\"{field}\"")))
+ }
+ 
+-fn routing_schema() -> Value {
+-    serde_json::json!({
+-        "type": "object",
+-        "additionalProperties": true,
+-        "properties": {
+-            "preferred_next_label": { "type": "string" },
+-            "outcome": {
+-                "type": "string",
+-                "enum": ["succeeded", "partially_succeeded", "failed", "skipped"]
+-            },
+-            "failure_reason": { "type": "string" },
+-            "suggested_next_ids": {
+-                "type": "array",
+-                "items": { "type": "string" }
++fn routing_validator() -> &'static Validator {
++    static ROUTING_VALIDATOR: LazyLock<Validator> = LazyLock::new(|| {
++        let schema = serde_json::json!({
++            "type": "object",
++            "additionalProperties": true,
++            "properties": {
++                "preferred_next_label": { "type": "string" },
++                "outcome": {
++                    "type": "string",
++                    "enum": ["succeeded", "partially_succeeded", "failed", "skipped"]
++                },
++                "failure_reason": { "type": "string" },
++                "suggested_next_ids": {
++                    "type": "array",
++                    "items": { "type": "string" }
++                },
++                "context_updates": { "type": "object" }
+             },
+-            "context_updates": { "type": "object" }
+-        },
+-        "anyOf": ROUTING_STATUS_FIELDS
+-            .iter()
+-            .map(|field| serde_json::json!({ "required": [field] }))
+-            .collect::<Vec<_>>()
+-    })
++            "anyOf": ROUTING_STATUS_FIELDS
++                .iter()
++                .map(|field| serde_json::json!({ "required": [field] }))
++                .collect::<Vec<_>>()
++        });
++        jsonschema::validator_for(&schema).expect("built-in routing schema must compile")
++    });
++    &ROUTING_VALIDATOR
+ }
+ 
+ fn apply_routing_fields(value: &Value, outcome: &mut Outcome) {
+@@ -433,7 +440,12 @@ mod tests {
+     }
+ 
+     fn schema(value: Value) -> OutputSchemaKind {
+-        OutputSchemaKind::JsonSchema { schema: value }
++        let validator =
++            jsonschema::validator_for(&value).expect("test schema should be a valid JSON Schema");
++        OutputSchemaKind::JsonSchema {
++            schema:    value,
++            validator: Arc::new(validator),
++        }
+     }
+ 
+     #[test]
+@@ -572,7 +584,7 @@ mod tests {
+ 
+         let parsed = parse_node_output_schema(&node).unwrap();
+ 
+-        assert_eq!(parsed, Some(OutputSchemaKind::Routing));
++        assert!(matches!(parsed, Some(OutputSchemaKind::Routing)));
+     }
+ 
+     #[test]

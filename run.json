@@ -492,7 +492,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T19:56:01.493793Z",
-  "last_event_at": "2026-05-23T20:42:40.964151Z",
+  "last_event_at": "2026-05-23T20:46:05.671722Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -862,9 +862,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1352,
       "checkpoint": {
-        "timestamp": "2026-05-23T20:42:41.068135Z",
+        "timestamp": "2026-05-23T20:42:44.765243Z",
         "current_node": "simplify_opus",
         "completed_nodes": [
           "start",
@@ -876,36 +876,81 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.retry_count.implement": 0,
-          "failure_class": "",
-          "internal.run_id": "01KSB6GTZ00T5V6BNMXN3SPKZF",
-          "thread.toolchain.current_node": "preflight_compile",
-          "current_node": "simplify_opus",
-          "thread.preflight_compile.current_node": "preflight_lint",
-          "thread.preflight_lint.current_node": "implement",
-          "internal.retry_count.preflight_lint": 0,
-          "response.implement": "Implemented output schema validation end-to-end.\n\nSummary:\n- Added `output_schema` / `output_retries` node attrs.\n- Added `output_schema` static/file reference handling and inlining.\n- Added `handler::structured_output` for:\n  - routing/custom schema parsing\n  - balanced JSON extraction\n  - JSON Schema validation\n  - repair prompts\n  - routing/custom context application\n- Integrated strict routing/custom output into agent and prompt handlers.\n- Added same-context repair for:\n  - prompt API calls via mutable message history\n  - agent API sessions via the same live `Session`\n- Added ACP guardrail:\n  - `output_schema is not supported with backend=\"acp\" in this release`\n  - test verifies no process launch\n- Added custom output storage at `output.{node_id}`.\n- Updated docs for routing/custom schemas, `output_retries`, repair behavior, ACP limitation.\n\nValidation run:\n- `cargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference` ✅\n- `cargo nextest run -p fabro-workflow` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo insta pending-snapshots` unavailable in this environment (`cargo-insta` not installed); checked for `**/*.snap.new` and found none.",
-          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
-          "internal.fidelity": "compact",
-          "last_response": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n*",
-          "last_stage": "simplify_opus",
-          "internal.thread_id": "implement",
-          "failure_signature": "",
-          "graph.goal": "# Output Schema Validation Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `output_schema` validation for agent and prompt nodes, with context-preserving repair turns when structured output does not validate.\n\n**Architecture:** Introduce a small structured-output layer in `fabro-workflow` that resolves node-level schema declarations, extracts JSON output, validates it, and produces either routing side effects or a parsed custom output context update. Agent and prompt execution must perform schema repair inside the active LLM conversation instead of using the workflow executor retry path.\n\n**Tech Stack:** Rust, Graphviz workflow attrs, `serde_json`, workspace `jsonschema`, existing `fabro-llm::ResponseFormat`, Fabro agent sessions, `cargo nextest`.\n\n---\n\n## Public Interface\n\nWorkflow authors can opt in on agent and prompt nodes:\n\n```dot\nreview [\n  shape=tab,\n  output_schema=\"routing\",\n  output_retries=2\n]\n\naudit [\n  shape=tab,\n  output_schema=\"@schemas/audit-result.schema.json\",\n  output_retries=2\n]\n```\n\n- `output_schema=\"routing\"` uses Fabro's built-in routing directive schema.\n- `output_schema=\"@path/to/schema.json\"` loads a JSON Schema file through existing workflow file-reference rules.\n- `output_retries` controls corrective turns inside the same node execution. Default: `2`. `0` means validate once and fail without a repair turn.\n- Schema failures are terminal node failures after `output_retries` is exhausted. They are not `retry_requested` outcomes and do not consume `max_retries`.\n- `backend=\"acp\"` with `output_schema` is unsupported in v1 and returns a clear validation error.\n\n## Implementation Tasks\n\n### Task 1: Node Attributes And File Reference Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/graph.rs`\n- Modify: `lib/crates/fabro-workflow/src/static_reference.rs`\n- Modify: `lib/crates/fabro-workflow/src/transforms/file_inlining.rs`\n- Test: existing unit tests in those files\n\n- [ ] Add `Node::output_schema(&self) -> Option<&str>` next to other agent/prompt attrs.\n- [ ] Add `Node::output_retries(&self) -> i64` returning `self.int_attr(\"output_retries\").unwrap_or(2).max(0)`.\n- [ ] Teach static reference validation that node attr `output_schema` values starting with `@` are file inline references.\n- [ ] Extend file inlining so `output_schema=\"@schemas/foo.json\"` is replaced with the schema file contents before execution, while `output_schema=\"routing\"` stays unchanged.\n- [ ] Add tests for absent attrs, default retries, zero retries, file inlining, and unresolved schema reference diagnostics.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference\n```\n\nExpected: targeted tests pass.\n\n### Task 2: Structured Output Module\n\n**Files:**\n- Create: `lib/crates/fabro-workflow/src/handler/structured_output.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/mod.rs`\n- Modify: `lib/crates/fabro-workflow/Cargo.toml`\n- Test: unit tests in `structured_output.rs`\n\n- [ ] Add `jsonschema.workspace = true` to `fabro-workflow` dependencies.\n- [ ] Define `OutputSchemaKind` with `Routing` and `JsonSchema { schema: serde_json::Value }`.\n- [ ] Parse `node.output_schema()` into `None`, `Routing`, or custom JSON Schema. Treat literal `routing` as the only built-in keyword.\n- [ ] Add a built-in routing schema requiring an object with at least one recognized field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.\n- [ ] Reuse balanced-object scanning semantics for response text: validate the last JSON object that is relevant to the selected schema.\n- [ ] Return a structured validation result containing the parsed JSON object, concise error messages, and enough information to build a repair prompt.\n- [ ] Add tests for valid routing JSON, missing routing fields, wrong routing field types, valid custom schema, invalid custom schema, invalid JSON, and no JSON object.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow structured_output\n```\n\nExpected: structured-output unit tests pass.\n\n### Task 3: Routing Extraction Compatibility\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: existing agent handler unit tests\n\n- [ ] Keep the loose default unchanged when `output_schema` is absent.\n- [ ] Move current `STATUS_FIELDS`, balanced JSON scanning, and routing-field application behind reusable functions in `structured_output.rs` or call the new module from `agent.rs`.\n- [ ] For `output_schema=\"routing\"`, require schema-valid routing JSON and surface validation failures for repair instead of silently ignoring bad candidates.\n- [ ] Preserve existing routing fallback priority for agent nodes: response text first, then `status.json`, then last file touched.\n- [ ] Keep prompt-node routing behavior response-only unless later tasks explicitly add prompt `status.json` support.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent\n```\n\nExpected: existing loose routing tests still pass, plus new strict routing tests pass.\n\n### Task 4: Prompt Node Same-Context Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/prompt.rs`\n- Test: prompt/API backend tests in those files\n\n- [ ] In `AgentApiBackend::one_shot`, keep `messages` mutable across attempts.\n- [ ] When a prompt node has a custom JSON Schema, set `response_format=JsonSchema` on the initial and repair LLM requests. For `routing`, use `JsonObject` or no provider-native schema if provider behavior would conflict with Fabro's routing extraction.\n- [ ] After each LLM response, validate according to `output_schema`.\n- [ ] On validation failure with repair attempts remaining, append `Message::assistant(response.text())`, then append a corrective `Message::user(repair_message)`, and call `client.complete` again with the same messages.\n- [ ] On success, return the validated response text and aggregate usage across all attempts.\n- [ ] On exhaustion, return a terminal failed outcome with failure reason `output schema validation failed after N repair attempt(s)`.\n- [ ] Update `PromptHandler` so validated custom output is added to `context_updates[\"output.{node_id}\"]`; routing output still updates outcome routing fields.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::prompt handler::llm::api\n```\n\nExpected: prompt repair keeps previous assistant output in the message list and succeeds after a corrective response.\n\n### Task 5: Agent Node Same-Session Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: agent/API backend tests in those files\n\n- [ ] In `AgentApiBackend::run`, validate the final assistant response before releasing, closing, or caching the session.\n- [ ] On validation failure with repair attempts remaining, call `session.process_input(repair_message)` on the same `Session`.\n- [ ] Recompute the final assistant response after each repair turn from `session.history()`.\n- [ ] Aggregate usage across all new assistant turns, including repair turns, without double-counting reused session history.\n- [ ] Do not set provider-native `response_format` for agent sessions in v1, because agent sessions may need normal tool-use messages before final output.\n- [ ] Return terminal failure after exhaustion; do not return a retryable backend error and do not request workflow node retry.\n- [ ] Update `AgentHandler` to apply validated routing/custom output to the final `Outcome`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent handler::llm::api\n```\n\nExpected: agent repair sends a second `process_input` to the same session and final validated output drives outcome/context updates.\n\n### Task 6: ACP Guardrail\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/acp.rs`\n- Test: ACP backend tests in that file\n\n- [ ] At the start of `AgentAcpBackend::run`, reject nodes where `node.output_schema().is_some()`.\n- [ ] Use a clear error message: `output_schema is not supported with backend=\"acp\" in this release`.\n- [ ] Add a test proving the ACP backend does not launch a process when `output_schema` is present.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::llm::acp\n```\n\nExpected: ACP guardrail test passes.\n\n### Task 7: Docs\n\n**Files:**\n- Modify: `docs/public/agents/outputs.mdx`\n- Modify: `docs/public/reference/dot-language.mdx`\n\n- [ ] Document `output_schema=\"routing\"` and `output_schema=\"@schema.json\"` under routing/structured outputs.\n- [ ] Document same-context repair behavior explicitly: Fabro sends validation feedback to the same agent/prompt context before failing.\n- [ ] Document `output_retries`, default `2`, and distinction from `max_retries`.\n- [ ] Document v1 scope: agent/prompt nodes only; ACP unsupported; custom schema output stored at `output.{node_id}`.\n\nRun:\n\n```bash\nrg -n \"output_schema|output_retries|output\\\\.\" docs/public/agents/outputs.mdx docs/public/reference/dot-language.mdx\n```\n\nExpected: docs mention the new attrs and storage behavior.\n\n### Task 8: Full Verification\n\n**Files:**\n- No new files beyond prior tasks\n\n- [ ] Run focused workflow tests:\n\n```bash\ncargo nextest run -p fabro-workflow\n```\n\n- [ ] Run formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] If snapshots change, inspect before accepting:\n\n```bash\ncargo insta pending-snapshots\n```\n\nOnly run `cargo insta accept` after verifying every pending snapshot is expected.\n\n## Acceptance Criteria\n\n- Existing workflows without `output_schema` behave exactly as before.\n- `output_schema=\"routing\"` prevents malformed/missing routing JSON from silently falling through to normal edge selection.\n- Invalid structured output results in a corrective LLM turn in the same context window.\n- Prompt repair preserves previous assistant output in the message list.\n- Agent repair preserves the same live session and does not re-run the node from scratch.\n- Exhausted output repair attempts produce a clear terminal failure.\n- Custom schema output is available to downstream nodes at `output.{node_id}`.\n- Docs clearly distinguish `output_retries` from `max_retries`.\n\n## Assumptions\n\n- `output_retries=2` is the default.\n- Custom schema validation targets the final JSON object in the response text.\n- `status.json` fallback remains routing-specific.\n- Provider-native response schema is used for prompt nodes only where it is safe.\n- ACP support can be added later after there is a guaranteed context-preserving repair mechanism.\n",
-          "internal.retry_count.toolchain": 0,
-          "thread.implement.current_node": "simplify_opus",
           "internal.retry_count.start": 0,
           "graph.rankdir": "LR",
-          "thread.start.current_node": "toolchain",
-          "internal.node_visit_count": 1,
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "internal.retry_count.preflight_compile": 0,
           "internal.retry_count.simplify_opus": 0,
+          "internal.run_id": "01KSB6GTZ00T5V6BNMXN3SPKZF",
+          "thread.start.current_node": "toolchain",
+          "thread.implement.current_node": "simplify_opus",
+          "last_stage": "simplify_opus",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "response.implement": "Implemented output schema validation end-to-end.\n\nSummary:\n- Added `output_schema` / `output_retries` node attrs.\n- Added `output_schema` static/file reference handling and inlining.\n- Added `handler::structured_output` for:\n  - routing/custom schema parsing\n  - balanced JSON extraction\n  - JSON Schema validation\n  - repair prompts\n  - routing/custom context application\n- Integrated strict routing/custom output into agent and prompt handlers.\n- Added same-context repair for:\n  - prompt API calls via mutable message history\n  - agent API sessions via the same live `Session`\n- Added ACP guardrail:\n  - `output_schema is not supported with backend=\"acp\" in this release`\n  - test verifies no process launch\n- Added custom output storage at `output.{node_id}`.\n- Updated docs for routing/custom schemas, `output_retries`, repair behavior, ACP limitation.\n\nValidation run:\n- `cargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference` ✅\n- `cargo nextest run -p fabro-workflow` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo insta pending-snapshots` unavailable in this environment (`cargo-insta` not installed); checked for `**/*.snap.new` and found none.",
+          "thread.preflight_lint.current_node": "implement",
+          "failure_class": "",
+          "current_node": "simplify_opus",
+          "failure_signature": "",
+          "internal.retry_count.toolchain": 0,
           "outcome": "succeeded",
-          "response.simplify_opus": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n**Fixed:**\n1. **Schema compiled twice per node** (efficiency #1, reuse #3, quality #1) — `OutputSchemaKind::JsonSchema` now stores an `Arc<jsonschema::Validator>` compiled once in `parse_node_output_schema`; the routing validator is a `LazyLock<Validator>`, so repair iterations no longer recompile. Also removed the redundant `compile_schema` helper.\n2. **`read_sandbox_file` reimplemented `Sandbox::read_file_text`** (reuse #2) — replaced the `cat <quoted>` exec_command call with the existing trait method; dropped the unused `shell_quote` import and the magic 5s timeout.\n3. **Redundant re-validation** in `validate_agent_output_sources` (efficiency #6) — bound the first error and reused it instead of calling `validate_response_text` again just to `.expect_err(...)`.\n4. **`OneShotCompletion::actual_speed` was always `controls.speed`** (quality #2, reuse #4) — collapsed the three `actual_*` fields into a single `model: ModelRef`, removing the manual reconstruction one line later.\n5. **`extract_status_fields` wrapper deletion** (reuse #1, quality #5) — renamed `extract_status_fields_loose` → `extract_status_fields` in `structured_output.rs`; agent.rs re-exports it so existing call sites (including `prompt.rs`) work unchanged.\n6. **`find_json_objects` visibility** (quality #6) — tightened from `pub(crate)` to `fn`.\n7. **`last_touched_file` cheap accessor** (efficiency #5) — added a tiny helper that grabs only `.last`; the repair loop no longer clones+sorts the full `touched` set each iteration.\n8. **`ROUTING_KEYWORD` constant** (quality #8) — extracted the literal `\"routing\"` to a const used by `parse_node_output_schema`.\n\n**Skipped:**\n- Folding `Error::OutputSchemaValidation` into `Error::Validation` — `Validation` adds a `\"Validation error: \"` prefix that would change user-visible failure messages and downstream event content. Not worth the drift for one extra enum variant.\n- Other suggestions (request structs for multi-param functions, deduping the two repair loops across `one_shot`/`run`, moving `validate_agent_output_sources` into `structured_output.rs`, collapsing `StructuredOutputErrorKind`) — judged as larger refactors with no clear correctness payoff for this iteration.\n\n**Verification:** `cargo nextest run -p fabro-types -p fabro-workflow` → 1461 tests pass; `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean; `cargo +nightly-2026-04-14 fmt --check --all` clean."
+          "thread.toolchain.current_node": "preflight_compile",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.thread_id": "implement",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "graph.goal": "# Output Schema Validation Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `output_schema` validation for agent and prompt nodes, with context-preserving repair turns when structured output does not validate.\n\n**Architecture:** Introduce a small structured-output layer in `fabro-workflow` that resolves node-level schema declarations, extracts JSON output, validates it, and produces either routing side effects or a parsed custom output context update. Agent and prompt execution must perform schema repair inside the active LLM conversation instead of using the workflow executor retry path.\n\n**Tech Stack:** Rust, Graphviz workflow attrs, `serde_json`, workspace `jsonschema`, existing `fabro-llm::ResponseFormat`, Fabro agent sessions, `cargo nextest`.\n\n---\n\n## Public Interface\n\nWorkflow authors can opt in on agent and prompt nodes:\n\n```dot\nreview [\n  shape=tab,\n  output_schema=\"routing\",\n  output_retries=2\n]\n\naudit [\n  shape=tab,\n  output_schema=\"@schemas/audit-result.schema.json\",\n  output_retries=2\n]\n```\n\n- `output_schema=\"routing\"` uses Fabro's built-in routing directive schema.\n- `output_schema=\"@path/to/schema.json\"` loads a JSON Schema file through existing workflow file-reference rules.\n- `output_retries` controls corrective turns inside the same node execution. Default: `2`. `0` means validate once and fail without a repair turn.\n- Schema failures are terminal node failures after `output_retries` is exhausted. They are not `retry_requested` outcomes and do not consume `max_retries`.\n- `backend=\"acp\"` with `output_schema` is unsupported in v1 and returns a clear validation error.\n\n## Implementation Tasks\n\n### Task 1: Node Attributes And File Reference Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/graph.rs`\n- Modify: `lib/crates/fabro-workflow/src/static_reference.rs`\n- Modify: `lib/crates/fabro-workflow/src/transforms/file_inlining.rs`\n- Test: existing unit tests in those files\n\n- [ ] Add `Node::output_schema(&self) -> Option<&str>` next to other agent/prompt attrs.\n- [ ] Add `Node::output_retries(&self) -> i64` returning `self.int_attr(\"output_retries\").unwrap_or(2).max(0)`.\n- [ ] Teach static reference validation that node attr `output_schema` values starting with `@` are file inline references.\n- [ ] Extend file inlining so `output_schema=\"@schemas/foo.json\"` is replaced with the schema file contents before execution, while `output_schema=\"routing\"` stays unchanged.\n- [ ] Add tests for absent attrs, default retries, zero retries, file inlining, and unresolved schema reference diagnostics.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference\n```\n\nExpected: targeted tests pass.\n\n### Task 2: Structured Output Module\n\n**Files:**\n- Create: `lib/crates/fabro-workflow/src/handler/structured_output.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/mod.rs`\n- Modify: `lib/crates/fabro-workflow/Cargo.toml`\n- Test: unit tests in `structured_output.rs`\n\n- [ ] Add `jsonschema.workspace = true` to `fabro-workflow` dependencies.\n- [ ] Define `OutputSchemaKind` with `Routing` and `JsonSchema { schema: serde_json::Value }`.\n- [ ] Parse `node.output_schema()` into `None`, `Routing`, or custom JSON Schema. Treat literal `routing` as the only built-in keyword.\n- [ ] Add a built-in routing schema requiring an object with at least one recognized field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.\n- [ ] Reuse balanced-object scanning semantics for response text: validate the last JSON object that is relevant to the selected schema.\n- [ ] Return a structured validation result containing the parsed JSON object, concise error messages, and enough information to build a repair prompt.\n- [ ] Add tests for valid routing JSON, missing routing fields, wrong routing field types, valid custom schema, invalid custom schema, invalid JSON, and no JSON object.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow structured_output\n```\n\nExpected: structured-output unit tests pass.\n\n### Task 3: Routing Extraction Compatibility\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: existing agent handler unit tests\n\n- [ ] Keep the loose default unchanged when `output_schema` is absent.\n- [ ] Move current `STATUS_FIELDS`, balanced JSON scanning, and routing-field application behind reusable functions in `structured_output.rs` or call the new module from `agent.rs`.\n- [ ] For `output_schema=\"routing\"`, require schema-valid routing JSON and surface validation failures for repair instead of silently ignoring bad candidates.\n- [ ] Preserve existing routing fallback priority for agent nodes: response text first, then `status.json`, then last file touched.\n- [ ] Keep prompt-node routing behavior response-only unless later tasks explicitly add prompt `status.json` support.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent\n```\n\nExpected: existing loose routing tests still pass, plus new strict routing tests pass.\n\n### Task 4: Prompt Node Same-Context Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/prompt.rs`\n- Test: prompt/API backend tests in those files\n\n- [ ] In `AgentApiBackend::one_shot`, keep `messages` mutable across attempts.\n- [ ] When a prompt node has a custom JSON Schema, set `response_format=JsonSchema` on the initial and repair LLM requests. For `routing`, use `JsonObject` or no provider-native schema if provider behavior would conflict with Fabro's routing extraction.\n- [ ] After each LLM response, validate according to `output_schema`.\n- [ ] On validation failure with repair attempts remaining, append `Message::assistant(response.text())`, then append a corrective `Message::user(repair_message)`, and call `client.complete` again with the same messages.\n- [ ] On success, return the validated response text and aggregate usage across all attempts.\n- [ ] On exhaustion, return a terminal failed outcome with failure reason `output schema validation failed after N repair attempt(s)`.\n- [ ] Update `PromptHandler` so validated custom output is added to `context_updates[\"output.{node_id}\"]`; routing output still updates outcome routing fields.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::prompt handler::llm::api\n```\n\nExpected: prompt repair keeps previous assistant output in the message list and succeeds after a corrective response.\n\n### Task 5: Agent Node Same-Session Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: agent/API backend tests in those files\n\n- [ ] In `AgentApiBackend::run`, validate the final assistant response before releasing, closing, or caching the session.\n- [ ] On validation failure with repair attempts remaining, call `session.process_input(repair_message)` on the same `Session`.\n- [ ] Recompute the final assistant response after each repair turn from `session.history()`.\n- [ ] Aggregate usage across all new assistant turns, including repair turns, without double-counting reused session history.\n- [ ] Do not set provider-native `response_format` for agent sessions in v1, because agent sessions may need normal tool-use messages before final output.\n- [ ] Return terminal failure after exhaustion; do not return a retryable backend error and do not request workflow node retry.\n- [ ] Update `AgentHandler` to apply validated routing/custom output to the final `Outcome`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent handler::llm::api\n```\n\nExpected: agent repair sends a second `process_input` to the same session and final validated output drives outcome/context updates.\n\n### Task 6: ACP Guardrail\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/acp.rs`\n- Test: ACP backend tests in that file\n\n- [ ] At the start of `AgentAcpBackend::run`, reject nodes where `node.output_schema().is_some()`.\n- [ ] Use a clear error message: `output_schema is not supported with backend=\"acp\" in this release`.\n- [ ] Add a test proving the ACP backend does not launch a process when `output_schema` is present.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::llm::acp\n```\n\nExpected: ACP guardrail test passes.\n\n### Task 7: Docs\n\n**Files:**\n- Modify: `docs/public/agents/outputs.mdx`\n- Modify: `docs/public/reference/dot-language.mdx`\n\n- [ ] Document `output_schema=\"routing\"` and `output_schema=\"@schema.json\"` under routing/structured outputs.\n- [ ] Document same-context repair behavior explicitly: Fabro sends validation feedback to the same agent/prompt context before failing.\n- [ ] Document `output_retries`, default `2`, and distinction from `max_retries`.\n- [ ] Document v1 scope: agent/prompt nodes only; ACP unsupported; custom schema output stored at `output.{node_id}`.\n\nRun:\n\n```bash\nrg -n \"output_schema|output_retries|output\\\\.\" docs/public/agents/outputs.mdx docs/public/reference/dot-language.mdx\n```\n\nExpected: docs mention the new attrs and storage behavior.\n\n### Task 8: Full Verification\n\n**Files:**\n- No new files beyond prior tasks\n\n- [ ] Run focused workflow tests:\n\n```bash\ncargo nextest run -p fabro-workflow\n```\n\n- [ ] Run formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] If snapshots change, inspect before accepting:\n\n```bash\ncargo insta pending-snapshots\n```\n\nOnly run `cargo insta accept` after verifying every pending snapshot is expected.\n\n## Acceptance Criteria\n\n- Existing workflows without `output_schema` behave exactly as before.\n- `output_schema=\"routing\"` prevents malformed/missing routing JSON from silently falling through to normal edge selection.\n- Invalid structured output results in a corrective LLM turn in the same context window.\n- Prompt repair preserves previous assistant output in the message list.\n- Agent repair preserves the same live session and does not re-run the node from scratch.\n- Exhausted output repair attempts produce a clear terminal failure.\n- Custom schema output is available to downstream nodes at `output.{node_id}`.\n- Docs clearly distinguish `output_retries` from `max_retries`.\n\n## Assumptions\n\n- `output_retries=2` is the default.\n- Custom schema validation targets the final JSON object in the response text.\n- `status.json` fallback remains routing-specific.\n- Provider-native response schema is used for prompt nodes only where it is safe.\n- ACP support can be added later after there is a guaranteed context-preserving repair mechanism.\n",
+          "internal.node_visit_count": 1,
+          "last_response": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n*",
+          "response.simplify_opus": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n**Fixed:**\n1. **Schema compiled twice per node** (efficiency #1, reuse #3, quality #1) — `OutputSchemaKind::JsonSchema` now stores an `Arc<jsonschema::Validator>` compiled once in `parse_node_output_schema`; the routing validator is a `LazyLock<Validator>`, so repair iterations no longer recompile. Also removed the redundant `compile_schema` helper.\n2. **`read_sandbox_file` reimplemented `Sandbox::read_file_text`** (reuse #2) — replaced the `cat <quoted>` exec_command call with the existing trait method; dropped the unused `shell_quote` import and the magic 5s timeout.\n3. **Redundant re-validation** in `validate_agent_output_sources` (efficiency #6) — bound the first error and reused it instead of calling `validate_response_text` again just to `.expect_err(...)`.\n4. **`OneShotCompletion::actual_speed` was always `controls.speed`** (quality #2, reuse #4) — collapsed the three `actual_*` fields into a single `model: ModelRef`, removing the manual reconstruction one line later.\n5. **`extract_status_fields` wrapper deletion** (reuse #1, quality #5) — renamed `extract_status_fields_loose` → `extract_status_fields` in `structured_output.rs`; agent.rs re-exports it so existing call sites (including `prompt.rs`) work unchanged.\n6. **`find_json_objects` visibility** (quality #6) — tightened from `pub(crate)` to `fn`.\n7. **`last_touched_file` cheap accessor** (efficiency #5) — added a tiny helper that grabs only `.last`; the repair loop no longer clones+sorts the full `touched` set each iteration.\n8. **`ROUTING_KEYWORD` constant** (quality #8) — extracted the literal `\"routing\"` to a const used by `parse_node_output_schema`.\n\n**Skipped:**\n- Folding `Error::OutputSchemaValidation` into `Error::Validation` — `Validation` adds a `\"Validation error: \"` prefix that would change user-visible failure messages and downstream event content. Not worth the drift for one extra enum variant.\n- Other suggestions (request structs for multi-param functions, deduping the two repair loops across `one_shot`/`run`, moving `validate_agent_output_sources` into `structured_output.rs`, collapsing `StructuredOutputErrorKind`) — judged as larger refactors with no clear correctness payoff for this iteration.\n\n**Verification:** `cargo nextest run -p fabro-types -p fabro-workflow` → 1461 tests pass; `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean; `cargo +nightly-2026-04-14 fmt --check --all` clean.",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.implement": 0
         },
         "node_outcomes": {
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_opus",
+              "last_response": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n*",
+              "response.simplify_opus": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n**Fixed:**\n1. **Schema compiled twice per node** (efficiency #1, reuse #3, quality #1) — `OutputSchemaKind::JsonSchema` now stores an `Arc<jsonschema::Validator>` compiled once in `parse_node_output_schema`; the routing validator is a `LazyLock<Validator>`, so repair iterations no longer recompile. Also removed the redundant `compile_schema` helper.\n2. **`read_sandbox_file` reimplemented `Sandbox::read_file_text`** (reuse #2) — replaced the `cat <quoted>` exec_command call with the existing trait method; dropped the unused `shell_quote` import and the magic 5s timeout.\n3. **Redundant re-validation** in `validate_agent_output_sources` (efficiency #6) — bound the first error and reused it instead of calling `validate_response_text` again just to `.expect_err(...)`.\n4. **`OneShotCompletion::actual_speed` was always `controls.speed`** (quality #2, reuse #4) — collapsed the three `actual_*` fields into a single `model: ModelRef`, removing the manual reconstruction one line later.\n5. **`extract_status_fields` wrapper deletion** (reuse #1, quality #5) — renamed `extract_status_fields_loose` → `extract_status_fields` in `structured_output.rs`; agent.rs re-exports it so existing call sites (including `prompt.rs`) work unchanged.\n6. **`find_json_objects` visibility** (quality #6) — tightened from `pub(crate)` to `fn`.\n7. **`last_touched_file` cheap accessor** (efficiency #5) — added a tiny helper that grabs only `.last`; the repair loop no longer clones+sorts the full `touched` set each iteration.\n8. **`ROUTING_KEYWORD` constant** (quality #8) — extracted the literal `\"routing\"` to a const used by `parse_node_output_schema`.\n\n**Skipped:**\n- Folding `Error::OutputSchemaValidation` into `Error::Validation` — `Validation` adds a `\"Validation error: \"` prefix that would change user-visible failure messages and downstream event content. Not worth the drift for one extra enum variant.\n- Other suggestions (request structs for multi-param functions, deduping the two repair loops across `one_shot`/`run`, moving `validate_agent_output_sources` into `structured_output.rs`, collapsing `StructuredOutputErrorKind`) — judged as larger refactors with no clear correctness payoff for this iteration.\n\n**Verification:** `cargo nextest run -p fabro-types -p fabro-workflow` → 1461 tests pass; `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean; `cargo +nightly-2026-04-14 fmt --check --all` clean."
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 141487,
+                    "output_tokens": 35894,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 8125892,
+                    "cache_write_tokens": 684904
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 684904,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 9948381
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/agent.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/llm/api.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/structured_output.rs"
+            ]
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
           "start": {
             "status": "succeeded",
             "usage": null
@@ -918,12 +963,12 @@
             "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
             "usage": null
           },
-          "preflight_compile": {
+          "preflight_lint": {
             "status": "succeeded",
             "context_updates": {
               "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
             },
-            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
             "usage": null
           },
           "implement": {
@@ -958,14 +1003,117 @@
             "files_touched": [
               "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/structured_output.rs"
             ]
-          },
-          "preflight_lint": {
+          }
+        },
+        "next_node_id": "simplify_gpt",
+        "git_commit_sha": "d747924471dce55386a41df0dcafbf1dba5768e3",
+        "node_visits": {
+          "implement": 1,
+          "preflight_compile": 1,
+          "preflight_lint": 1,
+          "simplify_opus": 1,
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-workflow/src/handler/agent.rs b/lib/crates/fabro-workflow/src/handler/agent.rs\nindex 0f2118df8..95bc502b4 100644\n--- a/lib/crates/fabro-workflow/src/handler/agent.rs\n+++ b/lib/crates/fabro-workflow/src/handler/agent.rs\n@@ -2,9 +2,10 @@ use std::path::Path;\n use std::sync::Arc;\n \n use async_trait::async_trait;\n-use fabro_agent::{Sandbox, shell_quote};\n+use fabro_agent::Sandbox;\n use fabro_graphviz::graph::{Graph, Node};\n use fabro_types::{RunId, StageModelUsage};\n+pub(crate) use structured_output::extract_status_fields;\n use tokio_util::sync::CancellationToken;\n \n use super::llm::api::EffectiveRequestControls;\n@@ -133,15 +134,6 @@ impl AgentHandler {\n     }\n }\n \n-/// Extract routing directives from LLM response text.\n-///\n-/// Searches for the last JSON object in the response that contains at least\n-/// one status field (`preferred_next_label`, `outcome`, `suggested_next_ids`,\n-/// `context_updates`). Merges extracted fields into the outcome.\n-pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {\n-    structured_output::extract_status_fields_loose(text, outcome)\n-}\n-\n pub(crate) async fn validate_agent_output_sources(\n     schema: &OutputSchemaKind,\n     response_text: &str,\n@@ -152,18 +144,18 @@ pub(crate) async fn validate_agent_output_sources(\n         return structured_output::validate_response_text(schema, response_text);\n     }\n \n-    match structured_output::validate_response_text(schema, response_text) {\n+    let initial_error = match structured_output::validate_response_text(schema, response_text) {\n         Ok(validated) => return Ok(validated),\n-        Err(error) if error.allows_routing_fallback() => {}\n+        Err(error) if error.allows_routing_fallback() => error,\n         Err(error) => return Err(error),\n-    }\n+    };\n \n-    let mut fallback_error = None;\n+    let mut fallback_error = initial_error;\n     if let Some(status_json) = read_sandbox_file(sandbox, \"status.json\").await {\n         match structured_output::validate_response_text(schema, &status_json) {\n             Ok(validated) => return Ok(validated),\n             Err(error) if error.allows_routing_fallback() => {\n-                fallback_error = Some(error);\n+                fallback_error = error;\n             }\n             Err(error) => return Err(error),\n         }\n@@ -175,23 +167,11 @@ pub(crate) async fn validate_agent_output_sources(\n         }\n     }\n \n-    Err(fallback_error.unwrap_or_else(|| {\n-        structured_output::validate_response_text(schema, response_text)\n-            .expect_err(\"response text should have failed routing validation\")\n-    }))\n+    Err(fallback_error)\n }\n \n async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {\n-    let cmd = format!(\"cat {}\", shell_quote(path));\n-    let result = sandbox\n-        .exec_command(&cmd, 5_000, None, None, None)\n-        .await\n-        .ok()?;\n-    if result.is_success() {\n-        Some(result.stdout)\n-    } else {\n-        None\n-    }\n+    sandbox.read_file_text(path).await.ok()\n }\n \n /// Truncate a string to at most `max_chars` characters (char-boundary safe).\ndiff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs\nindex 22d08dc4b..8a92973df 100644\n--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs\n+++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs\n@@ -474,6 +474,10 @@ fn file_tracking_snapshot(\n     (files, state.last.clone())\n }\n \n+fn last_touched_file(file_tracking: &Arc<Mutex<FileTracking>>) -> Option<String> {\n+    file_tracking.lock().unwrap().last.clone()\n+}\n+\n fn last_assistant_response(session: &Session) -> String {\n     session\n         .history()\n@@ -553,10 +557,8 @@ pub struct AgentApiBackend {\n }\n \n struct OneShotCompletion {\n-    response:        Response,\n-    actual_model:    String,\n-    actual_provider: String,\n-    actual_speed:    Option<Speed>,\n+    response: Response,\n+    model:    ModelRef,\n }\n \n impl AgentApiBackend {\n@@ -864,16 +866,17 @@ impl AgentApiBackend {\n         let result = client.complete(request).await;\n         let default_provider = self.provider_id.to_string();\n \n-        let (response, actual_model, actual_provider, actual_speed) = match result {\n-            Ok(resp) => (\n-                resp,\n-                request.model.clone(),\n-                request\n-                    .provider\n-                    .clone()\n-                    .unwrap_or_else(|| default_provider.clone()),\n-                controls.speed,\n-            ),\n+        let (response, model) = match result {\n+            Ok(resp) => (resp, ModelRef {\n+                provider: ProviderId::from(\n+                    request\n+                        .provider\n+                        .clone()\n+                        .unwrap_or_else(|| default_provider.clone()),\n+                ),\n+                model_id: request.model.clone(),\n+                speed:    controls.speed,\n+            }),\n             Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {\n                 let error_msg = sdk_err.to_string();\n                 let from_provider = request\n@@ -916,10 +919,12 @@ impl AgentApiBackend {\n                     match client.complete(&fallback_request).await {\n                         Ok(resp) => {\n                             found = Some(OneShotCompletion {\n-                                response:        resp,\n-                                actual_model:    target.model.clone(),\n-                                actual_provider: target.provider.clone(),\n-                                actual_speed:    controls.speed,\n+                                response: resp,\n+                                model:    ModelRef {\n+                                    provider: ProviderId::from(target.provider.clone()),\n+                                    model_id: target.model.clone(),\n+                                    speed:    controls.speed,\n+                                },\n                             });\n                             break;\n                         }\n@@ -938,12 +943,7 @@ impl AgentApiBackend {\n             Err(sdk_err) => return Err(Error::Llm(sdk_err)),\n         };\n \n-        Ok(OneShotCompletion {\n-            response,\n-            actual_model,\n-            actual_provider,\n-            actual_speed,\n-        })\n+        Ok(OneShotCompletion { response, model })\n     }\n }\n \n@@ -1053,11 +1053,7 @@ impl CodergenBackend for AgentApiBackend {\n \n             let stage_usage = billed_model_usage_from_llm(\n                 self.catalog.as_ref(),\n-                &ModelRef {\n-                    provider: ProviderId::from(completion.actual_provider),\n-                    model_id: completion.actual_model,\n-                    speed:    completion.actual_speed,\n-                },\n+                &completion.model,\n                 &total_usage,\n             )?;\n \n@@ -1362,7 +1358,7 @@ impl CodergenBackend for AgentApiBackend {\n         if let Some(schema) = &output_schema {\n             let mut repair_attempts = 0_i64;\n             loop {\n-                let (_, last_file_touched) = file_tracking_snapshot(&file_tracking);\n+                let last_file_touched = last_touched_file(&file_tracking);\n                 match validate_agent_output_sources(\n                     schema,\n                     &response,\ndiff --git a/lib/crates/fabro-workflow/src/handler/structured_output.rs b/lib/crates/fabro-workflow/src/handler/structured_output.rs\nindex d98a42afb..855d6e456 100644\n--- a/lib/crates/fabro-workflow/src/handler/structured_output.rs\n+++ b/lib/crates/fabro-workflow/src/handler/structured_output.rs\n@@ -1,10 +1,15 @@\n+use std::sync::{Arc, LazyLock};\n+\n use fabro_graphviz::graph::Node;\n use fabro_llm::types::{ResponseFormat, ResponseFormatType};\n+use jsonschema::Validator;\n use serde_json::Value;\n \n use crate::error::Error;\n use crate::outcome::{FailureCategory, FailureDetail, Outcome, StageOutcome};\n \n+pub(crate) const ROUTING_KEYWORD: &str = \"routing\";\n+\n pub(crate) const ROUTING_STATUS_FIELDS: &[&str] = &[\n     \"preferred_next_label\",\n     \"outcome\",\n@@ -13,10 +18,15 @@ pub(crate) const ROUTING_STATUS_FIELDS: &[&str] = &[\n     \"context_updates\",\n ];\n \n-#[derive(Debug, Clone, PartialEq)]\n+/// Parsed `output_schema` declaration with a precompiled validator so that\n+/// repair turns don't recompile the schema on every iteration.\n+#[derive(Debug, Clone)]\n pub(crate) enum OutputSchemaKind {\n     Routing,\n-    JsonSchema { schema: Value },\n+    JsonSchema {\n+        schema:    Value,\n+        validator: Arc<Validator>,\n+    },\n }\n \n #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n@@ -135,7 +145,7 @@ pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchem\n             node.id\n         )));\n     }\n-    if value == \"routing\" {\n+    if value == ROUTING_KEYWORD {\n         return Ok(Some(OutputSchemaKind::Routing));\n     }\n     if value.starts_with('@') {\n@@ -151,13 +161,16 @@ pub(crate) fn parse_node_output_schema(node: &Node) -> Result<Option<OutputSchem\n             node.id\n         ))\n     })?;\n-    compile_schema(&schema).map_err(|err| {\n+    let validator = jsonschema::validator_for(&schema).map_err(|err| {\n         Error::Validation(format!(\n             \"Invalid output_schema for node \\\"{}\\\": {err}\",\n             node.id\n         ))\n     })?;\n-    Ok(Some(OutputSchemaKind::JsonSchema { schema }))\n+    Ok(Some(OutputSchemaKind::JsonSchema {\n+        schema,\n+        validator: Arc::new(validator),\n+    }))\n }\n \n #[must_use]\n@@ -168,7 +181,7 @@ pub(crate) fn prompt_response_format(schema: &OutputSchemaKind) -> ResponseForma\n             json_schema: None,\n             strict:      false,\n         },\n-        OutputSchemaKind::JsonSchema { schema } => ResponseFormat {\n+        OutputSchemaKind::JsonSchema { schema, .. } => ResponseFormat {\n             kind:        ResponseFormatType::JsonSchema,\n             json_schema: Some(schema.clone()),\n             strict:      true,\n@@ -182,7 +195,9 @@ pub(crate) fn validate_response_text(\n ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {\n     match schema {\n         OutputSchemaKind::Routing => validate_routing_response_text(text),\n-        OutputSchemaKind::JsonSchema { schema } => validate_custom_response_text(schema, text),\n+        OutputSchemaKind::JsonSchema { validator, .. } => {\n+            validate_custom_response_text(validator, text)\n+        }\n     }\n }\n \n@@ -203,7 +218,7 @@ pub(crate) fn apply_validated_output(\n }\n \n /// Find all balanced `{...}` JSON object substrings in the text.\n-pub(crate) fn find_json_objects(text: &str) -> Vec<&str> {\n+fn find_json_objects(text: &str) -> Vec<&str> {\n     let mut results = Vec::new();\n     let bytes = text.as_bytes();\n     let mut i = 0;\n@@ -241,7 +256,7 @@ pub(crate) fn find_json_objects(text: &str) -> Vec<&str> {\n     results\n }\n \n-pub(crate) fn extract_status_fields_loose(text: &str, outcome: &mut Outcome) -> bool {\n+pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {\n     let candidates = find_json_objects(text);\n \n     let parsed = candidates.iter().rev().find_map(|candidate| {\n@@ -286,7 +301,7 @@ fn validate_routing_response_text(\n         if !contains_routing_field(obj) {\n             continue;\n         }\n-        validate_value_against_schema(&routing_schema(), &parsed)?;\n+        validate_value_against_validator(routing_validator(), &parsed)?;\n         return Ok(ValidatedStructuredOutput { value: parsed });\n     }\n \n@@ -300,7 +315,7 @@ fn validate_routing_response_text(\n }\n \n fn validate_custom_response_text(\n-    schema: &Value,\n+    validator: &Validator,\n     text: &str,\n ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {\n     let candidates = find_json_objects(text);\n@@ -316,20 +331,14 @@ fn validate_custom_response_text(\n             format!(\"invalid JSON object: {err}\"),\n         )\n     })?;\n-    validate_value_against_schema(schema, &parsed)?;\n+    validate_value_against_validator(validator, &parsed)?;\n     Ok(ValidatedStructuredOutput { value: parsed })\n }\n \n-fn validate_value_against_schema(\n-    schema: &Value,\n+fn validate_value_against_validator(\n+    validator: &Validator,\n     value: &Value,\n ) -> Result<(), StructuredOutputError> {\n-    let validator = compile_schema(schema).map_err(|err| {\n-        StructuredOutputError::new(\n-            StructuredOutputErrorKind::SchemaValidation,\n-            format!(\"invalid JSON Schema: {err}\"),\n-        )\n-    })?;\n     let errors = validator\n         .iter_errors(value)\n         .map(|error| error.to_string())\n@@ -342,12 +351,6 @@ fn validate_value_against_schema(\n     }\n }\n \n-fn compile_schema(\n-    schema: &Value,\n-) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {\n-    jsonschema::validator_for(schema)\n-}\n-\n fn contains_routing_field(obj: &serde_json::Map<String, Value>) -> bool {\n     ROUTING_STATUS_FIELDS\n         .iter()\n@@ -360,28 +363,32 @@ fn raw_mentions_routing_field(candidate: &str) -> bool {\n         .any(|field| candidate.contains(&format!(\"\\\"{field}\\\"\")))\n }\n \n-fn routing_schema() -> Value {\n-    serde_json::json!({\n-        \"type\": \"object\",\n-        \"additionalProperties\": true,\n-        \"properties\": {\n-            \"preferred_next_label\": { \"type\": \"string\" },\n-            \"outcome\": {\n-                \"type\": \"string\",\n-                \"enum\": [\"succeeded\", \"partially_succeeded\", \"failed\", \"skipped\"]\n-            },\n-            \"failure_reason\": { \"type\": \"string\" },\n-            \"suggested_next_ids\": {\n-                \"type\": \"array\",\n-                \"items\": { \"type\": \"string\" }\n+fn routing_validator() -> &'static Validator {\n+    static ROUTING_VALIDATOR: LazyLock<Validator> = LazyLock::new(|| {\n+        let schema = serde_json::json!({\n+            \"type\": \"object\",\n+            \"additionalProperties\": true,\n+            \"properties\": {\n+                \"preferred_next_label\": { \"type\": \"string\" },\n+                \"outcome\": {\n+                    \"type\": \"string\",\n+                    \"enum\": [\"succeeded\", \"partially_succeeded\", \"failed\", \"skipped\"]\n+                },\n+                \"failure_reason\": { \"type\": \"string\" },\n+                \"suggested_next_ids\": {\n+                    \"type\": \"array\",\n+                    \"items\": { \"type\": \"string\" }\n+                },\n+                \"context_updates\": { \"type\": \"object\" }\n             },\n-            \"context_updates\": { \"type\": \"object\" }\n-        },\n-        \"anyOf\": ROUTING_STATUS_FIELDS\n-            .iter()\n-            .map(|field| serde_json::json!({ \"required\": [field] }))\n-            .collect::<Vec<_>>()\n-    })\n+            \"anyOf\": ROUTING_STATUS_FIELDS\n+                .iter()\n+                .map(|field| serde_json::json!({ \"required\": [field] }))\n+                .collect::<Vec<_>>()\n+        });\n+        jsonschema::validator_for(&schema).expect(\"built-in routing schema must compile\")\n+    });\n+    &ROUTING_VALIDATOR\n }\n \n fn apply_routing_fields(value: &Value, outcome: &mut Outcome) {\n@@ -433,7 +440,12 @@ mod tests {\n     }\n \n     fn schema(value: Value) -> OutputSchemaKind {\n-        OutputSchemaKind::JsonSchema { schema: value }\n+        let validator =\n+            jsonschema::validator_for(&value).expect(\"test schema should be a valid JSON Schema\");\n+        OutputSchemaKind::JsonSchema {\n+            schema:    value,\n+            validator: Arc::new(validator),\n+        }\n     }\n \n     #[test]\n@@ -572,7 +584,7 @@ mod tests {\n \n         let parsed = parse_node_output_schema(&node).unwrap();\n \n-        assert_eq!(parsed, Some(OutputSchemaKind::Routing));\n+        assert!(matches!(parsed, Some(OutputSchemaKind::Routing)));\n     }\n \n     #[test]\n",
+        "summary": {
+          "files_changed": 14,
+          "additions": 1770,
+          "deletions": 279
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T20:46:05.707281Z",
+        "current_node": "simplify_gpt",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.retry_count.implement": 0,
+          "failure_class": "",
+          "internal.run_id": "01KSB6GTZ00T5V6BNMXN3SPKZF",
+          "thread.toolchain.current_node": "preflight_compile",
+          "current_node": "simplify_gpt",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.preflight_lint": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "response.implement": "Implemented output schema validation end-to-end.\n\nSummary:\n- Added `output_schema` / `output_retries` node attrs.\n- Added `output_schema` static/file reference handling and inlining.\n- Added `handler::structured_output` for:\n  - routing/custom schema parsing\n  - balanced JSON extraction\n  - JSON Schema validation\n  - repair prompts\n  - routing/custom context application\n- Integrated strict routing/custom output into agent and prompt handlers.\n- Added same-context repair for:\n  - prompt API calls via mutable message history\n  - agent API sessions via the same live `Session`\n- Added ACP guardrail:\n  - `output_schema is not supported with backend=\"acp\" in this release`\n  - test verifies no process launch\n- Added custom output storage at `output.{node_id}`.\n- Updated docs for routing/custom schemas, `output_retries`, repair behavior, ACP limitation.\n\nValidation run:\n- `cargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference` ✅\n- `cargo nextest run -p fabro-workflow` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo insta pending-snapshots` unavailable in this environment (`cargo-insta` not installed); checked for `**/*.snap.new` and found none.",
+          "internal.retry_count.simplify_gpt": 0,
+          "response.simplify_gpt": "Implemented one cleanup from the simplify review:\n\n- Optimized routing-field raw text detection in `structured_output.rs` by replacing per-check `format!(\"\\\"{field}\\\"\")` allocations with a static quoted-field list.\n\nNo other actionable reuse/quality/efficiency issues were found during the review pass.\n\nValidation run:\n\n- `cargo nextest run -p fabro-workflow structured_output handler::agent handler::prompt handler::llm::api handler::llm::acp` ✅\n- `cargo nextest run -p fabro-workflow` ✅ 1160 passed\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n\nChanged file:\n\n- `lib/crates/fabro-workflow/src/handler/structured_output.rs`",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.fidelity": "compact",
+          "last_response": "Implemented one cleanup from the simplify review:\n\n- Optimized routing-field raw text detection in `structured_output.rs` by replacing per-check `format!(\"\\\"{field}\\\"\")` allocations with a static quot",
+          "last_stage": "simplify_gpt",
+          "internal.thread_id": "simplify_opus",
+          "failure_signature": "",
+          "graph.goal": "# Output Schema Validation Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add `output_schema` validation for agent and prompt nodes, with context-preserving repair turns when structured output does not validate.\n\n**Architecture:** Introduce a small structured-output layer in `fabro-workflow` that resolves node-level schema declarations, extracts JSON output, validates it, and produces either routing side effects or a parsed custom output context update. Agent and prompt execution must perform schema repair inside the active LLM conversation instead of using the workflow executor retry path.\n\n**Tech Stack:** Rust, Graphviz workflow attrs, `serde_json`, workspace `jsonschema`, existing `fabro-llm::ResponseFormat`, Fabro agent sessions, `cargo nextest`.\n\n---\n\n## Public Interface\n\nWorkflow authors can opt in on agent and prompt nodes:\n\n```dot\nreview [\n  shape=tab,\n  output_schema=\"routing\",\n  output_retries=2\n]\n\naudit [\n  shape=tab,\n  output_schema=\"@schemas/audit-result.schema.json\",\n  output_retries=2\n]\n```\n\n- `output_schema=\"routing\"` uses Fabro's built-in routing directive schema.\n- `output_schema=\"@path/to/schema.json\"` loads a JSON Schema file through existing workflow file-reference rules.\n- `output_retries` controls corrective turns inside the same node execution. Default: `2`. `0` means validate once and fail without a repair turn.\n- Schema failures are terminal node failures after `output_retries` is exhausted. They are not `retry_requested` outcomes and do not consume `max_retries`.\n- `backend=\"acp\"` with `output_schema` is unsupported in v1 and returns a clear validation error.\n\n## Implementation Tasks\n\n### Task 1: Node Attributes And File Reference Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/graph.rs`\n- Modify: `lib/crates/fabro-workflow/src/static_reference.rs`\n- Modify: `lib/crates/fabro-workflow/src/transforms/file_inlining.rs`\n- Test: existing unit tests in those files\n\n- [ ] Add `Node::output_schema(&self) -> Option<&str>` next to other agent/prompt attrs.\n- [ ] Add `Node::output_retries(&self) -> i64` returning `self.int_attr(\"output_retries\").unwrap_or(2).max(0)`.\n- [ ] Teach static reference validation that node attr `output_schema` values starting with `@` are file inline references.\n- [ ] Extend file inlining so `output_schema=\"@schemas/foo.json\"` is replaced with the schema file contents before execution, while `output_schema=\"routing\"` stays unchanged.\n- [ ] Add tests for absent attrs, default retries, zero retries, file inlining, and unresolved schema reference diagnostics.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference\n```\n\nExpected: targeted tests pass.\n\n### Task 2: Structured Output Module\n\n**Files:**\n- Create: `lib/crates/fabro-workflow/src/handler/structured_output.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/mod.rs`\n- Modify: `lib/crates/fabro-workflow/Cargo.toml`\n- Test: unit tests in `structured_output.rs`\n\n- [ ] Add `jsonschema.workspace = true` to `fabro-workflow` dependencies.\n- [ ] Define `OutputSchemaKind` with `Routing` and `JsonSchema { schema: serde_json::Value }`.\n- [ ] Parse `node.output_schema()` into `None`, `Routing`, or custom JSON Schema. Treat literal `routing` as the only built-in keyword.\n- [ ] Add a built-in routing schema requiring an object with at least one recognized field: `preferred_next_label`, `outcome`, `failure_reason`, `suggested_next_ids`, or `context_updates`.\n- [ ] Reuse balanced-object scanning semantics for response text: validate the last JSON object that is relevant to the selected schema.\n- [ ] Return a structured validation result containing the parsed JSON object, concise error messages, and enough information to build a repair prompt.\n- [ ] Add tests for valid routing JSON, missing routing fields, wrong routing field types, valid custom schema, invalid custom schema, invalid JSON, and no JSON object.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow structured_output\n```\n\nExpected: structured-output unit tests pass.\n\n### Task 3: Routing Extraction Compatibility\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: existing agent handler unit tests\n\n- [ ] Keep the loose default unchanged when `output_schema` is absent.\n- [ ] Move current `STATUS_FIELDS`, balanced JSON scanning, and routing-field application behind reusable functions in `structured_output.rs` or call the new module from `agent.rs`.\n- [ ] For `output_schema=\"routing\"`, require schema-valid routing JSON and surface validation failures for repair instead of silently ignoring bad candidates.\n- [ ] Preserve existing routing fallback priority for agent nodes: response text first, then `status.json`, then last file touched.\n- [ ] Keep prompt-node routing behavior response-only unless later tasks explicitly add prompt `status.json` support.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent\n```\n\nExpected: existing loose routing tests still pass, plus new strict routing tests pass.\n\n### Task 4: Prompt Node Same-Context Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/prompt.rs`\n- Test: prompt/API backend tests in those files\n\n- [ ] In `AgentApiBackend::one_shot`, keep `messages` mutable across attempts.\n- [ ] When a prompt node has a custom JSON Schema, set `response_format=JsonSchema` on the initial and repair LLM requests. For `routing`, use `JsonObject` or no provider-native schema if provider behavior would conflict with Fabro's routing extraction.\n- [ ] After each LLM response, validate according to `output_schema`.\n- [ ] On validation failure with repair attempts remaining, append `Message::assistant(response.text())`, then append a corrective `Message::user(repair_message)`, and call `client.complete` again with the same messages.\n- [ ] On success, return the validated response text and aggregate usage across all attempts.\n- [ ] On exhaustion, return a terminal failed outcome with failure reason `output schema validation failed after N repair attempt(s)`.\n- [ ] Update `PromptHandler` so validated custom output is added to `context_updates[\"output.{node_id}\"]`; routing output still updates outcome routing fields.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::prompt handler::llm::api\n```\n\nExpected: prompt repair keeps previous assistant output in the message list and succeeds after a corrective response.\n\n### Task 5: Agent Node Same-Session Repair\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/agent.rs`\n- Test: agent/API backend tests in those files\n\n- [ ] In `AgentApiBackend::run`, validate the final assistant response before releasing, closing, or caching the session.\n- [ ] On validation failure with repair attempts remaining, call `session.process_input(repair_message)` on the same `Session`.\n- [ ] Recompute the final assistant response after each repair turn from `session.history()`.\n- [ ] Aggregate usage across all new assistant turns, including repair turns, without double-counting reused session history.\n- [ ] Do not set provider-native `response_format` for agent sessions in v1, because agent sessions may need normal tool-use messages before final output.\n- [ ] Return terminal failure after exhaustion; do not return a retryable backend error and do not request workflow node retry.\n- [ ] Update `AgentHandler` to apply validated routing/custom output to the final `Outcome`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::agent handler::llm::api\n```\n\nExpected: agent repair sends a second `process_input` to the same session and final validated output drives outcome/context updates.\n\n### Task 6: ACP Guardrail\n\n**Files:**\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/acp.rs`\n- Test: ACP backend tests in that file\n\n- [ ] At the start of `AgentAcpBackend::run`, reject nodes where `node.output_schema().is_some()`.\n- [ ] Use a clear error message: `output_schema is not supported with backend=\"acp\" in this release`.\n- [ ] Add a test proving the ACP backend does not launch a process when `output_schema` is present.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-workflow handler::llm::acp\n```\n\nExpected: ACP guardrail test passes.\n\n### Task 7: Docs\n\n**Files:**\n- Modify: `docs/public/agents/outputs.mdx`\n- Modify: `docs/public/reference/dot-language.mdx`\n\n- [ ] Document `output_schema=\"routing\"` and `output_schema=\"@schema.json\"` under routing/structured outputs.\n- [ ] Document same-context repair behavior explicitly: Fabro sends validation feedback to the same agent/prompt context before failing.\n- [ ] Document `output_retries`, default `2`, and distinction from `max_retries`.\n- [ ] Document v1 scope: agent/prompt nodes only; ACP unsupported; custom schema output stored at `output.{node_id}`.\n\nRun:\n\n```bash\nrg -n \"output_schema|output_retries|output\\\\.\" docs/public/agents/outputs.mdx docs/public/reference/dot-language.mdx\n```\n\nExpected: docs mention the new attrs and storage behavior.\n\n### Task 8: Full Verification\n\n**Files:**\n- No new files beyond prior tasks\n\n- [ ] Run focused workflow tests:\n\n```bash\ncargo nextest run -p fabro-workflow\n```\n\n- [ ] Run formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] If snapshots change, inspect before accepting:\n\n```bash\ncargo insta pending-snapshots\n```\n\nOnly run `cargo insta accept` after verifying every pending snapshot is expected.\n\n## Acceptance Criteria\n\n- Existing workflows without `output_schema` behave exactly as before.\n- `output_schema=\"routing\"` prevents malformed/missing routing JSON from silently falling through to normal edge selection.\n- Invalid structured output results in a corrective LLM turn in the same context window.\n- Prompt repair preserves previous assistant output in the message list.\n- Agent repair preserves the same live session and does not re-run the node from scratch.\n- Exhausted output repair attempts produce a clear terminal failure.\n- Custom schema output is available to downstream nodes at `output.{node_id}`.\n- Docs clearly distinguish `output_retries` from `max_retries`.\n\n## Assumptions\n\n- `output_retries=2` is the default.\n- Custom schema validation targets the final JSON object in the response text.\n- `status.json` fallback remains routing-specific.\n- Provider-native response schema is used for prompt nodes only where it is safe.\n- ACP support can be added later after there is a guaranteed context-preserving repair mechanism.\n",
+          "internal.retry_count.toolchain": 0,
+          "thread.implement.current_node": "simplify_opus",
+          "internal.retry_count.start": 0,
+          "graph.rankdir": "LR",
+          "thread.start.current_node": "toolchain",
+          "internal.node_visit_count": 1,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "outcome": "succeeded",
+          "response.simplify_opus": "## Summary\n\nThree review agents flagged ~25 findings; I applied the high-impact, low-risk fixes (about 12 lines net reduction across the touched files, plus correctness wins on schema compilation).\n\n**Fixed:**\n1. **Schema compiled twice per node** (efficiency #1, reuse #3, quality #1) — `OutputSchemaKind::JsonSchema` now stores an `Arc<jsonschema::Validator>` compiled once in `parse_node_output_schema`; the routing validator is a `LazyLock<Validator>`, so repair iterations no longer recompile. Also removed the redundant `compile_schema` helper.\n2. **`read_sandbox_file` reimplemented `Sandbox::read_file_text`** (reuse #2) — replaced the `cat <quoted>` exec_command call with the existing trait method; dropped the unused `shell_quote` import and the magic 5s timeout.\n3. **Redundant re-validation** in `validate_agent_output_sources` (efficiency #6) — bound the first error and reused it instead of calling `validate_response_text` again just to `.expect_err(...)`.\n4. **`OneShotCompletion::actual_speed` was always `controls.speed`** (quality #2, reuse #4) — collapsed the three `actual_*` fields into a single `model: ModelRef`, removing the manual reconstruction one line later.\n5. **`extract_status_fields` wrapper deletion** (reuse #1, quality #5) — renamed `extract_status_fields_loose` → `extract_status_fields` in `structured_output.rs`; agent.rs re-exports it so existing call sites (including `prompt.rs`) work unchanged.\n6. **`find_json_objects` visibility** (quality #6) — tightened from `pub(crate)` to `fn`.\n7. **`last_touched_file` cheap accessor** (efficiency #5) — added a tiny helper that grabs only `.last`; the repair loop no longer clones+sorts the full `touched` set each iteration.\n8. **`ROUTING_KEYWORD` constant** (quality #8) — extracted the literal `\"routing\"` to a const used by `parse_node_output_schema`.\n\n**Skipped:**\n- Folding `Error::OutputSchemaValidation` into `Error::Validation` — `Validation` adds a `\"Validation error: \"` prefix that would change user-visible failure messages and downstream event content. Not worth the drift for one extra enum variant.\n- Other suggestions (request structs for multi-param functions, deduping the two repair loops across `one_shot`/`run`, moving `validate_agent_output_sources` into `structured_output.rs`, collapsing `StructuredOutputErrorKind`) — judged as larger refactors with no clear correctness payoff for this iteration.\n\n**Verification:** `cargo nextest run -p fabro-types -p fabro-workflow` → 1461 tests pass; `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean; `cargo +nightly-2026-04-14 fmt --check --all` clean."
+        },
+        "node_outcomes": {
+          "toolchain": {
             "status": "succeeded",
             "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
             },
-            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
             "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Implemented output schema validation end-to-end.\n\nSummary:\n- Added `output_schema` / `output_retries` node attrs.\n- Added `output_schema` static/file reference handling and inlining.\n- Added `handler:",
+              "response.implement": "Implemented output schema validation end-to-end.\n\nSummary:\n- Added `output_schema` / `output_retries` node attrs.\n- Added `output_schema` static/file reference handling and inlining.\n- Added `handler::structured_output` for:\n  - routing/custom schema parsing\n  - balanced JSON extraction\n  - JSON Schema validation\n  - repair prompts\n  - routing/custom context application\n- Integrated strict routing/custom output into agent and prompt handlers.\n- Added same-context repair for:\n  - prompt API calls via mutable message history\n  - agent API sessions via the same live `Session`\n- Added ACP guardrail:\n  - `output_schema is not supported with backend=\"acp\" in this release`\n  - test verifies no process launch\n- Added custom output storage at `output.{node_id}`.\n- Updated docs for routing/custom schemas, `output_retries`, repair behavior, ACP limitation.\n\nValidation run:\n- `cargo nextest run -p fabro-types -p fabro-workflow graph:: file_inlining static_reference` ✅\n- `cargo nextest run -p fabro-workflow` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo insta pending-snapshots` unavailable in this environment (`cargo-insta` not installed); checked for `**/*.snap.new` and found none.",
+              "last_stage": "implement"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 329828,
+                    "output_tokens": 33087,
+                    "reasoning_tokens": 21712,
+                    "cache_read_tokens": 29338112,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 17962166
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/structured_output.rs"
+            ]
           },
           "simplify_opus": {
             "status": "succeeded",
@@ -1003,12 +1151,63 @@
               "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/llm/api.rs",
               "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/handler/structured_output.rs"
             ]
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_gpt",
+              "last_response": "Implemented one cleanup from the simplify review:\n\n- Optimized routing-field raw text detection in `structured_output.rs` by replacing per-check `format!(\"\\\"{field}\\\"\")` allocations with a static quot",
+              "response.simplify_gpt": "Implemented one cleanup from the simplify review:\n\n- Optimized routing-field raw text detection in `structured_output.rs` by replacing per-check `format!(\"\\\"{field}\\\"\")` allocations with a static quoted-field list.\n\nNo other actionable reuse/quality/efficiency issues were found during the review pass.\n\nValidation run:\n\n- `cargo nextest run -p fabro-workflow structured_output handler::agent handler::prompt handler::llm::api handler::llm::acp` ✅\n- `cargo nextest run -p fabro-workflow` ✅ 1160 passed\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n\nChanged file:\n\n- `lib/crates/fabro-workflow/src/handler/structured_output.rs`"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 115994,
+                    "output_tokens": 3583,
+                    "reasoning_tokens": 2698,
+                    "cache_read_tokens": 1957376,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 1747088
+            }
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "simplify_gpt",
+        "next_node_id": "verify",
         "node_visits": {
           "simplify_opus": 1,
           "implement": 1,
+          "simplify_gpt": 1,
           "preflight_compile": 1,
           "start": 1,
           "preflight_lint": 1,
@@ -1282,7 +1481,12 @@
       "first_event_seq": 739,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_opus",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T20:42:41.067539Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "anthropic",
@@ -1295,6 +1499,12 @@
       "output": null,
       "started_at": "2026-05-23T20:26:04.064143Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 996999,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 141487,
         "output_tokens": 35894,
@@ -1399,6 +1609,105 @@
             "kind": "completed",
             "success": true,
             "turns_used": 41
+          }
+        }
+      ],
+      "state": "succeeded"
+    },
+    "simplify_gpt@1": {
+      "first_event_seq": 1355,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T20:42:44.769041Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 254362,
+        "output_tokens": 4878,
+        "total_tokens": 2850534,
+        "reasoning_tokens": 4670,
+        "cache_read_tokens": 2586624,
+        "cache_write_tokens": 0
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5-2026-04-23"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:b3a1a4a2-8d55-4805-b32f-7efa7108d5cd",
+        "items": [
+          {
+            "id": "a56b9e294bd0f467",
+            "status": "completed",
+            "order": 0,
+            "subject": "Inspect repository instructions and current diff"
+          },
+          {
+            "id": "ab19e4955a3c964a",
+            "status": "completed",
+            "order": 1,
+            "subject": "Run three parallel review subagents with the diff"
+          },
+          {
+            "id": "461ea1e4e398c63b",
+            "status": "completed",
+            "order": 2,
+            "subject": "Aggregate findings and apply cleanup fixes"
+          },
+          {
+            "id": "fd023712ff23d141",
+            "status": "completed",
+            "order": 3,
+            "subject": "Run focused validation for touched code"
+          },
+          {
+            "id": "86da9eb03151bb80",
+            "status": "in_progress",
+            "order": 4,
+            "subject": "Summarize fixes and any skipped findings"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "8a851218",
+          "depth": 1,
+          "task": "Code Reuse Review. Working dir /home/daytona/workspace/fabro. Review the full diff against origin/main, saved at /tmp/fabro-output-schema.diff (created with `git diff --find-renames origin/main...HEAD`). Treat that as the complete diff. For each change, search for existing utilities/helpers that could replace newly written code. Use grep/rg for similar patterns, especially adjacent workflow/handler utility modules. Flag any new function duplicating existing functionality and suggest exact existing function/module to use. Flag inline logic that could use an existing utility (string manipulation, path handling, env checks, type guards). Return concise actionable findings with file/line/function references. If clean, say so.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 21
+          }
+        },
+        {
+          "agent_id": "860fbfb0",
+          "depth": 1,
+          "task": "Code Quality Review. Working dir /home/daytona/workspace/fabro. Review the full diff against origin/main, saved at /tmp/fabro-output-schema.diff (created with `git diff --find-renames origin/main...HEAD`). Treat that as the complete diff. Aggressively review for hacky patterns: redundant state, parameter sprawl, copy-paste, leaky abstractions, stringly-typed code, poor error boundaries, or style mismatches. Return concise actionable findings with file/line/function references and suggested fix. If clean, say so.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 21
+          }
+        },
+        {
+          "agent_id": "ceea81e2",
+          "depth": 1,
+          "task": "Efficiency Review. Working dir /home/daytona/workspace/fabro. Review the full diff against origin/main, saved at /tmp/fabro-output-schema.diff (created with `git diff --find-renames origin/main...HEAD`). Treat that as the complete diff. Review for unnecessary work, redundant computations/file reads, missed concurrency, hot-path bloat, TOCTOU existence checks, memory issues, and overly broad operations. Return concise actionable findings with file/line/function references and suggested fix. If clean, say so.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 21
           }
         }
       ],
