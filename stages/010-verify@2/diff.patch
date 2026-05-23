@@ -1,0 +1,1706 @@
+diff --git a/apps/fabro-web/app/routes/run-detail.test.ts b/apps/fabro-web/app/routes/run-detail.test.ts
+index f0782fd97..b6d8d3341 100644
+--- a/apps/fabro-web/app/routes/run-detail.test.ts
++++ b/apps/fabro-web/app/routes/run-detail.test.ts
+@@ -382,7 +382,7 @@ describe("RunDetail full-height child routes", () => {
+     const outletWrappers = renderer.root.findAll(
+       (node) =>
+         node.type === "div" &&
+-        hasClasses(node.props.className, ["min-h-0", "flex-1", "flex-col"]),
++        hasClasses(node.props.className, ["pt-3", "min-h-0", "flex-1", "flex-col"]),
+     );
+     expect(outletWrappers).toHaveLength(1);
+   });
+@@ -540,7 +540,10 @@ describe("RunDetail full-height child routes", () => {
+     const outletWrappers = renderer.root.findAll(
+       (node) =>
+         node.type === "div" &&
+-        hasClasses(node.props.className, ["pb-[var(--fabro-interview-dock-clearance)]"]),
++        hasClasses(node.props.className, [
++          "pt-3",
++          "pb-[var(--fabro-interview-dock-clearance)]",
++        ]),
+     );
+     expect(outletWrappers).toHaveLength(1);
+   });
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index 978beb090..dfd45b73a 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -5881,6 +5881,7 @@ components:
+         - estimated_output_tps
+         - aliases
+         - default
++        - small_default
+         - configured
+       properties:
+         id:
+@@ -5924,6 +5925,9 @@ components:
+         default:
+           type: boolean
+           description: Whether this is the default model for its provider.
++        small_default:
++          type: boolean
++          description: Whether this is the provider's small/default utility model.
+         configured:
+           type: boolean
+           description: |
+diff --git a/docs/public/core-concepts/models.mdx b/docs/public/core-concepts/models.mdx
+index 177f8eb77..61b26419b 100644
+--- a/docs/public/core-concepts/models.mdx
++++ b/docs/public/core-concepts/models.mdx
+@@ -64,6 +64,7 @@ agent_profile = "anthropic"
+ display_name = "Team Code Large"
+ family = "team-code"
+ default = true
++small_default = true
+ aliases = ["team-code"]
+ estimated_output_tps = 80
+ 
+@@ -119,6 +120,8 @@ reasoning = false
+ 
+ `api_id` is the model name sent to the provider API. Omit it when the Fabro model ID and provider model ID are the same.
+ 
++Model roles are separate: `default = true` controls normal model selection for workflow execution, while `small_default = true` marks the provider's small/cheap utility model for metadata tasks such as generated run titles. If a provider has no small default, Fabro falls back to that provider's normal default.
++
+ Provider auth is declared in `[llm.providers.<id>.auth]` with ordered `env:<NAME>` or `vault:<NAME>` refs. The primary auth header defaults to `bearer`; override with `header = { custom = "Header-Name" }` for providers like Anthropic that use `x-api-key`. Omit the `[llm.providers.<id>.auth]` block entirely for providers that need no API key (e.g. Ollama). Custom headers for any provider — including providers that need only typed headers and no API-key auth — go in `extra_headers` as `{ env = "NAME" }`, `{ vault = "NAME" }`, or `{ literal = "value" }`.
+ 
+ Provider `agent_profile` defaults from `adapter` and controls profile-specific behavior such as project-memory filenames, CLI/ACP command selection, and native session routing. Valid values are `anthropic`, `openai`, and `gemini`; model-level values override provider-level values.
+diff --git a/docs/public/integrations/litellm.mdx b/docs/public/integrations/litellm.mdx
+index a19ac43e9..7e9102dde 100644
+--- a/docs/public/integrations/litellm.mdx
++++ b/docs/public/integrations/litellm.mdx
+@@ -111,7 +111,7 @@ vision = false
+ reasoning = false
+ ```
+ 
+-Only one model for a provider should set `default = true`.
++Only one model for a provider should set `default = true`. You may also mark one small/cheap utility model with `small_default = true`; Fabro uses it for metadata tasks such as generated run titles and falls back to the provider default when it is omitted.
+ 
+ ## Troubleshooting
+ 
+diff --git a/lib/crates/fabro-api/tests/model_round_trip.rs b/lib/crates/fabro-api/tests/model_round_trip.rs
+index 6e89a980a..ad896d4c4 100644
+--- a/lib/crates/fabro-api/tests/model_round_trip.rs
++++ b/lib/crates/fabro-api/tests/model_round_trip.rs
+@@ -38,6 +38,7 @@ fn model_json_matches_openapi_shape() {
+         estimated_output_tps: Some(25.0),
+         aliases:              vec!["opus".to_string()],
+         default:              false,
++        small_default:        true,
+         configured:           true,
+     };
+ 
+@@ -48,6 +49,7 @@ fn model_json_matches_openapi_shape() {
+     assert_eq!(json["features"]["reasoning_effort"], "levels");
+     assert_eq!(json["features"]["prompt_cache"], true);
+     assert_eq!(json["estimated_output_tps"], 25.0);
++    assert_eq!(json["small_default"], true);
+     assert_eq!(json["configured"], true);
+ 
+     let round_trip: ApiModel = serde_json::from_value(json).unwrap();
+diff --git a/lib/crates/fabro-api/tests/provider_id_round_trip.rs b/lib/crates/fabro-api/tests/provider_id_round_trip.rs
+index b20e15370..21c5227c6 100644
+--- a/lib/crates/fabro-api/tests/provider_id_round_trip.rs
++++ b/lib/crates/fabro-api/tests/provider_id_round_trip.rs
+@@ -48,6 +48,7 @@ fn provider_id_json_matches_openapi_shape_through_model() {
+         estimated_output_tps: None,
+         aliases:              Vec::new(),
+         default:              false,
++        small_default:        false,
+         configured:           true,
+     };
+ 
+diff --git a/lib/crates/fabro-cli/src/commands/model.rs b/lib/crates/fabro-cli/src/commands/model.rs
+index 659e4af3d..706cbbf84 100644
+--- a/lib/crates/fabro-cli/src/commands/model.rs
++++ b/lib/crates/fabro-cli/src/commands/model.rs
+@@ -503,6 +503,7 @@ mod tests {
+             estimated_output_tps: Some(100.0),
+             aliases: vec!["tm".to_string()],
+             default: false,
++            small_default: false,
+             configured: false,
+         })
+         .unwrap()
+@@ -535,6 +536,7 @@ mod tests {
+             estimated_output_tps: Some(100.0),
+             aliases:              vec![],
+             default:              false,
++            small_default:        false,
+             configured:           true,
+         })
+         .unwrap()
+diff --git a/lib/crates/fabro-config/src/builders.rs b/lib/crates/fabro-config/src/builders.rs
+index 80017af26..3562328f0 100644
+--- a/lib/crates/fabro-config/src/builders.rs
++++ b/lib/crates/fabro-config/src/builders.rs
+@@ -337,6 +337,7 @@ fn model_settings_to_catalog(settings: ModelSettings) -> model_catalog::ModelCat
+         training,
+         knowledge_cutoff,
+         default,
++        small_default,
+         probe,
+         enabled,
+         aliases,
+@@ -355,6 +356,7 @@ fn model_settings_to_catalog(settings: ModelSettings) -> model_catalog::ModelCat
+         training,
+         knowledge_cutoff,
+         default,
++        small_default,
+         probe,
+         enabled,
+         aliases,
+diff --git a/lib/crates/fabro-config/src/layers/llm.rs b/lib/crates/fabro-config/src/layers/llm.rs
+index 94b44ab2a..9afb41d9e 100644
+--- a/lib/crates/fabro-config/src/layers/llm.rs
++++ b/lib/crates/fabro-config/src/layers/llm.rs
+@@ -115,6 +115,10 @@ pub struct ModelSettings {
+     pub knowledge_cutoff:     Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub default:              Option<bool>,
++    /// Whether this model should be preferred for small/cheap utility tasks.
++    /// Missing or false falls back to the provider default model.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub small_default:        Option<bool>,
+     /// Whether this model should be preferred for provider connectivity
+     /// probes. Missing or false falls back to the provider default model.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+diff --git a/lib/crates/fabro-llm/src/model_test.rs b/lib/crates/fabro-llm/src/model_test.rs
+index 4fee55a24..e177901a2 100644
+--- a/lib/crates/fabro-llm/src/model_test.rs
++++ b/lib/crates/fabro-llm/src/model_test.rs
+@@ -195,6 +195,7 @@ mod tests {
+             estimated_output_tps: None,
+             aliases: vec![],
+             default: false,
++            small_default: false,
+             configured: false,
+         }
+     }
+diff --git a/lib/crates/fabro-model/src/catalog.rs b/lib/crates/fabro-model/src/catalog.rs
+index 69f687670..d0fa36cb9 100644
+--- a/lib/crates/fabro-model/src/catalog.rs
++++ b/lib/crates/fabro-model/src/catalog.rs
+@@ -82,6 +82,8 @@ pub struct ModelCatalogSettings {
+     #[serde(default)]
+     pub default:              Option<bool>,
+     #[serde(default)]
++    pub small_default:        Option<bool>,
++    #[serde(default)]
+     pub probe:                Option<bool>,
+     #[serde(default)]
+     pub enabled:              Option<bool>,
+@@ -564,6 +566,11 @@ pub enum CatalogBuildError {
+         provider: ProviderId,
+         models:   Vec<String>,
+     },
++    #[error("provider '{provider}' has multiple small default models: {models:?}")]
++    MultipleProviderSmallDefaults {
++        provider: ProviderId,
++        models:   Vec<String>,
++    },
+     #[error("catalog must contain at least one enabled default model")]
+     NoDefaultModel,
+     #[error("model '{model}' has invalid reasoning_effort '{value}'")]
+@@ -639,6 +646,7 @@ impl Catalog {
+         let mut models_with_settings = Vec::new();
+         let mut model_identifiers = BTreeMap::<String, String>::new();
+         let mut defaults_by_provider = HashMap::<ProviderId, Vec<String>>::new();
++        let mut small_defaults_by_provider = HashMap::<ProviderId, Vec<String>>::new();
+ 
+         let mut model_ids = settings.models.keys().cloned().collect::<Vec<_>>();
+         model_ids.sort_unstable();
+@@ -679,6 +687,12 @@ impl Catalog {
+                     .or_default()
+                     .push(model.id.clone());
+             }
++            if model.small_default {
++                small_defaults_by_provider
++                    .entry(model.provider.clone())
++                    .or_default()
++                    .push(model.id.clone());
++            }
+             models_with_settings.push((model, resolved_settings));
+         }
+ 
+@@ -690,6 +704,14 @@ impl Catalog {
+                 });
+             }
+         }
++        for (provider, small_defaults) in small_defaults_by_provider {
++            if small_defaults.len() > 1 {
++                return Err(CatalogBuildError::MultipleProviderSmallDefaults {
++                    provider,
++                    models: small_defaults,
++                });
++            }
++        }
+         if !models_with_settings.iter().any(|(model, _)| model.default) {
+             return Err(CatalogBuildError::NoDefaultModel);
+         }
+@@ -890,6 +912,18 @@ impl Catalog {
+             .find(|m| m.provider == provider_id && m.default)
+     }
+ 
++    /// Small default model for a provider — the small/cheap utility model used
++    /// for metadata enrichment. Falls back to the provider's normal default
++    /// when no explicit small default is configured.
++    #[must_use]
++    pub fn small_default_for_provider(&self, p: &ProviderId) -> Option<&Model> {
++        let provider_id = self.provider(p).map_or(p, |provider| &provider.id);
++        self.models
++            .iter()
++            .find(|m| &m.provider == provider_id && m.small_default)
++            .or_else(|| self.default_for_provider(provider_id))
++    }
++
+     /// Default model for the best-available provider (based on API keys),
+     /// falling back to the global catalog default.
+     #[must_use]
+@@ -931,6 +965,24 @@ impl Catalog {
+             .unwrap_or_else(|| self.default_model())
+     }
+ 
++    /// Small default model for the best-available built-in provider IDs,
++    /// falling back to the global catalog default.
++    #[must_use]
++    pub fn small_default_for_configured_ids(&self, configured: &[ProviderId]) -> &Model {
++        if configured.is_empty() {
++            return self.default_model();
++        }
++        let configured = configured
++            .iter()
++            .filter_map(|id| self.provider(id).map(|provider| provider.id.clone()))
++            .collect::<HashSet<_>>();
++        self.providers
++            .iter()
++            .filter(|provider| configured.contains(&provider.id))
++            .find_map(|provider| self.small_default_for_provider(&provider.id))
++            .unwrap_or_else(|| self.default_model())
++    }
++
+     /// Probe model for a provider — the cheapest model suitable for
+     /// connectivity checks. Falls back to the provider's default when no
+     /// explicit override is configured.
+@@ -1077,6 +1129,7 @@ fn merge_model_settings(
+         training:             higher.training.or(fallback.training),
+         knowledge_cutoff:     higher.knowledge_cutoff.or(fallback.knowledge_cutoff),
+         default:              higher.default.or(fallback.default),
++        small_default:        higher.small_default.or(fallback.small_default),
+         probe:                higher.probe.or(fallback.probe),
+         enabled:              higher.enabled.or(fallback.enabled),
+         aliases:              higher.aliases.or(fallback.aliases),
+@@ -1319,6 +1372,7 @@ fn build_model(
+         estimated_output_tps: settings.estimated_output_tps,
+         aliases: settings.aliases.clone().unwrap_or_default(),
+         default: settings.default.unwrap_or_default(),
++        small_default: settings.small_default.unwrap_or_default(),
+         configured: false,
+     };
+     let catalog_settings = CatalogModelSettings {
+@@ -1846,6 +1900,41 @@ enabled = true
+         assert_eq!(m.id, "gemini-3.1-pro-preview");
+     }
+ 
++    #[test]
++    fn builtin_small_defaults_are_marked_per_provider() {
++        let catalog = Catalog::builtin();
++
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::anthropic())
++                .unwrap()
++                .id,
++            "claude-haiku-4-5"
++        );
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::openai())
++                .unwrap()
++                .id,
++            "gpt-5.4-mini"
++        );
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::gemini())
++                .unwrap()
++                .id,
++            "gemini-3.1-flash-lite-preview"
++        );
++        assert!(catalog.get("claude-haiku-4-5").unwrap().small_default);
++        assert!(catalog.get("gpt-5.4-mini").unwrap().small_default);
++        assert!(
++            catalog
++                .get("gemini-3.1-flash-lite-preview")
++                .unwrap()
++                .small_default
++        );
++    }
++
+     #[test]
+     fn builtin_closest_opus_to_gemini() {
+         let opus = Catalog::builtin().get("claude-opus-4-6").unwrap();
+@@ -2464,6 +2553,365 @@ reasoning = false
+         );
+     }
+ 
++    #[test]
++    fn small_default_for_provider_prefers_enabled_small_default_model_over_provider_default() {
++        let layer = minimal_settings(
++            r#"
++[providers.test]
++display_name = "Test"
++adapter = "openai"
++agent_profile = "openai"
++
++[models.default_model]
++provider = "test"
++display_name = "Default Model"
++family = "test"
++default = true
++
++[models.default_model.limits]
++context_window = 1000
++
++[models.default_model.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.small_model]
++provider = "test"
++display_name = "Small Model"
++family = "test"
++small_default = true
++
++[models.small_model.limits]
++context_window = 1000
++
++[models.small_model.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++        let catalog = Catalog::from_settings(&layer).unwrap();
++
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::new("test"))
++                .unwrap()
++                .id,
++            "small_model"
++        );
++    }
++
++    #[test]
++    fn small_default_for_provider_falls_back_to_provider_default_when_no_small_default_marked() {
++        let layer = minimal_settings(
++            r#"
++[providers.test]
++display_name = "Test"
++adapter = "openai"
++agent_profile = "openai"
++
++[models.default_model]
++provider = "test"
++display_name = "Default Model"
++family = "test"
++default = true
++
++[models.default_model.limits]
++context_window = 1000
++
++[models.default_model.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.other_model]
++provider = "test"
++display_name = "Other Model"
++family = "test"
++
++[models.other_model.limits]
++context_window = 1000
++
++[models.other_model.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++        let catalog = Catalog::from_settings(&layer).unwrap();
++
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::new("test"))
++                .unwrap()
++                .id,
++            "default_model"
++        );
++    }
++
++    #[test]
++    fn small_default_for_provider_resolves_provider_alias() {
++        let layer = minimal_settings(
++            r#"
++[providers.canonical]
++display_name = "Canonical"
++adapter = "openai"
++agent_profile = "openai"
++aliases = ["alias"]
++
++[models.default_model]
++provider = "canonical"
++display_name = "Default Model"
++family = "test"
++default = true
++
++[models.default_model.limits]
++context_window = 1000
++
++[models.default_model.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.small_model]
++provider = "canonical"
++display_name = "Small Model"
++family = "test"
++small_default = true
++
++[models.small_model.limits]
++context_window = 1000
++
++[models.small_model.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++        let catalog = Catalog::from_settings(&layer).unwrap();
++
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::new("alias"))
++                .unwrap()
++                .id,
++            "small_model"
++        );
++    }
++
++    #[test]
++    fn small_default_for_configured_ids_uses_highest_priority_configured_provider() {
++        let layer = minimal_settings(
++            r#"
++[providers.low]
++display_name = "Low"
++adapter = "openai"
++agent_profile = "openai"
++priority = 10
++
++[providers.high]
++display_name = "High"
++adapter = "openai"
++agent_profile = "openai"
++priority = 20
++
++[models.low_default]
++provider = "low"
++display_name = "Low Default"
++family = "test"
++default = true
++
++[models.low_default.limits]
++context_window = 1000
++
++[models.low_default.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.low_small]
++provider = "low"
++display_name = "Low Small"
++family = "test"
++small_default = true
++
++[models.low_small.limits]
++context_window = 1000
++
++[models.low_small.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.high_default]
++provider = "high"
++display_name = "High Default"
++family = "test"
++default = true
++
++[models.high_default.limits]
++context_window = 1000
++
++[models.high_default.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.high_small]
++provider = "high"
++display_name = "High Small"
++family = "test"
++small_default = true
++
++[models.high_small.limits]
++context_window = 1000
++
++[models.high_small.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++        let catalog = Catalog::from_settings(&layer).unwrap();
++
++        assert_eq!(
++            catalog
++                .small_default_for_configured_ids(&[
++                    ProviderId::new("low"),
++                    ProviderId::new("high")
++                ])
++                .id,
++            "high_small"
++        );
++        assert_eq!(
++            catalog
++                .small_default_for_configured_ids(&[ProviderId::new("low")])
++                .id,
++            "low_small"
++        );
++        assert_eq!(
++            catalog.small_default_for_configured_ids(&[]).id,
++            catalog.default_model().id
++        );
++    }
++
++    #[test]
++    fn small_default_for_configured_ids_falls_back_to_provider_default() {
++        let layer = minimal_settings(
++            r#"
++[providers.test]
++display_name = "Test"
++adapter = "openai"
++agent_profile = "openai"
++
++[models.default_model]
++provider = "test"
++display_name = "Default Model"
++family = "test"
++default = true
++
++[models.default_model.limits]
++context_window = 1000
++
++[models.default_model.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++        let catalog = Catalog::from_settings(&layer).unwrap();
++
++        assert_eq!(
++            catalog
++                .small_default_for_configured_ids(&[ProviderId::new("test")])
++                .id,
++            "default_model"
++        );
++    }
++
++    #[test]
++    fn multiple_small_default_models_for_provider_fail_catalog_build() {
++        let layer = minimal_settings(
++            r#"
++[providers.test]
++display_name = "Test"
++adapter = "openai"
++agent_profile = "openai"
++
++[models.default_model]
++provider = "test"
++display_name = "Default Model"
++family = "test"
++default = true
++
++[models.default_model.limits]
++context_window = 1000
++
++[models.default_model.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.first_small]
++provider = "test"
++display_name = "First Small"
++family = "test"
++small_default = true
++
++[models.first_small.limits]
++context_window = 1000
++
++[models.first_small.features]
++tools = false
++vision = false
++reasoning = false
++
++[models.second_small]
++provider = "test"
++display_name = "Second Small"
++family = "test"
++small_default = true
++
++[models.second_small.limits]
++context_window = 1000
++
++[models.second_small.features]
++tools = false
++vision = false
++reasoning = false
++"#,
++        );
++
++        let err = Catalog::from_settings(&layer).unwrap_err();
++
++        assert!(matches!(
++            err,
++            CatalogBuildError::MultipleProviderSmallDefaults { provider, models }
++                if provider == ProviderId::new("test")
++                    && models == vec!["first_small".to_string(), "second_small".to_string()]
++        ));
++    }
++
++    #[test]
++    fn small_default_false_override_clears_inherited_builtin_small_default_marker() {
++        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
++            r#"
++[models."gpt-5.4-mini"]
++small_default = false
++"#,
++        ))
++        .expect("sparse built-in model override should build");
++
++        assert_eq!(
++            catalog
++                .small_default_for_provider(&ProviderId::openai())
++                .unwrap()
++                .id,
++            "gpt-5.4"
++        );
++    }
++
+     #[test]
+     fn multiple_probe_models_are_non_fatal_and_select_a_probe_model() {
+         let layer = minimal_settings(
+@@ -3215,6 +3663,7 @@ reasoning_effort = "levels"
+             ),
+             aliases: [],
+             default: false,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+@@ -3286,6 +3735,7 @@ reasoning_effort = "levels"
+                 "gemini-flash-lite",
+             ],
+             default: false,
++            small_default: true,
+             configured: false,
+         }
+         "#);
+@@ -3343,6 +3793,7 @@ reasoning_effort = "levels"
+                 "kimi",
+             ],
+             default: true,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+@@ -3405,6 +3856,7 @@ reasoning_effort = "levels"
+                 "mercury",
+             ],
+             default: true,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+@@ -3462,6 +3914,7 @@ reasoning_effort = "levels"
+                 "gpt-54",
+             ],
+             default: true,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+@@ -3514,6 +3967,7 @@ reasoning_effort = "levels"
+                 "gpt-54-pro",
+             ],
+             default: false,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+@@ -3585,6 +4039,7 @@ reasoning_effort = "levels"
+                 "codex-spark",
+             ],
+             default: false,
++            small_default: false,
+             configured: false,
+         }
+         "#);
+diff --git a/lib/crates/fabro-model/src/catalog/providers/anthropic.toml b/lib/crates/fabro-model/src/catalog/providers/anthropic.toml
+index ed3bd88ff..efa72ded7 100644
+--- a/lib/crates/fabro-model/src/catalog/providers/anthropic.toml
++++ b/lib/crates/fabro-model/src/catalog/providers/anthropic.toml
+@@ -140,6 +140,7 @@ knowledge_cutoff = "May 2025"
+ estimated_output_tps = 100
+ aliases = ["haiku", "claude-haiku"]
+ probe = true
++small_default = true
+ 
+ [models."claude-haiku-4-5".limits]
+ context_window = 200000
+diff --git a/lib/crates/fabro-model/src/catalog/providers/gemini.toml b/lib/crates/fabro-model/src/catalog/providers/gemini.toml
+index f91ca5c63..fb73d6723 100644
+--- a/lib/crates/fabro-model/src/catalog/providers/gemini.toml
++++ b/lib/crates/fabro-model/src/catalog/providers/gemini.toml
+@@ -94,6 +94,7 @@ training = "2025-01-01"
+ knowledge_cutoff = "January 2025"
+ estimated_output_tps = 200
+ aliases = ["gemini-flash-lite"]
++small_default = true
+ 
+ [models."gemini-3.1-flash-lite-preview".limits]
+ context_window = 1048576
+diff --git a/lib/crates/fabro-model/src/catalog/providers/openai.toml b/lib/crates/fabro-model/src/catalog/providers/openai.toml
+index 87dd2d8ac..3cdba296e 100644
+--- a/lib/crates/fabro-model/src/catalog/providers/openai.toml
++++ b/lib/crates/fabro-model/src/catalog/providers/openai.toml
+@@ -238,6 +238,7 @@ knowledge_cutoff = "April 2025"
+ estimated_output_tps = 140
+ aliases = ["gpt54-mini", "gpt-54-mini"]
+ probe = true
++small_default = true
+ 
+ [models."gpt-5.4-mini".limits]
+ context_window = 400000
+diff --git a/lib/crates/fabro-model/src/types.rs b/lib/crates/fabro-model/src/types.rs
+index f6b05d072..764943dd6 100644
+--- a/lib/crates/fabro-model/src/types.rs
++++ b/lib/crates/fabro-model/src/types.rs
+@@ -67,6 +67,8 @@ pub struct Model {
+     pub aliases:              Vec<String>,
+     #[serde(default)]
+     pub default:              bool,
++    #[serde(default)]
++    pub small_default:        bool,
+     /// Whether the server has any credential configured for this model's
+     /// provider at the time of the response. Always `false` in static catalog
+     /// data; populated by `GET /models` per request.
+@@ -150,6 +152,10 @@ impl Model {
+     pub fn is_default(&self) -> bool {
+         self.default
+     }
++
++    pub fn is_small_default(&self) -> bool {
++        self.small_default
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -178,5 +184,6 @@ mod tests {
+         assert_eq!(info.estimated_output_tps(), Some(25.0));
+         assert!(!info.aliases().is_empty());
+         assert!(!info.is_default());
++        assert!(!info.is_small_default());
+     }
+ }
+diff --git a/lib/crates/fabro-server/src/lib.rs b/lib/crates/fabro-server/src/lib.rs
+index 873482712..5bbad6ea5 100644
+--- a/lib/crates/fabro-server/src/lib.rs
++++ b/lib/crates/fabro-server/src/lib.rs
+@@ -31,6 +31,7 @@ mod run_files;
+ mod run_files_security;
+ mod run_manifest;
+ mod run_selector;
++mod run_title_generation;
+ pub mod run_tool_manifest;
+ pub mod security_headers;
+ pub mod serve;
+diff --git a/lib/crates/fabro-server/src/run_title_generation.rs b/lib/crates/fabro-server/src/run_title_generation.rs
+new file mode 100644
+index 000000000..c9d258cc9
+--- /dev/null
++++ b/lib/crates/fabro-server/src/run_title_generation.rs
+@@ -0,0 +1,374 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use fabro_llm::client::Client;
++use fabro_llm::generate::{self, GenerateParams};
++use fabro_llm::types::TimeoutOptions;
++use fabro_model::ProviderId;
++use fabro_types::{Graph, MAX_RUN_TITLE_CHARS, RunId};
++use serde::Serialize;
++use toml::Value as TomlValue;
++
++const TRUNCATED_MARKER: &str = "...[truncated]";
++const MAX_PROMPT_SECTION_CHARS: usize = 4_000;
++
++pub(crate) struct TitlePromptInput<'a> {
++    pub(crate) run_id:          &'a RunId,
++    pub(crate) current_title:   &'a str,
++    pub(crate) workflow_target: Option<&'a str>,
++    pub(crate) run_inputs:      &'a HashMap<String, TomlValue>,
++    pub(crate) workflow:        &'a WorkflowSummary,
++}
++
++pub(crate) struct GenerateTitleInput<'a> {
++    pub(crate) client:      Arc<Client>,
++    pub(crate) model_id:    String,
++    pub(crate) provider_id: ProviderId,
++    pub(crate) prompt:      TitlePromptInput<'a>,
++}
++
++pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> String {
++    let current_title = input.prompt.current_title.to_string();
++    let prompt = build_title_prompt(&input.prompt);
++    let params = GenerateParams::new(input.model_id, input.client)
++        .provider(input.provider_id.to_string())
++        .prompt(prompt)
++        .max_tokens(64)
++        .max_retries(0)
++        .timeout(TimeoutOptions {
++            total:    Some(10.0),
++            per_step: Some(5.0),
++        });
++
++    let result = match generate::generate_object(params, title_response_schema()).await {
++        Ok(result) => result,
++        Err(err) => {
++            tracing::debug!(error = %err, "Run title generation failed");
++            return current_title;
++        }
++    };
++    result
++        .output
++        .as_ref()
++        .and_then(|output| output.get("title"))
++        .and_then(serde_json::Value::as_str)
++        .and_then(normalize_generated_title)
++        .unwrap_or(current_title)
++}
++
++fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
++    let workflow_identity = serde_json::json!({
++        "run_id": input.run_id.to_string(),
++        "current_deterministic_title": input.current_title,
++        "target": input.workflow_target,
++        "name": input.workflow.graph_name,
++        "goal": input.workflow.goal,
++    });
++    let identity = pretty_json(&workflow_identity);
++    let inputs = pretty_json(input.run_inputs);
++    let workflow = pretty_json(input.workflow);
++
++    format!(
++        r#"Generate a concise, human-readable title for this Fabro workflow run.
++
++Base the title on the workflow identity, workflow goal, and run input values.
++Preserve meaningful proper nouns, ticket IDs, repositories, branches, environments, and explicit user goals.
++Return only structured JSON with one field: {{"title":"..."}}.
++The title must be a single line, not blank, and no more than {MAX_RUN_TITLE_CHARS} characters.
++
++Workflow identity:
++```json
++{}
++```
++
++Run inputs (raw values, not redacted):
++```json
++{}
++```
++
++Workflow summary:
++```json
++{}
++```
++"#,
++        truncate_section(&identity, MAX_PROMPT_SECTION_CHARS),
++        truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS),
++        truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS),
++    )
++}
++
++fn normalize_generated_title(title: &str) -> Option<String> {
++    let trimmed = title.trim();
++    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
++        return None;
++    }
++    Some(trimmed.chars().take(MAX_RUN_TITLE_CHARS).collect())
++}
++
++fn title_response_schema() -> serde_json::Value {
++    serde_json::json!({
++        "type": "object",
++        "additionalProperties": false,
++        "required": ["title"],
++        "properties": {
++            "title": {
++                "type": "string",
++                "description": "Concise single-line run title"
++            }
++        }
++    })
++}
++
++#[derive(Serialize)]
++pub(crate) struct WorkflowSummary {
++    pub(crate) graph_name:  String,
++    pub(crate) goal:        String,
++    pub(crate) stage_count: usize,
++    pub(crate) edge_count:  usize,
++    pub(crate) stages:      Vec<StageSummary>,
++}
++
++#[derive(Serialize)]
++pub(crate) struct StageSummary {
++    id:           String,
++    label:        String,
++    handler_type: Option<String>,
++}
++
++pub(crate) fn workflow_summary(graph: &Graph) -> WorkflowSummary {
++    let mut stages = graph
++        .nodes
++        .values()
++        .map(|node| StageSummary {
++            id:           node.id.clone(),
++            label:        node.label().to_string(),
++            handler_type: node.handler_type().map(str::to_string),
++        })
++        .collect::<Vec<_>>();
++    stages.sort_by(|left, right| left.id.cmp(&right.id));
++
++    WorkflowSummary {
++        graph_name: graph.name.clone(),
++        goal: graph.goal().to_string(),
++        stage_count: stages.len(),
++        edge_count: graph.edges.len(),
++        stages,
++    }
++}
++
++fn pretty_json(value: &impl Serialize) -> String {
++    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
++}
++
++fn truncate_section(value: &str, max_chars: usize) -> String {
++    if value.chars().count() <= max_chars {
++        return value.to_string();
++    }
++    let keep = max_chars.saturating_sub(TRUNCATED_MARKER.chars().count());
++    let truncated = value.chars().take(keep).collect::<String>();
++    format!("{truncated}{TRUNCATED_MARKER}")
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::HashMap;
++    use std::pin::Pin;
++    use std::sync::{Arc, Mutex};
++
++    use async_trait::async_trait;
++    use fabro_graphviz::parser;
++    use fabro_llm::client::Client;
++    use fabro_llm::error::Error as LlmError;
++    use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
++    use fabro_llm::token_count::InputTokenCount;
++    use fabro_llm::types::{FinishReason, Message, Request, Response, StreamEvent, TokenCounts};
++    use fabro_model::ProviderId;
++    use fabro_types::RunId;
++    use futures_util::stream;
++    use toml::Value as TomlValue;
++
++    use super::*;
++
++    fn title_test_graph() -> fabro_types::Graph {
++        parser::parse(
++            r#"digraph Ship {
++                graph [goal="Deploy API token SECRET_123 to production"]
++                start [shape=Mdiamond, label="Start"]
++                plan [shape=box, label="Plan rollout"]
++                deploy [shape=parallelogram, label="Deploy"]
++                exit [shape=Msquare, label="Exit"]
++                start -> plan -> deploy -> exit
++            }"#,
++        )
++        .unwrap()
++    }
++
++    #[test]
++    fn prompt_includes_goal_inputs_and_workflow_summary_without_redaction() {
++        let run_id = RunId::new();
++        let graph = title_test_graph();
++        let summary = workflow_summary(&graph);
++        let inputs = HashMap::from([
++            (
++                "api_key".to_string(),
++                TomlValue::String("SECRET_123".to_string()),
++            ),
++            (
++                "region".to_string(),
++                TomlValue::String("us-east-1".to_string()),
++            ),
++        ]);
++
++        let prompt = build_title_prompt(&TitlePromptInput {
++            run_id:          &run_id,
++            current_title:   "Deploy API token SECRET_123 to production",
++            workflow_target: Some("workflows/deploy.fabro"),
++            run_inputs:      &inputs,
++            workflow:        &summary,
++        });
++
++        assert!(prompt.contains("Deploy API token SECRET_123 to production"));
++        assert!(prompt.contains("\"api_key\": \"SECRET_123\""));
++        assert!(prompt.contains("workflows/deploy.fabro"));
++        assert!(prompt.contains("\"id\": \"deploy\""));
++        assert!(prompt.contains("\"handler_type\": \"command\""));
++        assert!(!prompt.contains("[REDACTED]"));
++    }
++
++    #[test]
++    fn prompt_bounds_large_input_and_workflow_sections() {
++        let run_id = RunId::new();
++        let graph = title_test_graph();
++        let summary = workflow_summary(&graph);
++        let inputs = HashMap::from([(
++            "large".to_string(),
++            TomlValue::String("x".repeat(MAX_PROMPT_SECTION_CHARS * 2)),
++        )]);
++
++        let prompt = build_title_prompt(&TitlePromptInput {
++            run_id:          &run_id,
++            current_title:   "Current",
++            workflow_target: Some("workflow.fabro"),
++            run_inputs:      &inputs,
++            workflow:        &summary,
++        });
++
++        // Section truncation: per-section budget × 3 + small boilerplate.
++        assert!(prompt.chars().count() < MAX_PROMPT_SECTION_CHARS * 3 + 1_000);
++        assert!(prompt.contains("...[truncated]"));
++        // One section was truncated, the others were not; ensure we don't
++        // emit a doubly-truncated marker run.
++        assert!(!prompt.contains("...[truncated]...[truncated]"));
++    }
++
++    #[test]
++    fn generated_title_normalization_accepts_and_truncates_valid_titles() {
++        let normalized = normalize_generated_title("  Ship the API rollout  ").unwrap();
++        assert_eq!(normalized, "Ship the API rollout");
++
++        let long = normalize_generated_title(&"a".repeat(101)).unwrap();
++        assert_eq!(long.chars().count(), 100);
++    }
++
++    #[test]
++    fn generated_title_normalization_rejects_blank_and_control_output() {
++        assert!(normalize_generated_title("   ").is_none());
++        assert!(normalize_generated_title("first\nsecond").is_none());
++        assert!(normalize_generated_title("first\tsecond").is_none());
++    }
++
++    #[tokio::test]
++    async fn generation_uses_supplied_small_default_model_id() {
++        let (title, captured) = title_with_mocked_response(r#"{"title":"Generated title"}"#).await;
++
++        assert_eq!(title, "Generated title");
++        let captured = captured.lock().unwrap();
++        assert_eq!(captured[0].model, "small-model");
++        assert_eq!(captured[0].provider.as_deref(), Some("openai"));
++        assert_eq!(captured[0].max_tokens, Some(64));
++    }
++
++    #[tokio::test]
++    async fn invalid_or_failed_generation_returns_current_title() {
++        let (invalid, _) = title_with_mocked_response(r#"{"title":"first\nsecond"}"#).await;
++        assert_eq!(invalid, "Current");
++
++        let (invalid_shape, _) = title_with_mocked_response(r#"{"name":"missing"}"#).await;
++        assert_eq!(invalid_shape, "Current");
++    }
++
++    async fn title_with_mocked_response(response_text: &str) -> (String, Arc<Mutex<Vec<Request>>>) {
++        let captured = Arc::new(Mutex::new(Vec::new()));
++        let provider = Arc::new(CapturingProvider {
++            captured:      Arc::clone(&captured),
++            response_text: response_text.to_string(),
++        });
++        let client = Arc::new(Client::new(
++            HashMap::from([("openai".to_string(), provider as Arc<dyn ProviderAdapter>)]),
++            Some("openai".to_string()),
++            Vec::new(),
++        ));
++        let run_id = RunId::new();
++        let graph = title_test_graph();
++        let summary = workflow_summary(&graph);
++        let inputs = HashMap::new();
++        let title = generate_title_or_current(GenerateTitleInput {
++            client,
++            model_id: "small-model".to_string(),
++            provider_id: ProviderId::openai(),
++            prompt: TitlePromptInput {
++                run_id:          &run_id,
++                current_title:   "Current",
++                workflow_target: Some("workflow.fabro"),
++                run_inputs:      &inputs,
++                workflow:        &summary,
++            },
++        })
++        .await;
++        (title, captured)
++    }
++
++    struct CapturingProvider {
++        captured:      Arc<Mutex<Vec<Request>>>,
++        response_text: String,
++    }
++
++    #[async_trait]
++    impl ProviderAdapter for CapturingProvider {
++        #[expect(
++            clippy::unnecessary_literal_bound,
++            reason = "ProviderAdapter trait signature returns &str."
++        )]
++        fn name(&self) -> &str {
++            "openai"
++        }
++
++        async fn complete(&self, request: &Request) -> Result<Response, LlmError> {
++            self.captured.lock().unwrap().push(request.clone());
++            Ok(Response {
++                id:            "resp_title".to_string(),
++                model:         request.model.clone(),
++                provider:      "openai".to_string(),
++                message:       Message::assistant(self.response_text.clone()),
++                finish_reason: FinishReason::Stop,
++                usage:         TokenCounts::default(),
++                raw:           None,
++                warnings:      Vec::new(),
++                rate_limit:    None,
++            })
++        }
++
++        async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
++            Ok(Pin::from(Box::new(stream::empty::<
++                Result<StreamEvent, LlmError>,
++            >())))
++        }
++
++        async fn count_input_tokens(
++            &self,
++            _request: &Request,
++        ) -> Result<Option<InputTokenCount>, LlmError> {
++            Ok(None)
++        }
++    }
++}
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index 0f1057071..a9aab7b05 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -18,8 +18,10 @@ use fabro_api::types::{
+ };
+ use fabro_config::Storage;
+ use fabro_interview::AnswerSubmission;
++use fabro_llm::client::Client as LlmClient;
+ use fabro_types::{
+-    Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance, parse_blob_ref,
++    Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance, SystemActorKind,
++    parse_blob_ref,
+ };
+ use fabro_util::version::FABRO_VERSION;
+ use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
+@@ -42,6 +44,8 @@ use crate::principal_middleware::{
+ use crate::run_files::{list_run_commits, list_run_files};
+ use crate::run_manifest;
+ use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
++use crate::run_title_generation::{self, GenerateTitleInput, TitlePromptInput, WorkflowSummary};
++use crate::server_secrets::LlmClientResult;
+ 
+ pub(super) fn manifest_routes() -> Router<Arc<AppState>> {
+     Router::new()
+@@ -553,6 +557,7 @@ async fn create_run(
+         Ok(req) => req,
+         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+     };
++    let explicit_title_supplied = req.title.is_some();
+     let manifest_run_defaults = state.manifest_run_defaults();
+     let manifest_environment_defaults = state.manifest_environment_defaults();
+     let prepared = match run_manifest::prepare_manifest_with_environment_defaults(
+@@ -576,9 +581,26 @@ async fn create_run(
+ 
+     let web_url = state.run_web_url(&run_id);
+     let catalog = state.catalog();
+-    let configured_providers = state.ready_llm_provider_ids().await;
+-    let mut create_input =
+-        run_manifest::create_run_input(prepared.clone(), configured_providers, web_url.clone());
++    // Resolve once: we need both the provider IDs (for the run create input
++    // and ask-fabro-readiness) and the LLM client itself (for the spawned
++    // title-generation task). `ready_llm_provider_ids` would otherwise call
++    // `resolve_llm_client` a second time and discard the client.
++    let llm_client_for_title = match state.resolve_llm_client().await {
++        Ok(result) => Some(result),
++        Err(err) => {
++            tracing::warn!(error = ?err, "Failed to resolve LLM client while creating run");
++            None
++        }
++    };
++    let ready_provider_ids = llm_client_for_title
++        .as_ref()
++        .map(LlmClientResult::provider_ids)
++        .unwrap_or_default();
++    let mut create_input = run_manifest::create_run_input(
++        prepared.clone(),
++        ready_provider_ids.clone(),
++        web_url.clone(),
++    );
+     create_input.run_id = Some(run_id);
+     create_input.provenance = Some(run_provenance(&headers, &actor));
+     create_input.submitted_manifest_bytes = Some(body.to_vec());
+@@ -626,6 +648,7 @@ async fn create_run(
+                 .into_response();
+         }
+     };
++    let deterministic_title = summary.title.clone();
+ 
+     {
+         let mut runs = state.runs.lock().expect("runs lock poisoned");
+@@ -641,6 +664,30 @@ async fn create_run(
+         );
+     }
+ 
++    if !explicit_title_supplied && !ready_provider_ids.is_empty() {
++        if let Some(llm_result) = llm_client_for_title {
++            let run_spec = created.persisted.run_spec();
++            let workflow = run_title_generation::workflow_summary(&run_spec.graph);
++            let run_inputs = run_spec.settings.run.inputs.clone();
++            let workflow_target = prepared.target_path.to_string();
++            let title_catalog = state.catalog();
++            let title_model = title_catalog.small_default_for_configured_ids(&ready_provider_ids);
++            let title_model_id = title_model.id.clone();
++            let title_provider_id = title_model.provider.clone();
++            spawn_generated_title_task(GeneratedTitleTask {
++                state: Arc::clone(&state),
++                run_id: created.run_id,
++                deterministic_title,
++                workflow_target,
++                workflow,
++                run_inputs,
++                client: llm_result.client,
++                model_id: title_model_id,
++                provider_id: title_provider_id,
++            });
++        }
++    }
++
+     (
+         StatusCode::CREATED,
+         Json(state.decorate_run_summary(summary).await),
+@@ -648,6 +695,77 @@ async fn create_run(
+         .into_response()
+ }
+ 
++struct GeneratedTitleTask {
++    state:               Arc<AppState>,
++    run_id:              RunId,
++    deterministic_title: String,
++    workflow_target:     String,
++    workflow:            WorkflowSummary,
++    run_inputs:          std::collections::HashMap<String, toml::Value>,
++    client:              LlmClient,
++    model_id:            String,
++    provider_id:         fabro_model::ProviderId,
++}
++
++fn spawn_generated_title_task(task: GeneratedTitleTask) {
++    tokio::spawn(async move {
++        let generated_title = run_title_generation::generate_title_or_current(GenerateTitleInput {
++            client:      Arc::new(task.client),
++            model_id:    task.model_id,
++            provider_id: task.provider_id,
++            prompt:      TitlePromptInput {
++                run_id:          &task.run_id,
++                current_title:   &task.deterministic_title,
++                workflow_target: Some(task.workflow_target.as_str()),
++                run_inputs:      &task.run_inputs,
++                workflow:        &task.workflow,
++            },
++        })
++        .await;
++        if generated_title == task.deterministic_title {
++            return;
++        }
++
++        let current = match task
++            .state
++            .store
++            .get_cached_summary(&task.run_id, Utc::now())
++            .await
++        {
++            Ok(Some(summary)) => summary,
++            Ok(None) => return,
++            Err(err) => {
++                tracing::debug!(run_id = %task.run_id, error = %err, "Failed to re-read run summary for title update");
++                return;
++            }
++        };
++        if current.title != task.deterministic_title {
++            return;
++        }
++        let run_store = match task.state.store.open_run(&task.run_id).await {
++            Ok(store) => store,
++            Err(err) => {
++                tracing::debug!(run_id = %task.run_id, error = %err, "Failed to open run store for title update");
++                return;
++            }
++        };
++        if let Err(err) = workflow_event::append_event(
++            &run_store,
++            &task.run_id,
++            &workflow_event::Event::RunTitleUpdated {
++                title: generated_title,
++                actor: Some(Principal::System {
++                    system_kind: SystemActorKind::Engine,
++                }),
++            },
++        )
++        .await
++        {
++            tracing::debug!(run_id = %task.run_id, error = %err, "Failed to append generated run title event");
++        }
++    });
++}
++
+ fn run_provenance(headers: &HeaderMap, subject: &Principal) -> RunProvenance {
+     RunProvenance {
+         server:  Some(RunServerProvenance {
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index 7cee8c7d7..dc6bb885e 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -2377,6 +2377,254 @@ url = "http://127.0.0.1:32276"
+     );
+ }
+ 
++#[tokio::test]
++async fn create_run_without_explicit_title_returns_deterministic_then_updates_generated_title() {
++    let llm = MockServer::start_async().await;
++    let title_mock = mock_openai_title_response(&llm, "Generated deploy title", None).await;
++    let state = TestAppStateBuilder::new()
++        .provider_base_url("openai", llm.url("/v1"))
++        .env_lookup(|_| None)
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++
++    let body = post_run_manifest(&app, minimal_manifest_json(MINIMAL_DOT)).await;
++    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
++
++    assert_eq!(body["title"], "Test");
++    wait_for_run_title(&state, run_id, "Generated deploy title").await;
++    assert_eq!(title_update_event_count(&state, run_id).await, 1);
++    title_mock.assert_async().await;
++}
++
++#[tokio::test]
++async fn create_run_with_explicit_title_skips_generated_title_work() {
++    let llm = MockServer::start_async().await;
++    let title_mock = mock_openai_title_response(&llm, "Generated deploy title", None).await;
++    let state = TestAppStateBuilder::new()
++        .provider_base_url("openai", llm.url("/v1"))
++        .env_lookup(|_| None)
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
++    manifest["title"] = json!("Caller title");
++
++    let body = post_run_manifest(&app, manifest).await;
++    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
++    // The spawn gate is synchronous in `create_run`, so once the response
++    // returns we know no title task was scheduled. No sleep needed.
++
++    assert_eq!(
++        state
++            .store
++            .get_cached_summary(&run_id, Utc::now())
++            .await
++            .unwrap()
++            .unwrap()
++            .title,
++        "Caller title"
++    );
++    assert_eq!(title_update_event_count(&state, run_id).await, 0);
++    title_mock.assert_calls_async(0).await;
++}
++
++#[tokio::test]
++async fn create_run_without_ready_llm_provider_skips_generated_title_work() {
++    let state = TestAppStateBuilder::new().env_lookup(|_| None).build();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++
++    let body = post_run_manifest(&app, minimal_manifest_json(MINIMAL_DOT)).await;
++    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
++
++    assert_eq!(
++        state
++            .store
++            .get_cached_summary(&run_id, Utc::now())
++            .await
++            .unwrap()
++            .unwrap()
++            .title,
++        "Test"
++    );
++    assert_eq!(title_update_event_count(&state, run_id).await, 0);
++}
++
++#[tokio::test]
++async fn generated_title_failure_leaves_deterministic_title_unchanged() {
++    let llm = MockServer::start_async().await;
++    let title_mock = llm
++        .mock_async(|when, then| {
++            when.method(POST).path("/v1/responses");
++            then.status(500)
++                .header("content-type", "application/json")
++                .json_body(json!({"error": {"message": "boom"}}));
++        })
++        .await;
++    let state = TestAppStateBuilder::new()
++        .provider_base_url("openai", llm.url("/v1"))
++        .env_lookup(|_| None)
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++
++    let body = post_run_manifest(&app, minimal_manifest_json(MINIMAL_DOT)).await;
++    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
++    wait_for_mock_hits(&title_mock, 1).await;
++    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
++
++    assert_eq!(
++        state
++            .store
++            .get_cached_summary(&run_id, Utc::now())
++            .await
++            .unwrap()
++            .unwrap()
++            .title,
++        "Test"
++    );
++    assert_eq!(title_update_event_count(&state, run_id).await, 0);
++}
++
++#[tokio::test]
++async fn generated_title_does_not_overwrite_user_title_edit() {
++    let llm = MockServer::start_async().await;
++    let title_mock = mock_openai_title_response(
++        &llm,
++        "Generated deploy title",
++        Some(std::time::Duration::from_millis(150)),
++    )
++    .await;
++    let state = TestAppStateBuilder::new()
++        .provider_base_url("openai", llm.url("/v1"))
++        .env_lookup(|_| None)
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(Arc::clone(&state));
++
++    let body = post_run_manifest(&app, minimal_manifest_json(MINIMAL_DOT)).await;
++    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
++    let patch = Request::builder()
++        .method("PATCH")
++        .uri(api(&format!("/runs/{run_id}")))
++        .header("content-type", "application/json")
++        .body(Body::from(json!({"title": "User title"}).to_string()))
++        .unwrap();
++    let response = app.clone().oneshot(patch).await.unwrap();
++    response_json!(response, StatusCode::OK).await;
++
++    wait_for_mock_hits(&title_mock, 1).await;
++    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++
++    assert_eq!(
++        state
++            .store
++            .get_cached_summary(&run_id, Utc::now())
++            .await
++            .unwrap()
++            .unwrap()
++            .title,
++        "User title"
++    );
++    assert_eq!(title_update_event_count(&state, run_id).await, 1);
++}
++
++async fn post_run_manifest(app: &Router, manifest: serde_json::Value) -> serde_json::Value {
++    let response = app
++        .clone()
++        .oneshot(
++            Request::builder()
++                .method("POST")
++                .uri(api("/runs"))
++                .header("content-type", "application/json")
++                .body(Body::from(manifest.to_string()))
++                .unwrap(),
++        )
++        .await
++        .unwrap();
++    response_json!(response, StatusCode::CREATED).await
++}
++
++async fn mock_openai_title_response<'a>(
++    server: &'a MockServer,
++    title: &str,
++    delay: Option<std::time::Duration>,
++) -> httpmock::Mock<'a> {
++    let title = title.to_string();
++    server
++        .mock_async(move |when, then| {
++            when.method(POST).path("/v1/responses");
++            let then = then
++                .status(200)
++                .header("content-type", "application/json")
++                .json_body(openai_responses_payload(
++                    &json!({ "title": title }).to_string(),
++                ));
++            if let Some(delay) = delay {
++                then.delay(delay);
++            }
++        })
++        .await
++}
++
++async fn wait_for_run_title(state: &AppState, run_id: RunId, expected: &str) {
++    for _ in 0..50 {
++        let title = state
++            .store
++            .get_cached_summary(&run_id, Utc::now())
++            .await
++            .unwrap()
++            .unwrap()
++            .title;
++        if title == expected {
++            return;
++        }
++        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++    }
++    panic!("run {run_id} title did not become {expected:?}");
++}
++
++async fn wait_for_mock_hits(mock: &httpmock::Mock<'_>, expected: usize) {
++    for _ in 0..50 {
++        if mock.calls_async().await >= expected {
++            return;
++        }
++        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++    }
++    panic!("mock did not receive {expected} request(s)");
++}
++
++async fn title_update_event_count(state: &AppState, run_id: RunId) -> usize {
++    let run_store = state.store.open_run(&run_id).await.unwrap();
++    run_store
++        .list_events()
++        .await
++        .unwrap()
++        .into_iter()
++        .filter(|event| event.event.event_name() == "run.title.updated")
++        .count()
++}
++
+ #[tokio::test]
+ async fn validate_endpoint_returns_workflow_summary_without_preflight_checks() {
+     let app = test_app_with();
+diff --git a/lib/crates/fabro-types/src/lib.rs b/lib/crates/fabro-types/src/lib.rs
+index 3c46fc819..b1f5ba2d0 100644
+--- a/lib/crates/fabro-types/src/lib.rs
++++ b/lib/crates/fabro-types/src/lib.rs
+@@ -112,7 +112,9 @@ pub use run_summary::{
+     AskFabro, AskFabroUnavailableReason, AutomationRef, Run, RunBillingSummary, RunError,
+     RunLifecycle, RunLinks, RunModel, RunOrigin, RunOriginKind, RunTimestamps, WorkflowRef,
+ };
+-pub use run_title::{RunTitleError, infer_run_title, normalize_explicit_run_title};
++pub use run_title::{
++    MAX_RUN_TITLE_CHARS, RunTitleError, infer_run_title, normalize_explicit_run_title,
++};
+ pub use sandbox_details::{
+     SandboxDetails, SandboxNetwork, SandboxNetworkPolicy, SandboxNetworkPolicyMode,
+     SandboxResources, SandboxState, SandboxTimestamps,
+diff --git a/lib/crates/fabro-types/src/run_title.rs b/lib/crates/fabro-types/src/run_title.rs
+index 9468e448b..d38b2e7b9 100644
+--- a/lib/crates/fabro-types/src/run_title.rs
++++ b/lib/crates/fabro-types/src/run_title.rs
+@@ -3,7 +3,7 @@ use std::fmt;
+ 
+ use fabro_util::text::strip_goal_decoration;
+ 
+-const MAX_RUN_TITLE_CHARS: usize = 100;
++pub const MAX_RUN_TITLE_CHARS: usize = 100;
+ const TRUNCATED_RUN_TITLE_CHARS: usize = MAX_RUN_TITLE_CHARS - 3;
+ const UNTITLED_RUN: &str = "Untitled run";
+ 
+diff --git a/lib/packages/fabro-api-client/src/models/model.ts b/lib/packages/fabro-api-client/src/models/model.ts
+index 4b03f415b..f02cb0e51 100644
+--- a/lib/packages/fabro-api-client/src/models/model.ts
++++ b/lib/packages/fabro-api-client/src/models/model.ts
+@@ -66,6 +66,10 @@ export interface Model {
+      * Whether this is the default model for its provider.
+      */
+     'default': boolean;
++    /**
++     * Whether this is the provider\'s small/default utility model.
++     */
++    'small_default': boolean;
+     /**
+      * Whether credential material is present for this model\'s provider on the server (vault entry or environment variable). Does NOT imply the credential is valid or that requests will succeed; call `POST /models/{id}/test` to verify usability.
+      */
