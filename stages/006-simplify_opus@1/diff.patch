@@ -1,0 +1,273 @@
+diff --git a/lib/crates/fabro-agent/src/question_tools.rs b/lib/crates/fabro-agent/src/question_tools.rs
+index fd9c7deda..290b2aa90 100644
+--- a/lib/crates/fabro-agent/src/question_tools.rs
++++ b/lib/crates/fabro-agent/src/question_tools.rs
+@@ -24,6 +24,9 @@ pub const ANTHROPIC_ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+ pub const OPTION_DESCRIPTION_MAX_CHARS: usize = 2_000;
+ pub const OPTION_PREVIEW_MAX_CHARS: usize = 4_000;
+ 
++const ROOT_SESSION_REQUIRED_ERROR: &str =
++    "human-question tools are available only during a root workflow agent session";
++
+ #[derive(Clone, Default)]
+ pub struct AgentToolRuntime {
+     question_runtime: Option<Arc<dyn AgentQuestionRuntime>>,
+@@ -265,12 +268,14 @@ async fn execute_question_tool(
+     ctx: ToolContext,
+     questions: Vec<AgentQuestion>,
+ ) -> Result<Vec<AgentQuestionAnswer>, String> {
+-    let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+-        "human-question tools are available only during a root workflow agent session".to_string()
+-    })?;
+-    let root_session_id = ctx.root_session_id.as_deref().ok_or_else(|| {
+-        "human-question tools are available only during a root workflow agent session".to_string()
+-    })?;
++    let session_id = ctx
++        .session_id
++        .as_deref()
++        .ok_or_else(|| ROOT_SESSION_REQUIRED_ERROR.to_string())?;
++    let root_session_id = ctx
++        .root_session_id
++        .as_deref()
++        .ok_or_else(|| ROOT_SESSION_REQUIRED_ERROR.to_string())?;
+     if session_id != root_session_id {
+         return Err(
+             "human-question tools are only available to the root agent; subagents must report back to their parent".to_string(),
+@@ -394,10 +399,10 @@ fn display_text(header: Option<&str>, question: &str) -> String {
+ 
+ #[must_use]
+ pub fn bounded_display_field(value: &str, max_chars: usize) -> String {
+-    if value.chars().count() <= max_chars {
+-        return value.to_string();
++    match value.char_indices().nth(max_chars) {
++        Some((byte_idx, _)) => value[..byte_idx].to_string(),
++        None => value.to_string(),
+     }
+-    value.chars().take(max_chars).collect()
+ }
+ 
+ fn ensure_all_answered(answers: &[AgentQuestionAnswer]) -> Result<(), String> {
+@@ -444,10 +449,8 @@ fn format_anthropic_answers(answers: &[AgentQuestionAnswer]) -> Result<String, S
+     let pairs = answers
+         .iter()
+         .map(|answer| {
+-            let question = serde_json::to_string(&answer.original_question)
+-                .unwrap_or_else(|_| "\"question\"".to_string());
+-            let answer_text = serde_json::to_string(&answer.answers.join(", "))
+-                .unwrap_or_else(|_| "\"\"".to_string());
++            let question = json!(answer.original_question);
++            let answer_text = json!(answer.answers.join(", "));
+             format!("{question}={answer_text}")
+         })
+         .collect::<Vec<_>>()
+diff --git a/lib/crates/fabro-agent/src/tool_execution.rs b/lib/crates/fabro-agent/src/tool_execution.rs
+index 3015b6147..c55b9ce3d 100644
+--- a/lib/crates/fabro-agent/src/tool_execution.rs
++++ b/lib/crates/fabro-agent/src/tool_execution.rs
+@@ -264,12 +264,21 @@ fn error_tool_result_with_events(
+     config: &SessionOptions,
+     message: &str,
+ ) -> ToolResult {
++    emit_tool_call_started(emitter, session_id, tc);
++    let result = ToolResult::error(&tc.id, message);
++    emit_tool_call_result(emitter, session_id, tc, &result);
++    truncate_tool_result(&result, &tc.name, config)
++}
++
++fn emit_tool_call_started(emitter: &Emitter, session_id: &str, tc: &ToolCall) {
+     emitter.emit(session_id.to_owned(), AgentEvent::ToolCallStarted {
+         tool_name:    tc.name.clone(),
+         tool_call_id: tc.id.clone(),
+         arguments:    tc.arguments.clone(),
+     });
+-    let result = ToolResult::error(&tc.id, message);
++}
++
++fn emit_tool_call_result(emitter: &Emitter, session_id: &str, tc: &ToolCall, result: &ToolResult) {
+     emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {
+         delta: result.content.to_string(),
+     });
+@@ -277,9 +286,8 @@ fn error_tool_result_with_events(
+         tool_name:    tc.name.clone(),
+         tool_call_id: tc.id.clone(),
+         output:       result.content.clone(),
+-        is_error:     true,
++        is_error:     result.is_error,
+     });
+-    truncate_tool_result(&result, &tc.name, config)
+ }
+ 
+ /// Execute a single tool call with event emission and output truncation.
+@@ -375,25 +383,11 @@ async fn execute_and_emit_one_tool_with_lookup(
+     tool_env_provider: Option<&Arc<dyn ToolEnvProvider>>,
+     agent_tool_runtime: &AgentToolRuntime,
+ ) -> ToolResult {
+-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallStarted {
+-        tool_name:    tc.name.clone(),
+-        tool_call_id: tc.id.clone(),
+-        arguments:    tc.arguments.clone(),
+-    });
++    emit_tool_call_started(emitter, session_id, tc);
+ 
+     if let Some(reason) = access_denial {
+         let result = ToolResult::error(&tc.id, &reason);
+-
+-        emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {
+-            delta: result.content.to_string(),
+-        });
+-        emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {
+-            tool_name:    tc.name.clone(),
+-            tool_call_id: tc.id.clone(),
+-            output:       result.content.clone(),
+-            is_error:     true,
+-        });
+-
++        emit_tool_call_result(emitter, session_id, tc, &result);
+         return truncate_tool_result(&result, &tc.name, config);
+     }
+ 
+@@ -407,17 +401,7 @@ async fn execute_and_emit_one_tool_with_lookup(
+ 
+         if let ToolHookDecision::Block { reason } = decision {
+             let result = ToolResult::error(&tc.id, &reason);
+-
+-            emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {
+-                delta: result.content.to_string(),
+-            });
+-            emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {
+-                tool_name:    tc.name.clone(),
+-                tool_call_id: tc.id.clone(),
+-                output:       result.content.clone(),
+-                is_error:     true,
+-            });
+-
++            emit_tool_call_result(emitter, session_id, tc, &result);
+             return truncate_tool_result(&result, &tc.name, config);
+         }
+     }
+@@ -435,16 +419,7 @@ async fn execute_and_emit_one_tool_with_lookup(
+     )
+     .await;
+ 
+-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {
+-        delta: result.content.to_string(),
+-    });
+-
+-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {
+-        tool_name:    tc.name.clone(),
+-        tool_call_id: tc.id.clone(),
+-        output:       result.content.clone(),
+-        is_error:     result.is_error,
+-    });
++    emit_tool_call_result(emitter, session_id, tc, &result);
+ 
+     // Post-tool-use hooks
+     if let Some(hooks) = tool_hooks {
+diff --git a/lib/crates/fabro-workflow/src/interview_runtime.rs b/lib/crates/fabro-workflow/src/interview_runtime.rs
+index e844de8b3..f0898a55c 100644
+--- a/lib/crates/fabro-workflow/src/interview_runtime.rs
++++ b/lib/crates/fabro-workflow/src/interview_runtime.rs
+@@ -10,7 +10,6 @@ use fabro_interview::{Answer, AnswerSubmission, AnswerValue, Interviewer, Questi
+ use fabro_types::{BlockedReason, InterviewOption, Principal, SystemActorKind};
+ use futures::future;
+ use tokio_util::sync::CancellationToken;
+-use ulid::Ulid;
+ 
+ use crate::event::{Emitter, Event, StageScope};
+ use crate::millis_u64;
+@@ -67,12 +66,6 @@ impl RunInterviewBlocker {
+     }
+ }
+ 
+-impl Default for RunInterviewBlocker {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+-
+ pub(crate) struct RunInterviewGuard {
+     blocker:  Arc<RunInterviewBlocker>,
+     emitter:  Arc<Emitter>,
+@@ -81,6 +74,10 @@ pub(crate) struct RunInterviewGuard {
+ 
+ impl RunInterviewGuard {
+     pub(crate) fn resolve(mut self) {
++        self.resolve_in_place();
++    }
++
++    fn resolve_in_place(&mut self) {
+         if !self.resolved {
+             self.blocker.resolved(self.emitter.as_ref());
+             self.resolved = true;
+@@ -90,10 +87,7 @@ impl RunInterviewGuard {
+ 
+ impl Drop for RunInterviewGuard {
+     fn drop(&mut self) {
+-        if !self.resolved {
+-            self.blocker.resolved(self.emitter.as_ref());
+-            self.resolved = true;
+-        }
++        self.resolve_in_place();
+     }
+ }
+ 
+@@ -426,13 +420,13 @@ fn answer_from_submission(
+ 
+ fn answer_labels(options: &[InterviewOption], answer: &Answer) -> Vec<String> {
+     match &answer.value {
+-        AnswerValue::Selected(key) => {
+-            vec![option_label(options, key, answer.selected_option.as_ref())]
++        AnswerValue::Selected(key) => vec![answer.selected_option.as_ref().map_or_else(
++            || label_for_key(options, key),
++            |option| option.label.clone(),
++        )],
++        AnswerValue::MultiSelected(keys) => {
++            keys.iter().map(|key| label_for_key(options, key)).collect()
+         }
+-        AnswerValue::MultiSelected(keys) => keys
+-            .iter()
+-            .map(|key| option_label(options, key, None))
+-            .collect(),
+         AnswerValue::Text(text) => vec![text.clone()],
+         AnswerValue::Yes => vec!["yes".to_string()],
+         AnswerValue::No => vec!["no".to_string()],
+@@ -443,25 +437,20 @@ fn answer_labels(options: &[InterviewOption], answer: &Answer) -> Vec<String> {
+     }
+ }
+ 
+-fn option_label(
+-    options: &[InterviewOption],
+-    key: &str,
+-    selected_option: Option<&InterviewOption>,
+-) -> String {
+-    selected_option
+-        .filter(|option| option.key == key)
+-        .or_else(|| options.iter().find(|option| option.key == key))
++fn label_for_key(options: &[InterviewOption], key: &str) -> String {
++    options
++        .iter()
++        .find(|option| option.key == key)
+         .map_or_else(|| key.to_string(), |option| option.label.clone())
+ }
+ 
+ fn internal_question_id(scope: &StageScope, tool_call_id: &str, index: usize) -> String {
+     format!(
+-        "agentq-{}-v{}-{}-{}-{}",
++        "agentq-{}-v{}-{}-{}",
+         slug(&scope.node_id),
+         scope.visit,
+         slug(tool_call_id),
+         index + 1,
+-        Ulid::new()
+     )
+ }
+ 
+@@ -522,7 +511,7 @@ mod tests {
+ 
+         let id = internal_question_id(&scope, "call_123", 1);
+ 
+-        assert!(id.starts_with("agentq-reviewchanges-v3-call_123-2-"));
++        assert_eq!(id, "agentq-reviewchanges-v3-call_123-2");
+     }
+ 
+     #[tokio::test]

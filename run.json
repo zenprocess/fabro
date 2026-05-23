@@ -493,7 +493,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-23T16:30:00.579662Z",
-  "last_event_at": "2026-05-23T17:36:14.461171Z",
+  "last_event_at": "2026-05-23T17:43:36.788408Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -864,9 +864,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1595,
       "checkpoint": {
-        "timestamp": "2026-05-23T17:36:14.594548Z",
+        "timestamp": "2026-05-23T17:36:18.587672Z",
         "current_node": "simplify_opus",
         "completed_nodes": [
           "start",
@@ -878,36 +878,40 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.fidelity": "compact",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "response.simplify_opus": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in a single `char_indices().nth(...)` pass instead of `chars().count()` + `chars().take()`.\n- Dropped redundant `Ulid::new()` from `internal_question_id` — slug + stage visit + tool-call-id + index is already unique.\n\n**Code quality**\n- De-duped the access-denial / hook-block / normal-execution event triple via shared `emit_tool_call_started` and `emit_tool_call_result` helpers in `tool_execution.rs`, dropping ~25 lines of copy-pasted emit code.\n- Cleaned up dead `unwrap_or_else` fallbacks in `format_anthropic_answers` (infallible string serialization).\n- Extracted repeated \"root agent session\" error string into `ROOT_SESSION_REQUIRED_ERROR` constant.\n- Renamed `option_label` to `label_for_key`, dropping the redundant `selected_option.filter(key)` defensive check. Preserved the `selected_option`-first lookup for `Selected` (control-protocol path supplies `Selected(key)` with `selected_option: None`).\n- Removed the unused `Default for RunInterviewBlocker` impl.\n- De-duped `RunInterviewGuard::resolve` and `Drop` via a shared `resolve_in_place` method.\n\n**Findings noted but not applied** (with rationale):\n- Lifting `agent_tool_runtime` from a parameter into a task-local set once at the top: large cross-crate refactor; skipped to keep scope bounded.\n- Unifying OpenAI/Anthropic question tools into one schema: schemas intentionally differ (`id`/`header` required for OpenAI, `multiSelect` and `preview` for Anthropic); separation matches provider contracts.\n- `AgentToolRuntime` one-field wrapper: keeping a struct allows future expansion at no extra friction.\n- `register_question_tools` moving into `AgentProfile` trait: cross-crate refactor; current explicit dispatch is fine for two profiles.\n- Cleaning `ControlInterviewer.pending` on agent-batch cancel: needs a new `Interviewer` API; flagged as the most substantial follow-up.\n- `..InterviewOption::default()` adoption in tests: high-churn, low-value compared to other items in this pass.\n- The `mem::forget` suggestion for `RunInterviewGuard::resolve` is buggy — it would leak the `Arc<RunInterviewBlocker>` and `Arc<Emitter>` refs. Used a shared method instead.\n\n**Verification**\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-interview -p fabro-server`: all tests pass except 3 pre-existing flaky SVG-render tests (confirmed by stashing changes and reproducing the same failures on the pre-cleanup tree).\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`: clean.\n- `cargo +nightly-2026-04-14 fmt --check --all`: clean.",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "last_stage": "simplify_opus",
+          "thread.preflight_lint.current_node": "implement",
           "response.implement": "Implemented the mid-stage agent interview tools and metadata plumbing.\n\nSummary of changes:\n- Extended canonical `InterviewOption` with optional `description` and `preview`.\n- Updated OpenAPI and regenerated the TypeScript API client:\n  - `ApiQuestion.options` now uses `InterviewOption`.\n  - Removed stale `ApiQuestionOption` export/file.\n- Added model-native agent question tools:\n  - OpenAI: `request_user_input`\n  - Anthropic: `AskUserQuestion`\n  - Gemini: no question tool\n- Added per-turn `AgentToolRuntime` so cached sessions receive current workflow/stage interview context dynamically.\n- Enforced question-tool round rules:\n  - question tool runs alone\n  - mixed tool peers get model-visible errors\n  - multiple separate question-tool calls execute only the first and tell the model to batch\n- Added shared run-level interview blocker/guard used by both human gates and agent questions.\n- Added workflow runtime for agent-originated batched questions:\n  - emits/registers all questions first\n  - blocks once per batch\n  - waits concurrently\n  - emits completion/interruption/timeout events per question\n  - cleans up pending questions on cancellation/drop\n- Preserved answer endpoints/paths through existing pending interview projection and submission flow.\n- Updated web/Slack display:\n  - web shows option descriptions\n  - Slack renders option descriptions where practical\n  - preview is captured/exposed but not specially rendered\n- Added/updated tests across agent, workflow, API, store, Slack, and web.\n\nValidation run:\n- `cargo check -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --tests` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --all-targets -- -D warnings` ✅\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-api ...focused question/API tests...` ✅\n- `cargo nextest run -p fabro-interview` ✅\n- `cargo nextest run -p fabro-slack -p fabro-store --lib --tests` ✅\n- `cd apps/fabro-web && bun test ./app/components/interview-dock.test.tsx ./app/components/stage-renderers/helpers.test.ts` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n\nNoted failures:\n- `cargo nextest run -p fabro-server ...` fails on `server::tests::get_graph_returns_svg`; rerun of the single test also fails. The error is the graph renderer subprocess returning nextest output (`running 0 tests`) instead of SVG, unrelated to the interview changes.\n- Full `cd apps/fabro-web && bun test` still has existing unrelated failures in run-detail/lifecycle tests; focused changed web tests pass and typecheck passes.",
-          "failure_signature": "",
           "failure_class": "",
+          "outcome": "succeeded",
+          "internal.node_visit_count": 1,
+          "thread.start.current_node": "toolchain",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.thread_id": "implement",
           "thread.toolchain.current_node": "preflight_compile",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "internal.thread_id": "implement",
-          "thread.preflight_lint.current_node": "implement",
-          "internal.retry_count.simplify_opus": 0,
-          "internal.retry_count.preflight_lint": 0,
-          "internal.retry_count.preflight_compile": 0,
-          "response.simplify_opus": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in a single `char_indices().nth(...)` pass instead of `chars().count()` + `chars().take()`.\n- Dropped redundant `Ulid::new()` from `internal_question_id` — slug + stage visit + tool-call-id + index is already unique.\n\n**Code quality**\n- De-duped the access-denial / hook-block / normal-execution event triple via shared `emit_tool_call_started` and `emit_tool_call_result` helpers in `tool_execution.rs`, dropping ~25 lines of copy-pasted emit code.\n- Cleaned up dead `unwrap_or_else` fallbacks in `format_anthropic_answers` (infallible string serialization).\n- Extracted repeated \"root agent session\" error string into `ROOT_SESSION_REQUIRED_ERROR` constant.\n- Renamed `option_label` to `label_for_key`, dropping the redundant `selected_option.filter(key)` defensive check. Preserved the `selected_option`-first lookup for `Selected` (control-protocol path supplies `Selected(key)` with `selected_option: None`).\n- Removed the unused `Default for RunInterviewBlocker` impl.\n- De-duped `RunInterviewGuard::resolve` and `Drop` via a shared `resolve_in_place` method.\n\n**Findings noted but not applied** (with rationale):\n- Lifting `agent_tool_runtime` from a parameter into a task-local set once at the top: large cross-crate refactor; skipped to keep scope bounded.\n- Unifying OpenAI/Anthropic question tools into one schema: schemas intentionally differ (`id`/`header` required for OpenAI, `multiSelect` and `preview` for Anthropic); separation matches provider contracts.\n- `AgentToolRuntime` one-field wrapper: keeping a struct allows future expansion at no extra friction.\n- `register_question_tools` moving into `AgentProfile` trait: cross-crate refactor; current explicit dispatch is fine for two profiles.\n- Cleaning `ControlInterviewer.pending` on agent-batch cancel: needs a new `Interviewer` API; flagged as the most substantial follow-up.\n- `..InterviewOption::default()` adoption in tests: high-churn, low-value compared to other items in this pass.\n- The `mem::forget` suggestion for `RunInterviewGuard::resolve` is buggy — it would leak the `Arc<RunInterviewBlocker>` and `Arc<Emitter>` refs. Used a shared method instead.\n\n**Verification**\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-interview -p fabro-server`: all tests pass except 3 pre-existing flaky SVG-render tests (confirmed by stashing changes and reproducing the same failures on the pre-cleanup tree).\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`: clean.\n- `cargo +nightly-2026-04-14 fmt --check --all`: clean.",
-          "internal.retry_count.start": 0,
-          "internal.run_id": "01KSATQNAXG41FHKV0QH5N1QGC",
-          "thread.start.current_node": "toolchain",
-          "graph.goal": "# Mid-Stage Agent Interview Tools\n\n## Summary\n\nAdd model-native question tools that let agents pause mid-stage and ask the human for input through Fabro's existing interview system.\n\nOpenAI-profile agents get `request_user_input`; Anthropic-profile agents get `AskUserQuestion`. When either tool is called, Fabro creates pending interview questions, surfaces them through the existing web/API/Slack paths, waits for answers, then returns provider-shaped tool results so the model can continue the same stage.\n\n## Key Changes\n\n- Extend the existing interview contract without type sprawl:\n  - Add optional `description` and `preview` fields to the canonical `fabro_types::InterviewOption`; reuse that type through `fabro-api` replacements instead of introducing `AgentQuestionOption`, API-only aliases, or adapter-only duplicate types.\n  - Update OpenAPI, generated Rust/TypeScript clients, event conversion, projection, Slack/web mappers, and the existing `with_replacement(\"InterviewOption\", \"fabro_types::InterviewOption\", ...)` parity tests.\n  - Treat both fields as untrusted model-authored display data. Store and expose them after enforcing bounded lengths; truncate or reject oversized values consistently before persistence.\n  - Initial UI behavior: display `description` under option labels where practical. Capture and expose `preview`, but do not render preview content specially in web or Slack v1.\n\n- Add a shared run-level interview runtime:\n  - Move the private human-node blocked-state refcount into a reusable run-level guard used by both `HumanHandler` and agent question tools, so `RunUnblocked` is emitted only when all human and agent interviews for the run are resolved.\n  - Runtime accepts the interviewer, workflow emitter, stage scope, stage id, tool call id, and normalized questions.\n  - Support batch asks as a first-class operation: emit/register all questions first, mark the run blocked once, await all answers concurrently, then emit completion/timeout/interrupted events per question and unblock when the batch resolves.\n  - Batch support applies only to multiple `questions[]` inside one question-tool call. Do not aggregate multiple separate question-tool calls from the same model round.\n  - Generate safe internal question IDs with a ULID/UUID plus stage visit/tool-call context; store original model question IDs/text in question metadata for provider result mapping.\n\n- Add provider-specific agent tools:\n  - `request_user_input` for `AgentProfileKind::OpenAi`.\n    - Accept Codex-compatible schema: `questions[]` with `id`, `header`, `question`, and `options[] { label, description }`.\n    - Normalize each question to `QuestionType::MultipleChoice` with `allow_freeform: true`.\n    - Return JSON text matching Codex shape, keyed by the original model question ID: `{\"answers\":{\"id\":{\"answers\":[\"...\"]}}}`.\n  - `AskUserQuestion` for `AgentProfileKind::Anthropic`.\n    - Accept Claude-compatible schema: `questions[]` with `question`, `header`, `options[] { label, description, preview? }`, and `multiSelect`.\n    - Normalize single-select to `MultipleChoice`, multi-select to `MultiSelect`, always with `allow_freeform: true`.\n    - Return Claude-style tool result text keyed by the original question text: `User has answered your questions: \"...question...\"=\"answer\". You can now continue...`.\n  - Answer formatting for both tools returns user-facing option labels to the model. Preserve internal option keys for validation and event storage. For multi-select, preserve the submission order supplied by the answer path.\n\n- Thread workflow interview context into agent tool execution:\n  - Add an explicit per-turn agent tool runtime context passed into `process_input` or an adjacent `process_input_with_runtime` API. It carries the interviewer, workflow emitter, stage scope/id, shared block guard, and provider answer formatter.\n  - Do not capture stage-specific interview handles in the profile registry or cached session construction; cached full-fidelity sessions must receive the current turn's stage context dynamically.\n  - Child/subagent sessions must not expose these question tools. If somehow called outside the root session, return a model-visible error.\n  - Question tools must execute alone in a model tool round. If a round contains one question tool plus any other tool call, execute the question tool and return model-visible error results for the non-question peers, preserving tool-call/tool-result ordering. If a round contains multiple separate question-tool calls, execute only the first and return model-visible error results for the later question-tool calls instructing the model to combine questions into one `questions[]` batch.\n  - Agent-originated questions have no per-question timeout in v1 because the provider schemas do not include timeout. They rely on existing stage timeout, wall-clock timeout, cancellation, and interruption behavior.\n\n- Preserve existing answer paths:\n  - Do not add a new answer endpoint.\n  - Continue using `GET /runs/{id}/questions` and `POST /runs/{id}/questions/{qid}/answer`.\n  - Keep `ControlInterviewer`, web `InterviewDock`, Slack blocks, and run projection as the delivery mechanism.\n\n## Test Plan\n\n- Unit tests for schema parsing and normalization:\n  - Codex request with descriptions maps to Fabro multiple-choice questions and returns answers by model question ID.\n  - Claude request with `multiSelect: true` maps to `MultiSelect` and returns comma-separated answer text.\n  - Batched Codex and Claude requests surface all questions as pending before awaiting answers, then return one result with every answer mapped to the original model ID/text.\n  - Optional `preview` and `description` survive event, projection, API conversion, OpenAPI replacement tests, and TypeScript client generation.\n  - Oversized `description`/`preview` values are bounded before persistence and never rendered as trusted HTML.\n\n- Workflow and agent tests:\n  - OpenAI-profile session advertises `request_user_input`; Anthropic-profile session advertises `AskUserQuestion`; Gemini advertises neither.\n  - Subagent profiles do not advertise the question tools.\n  - Root agent can ask a question and resume after the answer.\n  - Subagent or missing interview context returns a clear tool error.\n  - Cached full-fidelity session emits interview events against the current stage, not the original cached stage.\n  - A mixed tool round containing a human-question tool plus another tool preserves all required tool results and rejects the peer calls with model-visible errors.\n  - A round with multiple separate question-tool calls executes only the first and rejects later question-tool calls with model-visible errors.\n\n- Server, projection, and UI tests:\n  - `InterviewStarted` with option metadata appears in pending questions.\n  - Submitting valid selected, multi-selected, and freeform answers unblocks the waiting tool.\n  - Duplicate answer submission remains rejected through existing accepted-question logic.\n  - Parallel human gate plus agent question keeps the run blocked until both are answered.\n  - Pause, cancel, and interrupt while an agent question is waiting resolve pending questions consistently and do not leave the run blocked.\n  - Stage timeout or wall-clock timeout while an agent question is waiting interrupts the batch; no per-question timeout event is expected unless a future schema adds timeout.\n  - Slack answer submissions work for agent-originated questions using the same pending interview transport.\n\n- Run checks:\n  - `cargo nextest run -p fabro-interview -p fabro-workflow -p fabro-server -p fabro-agent`\n  - `cd apps/fabro-web && bun test && bun run typecheck`\n  - Regenerate and verify OpenAPI-derived Rust and TypeScript clients after schema changes.\n\n## Assumptions\n\n- This feature is only for in-process/API-backed agent sessions, not ACP external agents in v1.\n- `preview` is stored and exposed but not rendered specially in the first implementation.\n- Human-question tools are available only during root agent execution inside a workflow run with an active interviewer.\n- Existing interview events remain the source of truth for pending questions; no separate agent-question event family is added.\n- The implementation should prefer extending existing interview structs and replacement mappings over adding parallel API DTOs or conversion-only aliases.\n",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
-          "last_stage": "simplify_opus",
-          "graph.rankdir": "LR",
-          "internal.retry_count.implement": 0,
-          "current_node": "simplify_opus",
-          "internal.node_visit_count": 1,
           "internal.retry_count.toolchain": 0,
-          "thread.preflight_compile.current_node": "preflight_lint",
-          "last_response": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "graph.rankdir": "LR",
           "thread.implement.current_node": "simplify_opus",
-          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "outcome": "succeeded"
+          "failure_signature": "",
+          "internal.run_id": "01KSATQNAXG41FHKV0QH5N1QGC",
+          "last_response": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in",
+          "graph.goal": "# Mid-Stage Agent Interview Tools\n\n## Summary\n\nAdd model-native question tools that let agents pause mid-stage and ask the human for input through Fabro's existing interview system.\n\nOpenAI-profile agents get `request_user_input`; Anthropic-profile agents get `AskUserQuestion`. When either tool is called, Fabro creates pending interview questions, surfaces them through the existing web/API/Slack paths, waits for answers, then returns provider-shaped tool results so the model can continue the same stage.\n\n## Key Changes\n\n- Extend the existing interview contract without type sprawl:\n  - Add optional `description` and `preview` fields to the canonical `fabro_types::InterviewOption`; reuse that type through `fabro-api` replacements instead of introducing `AgentQuestionOption`, API-only aliases, or adapter-only duplicate types.\n  - Update OpenAPI, generated Rust/TypeScript clients, event conversion, projection, Slack/web mappers, and the existing `with_replacement(\"InterviewOption\", \"fabro_types::InterviewOption\", ...)` parity tests.\n  - Treat both fields as untrusted model-authored display data. Store and expose them after enforcing bounded lengths; truncate or reject oversized values consistently before persistence.\n  - Initial UI behavior: display `description` under option labels where practical. Capture and expose `preview`, but do not render preview content specially in web or Slack v1.\n\n- Add a shared run-level interview runtime:\n  - Move the private human-node blocked-state refcount into a reusable run-level guard used by both `HumanHandler` and agent question tools, so `RunUnblocked` is emitted only when all human and agent interviews for the run are resolved.\n  - Runtime accepts the interviewer, workflow emitter, stage scope, stage id, tool call id, and normalized questions.\n  - Support batch asks as a first-class operation: emit/register all questions first, mark the run blocked once, await all answers concurrently, then emit completion/timeout/interrupted events per question and unblock when the batch resolves.\n  - Batch support applies only to multiple `questions[]` inside one question-tool call. Do not aggregate multiple separate question-tool calls from the same model round.\n  - Generate safe internal question IDs with a ULID/UUID plus stage visit/tool-call context; store original model question IDs/text in question metadata for provider result mapping.\n\n- Add provider-specific agent tools:\n  - `request_user_input` for `AgentProfileKind::OpenAi`.\n    - Accept Codex-compatible schema: `questions[]` with `id`, `header`, `question`, and `options[] { label, description }`.\n    - Normalize each question to `QuestionType::MultipleChoice` with `allow_freeform: true`.\n    - Return JSON text matching Codex shape, keyed by the original model question ID: `{\"answers\":{\"id\":{\"answers\":[\"...\"]}}}`.\n  - `AskUserQuestion` for `AgentProfileKind::Anthropic`.\n    - Accept Claude-compatible schema: `questions[]` with `question`, `header`, `options[] { label, description, preview? }`, and `multiSelect`.\n    - Normalize single-select to `MultipleChoice`, multi-select to `MultiSelect`, always with `allow_freeform: true`.\n    - Return Claude-style tool result text keyed by the original question text: `User has answered your questions: \"...question...\"=\"answer\". You can now continue...`.\n  - Answer formatting for both tools returns user-facing option labels to the model. Preserve internal option keys for validation and event storage. For multi-select, preserve the submission order supplied by the answer path.\n\n- Thread workflow interview context into agent tool execution:\n  - Add an explicit per-turn agent tool runtime context passed into `process_input` or an adjacent `process_input_with_runtime` API. It carries the interviewer, workflow emitter, stage scope/id, shared block guard, and provider answer formatter.\n  - Do not capture stage-specific interview handles in the profile registry or cached session construction; cached full-fidelity sessions must receive the current turn's stage context dynamically.\n  - Child/subagent sessions must not expose these question tools. If somehow called outside the root session, return a model-visible error.\n  - Question tools must execute alone in a model tool round. If a round contains one question tool plus any other tool call, execute the question tool and return model-visible error results for the non-question peers, preserving tool-call/tool-result ordering. If a round contains multiple separate question-tool calls, execute only the first and return model-visible error results for the later question-tool calls instructing the model to combine questions into one `questions[]` batch.\n  - Agent-originated questions have no per-question timeout in v1 because the provider schemas do not include timeout. They rely on existing stage timeout, wall-clock timeout, cancellation, and interruption behavior.\n\n- Preserve existing answer paths:\n  - Do not add a new answer endpoint.\n  - Continue using `GET /runs/{id}/questions` and `POST /runs/{id}/questions/{qid}/answer`.\n  - Keep `ControlInterviewer`, web `InterviewDock`, Slack blocks, and run projection as the delivery mechanism.\n\n## Test Plan\n\n- Unit tests for schema parsing and normalization:\n  - Codex request with descriptions maps to Fabro multiple-choice questions and returns answers by model question ID.\n  - Claude request with `multiSelect: true` maps to `MultiSelect` and returns comma-separated answer text.\n  - Batched Codex and Claude requests surface all questions as pending before awaiting answers, then return one result with every answer mapped to the original model ID/text.\n  - Optional `preview` and `description` survive event, projection, API conversion, OpenAPI replacement tests, and TypeScript client generation.\n  - Oversized `description`/`preview` values are bounded before persistence and never rendered as trusted HTML.\n\n- Workflow and agent tests:\n  - OpenAI-profile session advertises `request_user_input`; Anthropic-profile session advertises `AskUserQuestion`; Gemini advertises neither.\n  - Subagent profiles do not advertise the question tools.\n  - Root agent can ask a question and resume after the answer.\n  - Subagent or missing interview context returns a clear tool error.\n  - Cached full-fidelity session emits interview events against the current stage, not the original cached stage.\n  - A mixed tool round containing a human-question tool plus another tool preserves all required tool results and rejects the peer calls with model-visible errors.\n  - A round with multiple separate question-tool calls executes only the first and rejects later question-tool calls with model-visible errors.\n\n- Server, projection, and UI tests:\n  - `InterviewStarted` with option metadata appears in pending questions.\n  - Submitting valid selected, multi-selected, and freeform answers unblocks the waiting tool.\n  - Duplicate answer submission remains rejected through existing accepted-question logic.\n  - Parallel human gate plus agent question keeps the run blocked until both are answered.\n  - Pause, cancel, and interrupt while an agent question is waiting resolve pending questions consistently and do not leave the run blocked.\n  - Stage timeout or wall-clock timeout while an agent question is waiting interrupts the batch; no per-question timeout event is expected unless a future schema adds timeout.\n  - Slack answer submissions work for agent-originated questions using the same pending interview transport.\n\n- Run checks:\n  - `cargo nextest run -p fabro-interview -p fabro-workflow -p fabro-server -p fabro-agent`\n  - `cd apps/fabro-web && bun test && bun run typecheck`\n  - Regenerate and verify OpenAPI-derived Rust and TypeScript clients after schema changes.\n\n## Assumptions\n\n- This feature is only for in-process/API-backed agent sessions, not ACP external agents in v1.\n- `preview` is stored and exposed but not rendered specially in the first implementation.\n- Human-question tools are available only during root agent execution inside a workflow run with an active interviewer.\n- Existing interview events remain the source of truth for pending questions; no separate agent-question event family is added.\n- The implementation should prefer extending existing interview structs and replacement mappings over adding parallel API DTOs or conversion-only aliases.\n",
+          "internal.retry_count.start": 0,
+          "current_node": "simplify_opus",
+          "internal.retry_count.implement": 0,
+          "internal.fidelity": "compact"
         },
         "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
           "implement": {
             "status": "succeeded",
             "context_updates": {
@@ -942,8 +946,12 @@
               "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/interview_runtime.rs"
             ]
           },
-          "start": {
+          "preflight_compile": {
             "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
           },
           "toolchain": {
@@ -952,14 +960,6 @@
               "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
             },
             "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-            "usage": null
-          },
-          "preflight_compile": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
           },
           "preflight_lint": {
@@ -1009,9 +1009,209 @@
           }
         },
         "next_node_id": "simplify_gpt",
+        "git_commit_sha": "4e691055bdfc9ae6a0b6399a9bac7b529b4effda",
+        "node_visits": {
+          "simplify_opus": 1,
+          "toolchain": 1,
+          "preflight_compile": 1,
+          "preflight_lint": 1,
+          "implement": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-agent/src/question_tools.rs b/lib/crates/fabro-agent/src/question_tools.rs\nindex fd9c7deda..290b2aa90 100644\n--- a/lib/crates/fabro-agent/src/question_tools.rs\n+++ b/lib/crates/fabro-agent/src/question_tools.rs\n@@ -24,6 +24,9 @@ pub const ANTHROPIC_ASK_USER_QUESTION_TOOL: &str = \"AskUserQuestion\";\n pub const OPTION_DESCRIPTION_MAX_CHARS: usize = 2_000;\n pub const OPTION_PREVIEW_MAX_CHARS: usize = 4_000;\n \n+const ROOT_SESSION_REQUIRED_ERROR: &str =\n+    \"human-question tools are available only during a root workflow agent session\";\n+\n #[derive(Clone, Default)]\n pub struct AgentToolRuntime {\n     question_runtime: Option<Arc<dyn AgentQuestionRuntime>>,\n@@ -265,12 +268,14 @@ async fn execute_question_tool(\n     ctx: ToolContext,\n     questions: Vec<AgentQuestion>,\n ) -> Result<Vec<AgentQuestionAnswer>, String> {\n-    let session_id = ctx.session_id.as_deref().ok_or_else(|| {\n-        \"human-question tools are available only during a root workflow agent session\".to_string()\n-    })?;\n-    let root_session_id = ctx.root_session_id.as_deref().ok_or_else(|| {\n-        \"human-question tools are available only during a root workflow agent session\".to_string()\n-    })?;\n+    let session_id = ctx\n+        .session_id\n+        .as_deref()\n+        .ok_or_else(|| ROOT_SESSION_REQUIRED_ERROR.to_string())?;\n+    let root_session_id = ctx\n+        .root_session_id\n+        .as_deref()\n+        .ok_or_else(|| ROOT_SESSION_REQUIRED_ERROR.to_string())?;\n     if session_id != root_session_id {\n         return Err(\n             \"human-question tools are only available to the root agent; subagents must report back to their parent\".to_string(),\n@@ -394,10 +399,10 @@ fn display_text(header: Option<&str>, question: &str) -> String {\n \n #[must_use]\n pub fn bounded_display_field(value: &str, max_chars: usize) -> String {\n-    if value.chars().count() <= max_chars {\n-        return value.to_string();\n+    match value.char_indices().nth(max_chars) {\n+        Some((byte_idx, _)) => value[..byte_idx].to_string(),\n+        None => value.to_string(),\n     }\n-    value.chars().take(max_chars).collect()\n }\n \n fn ensure_all_answered(answers: &[AgentQuestionAnswer]) -> Result<(), String> {\n@@ -444,10 +449,8 @@ fn format_anthropic_answers(answers: &[AgentQuestionAnswer]) -> Result<String, S\n     let pairs = answers\n         .iter()\n         .map(|answer| {\n-            let question = serde_json::to_string(&answer.original_question)\n-                .unwrap_or_else(|_| \"\\\"question\\\"\".to_string());\n-            let answer_text = serde_json::to_string(&answer.answers.join(\", \"))\n-                .unwrap_or_else(|_| \"\\\"\\\"\".to_string());\n+            let question = json!(answer.original_question);\n+            let answer_text = json!(answer.answers.join(\", \"));\n             format!(\"{question}={answer_text}\")\n         })\n         .collect::<Vec<_>>()\ndiff --git a/lib/crates/fabro-agent/src/tool_execution.rs b/lib/crates/fabro-agent/src/tool_execution.rs\nindex 3015b6147..c55b9ce3d 100644\n--- a/lib/crates/fabro-agent/src/tool_execution.rs\n+++ b/lib/crates/fabro-agent/src/tool_execution.rs\n@@ -264,12 +264,21 @@ fn error_tool_result_with_events(\n     config: &SessionOptions,\n     message: &str,\n ) -> ToolResult {\n+    emit_tool_call_started(emitter, session_id, tc);\n+    let result = ToolResult::error(&tc.id, message);\n+    emit_tool_call_result(emitter, session_id, tc, &result);\n+    truncate_tool_result(&result, &tc.name, config)\n+}\n+\n+fn emit_tool_call_started(emitter: &Emitter, session_id: &str, tc: &ToolCall) {\n     emitter.emit(session_id.to_owned(), AgentEvent::ToolCallStarted {\n         tool_name:    tc.name.clone(),\n         tool_call_id: tc.id.clone(),\n         arguments:    tc.arguments.clone(),\n     });\n-    let result = ToolResult::error(&tc.id, message);\n+}\n+\n+fn emit_tool_call_result(emitter: &Emitter, session_id: &str, tc: &ToolCall, result: &ToolResult) {\n     emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {\n         delta: result.content.to_string(),\n     });\n@@ -277,9 +286,8 @@ fn error_tool_result_with_events(\n         tool_name:    tc.name.clone(),\n         tool_call_id: tc.id.clone(),\n         output:       result.content.clone(),\n-        is_error:     true,\n+        is_error:     result.is_error,\n     });\n-    truncate_tool_result(&result, &tc.name, config)\n }\n \n /// Execute a single tool call with event emission and output truncation.\n@@ -375,25 +383,11 @@ async fn execute_and_emit_one_tool_with_lookup(\n     tool_env_provider: Option<&Arc<dyn ToolEnvProvider>>,\n     agent_tool_runtime: &AgentToolRuntime,\n ) -> ToolResult {\n-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallStarted {\n-        tool_name:    tc.name.clone(),\n-        tool_call_id: tc.id.clone(),\n-        arguments:    tc.arguments.clone(),\n-    });\n+    emit_tool_call_started(emitter, session_id, tc);\n \n     if let Some(reason) = access_denial {\n         let result = ToolResult::error(&tc.id, &reason);\n-\n-        emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {\n-            delta: result.content.to_string(),\n-        });\n-        emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {\n-            tool_name:    tc.name.clone(),\n-            tool_call_id: tc.id.clone(),\n-            output:       result.content.clone(),\n-            is_error:     true,\n-        });\n-\n+        emit_tool_call_result(emitter, session_id, tc, &result);\n         return truncate_tool_result(&result, &tc.name, config);\n     }\n \n@@ -407,17 +401,7 @@ async fn execute_and_emit_one_tool_with_lookup(\n \n         if let ToolHookDecision::Block { reason } = decision {\n             let result = ToolResult::error(&tc.id, &reason);\n-\n-            emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {\n-                delta: result.content.to_string(),\n-            });\n-            emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {\n-                tool_name:    tc.name.clone(),\n-                tool_call_id: tc.id.clone(),\n-                output:       result.content.clone(),\n-                is_error:     true,\n-            });\n-\n+            emit_tool_call_result(emitter, session_id, tc, &result);\n             return truncate_tool_result(&result, &tc.name, config);\n         }\n     }\n@@ -435,16 +419,7 @@ async fn execute_and_emit_one_tool_with_lookup(\n     )\n     .await;\n \n-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallOutputDelta {\n-        delta: result.content.to_string(),\n-    });\n-\n-    emitter.emit(session_id.to_owned(), AgentEvent::ToolCallCompleted {\n-        tool_name:    tc.name.clone(),\n-        tool_call_id: tc.id.clone(),\n-        output:       result.content.clone(),\n-        is_error:     result.is_error,\n-    });\n+    emit_tool_call_result(emitter, session_id, tc, &result);\n \n     // Post-tool-use hooks\n     if let Some(hooks) = tool_hooks {\ndiff --git a/lib/crates/fabro-workflow/src/interview_runtime.rs b/lib/crates/fabro-workflow/src/interview_runtime.rs\nindex e844de8b3..f0898a55c 100644\n--- a/lib/crates/fabro-workflow/src/interview_runtime.rs\n+++ b/lib/crates/fabro-workflow/src/interview_runtime.rs\n@@ -10,7 +10,6 @@ use fabro_interview::{Answer, AnswerSubmission, AnswerValue, Interviewer, Questi\n use fabro_types::{BlockedReason, InterviewOption, Principal, SystemActorKind};\n use futures::future;\n use tokio_util::sync::CancellationToken;\n-use ulid::Ulid;\n \n use crate::event::{Emitter, Event, StageScope};\n use crate::millis_u64;\n@@ -67,12 +66,6 @@ impl RunInterviewBlocker {\n     }\n }\n \n-impl Default for RunInterviewBlocker {\n-    fn default() -> Self {\n-        Self::new()\n-    }\n-}\n-\n pub(crate) struct RunInterviewGuard {\n     blocker:  Arc<RunInterviewBlocker>,\n     emitter:  Arc<Emitter>,\n@@ -81,6 +74,10 @@ pub(crate) struct RunInterviewGuard {\n \n impl RunInterviewGuard {\n     pub(crate) fn resolve(mut self) {\n+        self.resolve_in_place();\n+    }\n+\n+    fn resolve_in_place(&mut self) {\n         if !self.resolved {\n             self.blocker.resolved(self.emitter.as_ref());\n             self.resolved = true;\n@@ -90,10 +87,7 @@ impl RunInterviewGuard {\n \n impl Drop for RunInterviewGuard {\n     fn drop(&mut self) {\n-        if !self.resolved {\n-            self.blocker.resolved(self.emitter.as_ref());\n-            self.resolved = true;\n-        }\n+        self.resolve_in_place();\n     }\n }\n \n@@ -426,13 +420,13 @@ fn answer_from_submission(\n \n fn answer_labels(options: &[InterviewOption], answer: &Answer) -> Vec<String> {\n     match &answer.value {\n-        AnswerValue::Selected(key) => {\n-            vec![option_label(options, key, answer.selected_option.as_ref())]\n+        AnswerValue::Selected(key) => vec![answer.selected_option.as_ref().map_or_else(\n+            || label_for_key(options, key),\n+            |option| option.label.clone(),\n+        )],\n+        AnswerValue::MultiSelected(keys) => {\n+            keys.iter().map(|key| label_for_key(options, key)).collect()\n         }\n-        AnswerValue::MultiSelected(keys) => keys\n-            .iter()\n-            .map(|key| option_label(options, key, None))\n-            .collect(),\n         AnswerValue::Text(text) => vec![text.clone()],\n         AnswerValue::Yes => vec![\"yes\".to_string()],\n         AnswerValue::No => vec![\"no\".to_string()],\n@@ -443,25 +437,20 @@ fn answer_labels(options: &[InterviewOption], answer: &Answer) -> Vec<String> {\n     }\n }\n \n-fn option_label(\n-    options: &[InterviewOption],\n-    key: &str,\n-    selected_option: Option<&InterviewOption>,\n-) -> String {\n-    selected_option\n-        .filter(|option| option.key == key)\n-        .or_else(|| options.iter().find(|option| option.key == key))\n+fn label_for_key(options: &[InterviewOption], key: &str) -> String {\n+    options\n+        .iter()\n+        .find(|option| option.key == key)\n         .map_or_else(|| key.to_string(), |option| option.label.clone())\n }\n \n fn internal_question_id(scope: &StageScope, tool_call_id: &str, index: usize) -> String {\n     format!(\n-        \"agentq-{}-v{}-{}-{}-{}\",\n+        \"agentq-{}-v{}-{}-{}\",\n         slug(&scope.node_id),\n         scope.visit,\n         slug(tool_call_id),\n         index + 1,\n-        Ulid::new()\n     )\n }\n \n@@ -522,7 +511,7 @@ mod tests {\n \n         let id = internal_question_id(&scope, \"call_123\", 1);\n \n-        assert!(id.starts_with(\"agentq-reviewchanges-v3-call_123-2-\"));\n+        assert_eq!(id, \"agentq-reviewchanges-v3-call_123-2\");\n     }\n \n     #[tokio::test]\n",
+        "summary": {
+          "files_changed": 42,
+          "additions": 2063,
+          "deletions": 363
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-23T17:43:36.865493Z",
+        "current_node": "simplify_gpt",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.fidelity": "compact",
+          "response.implement": "Implemented the mid-stage agent interview tools and metadata plumbing.\n\nSummary of changes:\n- Extended canonical `InterviewOption` with optional `description` and `preview`.\n- Updated OpenAPI and regenerated the TypeScript API client:\n  - `ApiQuestion.options` now uses `InterviewOption`.\n  - Removed stale `ApiQuestionOption` export/file.\n- Added model-native agent question tools:\n  - OpenAI: `request_user_input`\n  - Anthropic: `AskUserQuestion`\n  - Gemini: no question tool\n- Added per-turn `AgentToolRuntime` so cached sessions receive current workflow/stage interview context dynamically.\n- Enforced question-tool round rules:\n  - question tool runs alone\n  - mixed tool peers get model-visible errors\n  - multiple separate question-tool calls execute only the first and tell the model to batch\n- Added shared run-level interview blocker/guard used by both human gates and agent questions.\n- Added workflow runtime for agent-originated batched questions:\n  - emits/registers all questions first\n  - blocks once per batch\n  - waits concurrently\n  - emits completion/interruption/timeout events per question\n  - cleans up pending questions on cancellation/drop\n- Preserved answer endpoints/paths through existing pending interview projection and submission flow.\n- Updated web/Slack display:\n  - web shows option descriptions\n  - Slack renders option descriptions where practical\n  - preview is captured/exposed but not specially rendered\n- Added/updated tests across agent, workflow, API, store, Slack, and web.\n\nValidation run:\n- `cargo check -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --tests` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --all-targets -- -D warnings` ✅\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-api ...focused question/API tests...` ✅\n- `cargo nextest run -p fabro-interview` ✅\n- `cargo nextest run -p fabro-slack -p fabro-store --lib --tests` ✅\n- `cd apps/fabro-web && bun test ./app/components/interview-dock.test.tsx ./app/components/stage-renderers/helpers.test.ts` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n\nNoted failures:\n- `cargo nextest run -p fabro-server ...` fails on `server::tests::get_graph_returns_svg`; rerun of the single test also fails. The error is the graph renderer subprocess returning nextest output (`running 0 tests`) instead of SVG, unrelated to the interview changes.\n- Full `cd apps/fabro-web && bun test` still has existing unrelated failures in run-detail/lifecycle tests; focused changed web tests pass and typecheck passes.",
+          "failure_signature": "",
+          "failure_class": "",
+          "thread.toolchain.current_node": "preflight_compile",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.thread_id": "simplify_opus",
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.simplify_opus": 0,
+          "internal.retry_count.simplify_gpt": 0,
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.preflight_compile": 0,
+          "response.simplify_opus": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in a single `char_indices().nth(...)` pass instead of `chars().count()` + `chars().take()`.\n- Dropped redundant `Ulid::new()` from `internal_question_id` — slug + stage visit + tool-call-id + index is already unique.\n\n**Code quality**\n- De-duped the access-denial / hook-block / normal-execution event triple via shared `emit_tool_call_started` and `emit_tool_call_result` helpers in `tool_execution.rs`, dropping ~25 lines of copy-pasted emit code.\n- Cleaned up dead `unwrap_or_else` fallbacks in `format_anthropic_answers` (infallible string serialization).\n- Extracted repeated \"root agent session\" error string into `ROOT_SESSION_REQUIRED_ERROR` constant.\n- Renamed `option_label` to `label_for_key`, dropping the redundant `selected_option.filter(key)` defensive check. Preserved the `selected_option`-first lookup for `Selected` (control-protocol path supplies `Selected(key)` with `selected_option: None`).\n- Removed the unused `Default for RunInterviewBlocker` impl.\n- De-duped `RunInterviewGuard::resolve` and `Drop` via a shared `resolve_in_place` method.\n\n**Findings noted but not applied** (with rationale):\n- Lifting `agent_tool_runtime` from a parameter into a task-local set once at the top: large cross-crate refactor; skipped to keep scope bounded.\n- Unifying OpenAI/Anthropic question tools into one schema: schemas intentionally differ (`id`/`header` required for OpenAI, `multiSelect` and `preview` for Anthropic); separation matches provider contracts.\n- `AgentToolRuntime` one-field wrapper: keeping a struct allows future expansion at no extra friction.\n- `register_question_tools` moving into `AgentProfile` trait: cross-crate refactor; current explicit dispatch is fine for two profiles.\n- Cleaning `ControlInterviewer.pending` on agent-batch cancel: needs a new `Interviewer` API; flagged as the most substantial follow-up.\n- `..InterviewOption::default()` adoption in tests: high-churn, low-value compared to other items in this pass.\n- The `mem::forget` suggestion for `RunInterviewGuard::resolve` is buggy — it would leak the `Arc<RunInterviewBlocker>` and `Arc<Emitter>` refs. Used a shared method instead.\n\n**Verification**\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-interview -p fabro-server`: all tests pass except 3 pre-existing flaky SVG-render tests (confirmed by stashing changes and reproducing the same failures on the pre-cleanup tree).\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`: clean.\n- `cargo +nightly-2026-04-14 fmt --check --all`: clean.",
+          "internal.retry_count.start": 0,
+          "internal.run_id": "01KSATQNAXG41FHKV0QH5N1QGC",
+          "thread.start.current_node": "toolchain",
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "response.simplify_gpt": "Review/cleanup completed.\n\nFixed:\n- Added a ULID suffix to agent-generated internal question IDs so they include stage/tool-call context but are still unique/safe.\n- Changed agent answer label mapping to use the persisted option list as the source of truth instead of trusting `selected_option` from the submission.\n- Made `bounded_display_field` private to avoid exposing a helper as public API unnecessarily.\n\nValidation run:\n- `cargo test -q -p fabro-workflow interview_runtime -- --nocapture`\n- `cargo test -q -p fabro-agent question_tools -- --nocapture`\n- `cargo test -q -p fabro-agent question_tool_round -- --nocapture`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo check -q -p fabro-agent -p fabro-workflow`\n\nAll passed.",
+          "graph.goal": "# Mid-Stage Agent Interview Tools\n\n## Summary\n\nAdd model-native question tools that let agents pause mid-stage and ask the human for input through Fabro's existing interview system.\n\nOpenAI-profile agents get `request_user_input`; Anthropic-profile agents get `AskUserQuestion`. When either tool is called, Fabro creates pending interview questions, surfaces them through the existing web/API/Slack paths, waits for answers, then returns provider-shaped tool results so the model can continue the same stage.\n\n## Key Changes\n\n- Extend the existing interview contract without type sprawl:\n  - Add optional `description` and `preview` fields to the canonical `fabro_types::InterviewOption`; reuse that type through `fabro-api` replacements instead of introducing `AgentQuestionOption`, API-only aliases, or adapter-only duplicate types.\n  - Update OpenAPI, generated Rust/TypeScript clients, event conversion, projection, Slack/web mappers, and the existing `with_replacement(\"InterviewOption\", \"fabro_types::InterviewOption\", ...)` parity tests.\n  - Treat both fields as untrusted model-authored display data. Store and expose them after enforcing bounded lengths; truncate or reject oversized values consistently before persistence.\n  - Initial UI behavior: display `description` under option labels where practical. Capture and expose `preview`, but do not render preview content specially in web or Slack v1.\n\n- Add a shared run-level interview runtime:\n  - Move the private human-node blocked-state refcount into a reusable run-level guard used by both `HumanHandler` and agent question tools, so `RunUnblocked` is emitted only when all human and agent interviews for the run are resolved.\n  - Runtime accepts the interviewer, workflow emitter, stage scope, stage id, tool call id, and normalized questions.\n  - Support batch asks as a first-class operation: emit/register all questions first, mark the run blocked once, await all answers concurrently, then emit completion/timeout/interrupted events per question and unblock when the batch resolves.\n  - Batch support applies only to multiple `questions[]` inside one question-tool call. Do not aggregate multiple separate question-tool calls from the same model round.\n  - Generate safe internal question IDs with a ULID/UUID plus stage visit/tool-call context; store original model question IDs/text in question metadata for provider result mapping.\n\n- Add provider-specific agent tools:\n  - `request_user_input` for `AgentProfileKind::OpenAi`.\n    - Accept Codex-compatible schema: `questions[]` with `id`, `header`, `question`, and `options[] { label, description }`.\n    - Normalize each question to `QuestionType::MultipleChoice` with `allow_freeform: true`.\n    - Return JSON text matching Codex shape, keyed by the original model question ID: `{\"answers\":{\"id\":{\"answers\":[\"...\"]}}}`.\n  - `AskUserQuestion` for `AgentProfileKind::Anthropic`.\n    - Accept Claude-compatible schema: `questions[]` with `question`, `header`, `options[] { label, description, preview? }`, and `multiSelect`.\n    - Normalize single-select to `MultipleChoice`, multi-select to `MultiSelect`, always with `allow_freeform: true`.\n    - Return Claude-style tool result text keyed by the original question text: `User has answered your questions: \"...question...\"=\"answer\". You can now continue...`.\n  - Answer formatting for both tools returns user-facing option labels to the model. Preserve internal option keys for validation and event storage. For multi-select, preserve the submission order supplied by the answer path.\n\n- Thread workflow interview context into agent tool execution:\n  - Add an explicit per-turn agent tool runtime context passed into `process_input` or an adjacent `process_input_with_runtime` API. It carries the interviewer, workflow emitter, stage scope/id, shared block guard, and provider answer formatter.\n  - Do not capture stage-specific interview handles in the profile registry or cached session construction; cached full-fidelity sessions must receive the current turn's stage context dynamically.\n  - Child/subagent sessions must not expose these question tools. If somehow called outside the root session, return a model-visible error.\n  - Question tools must execute alone in a model tool round. If a round contains one question tool plus any other tool call, execute the question tool and return model-visible error results for the non-question peers, preserving tool-call/tool-result ordering. If a round contains multiple separate question-tool calls, execute only the first and return model-visible error results for the later question-tool calls instructing the model to combine questions into one `questions[]` batch.\n  - Agent-originated questions have no per-question timeout in v1 because the provider schemas do not include timeout. They rely on existing stage timeout, wall-clock timeout, cancellation, and interruption behavior.\n\n- Preserve existing answer paths:\n  - Do not add a new answer endpoint.\n  - Continue using `GET /runs/{id}/questions` and `POST /runs/{id}/questions/{qid}/answer`.\n  - Keep `ControlInterviewer`, web `InterviewDock`, Slack blocks, and run projection as the delivery mechanism.\n\n## Test Plan\n\n- Unit tests for schema parsing and normalization:\n  - Codex request with descriptions maps to Fabro multiple-choice questions and returns answers by model question ID.\n  - Claude request with `multiSelect: true` maps to `MultiSelect` and returns comma-separated answer text.\n  - Batched Codex and Claude requests surface all questions as pending before awaiting answers, then return one result with every answer mapped to the original model ID/text.\n  - Optional `preview` and `description` survive event, projection, API conversion, OpenAPI replacement tests, and TypeScript client generation.\n  - Oversized `description`/`preview` values are bounded before persistence and never rendered as trusted HTML.\n\n- Workflow and agent tests:\n  - OpenAI-profile session advertises `request_user_input`; Anthropic-profile session advertises `AskUserQuestion`; Gemini advertises neither.\n  - Subagent profiles do not advertise the question tools.\n  - Root agent can ask a question and resume after the answer.\n  - Subagent or missing interview context returns a clear tool error.\n  - Cached full-fidelity session emits interview events against the current stage, not the original cached stage.\n  - A mixed tool round containing a human-question tool plus another tool preserves all required tool results and rejects the peer calls with model-visible errors.\n  - A round with multiple separate question-tool calls executes only the first and rejects later question-tool calls with model-visible errors.\n\n- Server, projection, and UI tests:\n  - `InterviewStarted` with option metadata appears in pending questions.\n  - Submitting valid selected, multi-selected, and freeform answers unblocks the waiting tool.\n  - Duplicate answer submission remains rejected through existing accepted-question logic.\n  - Parallel human gate plus agent question keeps the run blocked until both are answered.\n  - Pause, cancel, and interrupt while an agent question is waiting resolve pending questions consistently and do not leave the run blocked.\n  - Stage timeout or wall-clock timeout while an agent question is waiting interrupts the batch; no per-question timeout event is expected unless a future schema adds timeout.\n  - Slack answer submissions work for agent-originated questions using the same pending interview transport.\n\n- Run checks:\n  - `cargo nextest run -p fabro-interview -p fabro-workflow -p fabro-server -p fabro-agent`\n  - `cd apps/fabro-web && bun test && bun run typecheck`\n  - Regenerate and verify OpenAPI-derived Rust and TypeScript clients after schema changes.\n\n## Assumptions\n\n- This feature is only for in-process/API-backed agent sessions, not ACP external agents in v1.\n- `preview` is stored and exposed but not rendered specially in the first implementation.\n- Human-question tools are available only during root agent execution inside a workflow run with an active interviewer.\n- Existing interview events remain the source of truth for pending questions; no separate agent-question event family is added.\n- The implementation should prefer extending existing interview structs and replacement mappings over adding parallel API DTOs or conversion-only aliases.\n",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "last_stage": "simplify_gpt",
+          "graph.rankdir": "LR",
+          "internal.retry_count.implement": 0,
+          "current_node": "simplify_gpt",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.toolchain": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "last_response": "Review/cleanup completed.\n\nFixed:\n- Added a ULID suffix to agent-generated internal question IDs so they include stage/tool-call context but are still unique/safe.\n- Changed agent answer label mapping",
+          "thread.implement.current_node": "simplify_opus",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "outcome": "succeeded"
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Review/cleanup completed.\n\nFixed:\n- Added a ULID suffix to agent-generated internal question IDs so they include stage/tool-call context but are still unique/safe.\n- Changed agent answer label mapping",
+              "response.simplify_gpt": "Review/cleanup completed.\n\nFixed:\n- Added a ULID suffix to agent-generated internal question IDs so they include stage/tool-call context but are still unique/safe.\n- Changed agent answer label mapping to use the persisted option list as the source of truth instead of trusting `selected_option` from the submission.\n- Made `bounded_display_field` private to avoid exposing a helper as public API unnecessarily.\n\nValidation run:\n- `cargo test -q -p fabro-workflow interview_runtime -- --nocapture`\n- `cargo test -q -p fabro-agent question_tools -- --nocapture`\n- `cargo test -q -p fabro-agent question_tool_round -- --nocapture`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo check -q -p fabro-agent -p fabro-workflow`\n\nAll passed.",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 83557,
+                    "output_tokens": 4482,
+                    "reasoning_tokens": 3194,
+                    "cache_read_tokens": 2025984,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 1661057
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Implemented the mid-stage agent interview tools and metadata plumbing.\n\nSummary of changes:\n- Extended canonical `InterviewOption` with optional `description` and `preview`.\n- Updated OpenAPI and rege",
+              "last_stage": "implement",
+              "response.implement": "Implemented the mid-stage agent interview tools and metadata plumbing.\n\nSummary of changes:\n- Extended canonical `InterviewOption` with optional `description` and `preview`.\n- Updated OpenAPI and regenerated the TypeScript API client:\n  - `ApiQuestion.options` now uses `InterviewOption`.\n  - Removed stale `ApiQuestionOption` export/file.\n- Added model-native agent question tools:\n  - OpenAI: `request_user_input`\n  - Anthropic: `AskUserQuestion`\n  - Gemini: no question tool\n- Added per-turn `AgentToolRuntime` so cached sessions receive current workflow/stage interview context dynamically.\n- Enforced question-tool round rules:\n  - question tool runs alone\n  - mixed tool peers get model-visible errors\n  - multiple separate question-tool calls execute only the first and tell the model to batch\n- Added shared run-level interview blocker/guard used by both human gates and agent questions.\n- Added workflow runtime for agent-originated batched questions:\n  - emits/registers all questions first\n  - blocks once per batch\n  - waits concurrently\n  - emits completion/interruption/timeout events per question\n  - cleans up pending questions on cancellation/drop\n- Preserved answer endpoints/paths through existing pending interview projection and submission flow.\n- Updated web/Slack display:\n  - web shows option descriptions\n  - Slack renders option descriptions where practical\n  - preview is captured/exposed but not specially rendered\n- Added/updated tests across agent, workflow, API, store, Slack, and web.\n\nValidation run:\n- `cargo check -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --tests` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-agent -p fabro-workflow -p fabro-api -p fabro-server -p fabro-slack -p fabro-store -p fabro-cli --all-targets -- -D warnings` ✅\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-api ...focused question/API tests...` ✅\n- `cargo nextest run -p fabro-interview` ✅\n- `cargo nextest run -p fabro-slack -p fabro-store --lib --tests` ✅\n- `cd apps/fabro-web && bun test ./app/components/interview-dock.test.tsx ./app/components/stage-renderers/helpers.test.ts` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n\nNoted failures:\n- `cargo nextest run -p fabro-server ...` fails on `server::tests::get_graph_returns_svg`; rerun of the single test also fails. The error is the graph renderer subprocess returning nextest output (`running 0 tests`) instead of SVG, unrelated to the interview changes.\n- Full `cd apps/fabro-web && bun test` still has existing unrelated failures in run-detail/lifecycle tests; focused changed web tests pass and typecheck passes."
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 483262,
+                    "output_tokens": 43089,
+                    "reasoning_tokens": 20029,
+                    "cache_read_tokens": 63283712,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 35951706
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/question_tools.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/interview_runtime.rs"
+            ]
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in",
+              "response.simplify_opus": "All clean. Final summary:\n\n## Cleanup Applied\n\nAggregated findings from three reviews and applied 7 focused fixes (3 files, net −31 lines):\n\n**Efficiency**\n- `bounded_display_field` now truncates in a single `char_indices().nth(...)` pass instead of `chars().count()` + `chars().take()`.\n- Dropped redundant `Ulid::new()` from `internal_question_id` — slug + stage visit + tool-call-id + index is already unique.\n\n**Code quality**\n- De-duped the access-denial / hook-block / normal-execution event triple via shared `emit_tool_call_started` and `emit_tool_call_result` helpers in `tool_execution.rs`, dropping ~25 lines of copy-pasted emit code.\n- Cleaned up dead `unwrap_or_else` fallbacks in `format_anthropic_answers` (infallible string serialization).\n- Extracted repeated \"root agent session\" error string into `ROOT_SESSION_REQUIRED_ERROR` constant.\n- Renamed `option_label` to `label_for_key`, dropping the redundant `selected_option.filter(key)` defensive check. Preserved the `selected_option`-first lookup for `Selected` (control-protocol path supplies `Selected(key)` with `selected_option: None`).\n- Removed the unused `Default for RunInterviewBlocker` impl.\n- De-duped `RunInterviewGuard::resolve` and `Drop` via a shared `resolve_in_place` method.\n\n**Findings noted but not applied** (with rationale):\n- Lifting `agent_tool_runtime` from a parameter into a task-local set once at the top: large cross-crate refactor; skipped to keep scope bounded.\n- Unifying OpenAI/Anthropic question tools into one schema: schemas intentionally differ (`id`/`header` required for OpenAI, `multiSelect` and `preview` for Anthropic); separation matches provider contracts.\n- `AgentToolRuntime` one-field wrapper: keeping a struct allows future expansion at no extra friction.\n- `register_question_tools` moving into `AgentProfile` trait: cross-crate refactor; current explicit dispatch is fine for two profiles.\n- Cleaning `ControlInterviewer.pending` on agent-batch cancel: needs a new `Interviewer` API; flagged as the most substantial follow-up.\n- `..InterviewOption::default()` adoption in tests: high-churn, low-value compared to other items in this pass.\n- The `mem::forget` suggestion for `RunInterviewGuard::resolve` is buggy — it would leak the `Arc<RunInterviewBlocker>` and `Arc<Emitter>` refs. Used a shared method instead.\n\n**Verification**\n- `cargo nextest run -p fabro-agent -p fabro-workflow -p fabro-interview -p fabro-server`: all tests pass except 3 pre-existing flaky SVG-render tests (confirmed by stashing changes and reproducing the same failures on the pre-cleanup tree).\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`: clean.\n- `cargo +nightly-2026-04-14 fmt --check --all`: clean.",
+              "last_stage": "simplify_opus"
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 112522,
+                    "output_tokens": 28696,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 6453275,
+                    "cache_write_tokens": 664565
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 664565,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 8660178
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/question_tools.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-agent/src/tool_execution.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/interview_runtime.rs"
+            ]
+          }
+        },
+        "next_node_id": "verify",
         "node_visits": {
           "preflight_compile": 1,
           "implement": 1,
+          "simplify_gpt": 1,
           "simplify_opus": 1,
           "preflight_lint": 1,
           "start": 1,
@@ -1109,9 +1309,77 @@
           "subject": "Run formatting/type checks as feasible"
         }
       ]
+    },
+    "openai_plan:df03c91b-27a6-41af-9c1c-650983ece620": {
+      "kind": "openai_plan",
+      "list_id": "openai_plan:df03c91b-27a6-41af-9c1c-650983ece620",
+      "items": [
+        {
+          "id": "22888cf6f1b0cb9c",
+          "status": "completed",
+          "order": 0,
+          "subject": "Inspect current git diff and relevant instructions"
+        },
+        {
+          "id": "a6a40904d31a5962",
+          "status": "completed",
+          "order": 1,
+          "subject": "Launch three parallel review agents with full diff"
+        },
+        {
+          "id": "1b634bf3ca41d84b",
+          "status": "completed",
+          "order": 2,
+          "subject": "Aggregate findings and apply cleanup fixes"
+        },
+        {
+          "id": "e2722b546f23067a",
+          "status": "completed",
+          "order": 3,
+          "subject": "Run focused validation"
+        },
+        {
+          "id": "b84a5ce6af244e2e",
+          "status": "in_progress",
+          "order": 4,
+          "subject": "Summarize outcome"
+        }
+      ]
     }
   },
   "stages": {
+    "simplify_gpt@1": {
+      "first_event_seq": 1598,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-23T17:36:18.593921Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 83557,
+        "output_tokens": 4482,
+        "total_tokens": 2117217,
+        "reasoning_tokens": 3194,
+        "cache_read_tokens": 2025984,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 1661057
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "state": "running"
+    },
     "implement@1": {
       "first_event_seq": 50,
       "prompt": null,
@@ -1241,7 +1509,12 @@
       "first_event_seq": 1027,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_opus",
+        "failure_reason": null,
+        "timestamp": "2026-05-23T17:36:14.591031Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "anthropic",
@@ -1254,20 +1527,26 @@
       "output": null,
       "started_at": "2026-05-23T17:14:07.821973Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 1326763,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
-        "input_tokens": 112763,
-        "output_tokens": 29805,
-        "total_tokens": 7384871,
+        "input_tokens": 112522,
+        "output_tokens": 28696,
+        "total_tokens": 7259058,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 6577290,
-        "cache_write_tokens": 665013,
+        "cache_read_tokens": 6453275,
+        "cache_write_tokens": 664565,
         "total_usd_micros": 8660178
       },
       "model": {
         "provider": "anthropic",
         "model_id": "claude-opus-4-7"
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_compile@1": {
       "first_event_seq": 30,
