@@ -1,0 +1,1002 @@
+diff --git a/docs/public/agents/mcp.mdx b/docs/public/agents/mcp.mdx
+index da7868ee4..4e17a7fa8 100644
+--- a/docs/public/agents/mcp.mdx
++++ b/docs/public/agents/mcp.mdx
+@@ -7,6 +7,8 @@ MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) lets you connec
+ 
+ Fabro can also run as an MCP server. MCP clients can use Fabro's run-management tools to create, inspect, control, wait for, and read events from workflow runs through the authenticated `fabro` CLI.
+ 
++Workflow agents can opt in to that same run-management tool catalog with `[run.agent] fabro_tools = true`. This is not the same as configuring external MCP servers for the agent, and it does not change the agent's normal workspace permissions. When a workflow agent calls `fabro_run_create`, created runs are always children of the current run; an explicit `parent_id` must match the current run ID.
++
+ ## Fabro as an MCP server
+ 
+ Use `fabro mcp init` to configure an MCP client to launch Fabro:
+diff --git a/docs/public/execution/run-configuration.mdx b/docs/public/execution/run-configuration.mdx
+index d8549e1e8..70f5f7573 100644
+--- a/docs/public/execution/run-configuration.mdx
++++ b/docs/public/execution/run-configuration.mdx
+@@ -424,7 +424,11 @@ Configure workflow agent behavior that is not tied to a single stage.
+ fabro_tools = true
+ ```
+ 
+-`fabro_tools` defaults to `false`. Set it to `true` only for runs whose agents should be able to create, search, inspect, and interact with Fabro runs through the built-in Fabro run tools. This setting is separate from normal agent `permissions` and from MCP server configuration.
++`fabro_tools` defaults to `false`. Set it to `true` only for runs whose agents should be able to use the same Fabro run-management MCP tool catalog exposed to human MCP clients: create, search, get, interact, gather, events, and pair.
++
++One workflow-agent exception is intentional: `fabro_run_create` always creates child runs parented to the current run. If an agent supplies `parent_id`, it must match the current run ID.
++
++This setting is separate from normal agent `permissions` and from MCP server configuration. `permissions` controls workspace tool access, while `[run.agent.mcps]` configures external MCP servers available to the agent.
+ 
+ ### `[run.agent.mcps]`
+ 
+diff --git a/docs/public/reference/user-configuration.mdx b/docs/public/reference/user-configuration.mdx
+index bdad7e3c5..c20e07282 100644
+--- a/docs/public/reference/user-configuration.mdx
++++ b/docs/public/reference/user-configuration.mdx
+@@ -440,7 +440,7 @@ permissions = "read-write"
+ 
+ | Key | Type / values | Default | Description |
+ |---|---|---|---|
+-| `fabro_tools` | boolean | false | Allow workflow agents to use Fabro run-management tools. |
++| `fabro_tools` | boolean | false | Allow workflow agents to use the Fabro run-management MCP tool catalog: create, search, get, interact, gather, events, and pair. Agent-created runs are always children of the current run. |
+ | `mcps` | table | None | Agent-scoped MCP server entries, keyed by name. |
+ | `permissions` | "read-only" \| "read-write" \| "full" | "read-write" | Default tool permission level for workflow agents. |
+ 
+diff --git a/lib/crates/fabro-server/src/principal_middleware.rs b/lib/crates/fabro-server/src/principal_middleware.rs
+index 8200dc81b..acc9eb250 100644
+--- a/lib/crates/fabro-server/src/principal_middleware.rs
++++ b/lib/crates/fabro-server/src/principal_middleware.rs
+@@ -56,9 +56,9 @@ pub(crate) struct AuthContextSlot(pub(crate) Arc<Mutex<RequestAuthContext>>);
+ pub(crate) struct RequestAuth(pub(crate) AuthContextSlot);
+ 
+ pub(crate) struct RequiredUser(pub(crate) UserPrincipal);
+-pub(crate) struct RequiredRunToolActor(pub(crate) Principal);
++pub(crate) struct RequiredRunManagementActor(pub(crate) Principal);
+ pub(crate) struct RequireRunScoped(pub(crate) RunId);
+-pub(crate) struct RequireRunScopedOrRunTools(pub(crate) RunId, pub(crate) Principal);
++pub(crate) struct RequireRunManagementTarget(pub(crate) RunId, pub(crate) Principal);
+ pub(crate) struct RequireRunBlob(pub(crate) RunId, pub(crate) RunBlobId);
+ pub(crate) struct RequireRunStageScoped(pub(crate) RunId, pub(crate) String);
+ pub(crate) struct RequireStageArtifact(pub(crate) RunId, pub(crate) StageId);
+@@ -215,7 +215,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequiredUser {
+     }
+ }
+ 
+-impl<S: Send + Sync> FromRequestParts<S> for RequiredRunToolActor {
++impl<S: Send + Sync> FromRequestParts<S> for RequiredRunManagementActor {
+     type Rejection = ApiError;
+ 
+     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+@@ -224,7 +224,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequiredRunToolActor {
+             .get::<AuthContextSlot>()
+             .cloned()
+             .unwrap_or_else(AuthContextSlot::initial);
+-        require_run_tool_actor(&slot).map(Self)
++        require_run_management_actor(&slot).map(Self)
+     }
+ }
+ 
+@@ -245,7 +245,7 @@ impl FromRequestParts<Arc<AppState>> for RequireRunScoped {
+     }
+ }
+ 
+-impl FromRequestParts<Arc<AppState>> for RequireRunScopedOrRunTools {
++impl FromRequestParts<Arc<AppState>> for RequireRunManagementTarget {
+     type Rejection = Response;
+ 
+     async fn from_request_parts(
+@@ -262,9 +262,8 @@ impl FromRequestParts<Arc<AppState>> for RequireRunScopedOrRunTools {
+             );
+         };
+         let run_id = parse_run_id_path(id)?;
+-        let actor =
+-            require_worker_or_user_for_run_or_run_tools(&auth_slot_from_parts(parts), &run_id)
+-                .map_err(IntoResponse::into_response)?;
++        let actor = require_run_management_target(&auth_slot_from_parts(parts), &run_id)
++            .map_err(IntoResponse::into_response)?;
+         Ok(Self(run_id, actor))
+     }
+ }
+@@ -394,7 +393,7 @@ pub(crate) fn require_authenticated_user(
+     }
+ }
+ 
+-pub(crate) fn require_run_tool_actor(slot: &AuthContextSlot) -> Result<Principal, ApiError> {
++pub(crate) fn require_run_management_actor(slot: &AuthContextSlot) -> Result<Principal, ApiError> {
+     let context = slot.0.lock().expect("auth context lock poisoned");
+     match &context.principal {
+         Principal::User(user) => Ok(Principal::User(user.clone())),
+@@ -419,7 +418,7 @@ fn require_worker_or_user_for_run(
+     }
+ }
+ 
+-fn require_worker_or_user_for_run_or_run_tools(
++fn require_run_management_target(
+     slot: &AuthContextSlot,
+     route_run_id: &RunId,
+ ) -> Result<Principal, ApiError> {
+@@ -818,36 +817,77 @@ mod tests {
+         assert_eq!(err.code(), Some("access_token_invalid"));
+     }
+ 
++    fn test_user_principal() -> Principal {
++        Principal::user(
++            IdpIdentity::new("https://github.com", "12345").unwrap(),
++            "octocat".to_string(),
++            AuthMethod::Github,
++        )
++    }
++
+     #[test]
+-    fn run_tool_actor_rejects_base_worker_scope() {
++    fn run_management_actor_accepts_users_and_run_tools_workers() {
++        let user_slot = AuthContextSlot::initial();
++        let user = test_user_principal();
++        user_slot.replace(RequestAuthContext::authenticated(user.clone(), None));
++        assert_eq!(require_run_management_actor(&user_slot).unwrap(), user);
++
+         let run_id = RunId::new();
+-        let slot = AuthContextSlot::initial();
+-        slot.replace(RequestAuthContext::authenticated(
++        let worker_slot = AuthContextSlot::initial();
++        worker_slot.replace(RequestAuthContext::authenticated_worker(
++            run_id,
++            WorkerScopeSet::run_worker_with_agent_run_tools(),
++        ));
++
++        assert_eq!(
++            require_run_management_actor(&worker_slot).unwrap(),
+             Principal::Worker { run_id },
+-            None,
++        );
++    }
++
++    #[test]
++    fn run_management_actor_rejects_base_worker_scope() {
++        let run_id = RunId::new();
++        let slot = AuthContextSlot::initial();
++        slot.replace(RequestAuthContext::authenticated_worker(
++            run_id,
++            WorkerScopeSet::run_worker(),
+         ));
+ 
+-        let err = require_run_tool_actor(&slot).unwrap_err();
++        let err = require_run_management_actor(&slot).unwrap_err();
+ 
+         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+     }
+ 
+     #[test]
+-    fn run_tool_actor_accepts_worker_with_run_tools_scope() {
++    fn run_management_target_accepts_users() {
++        let slot = AuthContextSlot::initial();
++        let user = test_user_principal();
++        slot.replace(RequestAuthContext::authenticated(user.clone(), None));
++
++        assert_eq!(
++            require_run_management_target(&slot, &RunId::new()).unwrap(),
++            user,
++        );
++    }
++
++    #[test]
++    fn run_management_target_accepts_same_run_base_worker() {
+         let run_id = RunId::new();
+         let slot = AuthContextSlot::initial();
+         slot.replace(RequestAuthContext::authenticated_worker(
+             run_id,
+-            WorkerScopeSet::run_worker_with_agent_run_tools(),
++            WorkerScopeSet::run_worker(),
+         ));
+ 
+-        assert_eq!(require_run_tool_actor(&slot).unwrap(), Principal::Worker {
+-            run_id
+-        },);
++        assert_eq!(
++            require_run_management_target(&slot, &run_id).unwrap(),
++            Principal::Worker { run_id },
++        );
+     }
+ 
+     #[test]
+-    fn run_scoped_or_run_tools_accepts_cross_run_with_run_tools_scope() {
++    fn run_management_target_accepts_cross_run_with_run_tools_scope() {
+         let token_run_id = RunId::new();
+         let route_run_id = RunId::new();
+         let slot = AuthContextSlot::initial();
+@@ -857,10 +897,25 @@ mod tests {
+         ));
+ 
+         assert_eq!(
+-            require_worker_or_user_for_run_or_run_tools(&slot, &route_run_id).unwrap(),
++            require_run_management_target(&slot, &route_run_id).unwrap(),
+             Principal::Worker {
+                 run_id: token_run_id,
+             },
+         );
+     }
++
++    #[test]
++    fn run_management_target_rejects_cross_run_base_worker() {
++        let token_run_id = RunId::new();
++        let route_run_id = RunId::new();
++        let slot = AuthContextSlot::initial();
++        slot.replace(RequestAuthContext::authenticated_worker(
++            token_run_id,
++            WorkerScopeSet::run_worker(),
++        ));
++
++        let err = require_run_management_target(&slot, &route_run_id).unwrap_err();
++
++        assert_eq!(err.status(), StatusCode::FORBIDDEN);
++    }
+ }
+diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs
+index 3b6069115..94c02a6b3 100644
+--- a/lib/crates/fabro-server/src/server.rs
++++ b/lib/crates/fabro-server/src/server.rs
+@@ -135,8 +135,8 @@ use crate::github_webhooks::{
+ use crate::ip_allowlist::{IpAllowlistConfig, ip_allowlist_middleware};
+ use crate::jwt_auth::{self, AuthMode};
+ use crate::principal_middleware::{
+-    AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunScoped,
+-    RequireRunScopedOrRunTools, RequireRunStageScoped, RequireStageArtifact, RequiredUser,
++    AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
++    RequireRunScoped, RequireRunStageScoped, RequireStageArtifact, RequiredUser,
+     principal_middleware,
+ };
+ use crate::request_id::{self, RequestId};
+diff --git a/lib/crates/fabro-server/src/server/handler/events.rs b/lib/crates/fabro-server/src/server/handler/events.rs
+index a0cf38f42..8e7806522 100644
+--- a/lib/crates/fabro-server/src/server/handler/events.rs
++++ b/lib/crates/fabro-server/src/server/handler/events.rs
+@@ -9,7 +9,7 @@ use fabro_workflow::event::build_redacted_event_payload;
+ use super::super::{
+     ApiError, AppState, AppendEventResponse, BroadcastStream, Event, EventBody, EventEnvelope,
+     EventPayload, HashSet, IntoResponse, Json, KeepAlive, PaginatedEventList, PaginationMeta, Path,
+-    Query, RequireRunScoped, RequireRunScopedOrRunTools, RequireRunStageScoped, RequiredUser,
++    Query, RequireRunManagementTarget, RequireRunScoped, RequireRunStageScoped, RequiredUser,
+     Response, Router, RunEvent, RunId, Sse, State, StatusCode, StreamExt, UnboundedReceiverStream,
+     broadcast, get, mpsc, parse_run_id_path, parse_stage_id_path, redact_jsonl_line,
+     reject_if_archived, update_live_run_from_event,
+@@ -198,7 +198,7 @@ async fn append_run_event(
+ }
+ 
+ async fn list_run_events(
+-    RequireRunScopedOrRunTools(id, _actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+     Query(params): Query<EventListParams>,
+ ) -> Response {
+diff --git a/lib/crates/fabro-server/src/server/handler/lifecycle.rs b/lib/crates/fabro-server/src/server/handler/lifecycle.rs
+index f3559a12c..0c2697133 100644
+--- a/lib/crates/fabro-server/src/server/handler/lifecycle.rs
++++ b/lib/crates/fabro-server/src/server/handler/lifecycle.rs
+@@ -9,7 +9,7 @@ use super::super::{
+     BatchRunLifecycleRequest, BatchRunLifecycleResponse, BatchRunLifecycleResult,
+     BatchRunLifecycleResultOutcome, BatchRunLifecycleSummary, DeleteRunOutcome, DeleteRunSandbox,
+     DenyRunRequest, FailureReason, ForkRequest, ForkResponse, HeaderMap, IntoResponse, Json, Path,
+-    PendingReason, Principal, RequireRunScopedOrRunTools, RequiredUser, Response, RewindRequest,
++    PendingReason, Principal, RequireRunManagementTarget, RequiredUser, Response, RewindRequest,
+     RewindResponse, Router, RunAnswerTransport, RunControlAction, RunExecutionMode, RunId,
+     RunRunnableSource, RunStatus, StartRunRequest, State, StatusCode, Storage,
+     TimelineEntryResponse, WORKER_CANCEL_GRACE, WorkflowError, append_control_request,
+@@ -51,7 +51,7 @@ async fn run_response(state: &AppState, id: RunId, status: StatusCode) -> Respon
+ }
+ 
+ async fn start_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+     body: Option<Json<StartRunRequest>>,
+ ) -> Response {
+@@ -363,7 +363,7 @@ fn schedule_worker_kill(state: Arc<AppState>, run_id: RunId, worker_pid: u32) {
+ }
+ 
+ async fn cancel_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
+@@ -679,14 +679,14 @@ async fn unpause_run(
+ }
+ 
+ async fn archive_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     run_archive_action(state, actor, id, ArchiveAction::Archive).await
+ }
+ 
+ async fn unarchive_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     run_archive_action(state, actor, id, ArchiveAction::Unarchive).await
+diff --git a/lib/crates/fabro-server/src/server/handler/pair.rs b/lib/crates/fabro-server/src/server/handler/pair.rs
+index f5170aa86..7b9701a4a 100644
+--- a/lib/crates/fabro-server/src/server/handler/pair.rs
++++ b/lib/crates/fabro-server/src/server/handler/pair.rs
+@@ -14,18 +14,16 @@ use fabro_types::{
+     PairTranscriptAssistantMessage, PairTranscriptDetailRef, PairTranscriptEntry,
+     PairTranscriptError, PairTranscriptMeta, PairTranscriptResponse, PairTranscriptSystemMessage,
+     PairTranscriptToolCall, PairTranscriptToolStatus, PairTranscriptUserMessage,
+-    PairTranscriptWarning, Principal, RunId, StageId,
++    PairTranscriptWarning, RunId, StageId,
+ };
+ use fabro_workflow::run_status::RunStatus;
+ use tokio::time::timeout;
+ use tokio_stream::StreamExt;
+ 
+-use super::super::{
+-    AppState, PairTransportError, durable_run_status, parse_run_id_path, reject_if_archived,
+-};
++use super::super::{AppState, PairTransportError, durable_run_status, reject_if_archived};
+ use super::events::EventListParams;
+ use crate::error::ApiError;
+-use crate::principal_middleware::RequiredUser;
++use crate::principal_middleware::RequireRunManagementTarget;
+ 
+ const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
+ 
+@@ -41,15 +39,9 @@ pub(super) fn routes() -> axum::Router<Arc<AppState>> {
+ }
+ 
+ async fn get_pair_status(
+-    _auth: RequiredUser,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path(id): Path<String>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+-
+     let targets = live_pair_targets(state.as_ref(), &id);
+     let current_pair = match reconstruct_pairs(state.as_ref(), &id).await {
+         Ok(pairs) => pairs
+@@ -69,15 +61,10 @@ async fn get_pair_status(
+ }
+ 
+ async fn start_pair(
+-    auth: RequiredUser,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path(id): Path<String>,
+     Json(req): Json<PairStartRequest>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
+         return response;
+     }
+@@ -104,7 +91,6 @@ async fn start_pair(
+     };
+ 
+     let pair_id = PairId::new();
+-    let actor = Principal::User(auth.0);
+     match transport.start_pair(id, pair_id, target, actor).await {
+         Ok(()) => {
+             match wait_for_pair_record(state.as_ref(), &id, pair_id, PairStatus::Active, None).await
+@@ -118,14 +104,10 @@ async fn start_pair(
+ }
+ 
+ async fn get_pair(
+-    _auth: RequiredUser,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path((id, pair_id)): Path<(String, String)>,
++    Path((_id, pair_id)): Path<(String, String)>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+     let pair_id = match parse_pair_id(&pair_id) {
+         Ok(pair_id) => pair_id,
+         Err(response) => return response,
+@@ -137,14 +119,10 @@ async fn get_pair(
+ }
+ 
+ async fn end_pair(
+-    auth: RequiredUser,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path((id, pair_id)): Path<(String, String)>,
++    Path((_id, pair_id)): Path<(String, String)>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
+         return response;
+     }
+@@ -167,7 +145,7 @@ async fn end_pair(
+         return worker_unavailable("Run has no live worker control channel.");
+     };
+ 
+-    match transport.end_pair(pair_id, Principal::User(auth.0)).await {
++    match transport.end_pair(pair_id, actor).await {
+         Ok(()) => {
+             match wait_for_pair_record(
+                 state.as_ref(),
+@@ -187,15 +165,11 @@ async fn end_pair(
+ }
+ 
+ async fn send_pair_message(
+-    auth: RequiredUser,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path((id, pair_id)): Path<(String, String)>,
++    Path((_id, pair_id)): Path<(String, String)>,
+     Json(req): Json<PairMessageRequest>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
+         return response;
+     }
+@@ -231,13 +205,7 @@ async fn send_pair_message(
+     };
+     let message_id = PairMessageId::new();
+     match transport
+-        .send_pair_message(
+-            pair_id,
+-            message_id,
+-            text,
+-            req.client_message_id,
+-            Principal::User(auth.0),
+-        )
++        .send_pair_message(pair_id, message_id, text, req.client_message_id, actor)
+         .await
+     {
+         Ok(()) => {
+@@ -252,15 +220,11 @@ async fn send_pair_message(
+ }
+ 
+ async fn get_transcript(
+-    _auth: RequiredUser,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+-    Path((id, pair_id)): Path<(String, String)>,
++    Path((_id, pair_id)): Path<(String, String)>,
+     Query(params): Query<EventListParams>,
+ ) -> Response {
+-    let id = match parse_run_id_path(&id) {
+-        Ok(id) => id,
+-        Err(response) => return response,
+-    };
+     let pair_id = match parse_pair_id(&pair_id) {
+         Ok(pair_id) => pair_id,
+         Err(response) => return response,
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index cfc8dba88..db1f74ca4 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -40,8 +40,8 @@ use super::super::{
+ };
+ use crate::error::ApiError;
+ use crate::principal_middleware::{
+-    RequireCommandLog, RequireRunScoped, RequireRunScopedOrRunTools, RequireRunStageScoped,
+-    RequiredRunToolActor, RequiredUser,
++    RequireCommandLog, RequireRunManagementTarget, RequireRunScoped, RequireRunStageScoped,
++    RequiredRunManagementActor, RequiredUser,
+ };
+ use crate::run_files::{list_run_commits, list_run_files};
+ use crate::run_manifest;
+@@ -229,7 +229,7 @@ fn run_changes_total(run: &fabro_types::Run) -> i64 {
+ }
+ 
+ async fn link_run_parent(
+-    RequireRunScopedOrRunTools(child_id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(child_id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+     Json(req): Json<UpdateRunParentRequest>,
+ ) -> Response {
+@@ -282,7 +282,7 @@ async fn link_run_parent(
+ }
+ 
+ async fn unlink_run_parent(
+-    RequireRunScopedOrRunTools(child_id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(child_id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     let _parent_link_guard = state.parent_link_lock.lock().await;
+@@ -365,7 +365,7 @@ async fn updated_run_response(state: &AppState, run_id: &RunId) -> Response {
+ }
+ 
+ async fn list_runs(
+-    _auth: RequiredRunToolActor,
++    _auth: RequiredRunManagementActor,
+     State(state): State<Arc<AppState>>,
+     ExtraQuery(params): ExtraQuery<ListRunsParams>,
+ ) -> Response {
+@@ -455,7 +455,7 @@ struct CommandLogResponseBody {
+ }
+ 
+ async fn resolve_run(
+-    _auth: RequiredRunToolActor,
++    _auth: RequiredRunManagementActor,
+     State(state): State<Arc<AppState>>,
+     Query(query): Query<ResolveRunQuery>,
+ ) -> Response {
+@@ -585,7 +585,7 @@ async fn update_run(
+ }
+ 
+ async fn create_run(
+-    RequiredRunToolActor(actor): RequiredRunToolActor,
++    RequiredRunManagementActor(actor): RequiredRunManagementActor,
+     State(state): State<Arc<AppState>>,
+     headers: HeaderMap,
+     body: Bytes,
+@@ -904,7 +904,7 @@ async fn validate_run_manifest(
+ }
+ 
+ async fn get_run_status(
+-    RequireRunScopedOrRunTools(id, _actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     match state.store.get_cached_summary(&id, Utc::now()).await {
+@@ -943,7 +943,7 @@ async fn get_run_settings(
+ }
+ 
+ async fn get_questions(
+-    RequireRunScopedOrRunTools(id, _actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     match state.store.get_cached_run(&id).await {
+@@ -964,7 +964,7 @@ async fn get_questions(
+ }
+ 
+ async fn submit_answer(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+     Path((_id, qid)): Path<(String, String)>,
+     Json(req): Json<SubmitAnswerRequest>,
+@@ -988,7 +988,7 @@ async fn submit_answer(
+ }
+ 
+ async fn get_run_state(
+-    RequireRunScopedOrRunTools(id, _actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     match state.store.get_cached_run(&id).await {
+diff --git a/lib/crates/fabro-server/src/server/handler/sessions.rs b/lib/crates/fabro-server/src/server/handler/sessions.rs
+index f9c5d11b6..f87184289 100644
+--- a/lib/crates/fabro-server/src/server/handler/sessions.rs
++++ b/lib/crates/fabro-server/src/server/handler/sessions.rs
+@@ -1536,6 +1536,7 @@ mod tests {
+             fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME,
+             fabro_tool::FABRO_RUN_GET_TOOL_NAME,
+             fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME,
++            fabro_tool::FABRO_RUN_PAIR_TOOL_NAME,
+         ] {
+             registry.register(stub_tool(name));
+         }
+@@ -1589,6 +1590,7 @@ mod tests {
+             "web_fetch",
+             fabro_tool::FABRO_RUN_CREATE_TOOL_NAME,
+             fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME,
++            fabro_tool::FABRO_RUN_PAIR_TOOL_NAME,
+         ] {
+             assert_eq!(policy.access_for_tool(tool_name), ToolAccess::Denied);
+         }
+diff --git a/lib/crates/fabro-server/src/server/handler/steer.rs b/lib/crates/fabro-server/src/server/handler/steer.rs
+index ee58ae910..9e06cd963 100644
+--- a/lib/crates/fabro-server/src/server/handler/steer.rs
++++ b/lib/crates/fabro-server/src/server/handler/steer.rs
+@@ -11,7 +11,7 @@ use fabro_workflow::run_status::RunStatus;
+ 
+ use super::super::{AnswerTransportError, AppState, durable_run_status, reject_if_archived};
+ use crate::error::ApiError;
+-use crate::principal_middleware::RequireRunScopedOrRunTools;
++use crate::principal_middleware::RequireRunManagementTarget;
+ 
+ pub(super) fn routes() -> axum::Router<Arc<AppState>> {
+     axum::Router::new()
+@@ -32,7 +32,7 @@ impl RunControlRequest {
+ }
+ 
+ async fn steer_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+     Json(req): Json<SteerRunRequest>,
+ ) -> Response {
+@@ -53,7 +53,7 @@ async fn steer_run(
+ }
+ 
+ async fn interrupt_run(
+-    RequireRunScopedOrRunTools(id, actor): RequireRunScopedOrRunTools,
++    RequireRunManagementTarget(id, actor): RequireRunManagementTarget,
+     State(state): State<Arc<AppState>>,
+ ) -> Response {
+     control_run(actor, state, id, RunControlRequest::Interrupt).await
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index 6488ab364..e9087b184 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -608,6 +608,50 @@ async fn create_run_with_bearer(app: &Router, bearer: &str) -> RunId {
+     body["id"].as_str().unwrap().parse().unwrap()
+ }
+ 
++fn pair_test_target() -> PairTarget {
++    PairTarget {
++        stage_id:   StageId::new("agent", 1),
++        node_label: "Agent".to_string(),
++    }
++}
++
++async fn append_pair_transcript_fixture(state: &Arc<AppState>, run_id: RunId) -> PairId {
++    let pair_id = "01HZX6M29F1CD5YYMHT1F5D7WQ".parse().unwrap();
++    let run_store = state
++        .store
++        .open_run(&run_id)
++        .await
++        .expect("test run should be openable");
++    workflow_event::append_event(
++        &run_store,
++        &run_id,
++        &workflow_event::Event::RunPairStarted {
++            pair_id,
++            target: pair_test_target(),
++            actor: None,
++        },
++    )
++    .await
++    .unwrap();
++    workflow_event::append_event(
++        &run_store,
++        &run_id,
++        &workflow_event::Event::AgentPairUserMessage {
++            node_id: "agent".to_string(),
++            visit: 1,
++            session_id: "session-1".to_string(),
++            pair_id,
++            message_id: PairMessageId::new(),
++            client_message_id: None,
++            text: "hello pair".to_string(),
++            actor: None,
++        },
++    )
++    .await
++    .unwrap();
++    pair_id
++}
++
+ fn bearer_request(method: Method, path: &str, bearer: &str, body: Body) -> Request<Body> {
+     Request::builder()
+         .method(method)
+@@ -8557,6 +8601,127 @@ async fn run_tool_worker_token_can_use_client_backend_routes_across_runs() {
+     assert_status!(response, StatusCode::OK).await;
+ }
+ 
++#[tokio::test]
++async fn run_tools_worker_can_read_pair_status_and_transcript_across_runs() {
++    let (state, app) = jwt_auth_app();
++    let user_jwt = issue_test_user_jwt();
++    let origin_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let target_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let worker_token = issue_test_run_tools_worker_token(&origin_run_id);
++    let pair_id = append_pair_transcript_fixture(&state, target_run_id).await;
++
++    let response = app
++        .clone()
++        .oneshot(bearer_request(
++            Method::GET,
++            &format!("/runs/{target_run_id}/pair"),
++            &worker_token,
++            Body::empty(),
++        ))
++        .await
++        .unwrap();
++    let status_body = response_json!(response, StatusCode::OK).await;
++    assert_eq!(status_body["run_id"], target_run_id.to_string());
++
++    let response = app
++        .clone()
++        .oneshot(bearer_request(
++            Method::GET,
++            &format!("/runs/{target_run_id}/pair/{pair_id}/transcript"),
++            &worker_token,
++            Body::empty(),
++        ))
++        .await
++        .unwrap();
++    let transcript_body = response_json!(response, StatusCode::OK).await;
++    assert_eq!(transcript_body["data"].as_array().unwrap().len(), 1);
++}
++
++#[tokio::test]
++async fn run_tools_worker_start_pair_reaches_worker_control_domain_across_runs() {
++    let (state, app) = jwt_auth_app();
++    let user_jwt = issue_test_user_jwt();
++    let origin_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let target_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let worker_token = issue_test_run_tools_worker_token(&origin_run_id);
++    let target = pair_test_target();
++    let _temp_dir = insert_running_control_run(&state, target_run_id, None);
++    {
++        let mut runs = state.runs.lock().expect("runs lock poisoned");
++        runs.get_mut(&target_run_id)
++            .unwrap()
++            .active_api_targets
++            .insert(target.stage_id.clone(), target.clone());
++    }
++
++    let response = app
++        .clone()
++        .oneshot(json_bearer_request(
++            Method::POST,
++            &format!("/runs/{target_run_id}/pair"),
++            &worker_token,
++            &json!({ "stage_id": target.stage_id.to_string() }),
++        ))
++        .await
++        .unwrap();
++    let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
++    assert_eq!(body["errors"][0]["code"], "worker_control_unavailable");
++}
++
++#[tokio::test]
++async fn cross_run_base_worker_remains_forbidden_from_pair_routes() {
++    let (_state, app) = jwt_auth_app();
++    let user_jwt = issue_test_user_jwt();
++    let origin_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let target_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let worker_token = issue_test_worker_token(&origin_run_id);
++
++    let response = app
++        .clone()
++        .oneshot(bearer_request(
++            Method::GET,
++            &format!("/runs/{target_run_id}/pair"),
++            &worker_token,
++            Body::empty(),
++        ))
++        .await
++        .unwrap();
++    assert_status!(response, StatusCode::FORBIDDEN).await;
++}
++
++#[tokio::test]
++async fn run_tools_worker_cannot_call_user_only_non_mcp_routes() {
++    let (_state, app) = jwt_auth_app();
++    let user_jwt = issue_test_user_jwt();
++    let origin_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let target_run_id = create_run_with_bearer(&app, &user_jwt).await;
++    let worker_token = issue_test_run_tools_worker_token(&origin_run_id);
++
++    for (method, path) in [
++        (Method::POST, format!("/runs/{target_run_id}/approve")),
++        (Method::GET, format!("/runs/{target_run_id}/timeline")),
++    ] {
++        let response = app
++            .clone()
++            .oneshot(bearer_request(
++                method.clone(),
++                &path,
++                &worker_token,
++                Body::empty(),
++            ))
++            .await
++            .unwrap();
++        assert!(
++            matches!(
++                response.status(),
++                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
++            ),
++            "{method} {path} unexpectedly accepted run-tools worker token with status {}",
++            response.status()
++        );
++    }
++}
++
+ #[tokio::test]
+ async fn base_worker_token_is_rejected_by_run_tool_only_routes() {
+     let (_state, app) = jwt_auth_app();
+diff --git a/lib/crates/fabro-tool/src/common.rs b/lib/crates/fabro-tool/src/common.rs
+index 5a2c5a8e0..e8318e87e 100644
+--- a/lib/crates/fabro-tool/src/common.rs
++++ b/lib/crates/fabro-tool/src/common.rs
+@@ -194,6 +194,10 @@ static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
+             FABRO_RUN_GATHER_TOOL_NAME,
+             "Wait for Fabro runs to reach terminal states, returning current state on timeout.",
+         ),
++        tool_definition::<crate::FabroRunPairParams>(
++            FABRO_RUN_PAIR_TOOL_NAME,
++            "Inspect, start, message, end, or read transcript for a live Fabro run pairing session.",
++        ),
+         tool_definition::<crate::FabroRunEventsParams>(
+             FABRO_RUN_EVENTS_TOOL_NAME,
+             "List, inspect, or search stored events for a Fabro workflow run.",
+@@ -301,6 +305,62 @@ mod tests {
+ 
+     use super::*;
+ 
++    fn shared_tool_names() -> Vec<&'static str> {
++        tool_definitions()
++            .iter()
++            .map(|definition| definition.name)
++            .collect()
++    }
++
++    #[test]
++    fn shared_tool_definitions_include_run_management_catalog() {
++        assert_eq!(shared_tool_names(), vec![
++            FABRO_RUN_CREATE_TOOL_NAME,
++            FABRO_RUN_SEARCH_TOOL_NAME,
++            FABRO_RUN_GET_TOOL_NAME,
++            FABRO_RUN_INTERACT_TOOL_NAME,
++            FABRO_RUN_GATHER_TOOL_NAME,
++            FABRO_RUN_PAIR_TOOL_NAME,
++            FABRO_RUN_EVENTS_TOOL_NAME,
++        ]);
++    }
++
++    #[test]
++    fn pair_tool_definition_exposes_pair_schema() {
++        let definition = tool_definitions()
++            .iter()
++            .find(|definition| definition.name == FABRO_RUN_PAIR_TOOL_NAME)
++            .expect("pair tool should be in the shared catalog");
++        let schema = &definition.parameters;
++        let schema_text = schema.to_string();
++
++        assert_eq!(
++            definition.description,
++            "Inspect, start, message, end, or read transcript for a live Fabro run pairing session."
++        );
++        for field in [
++            "action",
++            "run_id",
++            "pair_id",
++            "stage_id",
++            "text",
++            "client_message_id",
++            "since_seq",
++            "limit",
++        ] {
++            assert!(
++                schema.pointer(&format!("/properties/{field}")).is_some(),
++                "pair schema should expose {field}: {schema}"
++            );
++        }
++        for action in ["status", "start", "get", "message", "end", "transcript"] {
++            assert!(
++                schema_text.contains(&format!("\"{action}\"")),
++                "pair schema should expose action {action}: {schema}"
++            );
++        }
++    }
++
+     #[test]
+     fn run_summary_result_includes_parent_metadata() {
+         let parent_id = run_id("01KRBZW4DW0000000000000002");
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index 42dc0e1f5..10b08d61a 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -315,6 +315,16 @@ async fn execute_fabro_run_tool(
+             let summary = fabro_tool::run_events_text(&result);
+             render_fabro_tool_result(&summary, &result)
+         }
++        fabro_tool::FABRO_RUN_PAIR_TOOL_NAME => {
++            let params = parse_fabro_tool_args::<fabro_tool::FabroRunPairParams>(name, args)?;
++            let result = fabro_tool::pair_run(
++                Arc::clone(&services.backend),
++                fabro_tool::ValidatedPairRun::try_from(params)?,
++            )
++            .await?;
++            let summary = fabro_tool::pair_run_text(&result);
++            render_fabro_tool_result(&summary, &result)
++        }
+         _ => Err(fabro_tool::ToolError::message(format!(
+             "unknown Fabro run tool `{name}`"
+         ))),
+@@ -1507,8 +1517,8 @@ mod tests {
+     use fabro_llm::{Error as LlmError, ProviderErrorDetail, ProviderErrorKind};
+     use fabro_tool::FabroToolBackend;
+     use fabro_types::{
+-        EventEnvelope, Run, RunId, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunStatus,
+-        RunTimestamps, SuccessReason, WorkflowRef,
++        EventEnvelope, Run, RunId, RunLifecycle, RunLinks, RunOrigin, RunPairStatusResponse,
++        RunProjection, RunStatus, RunTimestamps, SuccessReason, WorkflowRef,
+     };
+     use fabro_vault::{SecretType, Vault};
+     use futures::stream;
+@@ -1730,6 +1740,7 @@ reasoning = false
+             fabro_tool::FABRO_RUN_GATHER_TOOL_NAME,
+             fabro_tool::FABRO_RUN_GET_TOOL_NAME,
+             fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME,
++            fabro_tool::FABRO_RUN_PAIR_TOOL_NAME,
+             fabro_tool::FABRO_RUN_SEARCH_TOOL_NAME,
+         ]);
+ 
+@@ -1914,11 +1925,38 @@ reasoning = false
+         ]);
+     }
+ 
++    #[tokio::test]
++    async fn agent_run_pair_dispatches_to_shared_backend() {
++        let (services, backend) = fabro_run_tool_services();
++        let mut registry = ToolRegistry::new();
++        register_fabro_run_tools(&mut registry, &services);
++        let tool = registry
++            .get(fabro_tool::FABRO_RUN_PAIR_TOOL_NAME)
++            .expect("pair tool should be registered");
++
++        let output = (tool.executor)(
++            serde_json::json!({
++                "action": "status",
++                "run_id": child_run_id().to_string()
++            }),
++            tool_context(),
++        )
++        .await
++        .expect("pair status should succeed");
++
++        assert!(output.contains("read pair status for Fabro run"));
++        assert!(output.contains("\"action\": \"status\""));
++        assert_eq!(backend.pair_status_run_ids.lock().unwrap().as_slice(), &[
++            child_run_id()
++        ]);
++    }
++
+     fn fabro_run_tool_services() -> (FabroRunToolServices, Arc<MockRunToolBackend>) {
+         let backend = Arc::new(MockRunToolBackend {
+-            child_id:           child_run_id(),
+-            created_parent_ids: Mutex::new(Vec::new()),
+-            started_run_ids:    Mutex::new(Vec::new()),
++            child_id:            child_run_id(),
++            created_parent_ids:  Mutex::new(Vec::new()),
++            started_run_ids:     Mutex::new(Vec::new()),
++            pair_status_run_ids: Mutex::new(Vec::new()),
+         });
+         let services = FabroRunToolServices {
+             backend:            backend.clone(),
+@@ -2015,9 +2053,10 @@ reasoning = false
+     }
+ 
+     struct MockRunToolBackend {
+-        child_id:           RunId,
+-        created_parent_ids: Mutex<Vec<Option<RunId>>>,
+-        started_run_ids:    Mutex<Vec<RunId>>,
++        child_id:            RunId,
++        created_parent_ids:  Mutex<Vec<Option<RunId>>>,
++        started_run_ids:     Mutex<Vec<RunId>>,
++        pair_status_run_ids: Mutex<Vec<RunId>>,
+     }
+ 
+     #[async_trait]
+@@ -2139,6 +2178,18 @@ reasoning = false
+         ) -> anyhow::Result<()> {
+             unreachable!()
+         }
++
++        async fn get_run_pair_status(
++            &self,
++            run_id: &RunId,
++        ) -> anyhow::Result<RunPairStatusResponse> {
++            self.pair_status_run_ids.lock().unwrap().push(*run_id);
++            Ok(RunPairStatusResponse {
++                run_id:       *run_id,
++                current_pair: None,
++                targets:      Vec::new(),
++            })
++        }
+     }
+ 
+     fn new_file_tracking() -> FileTracking {
