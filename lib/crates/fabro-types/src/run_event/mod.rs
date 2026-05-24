@@ -200,6 +200,8 @@ pub enum EventBody {
     AgentSessionActivated(AgentSessionActivatedProps),
     #[serde(rename = "agent.session.deactivated")]
     AgentSessionDeactivated(AgentSessionDeactivatedProps),
+    #[serde(rename = "agent.tools.available")]
+    AgentToolsAvailable(AgentToolsAvailableProps),
     #[serde(rename = "agent.session.ended")]
     AgentSessionEnded(AgentSessionEndedProps),
     #[serde(rename = "agent.processing.end")]
@@ -501,6 +503,7 @@ impl EventBody {
             Self::AgentSessionStarted(_) => "agent.session.started",
             Self::AgentSessionActivated(_) => "agent.session.activated",
             Self::AgentSessionDeactivated(_) => "agent.session.deactivated",
+            Self::AgentToolsAvailable(_) => "agent.tools.available",
             Self::AgentSessionEnded(_) => "agent.session.ended",
             Self::AgentProcessingEnd(_) => "agent.processing.end",
             Self::AgentInput(_) => "agent.input",
@@ -683,6 +686,7 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.session.started"
             | "agent.session.activated"
             | "agent.session.deactivated"
+            | "agent.tools.available"
             | "agent.session.ended"
             | "agent.processing.end"
             | "agent.input"
@@ -1051,6 +1055,50 @@ mod tests {
 
         let parsed = RunEvent::from_value(line).unwrap();
         assert!(matches!(parsed.body, EventBody::RunCreated(_)));
+    }
+
+    #[test]
+    fn agent_tools_available_run_event_round_trips_json() {
+        let value = json!({
+            "id": "evt_tools",
+            "ts": "2026-04-04T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "code",
+            "stage_id": "code@1",
+            "session_id": "session-1",
+            "event": "agent.tools.available",
+            "properties": {
+                "visit": 1,
+                "tools": [
+                    {
+                        "name": "grep",
+                        "description": "Search files",
+                        "source": { "kind": "native" },
+                        "category": "read",
+                        "invoked": false
+                    },
+                    {
+                        "name": "mcp__filesystem__read_file",
+                        "description": "Read via MCP",
+                        "source": {
+                            "kind": "mcp",
+                            "server_name": "filesystem",
+                            "original_name": "read_file"
+                        },
+                        "category": "other",
+                        "invoked": false
+                    }
+                ]
+            }
+        });
+
+        let parsed = RunEvent::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            parsed.body,
+            EventBody::AgentToolsAvailable(AgentToolsAvailableProps { .. })
+        ));
+        assert_eq!(parsed.event_name(), "agent.tools.available");
+        assert_eq!(parsed.to_value().unwrap(), value);
     }
 
     #[test]

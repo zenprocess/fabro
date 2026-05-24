@@ -9,7 +9,8 @@ use strum::{Display, EnumString, IntoStaticStr};
 use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
 use crate::{
     AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
-    BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord, InvalidTransition,
+    AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
+    InvalidTransition,
     ModelRef, PermissionLevel, PullRequestLink, RunApproval, RunControlAction, RunDiff, RunId,
     RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler, StageId, StageState,
     StageTiming, StartRecord, TodoListProjection,
@@ -360,6 +361,8 @@ pub struct StageProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_level:  Option<PermissionLevel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_tools:       Vec<AgentToolSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers:       Vec<McpServerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window:    Option<StageContextWindowProjection>,
@@ -440,6 +443,7 @@ impl StageProjection {
             subagents: Vec::new(),
             skills: SkillsProjection::default(),
             permission_level: None,
+            agent_tools: Vec::new(),
             mcp_servers: Vec::new(),
             context_window: None,
             provider_used: None,
@@ -668,6 +672,60 @@ impl RunProjection {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stage_projection_tests {
+    use serde_json::json;
+
+    use super::StageProjection;
+    use crate::{AgentToolCategory, AgentToolSource, AgentToolSummary, first_event_seq};
+
+    #[test]
+    fn missing_agent_tools_defaults_to_empty_and_serializes_omitted() {
+        let value = json!({
+            "first_event_seq": 1,
+            "prompt": null,
+            "response": null,
+            "completion": null,
+            "provider_used": null,
+            "diff": null,
+            "script_invocation": null,
+            "script_timing": null,
+            "parallel_results": null,
+            "output": null,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            },
+            "state": "running"
+        });
+
+        let projection: StageProjection = serde_json::from_value(value.clone()).unwrap();
+        assert!(projection.agent_tools.is_empty());
+        assert_eq!(serde_json::to_value(projection).unwrap(), value);
+    }
+
+    #[test]
+    fn stage_projection_serializes_agent_tools_when_present() {
+        let mut projection = StageProjection::new(first_event_seq(1));
+        projection.agent_tools.push(AgentToolSummary {
+            name:        "grep".to_string(),
+            description: "Search files".to_string(),
+            source:      AgentToolSource::Native,
+            category:    AgentToolCategory::Read,
+            invoked:     true,
+        });
+
+        let value = serde_json::to_value(projection).unwrap();
+        assert_eq!(value["agent_tools"][0]["name"], "grep");
+        assert_eq!(value["agent_tools"][0]["description"], "Search files");
+        assert_eq!(value["agent_tools"][0]["source"], json!({"kind": "native"}));
+        assert_eq!(value["agent_tools"][0]["category"], "read");
+        assert_eq!(value["agent_tools"][0]["invoked"], true);
+        assert!(value["agent_tools"][0].get("parameters").is_none());
     }
 }
 

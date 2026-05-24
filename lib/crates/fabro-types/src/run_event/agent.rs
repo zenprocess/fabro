@@ -53,6 +53,42 @@ pub struct AgentSessionDeactivatedProps {
     pub visit: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolsAvailableProps {
+    pub tools: Vec<AgentToolSummary>,
+    pub visit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentToolSummary {
+    pub name:        String,
+    pub description: String,
+    pub source:      AgentToolSource,
+    pub category:    AgentToolCategory,
+    pub invoked:     bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentToolSource {
+    Native,
+    Mcp {
+        server_name:   String,
+        original_name: String,
+    },
+    Skill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolCategory {
+    Read,
+    Write,
+    Shell,
+    Subagent,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentProcessingEndProps {
     pub visit: u32,
@@ -417,6 +453,48 @@ mod tests {
         assert_eq!(v["turn_id"], turn.to_string());
         assert_eq!(v["parent_message_id"], parent.to_string());
         let back: AgentToolStartedProps = serde_json::from_value(v).unwrap();
+        assert_eq!(back, props);
+    }
+
+    #[test]
+    fn agent_tools_available_props_round_trips_without_parameter_schemas() {
+        let props = AgentToolsAvailableProps {
+            tools: vec![
+                AgentToolSummary {
+                    name:        "apply_patch".to_string(),
+                    description: "Apply a patch to files".to_string(),
+                    source:      AgentToolSource::Native,
+                    category:    AgentToolCategory::Write,
+                    invoked:     false,
+                },
+                AgentToolSummary {
+                    name:        "mcp__filesystem__read_file".to_string(),
+                    description: "Read a file via MCP".to_string(),
+                    source:      AgentToolSource::Mcp {
+                        server_name:   "filesystem".to_string(),
+                        original_name: "read_file".to_string(),
+                    },
+                    category:    AgentToolCategory::Other,
+                    invoked:     true,
+                },
+            ],
+            visit: 1,
+        };
+
+        let value = serde_json::to_value(&props).unwrap();
+        assert_eq!(value["tools"][0]["source"], json!({ "kind": "native" }));
+        assert_eq!(
+            value["tools"][1]["source"],
+            json!({
+                "kind": "mcp",
+                "server_name": "filesystem",
+                "original_name": "read_file"
+            })
+        );
+        assert_eq!(value["tools"][0]["category"], "write");
+        assert!(value["tools"][0].get("parameters").is_none());
+
+        let back: AgentToolsAvailableProps = serde_json::from_value(value).unwrap();
         assert_eq!(back, props);
     }
 
