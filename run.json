@@ -494,7 +494,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-24T13:30:50.421201Z",
-  "last_event_at": "2026-05-24T13:33:06.745818Z",
+  "last_event_at": "2026-05-24T13:39:58.318051Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -661,9 +661,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 49,
       "checkpoint": {
-        "timestamp": "2026-05-24T13:35:25.982219Z",
+        "timestamp": "2026-05-24T13:35:29.775508Z",
         "current_node": "preflight_lint",
         "completed_nodes": [
           "start",
@@ -673,23 +673,107 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.retry_count.start": 0,
+          "internal.retry_count.toolchain": 0,
+          "outcome": "succeeded",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.preflight_lint": 0,
+          "graph.rankdir": "LR",
+          "internal.node_visit_count": 1,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.run_id": "01KSD2W90DVJ6Q4T0AD2H0DM7F",
+          "current_node": "preflight_lint",
+          "thread.start.current_node": "toolchain",
+          "internal.thread_id": "preflight_compile",
+          "failure_signature": "",
+          "graph.goal": "---\ntitle: feat: StageProjection agent tools API\ntype: feat\nstatus: active\ndate: 2026-05-24\n---\n\n# feat: StageProjection Agent Tools API\n\n## Overview\n\nExpose the complete effective tool list for each agent-backed stage through `StageProjection`, so UI and API consumers can show actual tools such as `apply_patch`, `grep`, `glob`, `read_file`, MCP tools, skill tools, and subagent tools without inferring them from `permission_level`.\n\nThe API should expose tool summaries with `name`, `description`, `source`, `category`, and `invoked`. It must not expose full JSON parameter schemas in the run projection.\n\n## Problem Frame\n\nThe stage sidebar currently has permission metadata such as \"Full access\", but `permission_level` is only an access mode. It does not tell consumers which tools were actually exposed to the model after provider profile setup, optional tool registration, MCP integration, and tool access policy filtering.\n\nThe authoritative list already exists at request-build time in the agent session registry. The API needs to capture that effective list once per stage session and project it onto the stage.\n\n## Requirements Trace\n\n- R1. Add a StageProjection API field containing the complete effective tools for a stage session.\n- R2. Include `name`, `description`, `source`, `category`, and `invoked` for each tool.\n- R3. Do not infer tools from `permission_level` in backend or frontend code.\n- R4. Do not expose full tool parameter schemas through StageProjection.\n- R5. Preserve existing `permission_level` and `mcp_servers` fields for compatibility.\n- R6. Mark individual tools as invoked when matching `agent.tool.started` events are projected.\n- R7. Keep legacy runs backward compatible by defaulting missing tool lists to empty.\n\n## Scope Boundaries\n\n- Do not remove or rename `StageProjection.permission_level`.\n- Do not remove the existing MCP server projection or `AgentMcpToolSummary`.\n- Do not change completion API tool definitions.\n- Do not add ACP-native tool discovery in this pass unless an ACP path already has an equivalent effective tool list available.\n- Do not render parameter schemas in the web UI.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- OpenAPI is the source of truth for HTTP contracts in `docs/public/api-reference/fabro-api.yaml`.\n- Shared API/projection DTOs should live in `fabro-types`, with `fabro-api/build.rs` replacements to avoid duplicate generated Rust types.\n- `StageProjection` lives in `lib/crates/fabro-types/src/run_projection.rs`.\n- Durable run event props live in `lib/crates/fabro-types/src/run_event/agent.rs` and `lib/crates/fabro-types/src/run_event/mod.rs`.\n- Workflow event conversion and event names live in `lib/crates/fabro-workflow/src/event/convert.rs`, `events.rs`, and `names.rs`.\n- Projection replay lives in `lib/crates/fabro-store/src/run_state.rs`.\n- The effective request tool list is built in `lib/crates/fabro-agent/src/session.rs` from `ToolRegistry::definitions_with_source_for_policy`.\n- Tool source metadata already exists as `ToolSource` and `ToolDefinitionWithSource` in `lib/crates/fabro-agent/src/tool_registry.rs`.\n- Tool category mapping already exists in `lib/crates/fabro-agent/src/tool_permissions.rs`.\n- The sidebar display lives in `apps/fabro-web/app/components/stage-insights-sidebar.tsx`.\n\n### Strategy Docs\n\n- Read `docs/internal/events-strategy.md` before adding the new durable event.\n- Read `docs/internal/testing-strategy.md` before adding or reorganizing tests.\n- Follow the OpenAPI type ownership guidance in `AGENTS.md`: reuse `fabro-types` through `fabro-api/build.rs` replacements when the API schema has the same product meaning and serde shape.\n\n## Key Technical Decisions\n\n- Add a new StageProjection field named `agent_tools`, not `tools`, to avoid ambiguity with MCP nested tools and completion tool definitions.\n- Add a dedicated durable event named `agent.tools.available` instead of overloading `agent.session.activated`.\n- Capture the effective tool list after session setup and filtering, using the same path as model request construction.\n- Store descriptions in the summary because they are useful API/UI metadata; omit parameter schemas to keep projection payloads small and avoid leaking full implementation detail.\n- Keep `AgentMcpToolSummary` MCP-only. Add a new general-purpose `AgentToolSummary` instead of stretching the MCP type beyond its meaning.\n- Treat `invoked` as projected state. The availability event should emit tools with `invoked: false`; replay of `agent.tool.started` flips matching tools to true.\n\n## API Contract\n\nAdd these schemas to OpenAPI and map them to `fabro_types` replacements:\n\n- `AgentToolSummary`\n  - required: `name`, `description`, `source`, `category`, `invoked`\n  - `name`: exposed tool name, e.g. `apply_patch` or `mcp__filesystem__read_file`\n  - `description`: model-facing tool description\n  - `source`: `AgentToolSource`\n  - `category`: `AgentToolCategory`\n  - `invoked`: boolean\n- `AgentToolSource`\n  - tagged by `kind`\n  - `native`\n  - `mcp` with `server_name` and `original_name`\n  - `skill`\n- `AgentToolCategory`\n  - enum: `read`, `write`, `shell`, `subagent`, `other`\n- `AgentToolsAvailableProps`\n  - required: `tools`, `visit`\n  - `tools`: array of `AgentToolSummary`\n  - `visit`: stage visit number\n\nAdd to `StageProjection`:\n\n- `agent_tools`: array of `AgentToolSummary`\n- Default to an empty array when omitted.\n- Skip serializing when empty, matching existing projection optional-list style.\n\nAdd event body:\n\n- Serialized event name: `agent.tools.available`\n- Event body type: `AgentToolsAvailableProps`\n\n## Implementation Units\n\n- [ ] **Unit 1: Add shared tool summary types**\n\n**Goal:** Define the canonical API/projection DTOs in `fabro-types`.\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/run_event/agent.rs`\n- Modify: `lib/crates/fabro-types/src/run_event/mod.rs`\n- Modify: `lib/crates/fabro-types/src/run_projection.rs`\n- Modify: `lib/crates/fabro-types/src/lib.rs`\n\n**Work:**\n- Add `AgentToolSummary`, `AgentToolSource`, `AgentToolCategory`, and `AgentToolsAvailableProps`.\n- Add `EventBody::AgentToolsAvailable` serialized as `agent.tools.available`.\n- Add `agent_tools: Vec<AgentToolSummary>` to `StageProjection`.\n- Ensure all new fields default cleanly for older persisted events/projections.\n- Export the new public types from `fabro-types`.\n\n- [ ] **Unit 2: Capture effective session tools**\n\n**Goal:** Provide an authoritative one-time source for the list that the model can actually call.\n\n**Files:**\n- Modify: `lib/crates/fabro-agent/src/session.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/events.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/names.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/convert.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/stored_fields.rs` only if the new event needs non-standard stored fields.\n\n**Work:**\n- Add `Session::available_tools()` that returns the same effective `ToolDefinitionWithSource` list as `build_request()`.\n- Map `ToolDefinitionWithSource` to `AgentToolSummary` at the workflow boundary.\n- Populate `description` from `ToolDefinition.description`.\n- Populate `source` from `ToolSource`.\n- For MCP tools, include the server name from `ToolSource::Mcp` and derive `original_name` from the qualified exposed name using the existing MCP naming convention.\n- Populate `category` from the existing tool category mapping for known exposed names; use `other` when no category mapping applies.\n- Emit `agent.tools.available` once for the stage session after session setup and filtering are complete.\n\n- [ ] **Unit 3: Project available and invoked tools**\n\n**Goal:** Make `StageProjection.agent_tools` replay-authoritative.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Work:**\n- On `EventBody::AgentToolsAvailable`, replace the current stage visit's `agent_tools` with the event tools.\n- On `EventBody::AgentToolStarted`, find a matching `agent_tools` entry by exposed `tool_name` and set `invoked = true`.\n- Keep the existing MCP server `invoked` update unchanged.\n- If a legacy run has no availability event, do not synthesize a full list from permissions.\n\n- [ ] **Unit 4: Update OpenAPI and generated clients**\n\n**Goal:** Expose the new projection field and event contract through public API clients without duplicate Rust API types.\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Modify: `lib/crates/fabro-api/src/lib.rs`\n- Modify generated files under `lib/crates/fabro-api/src/generated.rs` via `cargo build -p fabro-api`.\n- Modify generated files under `lib/packages/fabro-api-client/src` via TypeScript client generation.\n\n**Work:**\n- Add the OpenAPI schemas listed in the API Contract section.\n- Add `StageProjection.agent_tools`.\n- Add `fabro-api/build.rs` replacements for the new `fabro-types` types.\n- Regenerate Rust API code.\n- Regenerate TypeScript API client code.\n\n- [ ] **Unit 5: Render tools in the web sidebar**\n\n**Goal:** Replace the permission-derived sidebar display with the actual projected tool list.\n\n**Files:**\n- Modify: `apps/fabro-web/app/components/stage-insights-sidebar.tsx`\n- Modify: `apps/fabro-web/app/components/stage-insights-sidebar.test.tsx`\n\n**Work:**\n- Render `stage.agent_tools` when present.\n- Show each tool's name, description, source/category, and invoked state.\n- Keep permission level as secondary metadata or fallback for legacy stages with no `agent_tools`.\n- Do not infer tool availability from permission level.\n\n## Test Plan\n\n- `fabro-types`\n  - JSON round-trip for `agent.tools.available`.\n  - Serialization checks for `AgentToolSource` and `AgentToolCategory`.\n  - Backward compatibility check that missing `agent_tools` deserializes to an empty list.\n\n- `fabro-workflow`\n  - Event name and conversion tests for `agent.tools.available`.\n  - Capture test proving native tools such as `apply_patch`, `grep`, and `glob` are emitted from the effective registry path.\n  - MCP source mapping test for a qualified MCP tool name.\n\n- `fabro-store`\n  - Projection test that `agent.tools.available` populates `StageProjection.agent_tools`.\n  - Projection test that `agent.tool.started` marks only the matching tool as invoked.\n  - Regression test that MCP server `invoked` status still updates as before.\n\n- `fabro-api`\n  - Type identity/parity tests confirming API types reuse `fabro_types::AgentToolSummary`, `AgentToolSource`, `AgentToolCategory`, and `AgentToolsAvailableProps`.\n  - StageProjection round-trip test including `agent_tools`.\n\n- `fabro-web`\n  - Sidebar test rendering tool names and descriptions from `stage.agent_tools`.\n  - Sidebar test showing invoked state.\n  - Legacy fallback test for stages without `agent_tools`.\n\n## Run Checks\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo nextest run -p fabro-types -p fabro-workflow -p fabro-store -p fabro-api`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd apps/fabro-web && bun test && bun run typecheck`\n\n## Assumptions\n\n- The first implementation targets normal API-backed agent sessions, not ACP-native sessions.\n- `description` is safe to expose because it is already model-facing tool metadata, but parameter schemas remain out of scope for StageProjection.\n- `agent_tools` is a complete list only for runs that emit `agent.tools.available`; legacy runs return an empty list and may still show existing permission/MCP metadata.\n- If tool registration becomes mutable later, the event contract can be re-emitted and projection replacement semantics will still work.\n",
+          "failure_class": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.retry_count.preflight_compile": 0
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "implement",
+        "git_commit_sha": "5a2c4cc5275bee59b8a2892ba321cb2a890c6ac4",
+        "node_visits": {
+          "preflight_lint": 1,
+          "preflight_compile": 1,
+          "toolchain": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-24T13:39:58.322939Z",
+        "current_node": "implement",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement"
+        ],
+        "node_retries": {},
+        "context_values": {
           "graph.rankdir": "LR",
           "internal.run_id": "01KSD2W90DVJ6Q4T0AD2H0DM7F",
           "internal.retry_count.start": 0,
           "internal.retry_count.preflight_lint": 0,
-          "internal.thread_id": "preflight_compile",
+          "internal.thread_id": "preflight_lint",
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.implement": 0,
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "graph.goal": "---\ntitle: feat: StageProjection agent tools API\ntype: feat\nstatus: active\ndate: 2026-05-24\n---\n\n# feat: StageProjection Agent Tools API\n\n## Overview\n\nExpose the complete effective tool list for each agent-backed stage through `StageProjection`, so UI and API consumers can show actual tools such as `apply_patch`, `grep`, `glob`, `read_file`, MCP tools, skill tools, and subagent tools without inferring them from `permission_level`.\n\nThe API should expose tool summaries with `name`, `description`, `source`, `category`, and `invoked`. It must not expose full JSON parameter schemas in the run projection.\n\n## Problem Frame\n\nThe stage sidebar currently has permission metadata such as \"Full access\", but `permission_level` is only an access mode. It does not tell consumers which tools were actually exposed to the model after provider profile setup, optional tool registration, MCP integration, and tool access policy filtering.\n\nThe authoritative list already exists at request-build time in the agent session registry. The API needs to capture that effective list once per stage session and project it onto the stage.\n\n## Requirements Trace\n\n- R1. Add a StageProjection API field containing the complete effective tools for a stage session.\n- R2. Include `name`, `description`, `source`, `category`, and `invoked` for each tool.\n- R3. Do not infer tools from `permission_level` in backend or frontend code.\n- R4. Do not expose full tool parameter schemas through StageProjection.\n- R5. Preserve existing `permission_level` and `mcp_servers` fields for compatibility.\n- R6. Mark individual tools as invoked when matching `agent.tool.started` events are projected.\n- R7. Keep legacy runs backward compatible by defaulting missing tool lists to empty.\n\n## Scope Boundaries\n\n- Do not remove or rename `StageProjection.permission_level`.\n- Do not remove the existing MCP server projection or `AgentMcpToolSummary`.\n- Do not change completion API tool definitions.\n- Do not add ACP-native tool discovery in this pass unless an ACP path already has an equivalent effective tool list available.\n- Do not render parameter schemas in the web UI.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- OpenAPI is the source of truth for HTTP contracts in `docs/public/api-reference/fabro-api.yaml`.\n- Shared API/projection DTOs should live in `fabro-types`, with `fabro-api/build.rs` replacements to avoid duplicate generated Rust types.\n- `StageProjection` lives in `lib/crates/fabro-types/src/run_projection.rs`.\n- Durable run event props live in `lib/crates/fabro-types/src/run_event/agent.rs` and `lib/crates/fabro-types/src/run_event/mod.rs`.\n- Workflow event conversion and event names live in `lib/crates/fabro-workflow/src/event/convert.rs`, `events.rs`, and `names.rs`.\n- Projection replay lives in `lib/crates/fabro-store/src/run_state.rs`.\n- The effective request tool list is built in `lib/crates/fabro-agent/src/session.rs` from `ToolRegistry::definitions_with_source_for_policy`.\n- Tool source metadata already exists as `ToolSource` and `ToolDefinitionWithSource` in `lib/crates/fabro-agent/src/tool_registry.rs`.\n- Tool category mapping already exists in `lib/crates/fabro-agent/src/tool_permissions.rs`.\n- The sidebar display lives in `apps/fabro-web/app/components/stage-insights-sidebar.tsx`.\n\n### Strategy Docs\n\n- Read `docs/internal/events-strategy.md` before adding the new durable event.\n- Read `docs/internal/testing-strategy.md` before adding or reorganizing tests.\n- Follow the OpenAPI type ownership guidance in `AGENTS.md`: reuse `fabro-types` through `fabro-api/build.rs` replacements when the API schema has the same product meaning and serde shape.\n\n## Key Technical Decisions\n\n- Add a new StageProjection field named `agent_tools`, not `tools`, to avoid ambiguity with MCP nested tools and completion tool definitions.\n- Add a dedicated durable event named `agent.tools.available` instead of overloading `agent.session.activated`.\n- Capture the effective tool list after session setup and filtering, using the same path as model request construction.\n- Store descriptions in the summary because they are useful API/UI metadata; omit parameter schemas to keep projection payloads small and avoid leaking full implementation detail.\n- Keep `AgentMcpToolSummary` MCP-only. Add a new general-purpose `AgentToolSummary` instead of stretching the MCP type beyond its meaning.\n- Treat `invoked` as projected state. The availability event should emit tools with `invoked: false`; replay of `agent.tool.started` flips matching tools to true.\n\n## API Contract\n\nAdd these schemas to OpenAPI and map them to `fabro_types` replacements:\n\n- `AgentToolSummary`\n  - required: `name`, `description`, `source`, `category`, `invoked`\n  - `name`: exposed tool name, e.g. `apply_patch` or `mcp__filesystem__read_file`\n  - `description`: model-facing tool description\n  - `source`: `AgentToolSource`\n  - `category`: `AgentToolCategory`\n  - `invoked`: boolean\n- `AgentToolSource`\n  - tagged by `kind`\n  - `native`\n  - `mcp` with `server_name` and `original_name`\n  - `skill`\n- `AgentToolCategory`\n  - enum: `read`, `write`, `shell`, `subagent`, `other`\n- `AgentToolsAvailableProps`\n  - required: `tools`, `visit`\n  - `tools`: array of `AgentToolSummary`\n  - `visit`: stage visit number\n\nAdd to `StageProjection`:\n\n- `agent_tools`: array of `AgentToolSummary`\n- Default to an empty array when omitted.\n- Skip serializing when empty, matching existing projection optional-list style.\n\nAdd event body:\n\n- Serialized event name: `agent.tools.available`\n- Event body type: `AgentToolsAvailableProps`\n\n## Implementation Units\n\n- [ ] **Unit 1: Add shared tool summary types**\n\n**Goal:** Define the canonical API/projection DTOs in `fabro-types`.\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/run_event/agent.rs`\n- Modify: `lib/crates/fabro-types/src/run_event/mod.rs`\n- Modify: `lib/crates/fabro-types/src/run_projection.rs`\n- Modify: `lib/crates/fabro-types/src/lib.rs`\n\n**Work:**\n- Add `AgentToolSummary`, `AgentToolSource`, `AgentToolCategory`, and `AgentToolsAvailableProps`.\n- Add `EventBody::AgentToolsAvailable` serialized as `agent.tools.available`.\n- Add `agent_tools: Vec<AgentToolSummary>` to `StageProjection`.\n- Ensure all new fields default cleanly for older persisted events/projections.\n- Export the new public types from `fabro-types`.\n\n- [ ] **Unit 2: Capture effective session tools**\n\n**Goal:** Provide an authoritative one-time source for the list that the model can actually call.\n\n**Files:**\n- Modify: `lib/crates/fabro-agent/src/session.rs`\n- Modify: `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/events.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/names.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/convert.rs`\n- Modify: `lib/crates/fabro-workflow/src/event/stored_fields.rs` only if the new event needs non-standard stored fields.\n\n**Work:**\n- Add `Session::available_tools()` that returns the same effective `ToolDefinitionWithSource` list as `build_request()`.\n- Map `ToolDefinitionWithSource` to `AgentToolSummary` at the workflow boundary.\n- Populate `description` from `ToolDefinition.description`.\n- Populate `source` from `ToolSource`.\n- For MCP tools, include the server name from `ToolSource::Mcp` and derive `original_name` from the qualified exposed name using the existing MCP naming convention.\n- Populate `category` from the existing tool category mapping for known exposed names; use `other` when no category mapping applies.\n- Emit `agent.tools.available` once for the stage session after session setup and filtering are complete.\n\n- [ ] **Unit 3: Project available and invoked tools**\n\n**Goal:** Make `StageProjection.agent_tools` replay-authoritative.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Work:**\n- On `EventBody::AgentToolsAvailable`, replace the current stage visit's `agent_tools` with the event tools.\n- On `EventBody::AgentToolStarted`, find a matching `agent_tools` entry by exposed `tool_name` and set `invoked = true`.\n- Keep the existing MCP server `invoked` update unchanged.\n- If a legacy run has no availability event, do not synthesize a full list from permissions.\n\n- [ ] **Unit 4: Update OpenAPI and generated clients**\n\n**Goal:** Expose the new projection field and event contract through public API clients without duplicate Rust API types.\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Modify: `lib/crates/fabro-api/src/lib.rs`\n- Modify generated files under `lib/crates/fabro-api/src/generated.rs` via `cargo build -p fabro-api`.\n- Modify generated files under `lib/packages/fabro-api-client/src` via TypeScript client generation.\n\n**Work:**\n- Add the OpenAPI schemas listed in the API Contract section.\n- Add `StageProjection.agent_tools`.\n- Add `fabro-api/build.rs` replacements for the new `fabro-types` types.\n- Regenerate Rust API code.\n- Regenerate TypeScript API client code.\n\n- [ ] **Unit 5: Render tools in the web sidebar**\n\n**Goal:** Replace the permission-derived sidebar display with the actual projected tool list.\n\n**Files:**\n- Modify: `apps/fabro-web/app/components/stage-insights-sidebar.tsx`\n- Modify: `apps/fabro-web/app/components/stage-insights-sidebar.test.tsx`\n\n**Work:**\n- Render `stage.agent_tools` when present.\n- Show each tool's name, description, source/category, and invoked state.\n- Keep permission level as secondary metadata or fallback for legacy stages with no `agent_tools`.\n- Do not infer tool availability from permission level.\n\n## Test Plan\n\n- `fabro-types`\n  - JSON round-trip for `agent.tools.available`.\n  - Serialization checks for `AgentToolSource` and `AgentToolCategory`.\n  - Backward compatibility check that missing `agent_tools` deserializes to an empty list.\n\n- `fabro-workflow`\n  - Event name and conversion tests for `agent.tools.available`.\n  - Capture test proving native tools such as `apply_patch`, `grep`, and `glob` are emitted from the effective registry path.\n  - MCP source mapping test for a qualified MCP tool name.\n\n- `fabro-store`\n  - Projection test that `agent.tools.available` populates `StageProjection.agent_tools`.\n  - Projection test that `agent.tool.started` marks only the matching tool as invoked.\n  - Regression test that MCP server `invoked` status still updates as before.\n\n- `fabro-api`\n  - Type identity/parity tests confirming API types reuse `fabro_types::AgentToolSummary`, `AgentToolSource`, `AgentToolCategory`, and `AgentToolsAvailableProps`.\n  - StageProjection round-trip test including `agent_tools`.\n\n- `fabro-web`\n  - Sidebar test rendering tool names and descriptions from `stage.agent_tools`.\n  - Sidebar test showing invoked state.\n  - Legacy fallback test for stages without `agent_tools`.\n\n## Run Checks\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo nextest run -p fabro-types -p fabro-workflow -p fabro-store -p fabro-api`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd apps/fabro-web && bun test && bun run typecheck`\n\n## Assumptions\n\n- The first implementation targets normal API-backed agent sessions, not ACP-native sessions.\n- `description` is safe to expose because it is already model-facing tool metadata, but parameter schemas remain out of scope for StageProjection.\n- `agent_tools` is a complete list only for runs that emit `agent.tools.available`; legacy runs return an empty list and may still show existing permission/MCP metadata.\n- If tool registration becomes mutable later, the event contract can be re-emitted and projection replacement semantics will still work.\n",
-          "failure_class": "",
+          "failure_class": "budget_exhausted",
           "internal.retry_count.toolchain": 0,
           "thread.preflight_compile.current_node": "preflight_lint",
           "internal.fidelity": "compact",
-          "current_node": "preflight_lint",
+          "current_node": "implement",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.node_visit_count": 1,
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "failure_signature": "",
-          "outcome": "succeeded",
+          "failure_signature": "implement|budget_exhausted|api_deterministic|openai|quota_exceeded",
+          "outcome": "failed",
           "thread.start.current_node": "toolchain",
           "thread.toolchain.current_node": "preflight_compile",
           "internal.retry_count.preflight_compile": 0
@@ -719,13 +803,23 @@
             "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
             "usage": null
           },
+          "implement": {
+            "status": "failed",
+            "failure": {
+              "message": "LLM error: Quota exceeded for openai: You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.",
+              "category": "budget_exhausted",
+              "signature": "api_deterministic|openai|quota_exceeded"
+            },
+            "usage": null
+          },
           "start": {
             "status": "succeeded",
             "usage": null
           }
         },
-        "next_node_id": "implement",
+        "next_node_id": "simplify_opus",
         "node_visits": {
+          "implement": 1,
           "toolchain": 1,
           "preflight_compile": 1,
           "preflight_lint": 1,
@@ -755,6 +849,120 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "implement@1": {
+      "first_event_seq": 52,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-24T13:35:29.777422Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 190941,
+        "output_tokens": 6991,
+        "total_tokens": 8108026,
+        "reasoning_tokens": 2766,
+        "cache_read_tokens": 7907328,
+        "cache_write_tokens": 0
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5-2026-04-23"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:7b1bc877-d539-4fc8-87d4-0c8025aecc16",
+        "items": [
+          {
+            "id": "2fcd45938de22bb0",
+            "status": "in_progress",
+            "order": 0,
+            "subject": "Add shared fabro-types DTOs, event body, StageProjection field, and tests"
+          },
+          {
+            "id": "1e26317bfef11aae",
+            "status": "pending",
+            "order": 1,
+            "subject": "Expose effective session tools and emit agent.tools.available from workflow"
+          },
+          {
+            "id": "09ef3a2ba996b682",
+            "status": "pending",
+            "order": 2,
+            "subject": "Replay agent tools availability/invocation in fabro-store with tests"
+          },
+          {
+            "id": "4132850611e12561",
+            "status": "pending",
+            "order": 3,
+            "subject": "Update OpenAPI, fabro-api replacements/exports/tests, and regenerate clients"
+          },
+          {
+            "id": "0dfea1af402d8213",
+            "status": "pending",
+            "order": 4,
+            "subject": "Render projected agent tools in web sidebar with tests"
+          },
+          {
+            "id": "50c9dbdcbdd1f2e1",
+            "status": "pending",
+            "order": 5,
+            "subject": "Run targeted and broader validation checks"
+          }
+        ]
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 1050000,
+        "input_tokens": 170954,
+        "usage_percent": 16.281333333333333,
+        "count_method": "provider_api_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-24T13:39:56.043224Z",
+        "event_seq": 513,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 999,
+            "usage_percent": 0.09514285714285714
+          },
+          {
+            "category": "tools",
+            "tokens": 1456,
+            "usage_percent": 0.13866666666666666
+          },
+          {
+            "category": "memory",
+            "tokens": 3407,
+            "usage_percent": 0.3244761904761905
+          },
+          {
+            "category": "conversation",
+            "tokens": 165085,
+            "usage_percent": 15.722380952380952
+          },
+          {
+            "category": "other",
+            "tokens": 7,
+            "usage_percent": 0.0006666666666666666
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
     "start@1": {
       "first_event_seq": 18,
       "prompt": null,
@@ -889,7 +1097,12 @@
       "first_event_seq": 42,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T13:35:25.981470Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -897,11 +1110,27 @@
         "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 139228,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-24T13:33:06.745541Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 139235,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -910,7 +1139,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     }
   }
 }
