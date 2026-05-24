@@ -492,7 +492,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-24T17:26:19.008722Z",
-  "last_event_at": "2026-05-24T18:16:37.610960Z",
+  "last_event_at": "2026-05-24T18:16:41.389684Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1033,9 +1033,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 2421,
       "checkpoint": {
-        "timestamp": "2026-05-24T18:16:37.650088Z",
+        "timestamp": "2026-05-24T18:16:41.387665Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1048,9 +1048,215 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.thread_id": "simplify_opus",
+          "failure_signature": "",
+          "thread.start.current_node": "toolchain",
+          "internal.fidelity": "compact",
+          "internal.retry_count.preflight_lint": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "current_node": "simplify_gpt",
+          "last_response": "Review and cleanup complete.\n\nWhat I changed:\n- Renamed `fail_if_sandbox_provider_disabled` to `reject_run_if_sandbox_provider_disabled` in `lib/crates/fabro-server/src/server.rs` so the helper name c",
+          "thread.toolchain.current_node": "preflight_compile",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.retry_count.implement": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "failure_class": "",
+          "response.simplify_gpt": "Review and cleanup complete.\n\nWhat I changed:\n- Renamed `fail_if_sandbox_provider_disabled` to `reject_run_if_sandbox_provider_disabled` in `lib/crates/fabro-server/src/server.rs` so the helper name clearly reflects that it mutates run state.\n- Changed the launch-time policy log from `tracing::error!` to `tracing::warn!`, since rejecting a disabled sandbox provider is expected operator policy enforcement rather than an internal server error.\n\nReview agent results:\n- Code reuse: no issues found.\n- Code quality: one issue found and fixed as above.\n- Efficiency: no issues found.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet` ✅\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet` ✅\n- `cargo test -p fabro-api --test server_settings_round_trip server_settings_json_matches_openapi_shape --quiet` ✅\n- `cargo nextest run -p fabro-server sandbox_provider_policy` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n\nCurrent working tree has one intended cleanup diff in `lib/crates/fabro-server/src/server.rs`.",
+          "graph.goal": "# Server Sandbox Provider Enablement Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add server-owned sandbox provider enablement policy at `[server.sandbox.providers.<provider>]`, enforce it for launched runs, and make the installer write explicit provider policy entries.\n\n**Architecture:** Model sandbox provider policy as resolved server settings, separate from run environments. Missing config remains backward-compatible by resolving all providers to enabled, while explicit false values block the corresponding effective sandbox provider at server admission, preflight, and launch.\n\n**Tech Stack:** Rust, `serde`, existing `fabro-config` layer/resolve patterns, OpenAPI/progenitor, generated TypeScript API client, Axum server handlers, `cargo nextest`.\n\n---\n\n## File Structure\n\n- Modify `lib/crates/fabro-config/src/layers/server.rs`\n  - Add sparse `[server.sandbox]` layer structs with closed `providers.local`, `providers.docker`, and `providers.daytona` tables.\n- Modify `lib/crates/fabro-config/src/resolve/server.rs`\n  - Resolve missing sandbox provider policy to all providers enabled.\n- Modify `lib/crates/fabro-types/src/settings/server.rs`\n  - Add resolved `ServerSandboxSettings`, `ServerSandboxProvidersSettings`, and `ServerSandboxProviderSettings` types under `ServerNamespace`.\n- Modify `lib/crates/fabro-install/src/lib.rs`\n  - Make `write_sandbox_settings` write all three provider enablement tables with `enabled = true`.\n- Modify `lib/crates/fabro-server/src/run_manifest.rs` and `lib/crates/fabro-server/src/server/handler/runs.rs`\n  - Add policy checks for run creation and preflight.\n- Modify `lib/crates/fabro-server/src/server.rs`\n  - Add a launch-time recheck before sandbox setup.\n- Modify `docs/public/api-reference/fabro-api.yaml`\n  - Include `server.sandbox` in the `ServerSettings` API shape.\n- Regenerate `lib/packages/fabro-api-client/src/models/*`\n  - Include TypeScript client models for the new settings shape.\n- Modify docs:\n  - `docs/public/administration/server-configuration.mdx`\n  - `docs/public/administration/sandboxing.mdx`\n\n## Contract\n\nSupported TOML shape:\n\n```toml\n[server.sandbox.providers.local]\nenabled = true\n\n[server.sandbox.providers.docker]\nenabled = true\n\n[server.sandbox.providers.daytona]\nenabled = true\n```\n\nResolution rules:\n\n- Missing `[server.sandbox]` means all providers are enabled.\n- Missing `[server.sandbox.providers]` means all providers are enabled.\n- Missing individual provider tables mean that provider is enabled.\n- Missing individual `enabled` values mean that provider is enabled.\n- Unknown keys under `[server.sandbox]`, `[server.sandbox.providers]`, or provider tables are schema errors.\n\nPolicy rule:\n\n- The server checks the **effective** provider, after existing dry-run coercion from Docker/Daytona to Local.\n- Disabled-provider failures use this message:\n\n```text\nsandbox provider \"<provider>\" is disabled by server.sandbox.providers.<provider>.enabled\n```\n\nInstaller rule:\n\n- Browser install and CLI/shared install persistence keep using the chosen sandbox provider as the default run environment.\n- Installer-generated `settings.toml` always writes all three sandbox provider entries with `enabled = true`.\n\n## Task 1: Add Server Config Types and Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-config/src/layers/server.rs`\n- Modify: `lib/crates/fabro-config/src/resolve/server.rs`\n- Modify: `lib/crates/fabro-types/src/settings/server.rs`\n- Test: `lib/crates/fabro-config/src/tests/resolve_server.rs`\n\n- [ ] **Step 1: Write failing config tests**\n\nAdd tests in `lib/crates/fabro-config/src/tests/resolve_server.rs`:\n\n```rust\n#[test]\nfn server_sandbox_defaults_all_providers_enabled() {\n    let settings = super::server_settings_from_toml(\n        r#\"\n_version = 1\n\n[server.auth]\nmethods = [\"dev-token\"]\n\"#,\n    );\n\n    let sandbox = settings.server.sandbox;\n    assert!(sandbox.providers.local.enabled);\n    assert!(sandbox.providers.docker.enabled);\n    assert!(sandbox.providers.daytona.enabled);\n}\n\n#[test]\nfn server_sandbox_allows_partial_provider_overrides() {\n    let settings = super::server_settings_from_toml(\n        r#\"\n_version = 1\n\n[server.auth]\nmethods = [\"dev-token\"]\n\n[server.sandbox.providers.daytona]\nenabled = false\n\"#,\n    );\n\n    let sandbox = settings.server.sandbox;\n    assert!(sandbox.providers.local.enabled);\n    assert!(sandbox.providers.docker.enabled);\n    assert!(!sandbox.providers.daytona.enabled);\n}\n\n#[test]\nfn parsing_rejects_unknown_server_sandbox_provider() {\n    let err = fabro_config::ServerSettingsBuilder::from_toml(\n        r#\"\n_version = 1\n\n[server.auth]\nmethods = [\"dev-token\"]\n\n[server.sandbox.providers.exe]\nenabled = true\n\"#,\n    )\n    .expect_err(\"unknown sandbox provider should be rejected\");\n\n    assert!(\n        err.to_string().contains(\"unknown field `exe`\"),\n        \"unexpected error: {err}\"\n    );\n}\n```\n\nRun:\n\n```bash\ncargo test -p fabro-config server_sandbox --quiet\ncargo test -p fabro-config parsing_rejects_unknown_server_sandbox_provider --quiet\n```\n\nExpected: tests fail because `server.sandbox` does not exist yet.\n\n- [ ] **Step 2: Add sparse config layer types**\n\nIn `lib/crates/fabro-config/src/layers/server.rs`, add `sandbox` to `ServerLayer`:\n\n```rust\n#[serde(default, skip_serializing_if = \"Option::is_none\")]\npub sandbox: Option<ServerSandboxLayer>,\n```\n\nAdd the layer structs near the other server subdomain structs:\n\n```rust\n/// `[server.sandbox]` — server-owned sandbox provider policy.\n#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]\n#[serde(deny_unknown_fields)]\npub struct ServerSandboxLayer {\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub providers: Option<ServerSandboxProvidersLayer>,\n}\n\n#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]\n#[serde(deny_unknown_fields)]\npub struct ServerSandboxProvidersLayer {\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub local: Option<ServerSandboxProviderLayer>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub docker: Option<ServerSandboxProviderLayer>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub daytona: Option<ServerSandboxProviderLayer>,\n}\n\n#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]\n#[serde(deny_unknown_fields)]\npub struct ServerSandboxProviderLayer {\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub enabled: Option<bool>,\n}\n```\n\n- [ ] **Step 3: Add resolved server settings types**\n\nIn `lib/crates/fabro-types/src/settings/server.rs`, add `sandbox` to `ServerNamespace` after `ip_allowlist` or before `storage`:\n\n```rust\npub sandbox: ServerSandboxSettings,\n```\n\nUpdate `ServerNamespace::test_default()` to initialize it:\n\n```rust\nsandbox: ServerSandboxSettings::default(),\n```\n\nAdd resolved structs:\n\n```rust\n#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\npub struct ServerSandboxSettings {\n    pub providers: ServerSandboxProvidersSettings,\n}\n\nimpl Default for ServerSandboxSettings {\n    fn default() -> Self {\n        Self {\n            providers: ServerSandboxProvidersSettings::default(),\n        }\n    }\n}\n\n#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\npub struct ServerSandboxProvidersSettings {\n    pub local:   ServerSandboxProviderSettings,\n    pub docker:  ServerSandboxProviderSettings,\n    pub daytona: ServerSandboxProviderSettings,\n}\n\nimpl Default for ServerSandboxProvidersSettings {\n    fn default() -> Self {\n        Self {\n            local:   ServerSandboxProviderSettings::default(),\n            docker:  ServerSandboxProviderSettings::default(),\n            daytona: ServerSandboxProviderSettings::default(),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\npub struct ServerSandboxProviderSettings {\n    pub enabled: bool,\n}\n\nimpl Default for ServerSandboxProviderSettings {\n    fn default() -> Self {\n        Self { enabled: true }\n    }\n}\n```\n\n- [ ] **Step 4: Resolve the new settings**\n\nIn `lib/crates/fabro-config/src/resolve/server.rs`, import the new layer and resolved types, then add `sandbox` to `ServerNamespace` construction:\n\n```rust\nsandbox: resolve_sandbox(layer.sandbox.as_ref()),\n```\n\nAdd resolver helpers:\n\n```rust\nfn resolve_sandbox(layer: Option<&ServerSandboxLayer>) -> ServerSandboxSettings {\n    let providers = layer.and_then(|sandbox| sandbox.providers.as_ref());\n    ServerSandboxSettings {\n        providers: ServerSandboxProvidersSettings {\n            local:   resolve_sandbox_provider(providers.and_then(|providers| providers.local.as_ref())),\n            docker:  resolve_sandbox_provider(providers.and_then(|providers| providers.docker.as_ref())),\n            daytona: resolve_sandbox_provider(providers.and_then(|providers| providers.daytona.as_ref())),\n        },\n    }\n}\n\nfn resolve_sandbox_provider(\n    layer: Option<&ServerSandboxProviderLayer>,\n) -> ServerSandboxProviderSettings {\n    ServerSandboxProviderSettings {\n        enabled: layer.and_then(|provider| provider.enabled).unwrap_or(true),\n    }\n}\n```\n\n- [ ] **Step 5: Run config tests**\n\nRun:\n\n```bash\ncargo test -p fabro-config server_sandbox --quiet\ncargo test -p fabro-config parsing_rejects_unknown_server_sandbox_provider --quiet\n```\n\nExpected: all tests pass.\n\n## Task 2: Enforce Policy in Server Run Paths\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/run_manifest.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/runs.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n- Test: `lib/crates/fabro-server/tests/it/api/runs.rs`\n\n- [ ] **Step 1: Add the shared policy helper**\n\nIn `lib/crates/fabro-server/src/run_manifest.rs`, add this helper near `resolve_sandbox_provider`:\n\n```rust\npub(crate) fn sandbox_provider_policy_error(\n    server_settings: &fabro_types::ServerSettings,\n    provider: SandboxProvider,\n) -> Option<String> {\n    let enabled = match provider {\n        SandboxProvider::Local => server_settings.server.sandbox.providers.local.enabled,\n        SandboxProvider::Docker => server_settings.server.sandbox.providers.docker.enabled,\n        SandboxProvider::Daytona => server_settings.server.sandbox.providers.daytona.enabled,\n    };\n\n    (!enabled).then(|| {\n        format!(\n            \"sandbox provider \\\"{provider}\\\" is disabled by server.sandbox.providers.{provider}.enabled\"\n        )\n    })\n}\n\npub(crate) fn effective_sandbox_provider(settings: &RunNamespace) -> SandboxProvider {\n    let provider = resolve_sandbox_provider(settings);\n    if settings.execution.mode == RunMode::DryRun && !provider.is_local() {\n        SandboxProvider::Local\n    } else {\n        provider\n    }\n}\n```\n\nReplace local duplicate dry-run effective-provider logic in `build_preflight_report` with `effective_sandbox_provider(&resolved_run)`.\n\n- [ ] **Step 2: Add preflight policy failure**\n\nIn `build_preflight_report`, after `sandbox_provider` is computed and before runtime sandbox checks:\n\n```rust\nif let Some(error) = sandbox_provider_policy_error(&server_settings, sandbox_provider) {\n    checks.push(CheckResult {\n        name:        \"Sandbox Provider Policy\".into(),\n        status:      CheckStatus::Error,\n        summary:     error,\n        details:     Vec::new(),\n        remediation: None,\n    });\n    return Ok((\n        CheckReport {\n            title:    \"Run Preflight\".into(),\n            sections: vec![CheckSection {\n                title: String::new(),\n                checks,\n            }],\n        },\n        false,\n    ));\n}\n```\n\n- [ ] **Step 3: Reject disabled providers at run creation**\n\nIn `lib/crates/fabro-server/src/server/handler/runs.rs`, after `prepared` is created and before parent validation:\n\n```rust\nlet provider = run_manifest::effective_sandbox_provider(&prepared.settings.run);\nif let Some(error) = run_manifest::sandbox_provider_policy_error(&state.server_settings(), provider)\n{\n    return ApiError::bad_request(error).into_response();\n}\n```\n\nThis deliberately uses the resolved run settings already produced by `prepare_manifest_with_environment_defaults`; sandbox provider selection is not graph-dependent.\n\n- [ ] **Step 4: Recheck policy at launch**\n\nIn `lib/crates/fabro-server/src/server.rs`, after loading `persisted` and before resolving GitHub credentials:\n\n```rust\nlet effective_provider = run_manifest::effective_sandbox_provider(&persisted.run_spec().settings.run);\nif let Some(error) = run_manifest::sandbox_provider_policy_error(&server_settings, effective_provider)\n{\n    tracing::error!(run_id = %run_id, error = %error, \"Sandbox provider disabled by server policy\");\n    fail_run_before_execution(&state, run_id, FailureReason::LaunchFailed, error).await;\n    return;\n}\n```\n\n- [ ] **Step 5: Test server behavior**\n\nAdd tests covering:\n\n```rust\n#[test]\nfn sandbox_provider_policy_error_reports_disabled_provider() {\n    let settings = server_settings_from_toml(\n        r#\"\n_version = 1\n\n[server.auth]\nmethods = [\"dev-token\"]\n\n[server.sandbox.providers.daytona]\nenabled = false\n\"#,\n    );\n\n    assert_eq!(\n        crate::run_manifest::sandbox_provider_policy_error(\n            &settings,\n            fabro_sandbox::SandboxProvider::Daytona,\n        )\n        .as_deref(),\n        Some(\n            \"sandbox provider \\\"daytona\\\" is disabled by server.sandbox.providers.daytona.enabled\"\n        )\n    );\n}\n```\n\nAdd an API integration test in `lib/crates/fabro-server/tests/it/api/runs.rs` that creates a test app with Daytona disabled and a manifest selecting a Daytona environment. Assert `POST /api/v1/runs` returns `400` and the policy message.\n\nAdd a preflight test that sends the same manifest to `/api/v1/runs/preflight` and asserts `ok = false` plus a `Sandbox Provider Policy` error check.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server sandbox_provider_policy\ncargo nextest run -p fabro-server --test it runs::create_run_rejects_disabled_sandbox_provider\n```\n\nExpected: all new tests pass.\n\n## Task 3: Update Installer Persistence\n\n**Files:**\n- Modify: `lib/crates/fabro-install/src/lib.rs`\n- Test: `lib/crates/fabro-install/src/lib.rs`\n- Test: `lib/crates/fabro-server/tests/it/api/install.rs`\n\n- [ ] **Step 1: Add installer unit assertions**\n\nExtend `write_sandbox_settings_records_docker_provider` and `write_sandbox_settings_records_daytona_provider` to assert all three provider policies:\n\n```rust\nfn sandbox_provider_enabled(doc: &toml::Value, provider: &str) -> Option<bool> {\n    doc.get(\"server\")\n        .and_then(toml::Value::as_table)\n        .and_then(|server| server.get(\"sandbox\"))\n        .and_then(toml::Value::as_table)\n        .and_then(|sandbox| sandbox.get(\"providers\"))\n        .and_then(toml::Value::as_table)\n        .and_then(|providers| providers.get(provider))\n        .and_then(toml::Value::as_table)\n        .and_then(|provider| provider.get(\"enabled\"))\n        .and_then(toml::Value::as_bool)\n}\n\nassert_eq!(sandbox_provider_enabled(&doc, \"local\"), Some(true));\nassert_eq!(sandbox_provider_enabled(&doc, \"docker\"), Some(true));\nassert_eq!(sandbox_provider_enabled(&doc, \"daytona\"), Some(true));\n```\n\nRun:\n\n```bash\ncargo test -p fabro-install write_sandbox_settings_records --quiet\n```\n\nExpected: tests fail because policy entries are not written yet.\n\n- [ ] **Step 2: Write all provider policy entries**\n\nAdd helper functions in `lib/crates/fabro-install/src/lib.rs`:\n\n```rust\nfn write_sandbox_provider_enabled(\n    providers: &mut toml::Table,\n    provider: &str,\n    enabled: bool,\n) -> Result<()> {\n    let table = ensure_table(providers, provider)?;\n    table.insert(\"enabled\".to_string(), toml::Value::Boolean(enabled));\n    Ok(())\n}\n\nfn write_sandbox_provider_policy(server: &mut toml::Table) -> Result<()> {\n    let sandbox = ensure_table(server, \"sandbox\")?;\n    let providers = ensure_table(sandbox, \"providers\")?;\n    write_sandbox_provider_enabled(providers, \"local\", true)?;\n    write_sandbox_provider_enabled(providers, \"docker\", true)?;\n    write_sandbox_provider_enabled(providers, \"daytona\", true)?;\n    Ok(())\n}\n```\n\nIn `write_sandbox_settings`, after obtaining the root table and before returning:\n\n```rust\nlet server = ensure_table(root, \"server\")?;\nwrite_sandbox_provider_policy(server)?;\n```\n\n- [ ] **Step 3: Update browser install finish tests**\n\nIn `lib/crates/fabro-server/tests/it/api/install.rs`, update Docker and Daytona install finish tests to assert:\n\n```rust\nassert!(settings.contains(\"[server.sandbox.providers.local]\"));\nassert!(settings.contains(\"[server.sandbox.providers.docker]\"));\nassert!(settings.contains(\"[server.sandbox.providers.daytona]\"));\nassert!(settings.contains(\"enabled = true\"));\n```\n\nAlso parse the generated settings with `ServerSettingsBuilder::from_toml` and assert all three resolved providers are enabled.\n\n- [ ] **Step 4: Run installer tests**\n\nRun:\n\n```bash\ncargo test -p fabro-install write_sandbox_settings_records --quiet\ncargo nextest run -p fabro-server --test it install::token_install_finish_persists_settings_env_and_vault\ncargo nextest run -p fabro-server --test it install::daytona_install_finish_writes_settings_and_vault_secret\n```\n\nExpected: all tests pass.\n\n## Task 4: Update API Schema, Generated Clients, and Docs\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/tests/server_settings_round_trip.rs`\n- Regenerate: `lib/packages/fabro-api-client/src/models/*`\n- Modify: `docs/public/administration/server-configuration.mdx`\n- Modify: `docs/public/administration/sandboxing.mdx`\n\n- [ ] **Step 1: Update OpenAPI server settings schema**\n\nIn `docs/public/api-reference/fabro-api.yaml`, add `sandbox` as required on `ServerNamespace` and define:\n\n```yaml\n    ServerSandboxSettings:\n      type: object\n      required: [providers]\n      properties:\n        providers:\n          $ref: \"#/components/schemas/ServerSandboxProvidersSettings\"\n\n    ServerSandboxProvidersSettings:\n      type: object\n      required: [local, docker, daytona]\n      properties:\n        local:\n          $ref: \"#/components/schemas/ServerSandboxProviderSettings\"\n        docker:\n          $ref: \"#/components/schemas/ServerSandboxProviderSettings\"\n        daytona:\n          $ref: \"#/components/schemas/ServerSandboxProviderSettings\"\n\n    ServerSandboxProviderSettings:\n      type: object\n      required: [enabled]\n      properties:\n        enabled:\n          type: boolean\n```\n\n- [ ] **Step 2: Update API round-trip test**\n\nIn `lib/crates/fabro-api/tests/server_settings_round_trip.rs`, add TOML to the sample:\n\n```toml\n[server.sandbox.providers.daytona]\nenabled = false\n```\n\nAdd JSON assertions:\n\n```rust\nassert_eq!(json[\"server\"][\"sandbox\"][\"providers\"][\"local\"][\"enabled\"], true);\nassert_eq!(json[\"server\"][\"sandbox\"][\"providers\"][\"docker\"][\"enabled\"], true);\nassert_eq!(json[\"server\"][\"sandbox\"][\"providers\"][\"daytona\"][\"enabled\"], false);\n```\n\n- [ ] **Step 3: Regenerate API artifacts**\n\nRun:\n\n```bash\ncargo build -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\n```\n\nExpected: generated Rust/API and TypeScript client types include the new sandbox settings models.\n\n- [ ] **Step 4: Update docs**\n\nIn `docs/public/administration/server-configuration.mdx`, add `[server.sandbox]` to the server-owned sections table and full reference:\n\n```toml\n[server.sandbox.providers.local]\nenabled = true\n\n[server.sandbox.providers.docker]\nenabled = true\n\n[server.sandbox.providers.daytona]\nenabled = true\n```\n\nAdd a short section:\n\n```md\n### `[server.sandbox.providers]` section\n\nControls which sandbox providers the server may launch. Missing provider entries default to `enabled = true` for backward compatibility. Disabling a provider rejects new runs whose effective provider is disabled; dry-run Docker/Daytona runs use the local provider and are governed by `server.sandbox.providers.local.enabled`.\n```\n\nIn `docs/public/administration/sandboxing.mdx`, add one paragraph pointing operators to `[server.sandbox.providers.<provider>]` for enable/disable policy.\n\n- [ ] **Step 5: Run API/docs tests**\n\nRun:\n\n```bash\ncargo test -p fabro-api server_settings_json_matches_openapi_shape --quiet\ncd apps/fabro-web && bun run typecheck\n```\n\nExpected: tests and typecheck pass.\n\n## Task 5: Final Verification\n\n**Files:**\n- No new files.\n\n- [ ] **Step 1: Run focused Rust tests**\n\nRun:\n\n```bash\ncargo test -p fabro-config server_sandbox --quiet\ncargo test -p fabro-install write_sandbox_settings_records --quiet\ncargo test -p fabro-api server_settings_json_matches_openapi_shape --quiet\ncargo nextest run -p fabro-server sandbox_provider_policy\n```\n\nExpected: all focused tests pass.\n\n- [ ] **Step 2: Run formatting and lint checks**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nExpected: both pass.\n\n- [ ] **Step 3: Run frontend typecheck if generated TypeScript changed**\n\nRun:\n\n```bash\ncd apps/fabro-web && bun run typecheck\n```\n\nExpected: typecheck passes.\n\n- [ ] **Step 4: Commit**\n\nRun:\n\n```bash\ngit add lib/crates/fabro-config lib/crates/fabro-types lib/crates/fabro-install lib/crates/fabro-server docs/public lib/crates/fabro-api lib/packages/fabro-api-client apps/fabro-web\ngit commit -m \"feat: add server sandbox provider policy\"\n```\n\nExpected: commit succeeds with only intended files staged.\n",
+          "internal.node_visit_count": 1,
+          "thread.preflight_lint.current_node": "implement",
+          "graph.rankdir": "LR",
+          "internal.retry_count.simplify_gpt": 0,
+          "internal.run_id": "01KSDGBEV87WMKH9NQ7301WCKA",
+          "outcome": "succeeded",
+          "internal.retry_count.start": 0,
+          "response.simplify_opus": "## Summary\n\nThe three review agents flagged several issues; I implemented the high-value fixes and left low-value ones alone.\n\n### Fixes applied\n\n1. **Dedup'd dry-run coercion** — added `SandboxProvider::effective_for(mode)` in `fabro-types/src/sandbox_provider.rs`. Replaced the duplicated `if RunMode::DryRun && !is_local()` block in both `fabro-server/src/run_manifest.rs::effective_sandbox_provider` and `fabro-workflow/src/operations/start.rs` with a single method call. Also inlined the trivial one-line `resolve_sandbox_provider` wrapper in `run_manifest.rs`.\n\n2. **Encapsulated the stringly-typed match** — added `ServerSandboxProvidersSettings::for_provider(SandboxProvider) -> &ServerSandboxProviderSettings` in `fabro-types/src/settings/server.rs`. `sandbox_provider_policy_error` now uses that instead of hand-matching variants.\n\n3. **Extracted launch-time policy helper** — `fail_if_sandbox_provider_disabled` in `fabro-server/src/server.rs` replaces two identical 7-line blocks in `execute_run_in_process` and `execute_run_subprocess` (including the duplicated `tracing::error!` message).\n\n4. **Looped installer writes** — `write_sandbox_provider_policy` in `fabro-install/src/lib.rs` now iterates over `[SandboxProvider::Local, Docker, Daytona]` (via `Display`) instead of three hardcoded string-literal calls. Removed the now-redundant `write_sandbox_provider_enabled` helper.\n\n### Findings deliberately skipped\n\n- **Collapsing the 3-struct hierarchy** to a flat `{ local: bool, docker: bool, daytona: bool }` — keeping the per-provider struct preserves room for future per-provider fields and matches the TOML shape.\n- **Returning `Result<(), String>` from `sandbox_provider_policy_error`** — the four call sites use the error in different ways (response body, check report, run-fail message), so `Option<String>` is the right shape.\n- **Backtick-quoting the config path in the error message** — the spec mandates the exact string, and the new tests assert it verbatim.\n- **Hoisting `state.server_settings()` in `create_run`** — `RwLock::read + Arc::clone` is negligible.\n- **Pulling `assert_sandbox_provider_policy_enabled` into a shared test-support module** — only used in two tests of one crate.\n\n### Verification\n\n- `cargo check --workspace` clean\n- `cargo nextest run -p fabro-config` 220/220 pass (incl. new policy tests)\n- `cargo nextest run -p fabro-types -p fabro-install` 326+install pass\n- `cargo nextest run -p fabro-server` 631/634 pass — the 3 failures (`get_graph_returns_svg` + 2 related) are pre-existing and reproduced on the parent commit before any cleanup edits\n- `cargo nextest run -p fabro-server --test it --features test-support` 143/143 pass\n- `cargo nextest run -p fabro-workflow` 1162/1162 pass\n- `cargo nextest run -p fabro-api` 153/153 pass (incl. round-trip)\n- `cargo +nightly-2026-04-14 fmt --check --all` clean\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean\n\nNet change: **+76/−48 lines** removed across 6 files (further reducing duplication on top of the original feature commit).",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.toolchain": 0,
+          "response.implement": "Implemented and committed the server sandbox provider policy.\n\nCommit: `f5eac31bc feat: add server sandbox provider policy`\n\nSummary:\n- Added resolved `[server.sandbox.providers.{local,docker,daytona}].enabled` settings with backward-compatible defaults (`true`) and closed TOML schema validation.\n- Enforced disabled-provider policy for:\n  - run creation admission\n  - preflight reports\n  - launch-time rechecks before sandbox setup\n- Policy uses the effective provider after dry-run coercion to local.\n- Installer now writes all three provider policy tables with `enabled = true`.\n- Updated OpenAPI schema, Rust API replacements/tests, regenerated TypeScript API client models, and docs.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet`\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet`\n- `cargo test -p fabro-api server_settings_json_matches_openapi_shape --quiet`\n- `cargo nextest run -p fabro-server --features test-support sandbox_provider_policy`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::create_run_rejects_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::preflight_reports_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it install::token_install_finish_persists_settings_env_and_vault`\n- `cargo nextest run -p fabro-server --features test-support --test it install::daytona_install_finish_writes_settings_and_vault_secret`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck`\n\nWorking tree is clean.",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "thread.implement.current_node": "simplify_opus",
+          "last_stage": "simplify_gpt"
+        },
+        "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_gpt",
+              "response.simplify_gpt": "Review and cleanup complete.\n\nWhat I changed:\n- Renamed `fail_if_sandbox_provider_disabled` to `reject_run_if_sandbox_provider_disabled` in `lib/crates/fabro-server/src/server.rs` so the helper name clearly reflects that it mutates run state.\n- Changed the launch-time policy log from `tracing::error!` to `tracing::warn!`, since rejecting a disabled sandbox provider is expected operator policy enforcement rather than an internal server error.\n\nReview agent results:\n- Code reuse: no issues found.\n- Code quality: one issue found and fixed as above.\n- Efficiency: no issues found.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet` ✅\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet` ✅\n- `cargo test -p fabro-api --test server_settings_round_trip server_settings_json_matches_openapi_shape --quiet` ✅\n- `cargo nextest run -p fabro-server sandbox_provider_policy` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n\nCurrent working tree has one intended cleanup diff in `lib/crates/fabro-server/src/server.rs`.",
+              "last_response": "Review and cleanup complete.\n\nWhat I changed:\n- Renamed `fail_if_sandbox_provider_disabled` to `reject_run_if_sandbox_provider_disabled` in `lib/crates/fabro-server/src/server.rs` so the helper name c"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 346679,
+                    "output_tokens": 2595,
+                    "reasoning_tokens": 426,
+                    "cache_read_tokens": 112640,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 1880345
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Implemented and committed the server sandbox provider policy.\n\nCommit: `f5eac31bc feat: add server sandbox provider policy`\n\nSummary:\n- Added resolved `[server.sandbox.providers.{local,docker,daytona}",
+              "response.implement": "Implemented and committed the server sandbox provider policy.\n\nCommit: `f5eac31bc feat: add server sandbox provider policy`\n\nSummary:\n- Added resolved `[server.sandbox.providers.{local,docker,daytona}].enabled` settings with backward-compatible defaults (`true`) and closed TOML schema validation.\n- Enforced disabled-provider policy for:\n  - run creation admission\n  - preflight reports\n  - launch-time rechecks before sandbox setup\n- Policy uses the effective provider after dry-run coercion to local.\n- Installer now writes all three provider policy tables with `enabled = true`.\n- Updated OpenAPI schema, Rust API replacements/tests, regenerated TypeScript API client models, and docs.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet`\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet`\n- `cargo test -p fabro-api server_settings_json_matches_openapi_shape --quiet`\n- `cargo nextest run -p fabro-server --features test-support sandbox_provider_policy`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::create_run_rejects_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::preflight_reports_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it install::token_install_finish_persists_settings_env_and_vault`\n- `cargo nextest run -p fabro-server --features test-support --test it install::daytona_install_finish_writes_settings_and_vault_secret`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck`\n\nWorking tree is clean.",
+              "last_stage": "implement"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 5701485,
+                    "output_tokens": 22374,
+                    "reasoning_tokens": 9843,
+                    "cache_read_tokens": 18817536,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 38882703
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/packages/fabro-api-client/src/models/server-sandbox-provider-settings.ts",
+              "/home/daytona/workspace/fabro/lib/packages/fabro-api-client/src/models/server-sandbox-providers-settings.ts",
+              "/home/daytona/workspace/fabro/lib/packages/fabro-api-client/src/models/server-sandbox-settings.ts"
+            ]
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_opus",
+              "last_response": "## Summary\n\nThe three review agents flagged several issues; I implemented the high-value fixes and left low-value ones alone.\n\n### Fixes applied\n\n1. **Dedup'd dry-run coercion** — added `SandboxProv",
+              "response.simplify_opus": "## Summary\n\nThe three review agents flagged several issues; I implemented the high-value fixes and left low-value ones alone.\n\n### Fixes applied\n\n1. **Dedup'd dry-run coercion** — added `SandboxProvider::effective_for(mode)` in `fabro-types/src/sandbox_provider.rs`. Replaced the duplicated `if RunMode::DryRun && !is_local()` block in both `fabro-server/src/run_manifest.rs::effective_sandbox_provider` and `fabro-workflow/src/operations/start.rs` with a single method call. Also inlined the trivial one-line `resolve_sandbox_provider` wrapper in `run_manifest.rs`.\n\n2. **Encapsulated the stringly-typed match** — added `ServerSandboxProvidersSettings::for_provider(SandboxProvider) -> &ServerSandboxProviderSettings` in `fabro-types/src/settings/server.rs`. `sandbox_provider_policy_error` now uses that instead of hand-matching variants.\n\n3. **Extracted launch-time policy helper** — `fail_if_sandbox_provider_disabled` in `fabro-server/src/server.rs` replaces two identical 7-line blocks in `execute_run_in_process` and `execute_run_subprocess` (including the duplicated `tracing::error!` message).\n\n4. **Looped installer writes** — `write_sandbox_provider_policy` in `fabro-install/src/lib.rs` now iterates over `[SandboxProvider::Local, Docker, Daytona]` (via `Display`) instead of three hardcoded string-literal calls. Removed the now-redundant `write_sandbox_provider_enabled` helper.\n\n### Findings deliberately skipped\n\n- **Collapsing the 3-struct hierarchy** to a flat `{ local: bool, docker: bool, daytona: bool }` — keeping the per-provider struct preserves room for future per-provider fields and matches the TOML shape.\n- **Returning `Result<(), String>` from `sandbox_provider_policy_error`** — the four call sites use the error in different ways (response body, check report, run-fail message), so `Option<String>` is the right shape.\n- **Backtick-quoting the config path in the error message** — the spec mandates the exact string, and the new tests assert it verbatim.\n- **Hoisting `state.server_settings()` in `create_run`** — `RwLock::read + Arc::clone` is negligible.\n- **Pulling `assert_sandbox_provider_policy_enabled` into a shared test-support module** — only used in two tests of one crate.\n\n### Verification\n\n- `cargo check --workspace` clean\n- `cargo nextest run -p fabro-config` 220/220 pass (incl. new policy tests)\n- `cargo nextest run -p fabro-types -p fabro-install` 326+install pass\n- `cargo nextest run -p fabro-server` 631/634 pass — the 3 failures (`get_graph_returns_svg` + 2 related) are pre-existing and reproduced on the parent commit before any cleanup edits\n- `cargo nextest run -p fabro-server --test it --features test-support` 143/143 pass\n- `cargo nextest run -p fabro-workflow` 1162/1162 pass\n- `cargo nextest run -p fabro-api` 153/153 pass (incl. round-trip)\n- `cargo +nightly-2026-04-14 fmt --check --all` clean\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` clean\n\nNet change: **+76/−48 lines** removed across 6 files (further reducing duplication on top of the original feature commit)."
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 80191,
+                    "output_tokens": 20961,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 4224193,
+                    "cache_write_tokens": 303315
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 303315,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 4932794
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-install/src/lib.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/run_manifest.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/server.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/sandbox_provider.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/settings/server.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/operations/start.rs"
+            ]
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "8cfb710b3616cb63c21bd27078118d90f4967566",
+        "node_visits": {
+          "simplify_gpt": 1,
+          "toolchain": 1,
+          "preflight_compile": 1,
+          "simplify_opus": 1,
+          "implement": 1,
+          "preflight_lint": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs\nindex 81a8adeda..f97f8fda1 100644\n--- a/lib/crates/fabro-server/src/server.rs\n+++ b/lib/crates/fabro-server/src/server.rs\n@@ -2832,8 +2832,8 @@ async fn finish_cancelled_run_before_execution(state: &Arc<AppState>, run_id: Ru\n }\n \n /// Reject the run before execution if its effective sandbox provider is\n-/// disabled by server policy. Returns `true` when the run was failed.\n-async fn fail_if_sandbox_provider_disabled(\n+/// disabled by server policy. Returns `true` when the run was rejected.\n+async fn reject_run_if_sandbox_provider_disabled(\n     state: &Arc<AppState>,\n     server_settings: &ServerSettings,\n     run_id: RunId,\n@@ -2843,7 +2843,7 @@ async fn fail_if_sandbox_provider_disabled(\n     let Some(error) = run_manifest::sandbox_provider_policy_error(server_settings, provider) else {\n         return false;\n     };\n-    tracing::error!(run_id = %run_id, error = %error, \"Sandbox provider disabled by server policy\");\n+    tracing::warn!(run_id = %run_id, error = %error, \"Sandbox provider disabled by server policy\");\n     fail_run_before_execution(state, run_id, FailureReason::LaunchFailed, error).await;\n     true\n }\n@@ -3597,7 +3597,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {\n         finish_cancelled_run_before_execution(&state, run_id).await;\n         return;\n     }\n-    if fail_if_sandbox_provider_disabled(\n+    if reject_run_if_sandbox_provider_disabled(\n         &state,\n         &server_settings,\n         run_id,\n@@ -3831,7 +3831,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {\n         }\n     };\n     let agent_fabro_tools_enabled = run_state.spec.settings.run.agent.fabro_tools;\n-    if fail_if_sandbox_provider_disabled(\n+    if reject_run_if_sandbox_provider_disabled(\n         &state,\n         &state.server_settings(),\n         run_id,\n",
+        "summary": {
+          "files_changed": 27,
+          "additions": 593,
+          "deletions": 26
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-24T18:25:31.265411Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
           "response.simplify_gpt": "Review and cleanup complete.\n\nWhat I changed:\n- Renamed `fail_if_sandbox_provider_disabled` to `reject_run_if_sandbox_provider_disabled` in `lib/crates/fabro-server/src/server.rs` so the helper name clearly reflects that it mutates run state.\n- Changed the launch-time policy log from `tracing::error!` to `tracing::warn!`, since rejecting a disabled sandbox provider is expected operator policy enforcement rather than an internal server error.\n\nReview agent results:\n- Code reuse: no issues found.\n- Code quality: one issue found and fixed as above.\n- Efficiency: no issues found.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet` ✅\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet` ✅\n- `cargo test -p fabro-api --test server_settings_round_trip server_settings_json_matches_openapi_shape --quiet` ✅\n- `cargo nextest run -p fabro-server sandbox_provider_policy` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n\nCurrent working tree has one intended cleanup diff in `lib/crates/fabro-server/src/server.rs`.",
           "failure_class": "",
           "last_stage": "simplify_gpt",
+          "internal.retry_count.verify": 0,
           "thread.implement.current_node": "simplify_opus",
           "graph.rankdir": "LR",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
@@ -1071,12 +1277,13 @@
           "response.implement": "Implemented and committed the server sandbox provider policy.\n\nCommit: `f5eac31bc feat: add server sandbox provider policy`\n\nSummary:\n- Added resolved `[server.sandbox.providers.{local,docker,daytona}].enabled` settings with backward-compatible defaults (`true`) and closed TOML schema validation.\n- Enforced disabled-provider policy for:\n  - run creation admission\n  - preflight reports\n  - launch-time rechecks before sandbox setup\n- Policy uses the effective provider after dry-run coercion to local.\n- Installer now writes all three provider policy tables with `enabled = true`.\n- Updated OpenAPI schema, Rust API replacements/tests, regenerated TypeScript API client models, and docs.\n\nVerification run:\n- `cargo test -p fabro-config server_sandbox --quiet`\n- `cargo test -p fabro-install write_sandbox_settings_records --quiet`\n- `cargo test -p fabro-api server_settings_json_matches_openapi_shape --quiet`\n- `cargo nextest run -p fabro-server --features test-support sandbox_provider_policy`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::create_run_rejects_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it runs::preflight_reports_disabled_sandbox_provider`\n- `cargo nextest run -p fabro-server --features test-support --test it install::token_install_finish_persists_settings_env_and_vault`\n- `cargo nextest run -p fabro-server --features test-support --test it install::daytona_install_finish_writes_settings_and_vault_secret`\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck`\n\nWorking tree is clean.",
           "outcome": "succeeded",
           "internal.retry_count.simplify_gpt": 0,
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "thread.start.current_node": "toolchain",
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "internal.thread_id": "simplify_opus",
+          "command.output": "blob://sha256/9bdd527903271caa7e836b5bbf6d9ff4dd576beb769910364faba942af3eface",
+          "internal.thread_id": "simplify_gpt",
           "internal.node_visit_count": 1,
           "internal.fidelity": "compact",
+          "thread.simplify_gpt.current_node": "verify",
           "thread.preflight_lint.current_node": "implement",
           "internal.retry_count.preflight_lint": 0
         },
@@ -1099,6 +1306,14 @@
               "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/9bdd527903271caa7e836b5bbf6d9ff4dd576beb769910364faba942af3eface"
+            },
+            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
             "usage": null
           },
           "preflight_lint": {
@@ -1215,15 +1430,16 @@
             ]
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "exit",
         "node_visits": {
+          "simplify_gpt": 1,
+          "verify": 1,
+          "implement": 1,
+          "toolchain": 1,
           "start": 1,
           "preflight_lint": 1,
           "simplify_opus": 1,
-          "preflight_compile": 1,
-          "simplify_gpt": 1,
-          "implement": 1,
-          "toolchain": 1
+          "preflight_compile": 1
         }
       },
       "diff": {}
@@ -1402,102 +1618,6 @@
       },
       "state": "succeeded"
     },
-    "preflight_compile@1": {
-      "first_event_seq": 32,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo check -q --workspace 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-24T17:28:31.525229Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 125859,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-24T17:26:25.658988Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 125865,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "toolchain@1": {
-      "first_event_seq": 22,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-24T17:26:22.187223Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-        "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
-        "exit_code": 0,
-        "duration_ms": 1356,
-        "termination": "exited",
-        "output_bytes": 36,
-        "live_streaming": true
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 36,
-      "live_streaming": true,
-      "termination": "exited",
-      "started_at": "2026-05-24T17:26:20.817243Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 1369,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
     "implement@1": {
       "first_event_seq": 52,
       "prompt": null,
@@ -1656,11 +1776,64 @@
       },
       "state": "succeeded"
     },
+    "toolchain@1": {
+      "first_event_seq": 22,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T17:26:22.187223Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
+        "exit_code": 0,
+        "duration_ms": 1356,
+        "termination": "exited",
+        "output_bytes": 36,
+        "live_streaming": true
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 36,
+      "live_streaming": true,
+      "termination": "exited",
+      "started_at": "2026-05-24T17:26:20.817243Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 1369,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
     "simplify_gpt@1": {
       "first_event_seq": 2145,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_gpt",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T18:16:37.649624Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "openai",
@@ -1673,6 +1846,12 @@
       "output": null,
       "started_at": "2026-05-24T18:13:22.750050Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 194898,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 346679,
         "output_tokens": 2595,
@@ -1788,7 +1967,82 @@
         ],
         "warnings": []
       },
+      "state": "succeeded"
+    },
+    "verify@1": {
+      "first_event_seq": 2424,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-24T18:16:41.389383Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
       "state": "running"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 32,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T17:28:31.525229Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 125859,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-24T17:26:25.658988Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 125865,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
     },
     "start@1": {
       "first_event_seq": 18,
