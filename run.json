@@ -492,7 +492,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-24T17:14:13.435566Z",
-  "last_event_at": "2026-05-24T17:16:31.806071Z",
+  "last_event_at": "2026-05-24T17:42:02.288994Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -659,15 +659,97 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 49,
       "checkpoint": {
-        "timestamp": "2026-05-24T17:18:48.994696Z",
+        "timestamp": "2026-05-24T17:18:52.760316Z",
         "current_node": "preflight_lint",
         "completed_nodes": [
           "start",
           "toolchain",
           "preflight_compile",
           "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "failure_signature": "",
+          "outcome": "succeeded",
+          "graph.rankdir": "LR",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.start": 0,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.thread_id": "preflight_compile",
+          "internal.node_visit_count": 1,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "failure_class": "",
+          "internal.retry_count.preflight_lint": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "internal.retry_count.toolchain": 0,
+          "internal.run_id": "01KSDFNA5W8QN6Q9GJ078DDWA3",
+          "thread.start.current_node": "toolchain",
+          "graph.goal": "---\ntitle: \"feat: Give fabro_tools runs MCP tool parity\"\ntype: feat\nstatus: active\ndate: 2026-05-24\n---\n\n# feat: Give fabro_tools runs MCP tool parity\n\n## Overview\n\nWhen a workflow run opts in with `[run.agent] fabro_tools = true`, its agents\nshould see the same Fabro run-management tool catalog that a human MCP client\nsees: create, search, get, interact, gather, events, and pair.\n\nThis is MCP tool parity, not full user API parity. The implementation should\nsimplify the current permission model by replacing the ad hoc \"run tools\"\nextractor names with explicit run-management actor extractors. User/admin HTTP\nsurfaces that are not backed by Fabro MCP tools remain user-only.\n\nOne intentional exception to exact parity remains: workflow-agent\n`fabro_run_create` must keep today's forced-child behavior. Runs created from a\nworkflow agent are always parented to the current run.\n\n## Problem Frame\n\nToday there are two similar but different tool catalogs:\n\n- Human MCP clients get seven tools from `fabro-mcp-server`, including\n  `fabro_run_pair`.\n- Workflow agents with `fabro_tools = true` get six shared tool definitions\n  from `fabro_tool::tool_definitions()`, excluding `fabro_run_pair`.\n\nThe auth model also leaks implementation detail into handler names:\n`RequiredRunToolActor` and `RequireRunScopedOrRunTools` describe a historical\nscope shape rather than the product capability. The behavior we want is simpler:\nan authenticated human or an opted-in run-tools worker may perform\nrun-management actions exposed through the Fabro MCP tool surface.\n\n## Requirements\n\n- R1. Workflow agents with `fabro_tools = true` register `fabro_run_pair` in\n  addition to the existing six Fabro run-management tools.\n- R2. Workflow-agent `fabro_run_create` still forces the current run as parent\n  and rejects conflicting explicit `parent_id` values.\n- R3. The external Fabro MCP server tool list remains unchanged.\n- R4. Pair HTTP routes accept run-management actors, not only users, so\n  `fabro_run_pair` can work from workflow-agent tools.\n- R5. User-only APIs remain user-only. Do not make `RequiredUser` accept worker\n  principals.\n- R6. Permission code uses names that match the product concept:\n  run-management actor / target, not \"run scoped or run tools\".\n- R7. Ask Fabro remains read-only and run-scoped with only `fabro_run_get` and\n  `fabro_run_events`.\n\n## Scope Boundaries\n\nIn scope:\n\n- Shared Fabro tool catalog and workflow-agent tool registration.\n- `fabro_run_pair` dispatcher integration in `fabro-workflow`.\n- Server auth extractors for MCP-backed run-management endpoints.\n- Pair route auth migration to the new run-management extractor.\n- Docs updates for agent/MCP parity and the create-parent exception.\n\nOut of scope:\n\n- Treating worker tokens as generic user tokens.\n- Granting workers access to secrets, server/system settings, billing, models,\n  sandbox management, logs/files/artifacts, arbitrary event append, or other\n  user/admin HTTP APIs.\n- Changing Ask Fabro's read-only tool policy.\n- Changing the worker JWT scope string or minting flow beyond names/tests needed\n  for the run-management extractor cleanup.\n- Removing the forced-child behavior for workflow-agent `fabro_run_create`.\n\n## Technical Design\n\n### Shared Tool Catalog\n\n`lib/crates/fabro-tool/src/common.rs` should include\n`FABRO_RUN_PAIR_TOOL_NAME` in `TOOL_DEFINITIONS`, using\n`FabroRunPairParams` and the same description already used by\n`fabro-mcp-server`.\n\nThis makes `register_fabro_run_tools()` in `fabro-workflow` register all seven\ntools for workflow agents. `register_named_fabro_run_tools()` continues to\nfilter by name, so Ask Fabro remains restricted to its existing read-only list.\n\n### Workflow Agent Execution\n\n`lib/crates/fabro-workflow/src/handler/llm/api.rs` should add a\n`FABRO_RUN_PAIR_TOOL_NAME` match arm in `execute_fabro_run_tool`:\n\n- Parse `FabroRunPairParams`.\n- Validate with `ValidatedPairRun`.\n- Call `fabro_tool::pair_run`.\n- Render the normal summary and structured result.\n\nDo not change the `fabro_run_create` branch except for test updates caused by\nthe catalog growing. It must still call `ensure_current_run_parent` and pass\n`CreateRunOptions { forced_parent_id: Some(current_run_id) }`.\n\n### Run-Management Auth Model\n\nIn `lib/crates/fabro-server/src/principal_middleware.rs`, replace the current\nrun-tools-specific extractor names with product-level names:\n\n- `RequiredRunManagementActor(pub Principal)`\n- `RequireRunManagementTarget(pub RunId, pub Principal)`\n\nRecommended semantics:\n\n- `RequiredRunManagementActor` accepts a user principal or a worker principal\n  whose token has `agent:run_tools`. It rejects base worker tokens.\n- `RequireRunManagementTarget` accepts:\n  - any user principal,\n  - a same-run base worker principal,\n  - any worker principal with `agent:run_tools`, including cross-run targets.\n- Non-authenticated and invalid-token behavior should preserve the current\n  auth rejection status/code behavior.\n\nUse these names in route handlers that are directly backing the Fabro MCP\nrun-management tools. Remove or stop exporting the old\n`RequiredRunToolActor` and `RequireRunScopedOrRunTools` names once callers are\nmigrated.\n\n### Route Migrations\n\nMigrate these route groups to the new run-management actor names without\nchanging behavior:\n\n- Run collection/resolve/create endpoints used by `fabro_run_create` and\n  `fabro_run_search`.\n- Run parent link/unlink, run status, run state, questions, answer, start,\n  cancel, archive, unarchive, steer/message, and event-list endpoints used by\n  `fabro_run_get`, `fabro_run_interact`, and `fabro_run_events`.\n\nMigrate pair routes in `lib/crates/fabro-server/src/server/handler/pair.rs`:\n\n- `get_pair_status`, `get_pair`, and `get_transcript` use\n  `RequireRunManagementTarget`.\n- `start_pair`, `send_pair_message`, and `end_pair` also use\n  `RequireRunManagementTarget` and pass the returned `Principal` through to the\n  worker control transport.\n- Do not construct `Principal::User(auth.0)` in pair handlers after migration.\n\nDo not migrate endpoints whose behavior is not part of the Fabro MCP tool\nsurface. In particular, leave approve, deny, pause, unpause, retry, rewind,\nfork, delete, batch actions, timeline, settings, logs, files, artifacts,\nsecrets, server/system, models, sandbox, billing, and graph rendering on their\nexisting user or run-scoped auth rules unless they are already needed by the\ncurrent tool backend.\n\n### Documentation\n\nUpdate public docs where `fabro_tools` is described:\n\n- State that opted-in workflow agents get the same Fabro run-management MCP tool\n  catalog as human MCP clients.\n- Explicitly document the workflow-agent create exception: created runs are\n  children of the current run.\n- Keep the distinction from normal agent permissions and external MCP server\n  configuration.\n\n## Test Plan\n\n### `fabro-tool`\n\n- Update the shared tool-definition test coverage to expect seven tools,\n  including `fabro_run_pair`.\n- Assert the pair tool schema includes the expected action enum and stage/pair\n  fields.\n\n### `fabro-workflow`\n\n- Update `agent_run_tools_register_exact_shared_definitions` to expect\n  `fabro_run_pair`.\n- Add executor coverage for `fabro_run_pair` proving it dispatches to the\n  shared backend and renders the summary/result.\n- Keep or add coverage proving workflow-agent create still injects the current\n  run as parent and still rejects conflicting `parent_id`.\n- Confirm `register_named_fabro_run_tools` still registers only requested names\n  so Ask Fabro is unaffected.\n\n### `fabro-server`\n\n- Add/rename principal middleware tests:\n  - run-management actor accepts users and `agent:run_tools` workers.\n  - run-management actor rejects base worker tokens.\n  - run-management target accepts same-run base workers.\n  - run-management target accepts cross-run `agent:run_tools` workers.\n  - run-management target rejects cross-run base workers.\n- Extend existing run-tool worker API tests to cover the migrated extractor\n  names without broadening non-tool surfaces.\n- Add pair route auth tests:\n  - a run-tools worker can call pair status/transcript endpoints for another\n    run.\n  - a run-tools worker reaches pair command domain logic, such as\n    `worker_control_unavailable`, rather than failing auth.\n  - a cross-run base worker remains forbidden.\n- Add a negative test that a run-tools worker still cannot call at least one\n  user-only non-MCP endpoint, such as approve/deny or timeline.\n\n### `fabro-cli` / MCP Integration\n\n- Existing `stdio_server_initializes_and_lists_run_tools` should remain green\n  and continue to validate the external human MCP catalog.\n- Add or update integration coverage only if the shared catalog change affects\n  agent-visible tool listing snapshots or MCP schema parity tests.\n\n### Commands\n\nTargeted verification:\n\n```bash\ncargo nextest run -p fabro-tool -p fabro-workflow -p fabro-server -p fabro-cli\n```\n\nFull verification before merge if the route migration touches broad auth code:\n\n```bash\ncargo nextest run --workspace\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n## Implementation Notes\n\n- Prefer renaming and consolidating auth extractors over adding another layer of\n  compatibility aliases. The goal is to make handler signatures read like the\n  product policy.\n- Keep actor provenance as `Principal::Worker { run_id: <originating run> }`\n  when a workflow agent acts through `fabro_tools`; do not forge a user\n  principal.\n- Pair route behavior may return domain errors when no live worker control\n  channel exists. Tests should assert auth acceptance by expecting those domain\n  errors, not by requiring a fully active pair session unless a fixture already\n  supports it.\n- The external MCP server already registers `fabro_run_pair` directly. Avoid\n  duplicating tool catalogs there; use the shared `fabro-tool` definitions only\n  where workflow-agent registration needs them.\n",
+          "current_node": "preflight_lint",
+          "thread.toolchain.current_node": "preflight_compile"
+        },
+        "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "implement",
+        "git_commit_sha": "6c733189b332209c80e2b7b18d706c139de3f3d7",
+        "node_visits": {
+          "preflight_compile": 1,
+          "toolchain": 1,
+          "preflight_lint": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-24T17:42:02.346500Z",
+        "current_node": "implement",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement"
         ],
         "node_retries": {},
         "context_values": {
@@ -681,13 +763,18 @@
           "thread.start.current_node": "toolchain",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.fidelity": "compact",
-          "current_node": "preflight_lint",
+          "current_node": "implement",
           "outcome": "succeeded",
+          "last_response": "Implemented MCP tool parity for `[run.agent] fabro_tools = true`.\n\nSummary:\n- Added `fabro_run_pair` to the shared `fabro-tool` catalog with schema/test coverage.\n- Added workflow-agent dispatcher sup",
           "graph.rankdir": "LR",
           "internal.node_visit_count": 1,
-          "internal.thread_id": "preflight_compile",
+          "thread.preflight_lint.current_node": "implement",
+          "internal.thread_id": "preflight_lint",
+          "last_stage": "implement",
           "internal.retry_count.preflight_compile": 0,
+          "response.implement": "Implemented MCP tool parity for `[run.agent] fabro_tools = true`.\n\nSummary:\n- Added `fabro_run_pair` to the shared `fabro-tool` catalog with schema/test coverage.\n- Added workflow-agent dispatcher support for `fabro_run_pair`.\n- Kept workflow-agent `fabro_run_create` forced-child behavior and conflict rejection.\n- Replaced old run-tools extractor names with:\n  - `RequiredRunManagementActor`\n  - `RequireRunManagementTarget`\n- Migrated MCP-backed run-management routes to the new extractors.\n- Migrated pair routes so run-tools workers can call status/start/message/end/transcript while preserving worker provenance.\n- Kept user-only APIs user-only, including negative coverage for run-tools workers.\n- Confirmed Ask Fabro remains read-only with only `fabro_run_get` and `fabro_run_events`.\n- Updated public docs for `fabro_tools` parity and the create-parent exception.\n\nTDD/verification:\n- Confirmed red first for new catalog/auth coverage.\n- `cargo nextest run -p fabro-tool -p fabro-workflow -p fabro-server -p fabro-cli` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo nextest run --workspace` ✅ (6343 passed, 181 skipped)",
           "internal.retry_count.start": 0,
+          "internal.retry_count.implement": 0,
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "thread.preflight_compile.current_node": "preflight_lint",
           "failure_class": ""
@@ -696,6 +783,36 @@
           "start": {
             "status": "succeeded",
             "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "last_response": "Implemented MCP tool parity for `[run.agent] fabro_tools = true`.\n\nSummary:\n- Added `fabro_run_pair` to the shared `fabro-tool` catalog with schema/test coverage.\n- Added workflow-agent dispatcher sup",
+              "response.implement": "Implemented MCP tool parity for `[run.agent] fabro_tools = true`.\n\nSummary:\n- Added `fabro_run_pair` to the shared `fabro-tool` catalog with schema/test coverage.\n- Added workflow-agent dispatcher support for `fabro_run_pair`.\n- Kept workflow-agent `fabro_run_create` forced-child behavior and conflict rejection.\n- Replaced old run-tools extractor names with:\n  - `RequiredRunManagementActor`\n  - `RequireRunManagementTarget`\n- Migrated MCP-backed run-management routes to the new extractors.\n- Migrated pair routes so run-tools workers can call status/start/message/end/transcript while preserving worker provenance.\n- Kept user-only APIs user-only, including negative coverage for run-tools workers.\n- Confirmed Ask Fabro remains read-only with only `fabro_run_get` and `fabro_run_events`.\n- Updated public docs for `fabro_tools` parity and the create-parent exception.\n\nTDD/verification:\n- Confirmed red first for new catalog/auth coverage.\n- `cargo nextest run -p fabro-tool -p fabro-workflow -p fabro-server -p fabro-cli` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo nextest run --workspace` ✅ (6343 passed, 181 skipped)"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 5393488,
+                    "output_tokens": 17347,
+                    "reasoning_tokens": 8311,
+                    "cache_read_tokens": 10987008,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 33230684
+            }
           },
           "preflight_compile": {
             "status": "succeeded",
@@ -722,9 +839,10 @@
             "usage": null
           }
         },
-        "next_node_id": "implement",
+        "next_node_id": "simplify_opus",
         "node_visits": {
           "preflight_lint": 1,
+          "implement": 1,
           "toolchain": 1,
           "start": 1,
           "preflight_compile": 1
@@ -757,7 +875,12 @@
       "first_event_seq": 42,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T17:18:48.993527Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -765,11 +888,27 @@
         "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 137176,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-24T17:16:31.805498Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 137186,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -778,7 +917,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_compile@1": {
       "first_event_seq": 32,
@@ -827,6 +966,127 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "implement@1": {
+      "first_event_seq": 52,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-24T17:18:52.763923Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 5393488,
+        "output_tokens": 17347,
+        "total_tokens": 16406154,
+        "reasoning_tokens": 8311,
+        "cache_read_tokens": 10987008,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 33230684
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:abffb4fe-3281-4f79-97f4-85ed15dc41d3",
+        "items": [
+          {
+            "id": "bc2e6119a91f354c",
+            "status": "completed",
+            "order": 0,
+            "subject": "Read applicable repo instructions, strategy docs, and locate the goal/plan context"
+          },
+          {
+            "id": "6cf62703511a3fdc",
+            "status": "completed",
+            "order": 1,
+            "subject": "Inspect current fabro-tool/workflow/server implementations and tests"
+          },
+          {
+            "id": "c677ca3c20bfa082",
+            "status": "completed",
+            "order": 2,
+            "subject": "Add/adjust tests to capture MCP tool parity and auth behavior (red)"
+          },
+          {
+            "id": "942e94ed2c9e9867",
+            "status": "completed",
+            "order": 3,
+            "subject": "Implement shared pair tool registration and workflow dispatcher"
+          },
+          {
+            "id": "0b312828eab95be9",
+            "status": "completed",
+            "order": 4,
+            "subject": "Rename/consolidate run-management auth extractors and migrate routes"
+          },
+          {
+            "id": "ec3ddee7bf360e16",
+            "status": "completed",
+            "order": 5,
+            "subject": "Update documentation for fabro_tools parity and create-parent exception"
+          },
+          {
+            "id": "231a1222e003f6fa",
+            "status": "completed",
+            "order": 6,
+            "subject": "Run targeted formatting, tests, and lint; fix regressions"
+          }
+        ]
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 1050000,
+        "input_tokens": 225759,
+        "usage_percent": 21.500857142857143,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-24T17:42:02.288295Z",
+        "event_seq": 816,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 1024,
+            "usage_percent": 0.09752380952380953
+          },
+          {
+            "category": "tools",
+            "tokens": 1479,
+            "usage_percent": 0.14085714285714285
+          },
+          {
+            "category": "memory",
+            "tokens": 3459,
+            "usage_percent": 0.3294285714285714
+          },
+          {
+            "category": "conversation",
+            "tokens": 219790,
+            "usage_percent": 20.932380952380953
+          },
+          {
+            "category": "other",
+            "tokens": 7,
+            "usage_percent": 0.0006666666666666666
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
     },
     "start@1": {
       "first_event_seq": 18,
