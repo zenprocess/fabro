@@ -1,0 +1,1696 @@
+diff --git a/apps/fabro-web/app/components/stage-insights-sidebar.test.tsx b/apps/fabro-web/app/components/stage-insights-sidebar.test.tsx
+index c505a9ffd..713f1b4bc 100644
+--- a/apps/fabro-web/app/components/stage-insights-sidebar.test.tsx
++++ b/apps/fabro-web/app/components/stage-insights-sidebar.test.tsx
+@@ -3,6 +3,7 @@ import TestRenderer, { act } from "react-test-renderer";
+ import { MemoryRouter } from "react-router";
+ 
+ import {
++  AgentToolCategory,
+   AgentSkillActivationSource,
+   PermissionLevel,
+   StageContextWindowCategory,
+@@ -66,7 +67,7 @@ function makeContextWindow(overrides: Partial<StageContextWindow> = {}): StageCo
+ let restoreWindow: (() => void) | null = null;
+ beforeAll(() => {
+   const store = new Map<string, string>();
+-  for (const key of ["todos", "context", "skills", "mcps"]) {
++  for (const key of ["todos", "context", "tools", "skills", "mcps"]) {
+     store.set(`fabro:stage-insights-section:${key}`, "1");
+   }
+   const stub = {
+@@ -157,6 +158,50 @@ describe("StageInsightsSidebar", () => {
+     expect(dom).toContain("Full access");
+   });
+ 
++  test("renders projected agent tool names, descriptions, categories, and invoked state", () => {
++    const dom = render(
++      makeStage({
++        agent_tools: [
++          {
++            name:        "apply_patch",
++            description: "Apply a unified diff patch",
++            source:      { kind: "native" },
++            category:    AgentToolCategory.WRITE,
++            invoked:     true,
++          },
++          {
++            name:        "grep",
++            description: "Search file contents",
++            source:      { kind: "native" },
++            category:    AgentToolCategory.READ,
++            invoked:     false,
++          },
++        ],
++        permission_level: PermissionLevel.FULL,
++      }),
++      null,
++    );
++
++    expect(dom).toContain("1/2");
++    expect(dom).toContain("apply_patch");
++    expect(dom).toContain("Apply a unified diff patch");
++    expect(dom).toContain("write");
++    expect(dom).toContain("used");
++    expect(dom).toContain("grep");
++    expect(dom).toContain("Search file contents");
++    expect(dom).toContain("read");
++    expect(dom).toContain("available");
++    // Permission remains secondary compatibility metadata, not the source of
++    // the tool list.
++    expect(dom).toContain("Full access");
++  });
++
++  test("legacy stages without agent tools keep permission fallback only", () => {
++    const dom = render(makeStage({ permission_level: PermissionLevel.READ_WRITE }), null);
++    expect(dom).toContain("Read/write");
++    expect(dom).not.toContain("apply_patch");
++  });
++
+   test("renders mcp server used/total count, marks invoked servers as 'used'", () => {
+     const dom = render(
+       makeStage({
+diff --git a/apps/fabro-web/app/components/stage-insights-sidebar.tsx b/apps/fabro-web/app/components/stage-insights-sidebar.tsx
+index 71ffa5094..135f1dd72 100644
+--- a/apps/fabro-web/app/components/stage-insights-sidebar.tsx
++++ b/apps/fabro-web/app/components/stage-insights-sidebar.tsx
+@@ -19,6 +19,7 @@ import {
+   PuzzlePieceIcon,
+   ServerStackIcon,
+   Squares2X2Icon,
++  WrenchScrewdriverIcon,
+ } from "@heroicons/react/24/outline";
+ import {
+   AgentSkillActivationSource,
+@@ -30,6 +31,7 @@ import {
+ import type {
+   ActivatedSkill,
+   AgentSkillSummary,
++  AgentToolSummary,
+   McpServerProjection,
+   StageContextWindow,
+   StageContextWindowBreakdownItem,
+@@ -42,11 +44,12 @@ import { formatTokenCount } from "../lib/format";
+ const COLLAPSED_STORAGE_KEY = "fabro:stage-insights-sidebar-collapsed";
+ const SECTION_STORAGE_PREFIX = "fabro:stage-insights-section:";
+ 
+-type SectionKey = "todos" | "context" | "skills" | "mcps";
++type SectionKey = "todos" | "context" | "tools" | "skills" | "mcps";
+ 
+ const SECTIONS_DEFAULT_OPEN: Record<SectionKey, boolean> = {
+   todos:   true,
+   context: false,
++  tools:   false,
+   skills:  false,
+   mcps:    false,
+ };
+@@ -70,11 +73,13 @@ export function StageInsightsSidebar({ stage, contextWindow }: StageInsightsSide
+ 
+   const todos = stage?.todos ?? null;
+   const skills = stage?.skills ?? { activated: [], available: [] };
++  const agentTools = stage?.agent_tools ?? [];
+   const mcpServers = stage?.mcp_servers ?? [];
+   const permission = stage?.permission_level ?? null;
+ 
+   const todoStats = countTodoStats(todos);
+   const activatedSkillNames = new Set(skills.activated.map((s) => s.name));
++  const invokedToolCount = agentTools.filter((tool) => tool.invoked).length;
+ 
+   return (
+     <aside
+@@ -119,6 +124,18 @@ export function StageInsightsSidebar({ stage, contextWindow }: StageInsightsSide
+ 
+         <ContextWindowSection collapsed={collapsed} snapshot={contextWindow ?? null} />
+ 
++        <CollapsibleSection
++          sectionKey="tools"
++          title="Tools"
++          icon={WrenchScrewdriverIcon}
++          collapsed={collapsed}
++          count={`${invokedToolCount}/${agentTools.length}`}
++          empty={agentTools.length === 0}
++          hideCountWhenCollapsed
++        >
++          <AgentToolsSection tools={agentTools} />
++        </CollapsibleSection>
++
+         <CollapsibleSection
+           sectionKey="skills"
+           title="Skills"
+@@ -496,6 +513,61 @@ function SkillSourceIcon({ source }: { source: ActivatedSkill["source"] }) {
+   return <Icon className="size-3.5 shrink-0 text-fg-muted" />;
+ }
+ 
++// ---------- Tools ----------
++
++function AgentToolsSection({ tools }: { tools: AgentToolSummary[] }) {
++  if (tools.length === 0) return <p className="text-xs text-fg-muted">No tools reported.</p>;
++  return (
++    <ul role="list" className="space-y-2">
++      {tools.map((tool) => {
++        const nameClass = tool.invoked
++          ? "min-w-0 flex-1 truncate text-xs text-fg-2"
++          : "min-w-0 flex-1 truncate text-xs text-fg-muted";
++        return (
++          <li key={tool.name} className="space-y-0.5">
++            <div className="flex items-center gap-1.5">
++              {tool.invoked ? (
++                <CheckCircleIcon className="size-3.5 shrink-0 text-mint" aria-label="Invoked" />
++              ) : (
++                <ToolAvailableIcon className="size-3.5 shrink-0 text-fg-muted" />
++              )}
++              <span className={nameClass}>{tool.name}</span>
++              <span className="font-mono text-[10px] tabular-nums text-fg-muted">
++                {tool.invoked ? "used" : "available"}
++              </span>
++            </div>
++            <p className="text-[11px] leading-snug text-fg-muted">{tool.description}</p>
++            <div className="flex flex-wrap gap-1">
++              <span className="rounded bg-overlay px-1 py-0.5 text-[10px] uppercase tracking-wider text-fg-muted">
++                {toolSourceLabel(tool.source)}
++              </span>
++              <span className="rounded bg-overlay px-1 py-0.5 text-[10px] uppercase tracking-wider text-fg-muted">
++                {tool.category}
++              </span>
++            </div>
++          </li>
++        );
++      })}
++    </ul>
++  );
++}
++
++function toolSourceLabel(source: AgentToolSummary["source"]): string {
++  switch (source.kind) {
++    case "mcp":
++      return `mcp:${source.server_name}`;
++    case "skill":
++      return "skill";
++    case "native":
++    default:
++      return "native";
++  }
++}
++
++function ToolAvailableIcon({ className }: { className?: string }) {
++  return <span className={`inline-block rounded-full border border-current ${className ?? ""}`} aria-hidden="true" />;
++}
++
+ // ---------- MCPs ----------
+ 
+ function McpSection({ servers }: { servers: McpServerProjection[] }) {
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index 58a1e02e9..cc5eaa80b 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -7971,6 +7971,22 @@ components:
+           type: integer
+           minimum: 1
+ 
++    AgentToolsAvailableProps:
++      description: Properties for the `agent.tools.available` event.
++      type: object
++      required:
++        - tools
++        - visit
++      properties:
++        tools:
++          type: array
++          description: Effective model-callable tools exposed to the stage session.
++          items:
++            $ref: "#/components/schemas/AgentToolSummary"
++        visit:
++          type: integer
++          minimum: 1
++
+     RunSupersededByProps:
+       description: Properties for the `run.superseded_by` audit event emitted on a rewound source run after archive succeeds.
+       type: object
+@@ -8550,6 +8566,13 @@ components:
+             - $ref: "#/components/schemas/PermissionLevel"
+             - type: "null"
+           description: Agent tool permission level applied to this stage session.
++        agent_tools:
++          type: array
++          description: >
++            Effective model-callable tools exposed to this agent stage session.
++            Tool parameter schemas are intentionally omitted from this projection.
++          items:
++            $ref: "#/components/schemas/AgentToolSummary"
+         mcp_servers:
+           type: array
+           description: MCP servers observed by this stage.
+@@ -8689,6 +8712,83 @@ components:
+       type: string
+       enum: [slash, tool]
+ 
++    AgentToolSummary:
++      description: Summary of one effective model-callable tool exposed to an agent stage.
++      type: object
++      required:
++        - name
++        - description
++        - source
++        - category
++        - invoked
++      properties:
++        name:
++          type: string
++          description: Exposed model-facing tool name, for example `apply_patch` or `mcp__filesystem__read_file`.
++        description:
++          type: string
++          description: Model-facing tool description.
++        source:
++          $ref: "#/components/schemas/AgentToolSource"
++        category:
++          $ref: "#/components/schemas/AgentToolCategory"
++        invoked:
++          type: boolean
++          description: True once this tool has been invoked during the stage.
++
++    AgentToolSource:
++      description: Origin of an effective agent tool.
++      oneOf:
++        - $ref: "#/components/schemas/AgentToolSourceNative"
++        - $ref: "#/components/schemas/AgentToolSourceMcp"
++        - $ref: "#/components/schemas/AgentToolSourceSkill"
++      discriminator:
++        propertyName: kind
++        mapping:
++          native: "#/components/schemas/AgentToolSourceNative"
++          mcp: "#/components/schemas/AgentToolSourceMcp"
++          skill: "#/components/schemas/AgentToolSourceSkill"
++
++    AgentToolSourceNative:
++      type: object
++      required:
++        - kind
++      properties:
++        kind:
++          type: string
++          enum: [native]
++
++    AgentToolSourceMcp:
++      type: object
++      required:
++        - kind
++        - server_name
++        - original_name
++      properties:
++        kind:
++          type: string
++          enum: [mcp]
++        server_name:
++          type: string
++          description: MCP server name that provided the tool.
++        original_name:
++          type: string
++          description: Tool name before MCP qualification.
++
++    AgentToolSourceSkill:
++      type: object
++      required:
++        - kind
++      properties:
++        kind:
++          type: string
++          enum: [skill]
++
++    AgentToolCategory:
++      description: Coarse tool category for display and grouping.
++      type: string
++      enum: [read, write, shell, subagent, other]
++
+     McpServerProjection:
+       description: Projected state for one MCP server observed by an agent stage.
+       type: object
+diff --git a/lib/crates/fabro-agent/src/session.rs b/lib/crates/fabro-agent/src/session.rs
+index 62ca5f048..8a8fcf189 100644
+--- a/lib/crates/fabro-agent/src/session.rs
++++ b/lib/crates/fabro-agent/src/session.rs
+@@ -501,6 +501,11 @@ impl Session {
+         self.config.permission_level
+     }
+ 
++    #[must_use]
++    pub fn available_tools(&self) -> Vec<ToolDefinitionWithSource> {
++        self.effective_tools()
++    }
++
+     /// Initialize session by discovering project docs and capturing environment
+     /// context. Call before `process_input`.
+     ///
+@@ -1966,13 +1971,7 @@ impl Session {
+         }
+         messages.extend(self.history.convert_to_messages());
+ 
+-        let tools_with_source = self
+-            .provider_profile
+-            .tool_registry()
+-            .definitions_with_source_for_policy(
+-                self.config.tool_access_policy.as_deref(),
+-                self.config.tool_exposure_mode,
+-            );
++        let tools_with_source = self.effective_tools();
+         let tools: Vec<_> = tools_with_source
+             .iter()
+             .map(|tool| tool.definition.clone())
+@@ -2009,13 +2008,11 @@ impl Session {
+     }
+ 
+     fn inject_task_reminder_if_needed(&mut self) {
+-        let tools = self
+-            .provider_profile
+-            .tool_registry()
+-            .definitions_for_policy(
+-                self.config.tool_access_policy.as_deref(),
+-                self.config.tool_exposure_mode,
+-            );
++        let tools: Vec<_> = self
++            .effective_tools()
++            .into_iter()
++            .map(|tool| tool.definition)
++            .collect();
+         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+         if let Some(reminder) = task_reminder::maybe_reminder(&self.history, &tool_names) {
+             self.history.push(Message::System {
+@@ -2024,6 +2021,15 @@ impl Session {
+             });
+         }
+     }
++
++    fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
++        self.provider_profile
++            .tool_registry()
++            .definitions_with_source_for_policy(
++                self.config.tool_access_policy.as_deref(),
++                self.config.tool_exposure_mode,
++            )
++    }
+ }
+ 
+ const fn is_auth_error(err: &LlmError) -> bool {
+@@ -3274,6 +3280,38 @@ mod tests {
+         assert_eq!(tools[0].name, "read_file");
+     }
+ 
++    #[tokio::test]
++    async fn available_tools_uses_same_effective_registry_filter_as_requests() {
++        let provider = Arc::new(CapturingLlmProvider::new());
++        let client = make_client(provider as Arc<dyn ProviderAdapter>).await;
++        let mut registry = ToolRegistry::new();
++        registry.register(make_named_noop_tool("read_file"));
++        registry.register(make_named_noop_tool("apply_patch"));
++        registry.register(make_named_noop_tool("shell"));
++        let profile = Arc::new(TestProfile::with_tools(registry));
++        let env = Arc::new(MockSandbox::default());
++        let config = SessionOptions {
++            tool_access_policy: Some(Arc::new(NamedToolAccessPolicy::new(vec![
++                ("read_file", ToolAccess::Allowed),
++                ("apply_patch", ToolAccess::RequiresApproval),
++                ("shell", ToolAccess::Denied),
++            ]))),
++            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
++            ..SessionOptions::default()
++        };
++        let session = Session::new(client, profile, env, config, None);
++
++        let tools = session.available_tools();
++        let mut tool_names: Vec<&str> = tools
++            .iter()
++            .map(|tool| tool.definition.name.as_str())
++            .collect();
++        tool_names.sort_unstable();
++
++        assert_eq!(tool_names, vec!["apply_patch", "read_file"]);
++        assert!(tools.iter().all(|tool| tool.source == ToolSource::Native));
++    }
++
+     #[tokio::test]
+     async fn request_exposes_approval_required_tools_when_mode_allows_them() {
+         let provider = Arc::new(CapturingLlmProvider::new());
+diff --git a/lib/crates/fabro-agent/src/tool_permissions.rs b/lib/crates/fabro-agent/src/tool_permissions.rs
+index 3a62931f1..b22dba945 100644
+--- a/lib/crates/fabro-agent/src/tool_permissions.rs
++++ b/lib/crates/fabro-agent/src/tool_permissions.rs
+@@ -1,11 +1,16 @@
+ use fabro_types::PermissionLevel;
+ 
+ pub fn tool_category(name: &str) -> &'static str {
++    known_tool_category(name).unwrap_or("shell")
++}
++
++pub fn known_tool_category(name: &str) -> Option<&'static str> {
+     match name {
+-        "read_file" | "read_many_files" | "grep" | "glob" | "list_dir" => "read",
+-        "write_file" | "edit_file" | "apply_patch" => "write",
+-        "spawn_agent" | "send_input" | "wait" | "close_agent" => "subagent",
+-        _ => "shell",
++        "read_file" | "read_many_files" | "grep" | "glob" | "list_dir" => Some("read"),
++        "write_file" | "edit_file" | "apply_patch" => Some("write"),
++        "shell" => Some("shell"),
++        "spawn_agent" | "send_input" | "wait" | "close_agent" => Some("subagent"),
++        _ => None,
+     }
+ }
+ 
+diff --git a/lib/crates/fabro-api/build.rs b/lib/crates/fabro-api/build.rs
+index 4649ef19e..2a38da779 100644
+--- a/lib/crates/fabro-api/build.rs
++++ b/lib/crates/fabro-api/build.rs
+@@ -366,6 +366,14 @@ fn main() {
+             "fabro_types::AgentSkillActivationSource",
+             &[],
+         ),
++        ("AgentToolSummary", "fabro_types::AgentToolSummary", &[]),
++        ("AgentToolSource", "fabro_types::AgentToolSource", &[]),
++        ("AgentToolCategory", "fabro_types::AgentToolCategory", &[]),
++        (
++            "AgentToolsAvailableProps",
++            "fabro_types::AgentToolsAvailableProps",
++            &[],
++        ),
+         (
+             "McpServerProjection",
+             "fabro_types::McpServerProjection",
+diff --git a/lib/crates/fabro-api/src/lib.rs b/lib/crates/fabro-api/src/lib.rs
+index a148d9aac..d7ab6f416 100644
+--- a/lib/crates/fabro-api/src/lib.rs
++++ b/lib/crates/fabro-api/src/lib.rs
+@@ -34,8 +34,9 @@ pub mod types {
+     };
+     pub use fabro_types::{
+         ActivatedSkill, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
+-        AskFabro, AuthMethod, BilledTokenCounts, CommandTermination, Conclusion, DiffStats,
+-        DiffSummary, DirtyStatus, EventEnvelope, ExecOutputTail, FailureCategory, FailureDetail,
++        AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, AskFabro,
++        AuthMethod, BilledTokenCounts, CommandTermination, Conclusion, DiffStats, DiffSummary,
++        DirtyStatus, EventEnvelope, ExecOutputTail, FailureCategory, FailureDetail,
+         FailureSignature, GitContext, IdpIdentity, InterviewOption, InterviewQuestionRecord,
+         McpServerProjection, McpServerStatus, PairId, PairMessageId, PairMessageRecord,
+         PairMessageRequest, PairRecord, PairStartRequest, PairStatus, PairTarget,
+diff --git a/lib/crates/fabro-api/tests/stage_projection_round_trip.rs b/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
+index 8c110b5b4..2f26ad612 100644
+--- a/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
++++ b/lib/crates/fabro-api/tests/stage_projection_round_trip.rs
+@@ -3,9 +3,12 @@ use std::any::{TypeId, type_name};
+ use fabro_api::types::{
+     ActivatedSkill as ApiActivatedSkill, AgentMcpToolSummary as ApiAgentMcpToolSummary,
+     AgentSkillActivationSource as ApiAgentSkillActivationSource,
+-    AgentSkillSummary as ApiAgentSkillSummary, McpServerProjection as ApiMcpServerProjection,
+-    McpServerStatus as ApiMcpServerStatus, PermissionLevel as ApiPermissionLevel,
+-    SkillsProjection as ApiSkillsProjection, StageContextWindow as ApiStageContextWindow,
++    AgentSkillSummary as ApiAgentSkillSummary, AgentToolCategory as ApiAgentToolCategory,
++    AgentToolSource as ApiAgentToolSource, AgentToolSummary as ApiAgentToolSummary,
++    AgentToolsAvailableProps as ApiAgentToolsAvailableProps,
++    McpServerProjection as ApiMcpServerProjection, McpServerStatus as ApiMcpServerStatus,
++    PermissionLevel as ApiPermissionLevel, SkillsProjection as ApiSkillsProjection,
++    StageContextWindow as ApiStageContextWindow,
+     StageContextWindowBreakdownItem as ApiStageContextWindowBreakdownItem,
+     StageContextWindowCategory as ApiStageContextWindowCategory,
+     StageContextWindowCountMethod as ApiStageContextWindowCountMethod,
+@@ -18,6 +21,7 @@ use fabro_api::types::{
+ };
+ use fabro_types::{
+     ActivatedSkill, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
++    AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps,
+     McpServerProjection, McpServerStatus, PermissionLevel, SkillsProjection, StageContextWindow,
+     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
+     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
+@@ -40,6 +44,10 @@ fn stage_projection_reuses_nested_agent_state_types() {
+     assert_same_type::<ApiActivatedSkill, ActivatedSkill>();
+     assert_same_type::<ApiAgentSkillSummary, AgentSkillSummary>();
+     assert_same_type::<ApiAgentSkillActivationSource, AgentSkillActivationSource>();
++    assert_same_type::<ApiAgentToolSummary, AgentToolSummary>();
++    assert_same_type::<ApiAgentToolSource, AgentToolSource>();
++    assert_same_type::<ApiAgentToolCategory, AgentToolCategory>();
++    assert_same_type::<ApiAgentToolsAvailableProps, AgentToolsAvailableProps>();
+     assert_same_type::<ApiMcpServerProjection, McpServerProjection>();
+     assert_same_type::<ApiMcpServerStatus, McpServerStatus>();
+     assert_same_type::<ApiAgentMcpToolSummary, AgentMcpToolSummary>();
+@@ -135,6 +143,26 @@ fn stage_projection_round_trips_representative_json() {
+             ]
+         },
+         "permission_level": "read-only",
++        "agent_tools": [
++            {
++                "name": "apply_patch",
++                "description": "Apply a unified diff patch",
++                "source": { "kind": "native" },
++                "category": "write",
++                "invoked": true
++            },
++            {
++                "name": "mcp__filesystem__read_file",
++                "description": "Read a file through MCP",
++                "source": {
++                    "kind": "mcp",
++                    "server_name": "filesystem",
++                    "original_name": "read_file"
++                },
++                "category": "other",
++                "invoked": false
++            }
++        ],
+         "mcp_servers": [
+             {
+                 "server_name": "filesystem",
+@@ -355,6 +383,47 @@ fn nested_agent_state_types_match_openapi_json_shape() {
+     assert_eq!(mcp_server.tool_count, 1);
+ }
+ 
++#[test]
++fn agent_tool_summary_matches_openapi_json_shape_without_parameter_schema() {
++    let tool = AgentToolSummary {
++        name:        "mcp__filesystem__read_file".to_string(),
++        description: "Read a file through MCP".to_string(),
++        source:      AgentToolSource::Mcp {
++            server_name:   "filesystem".to_string(),
++            original_name: "read_file".to_string(),
++        },
++        category:    AgentToolCategory::Other,
++        invoked:     false,
++    };
++
++    let tool_json = serde_json::to_value(&tool).unwrap();
++    assert_eq!(
++        tool_json,
++        json!({
++            "name": "mcp__filesystem__read_file",
++            "description": "Read a file through MCP",
++            "source": {
++                "kind": "mcp",
++                "server_name": "filesystem",
++                "original_name": "read_file"
++            },
++            "category": "other",
++            "invoked": false
++        })
++    );
++    assert!(tool_json.as_object().unwrap().get("parameters").is_none());
++    let api_tool: ApiAgentToolSummary = serde_json::from_value(tool_json).unwrap();
++    assert_eq!(api_tool, tool);
++
++    let props = AgentToolsAvailableProps {
++        tools: vec![tool],
++        visit: 2,
++    };
++    let props_json = serde_json::to_value(&props).unwrap();
++    let api_props: ApiAgentToolsAvailableProps = serde_json::from_value(props_json).unwrap();
++    assert_eq!(api_props, props);
++}
++
+ fn assert_same_type<T: 'static, U: 'static>() {
+     assert_eq!(
+         TypeId::of::<T>(),
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index d5854291e..7bd2e8a3e 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -411,6 +411,13 @@ impl RunProjectionReducer for RunProjection {
+                 stage.provider_used = Some(StageModelUsage::from_agent_session_activated(props));
+                 stage.permission_level = props.permission_level;
+             }
++            EventBody::AgentToolsAvailable(props) => {
++                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
++                else {
++                    return Ok(());
++                };
++                stage.agent_tools.clone_from(&props.tools);
++            }
+             // `AgentAcpStarted` is the start-of-process signal for an external
+             // ACP agent. `provider_used` is intentionally sourced from the
+             // subsequent `AgentSessionActivated` event, which carries the
+@@ -605,6 +612,13 @@ impl RunProjectionReducer for RunProjection {
+                 else {
+                     return Ok(());
+                 };
++                if let Some(tool) = stage
++                    .agent_tools
++                    .iter_mut()
++                    .find(|tool| tool.name == props.tool_name)
++                {
++                    tool.invoked = true;
++                }
+                 if let Some(server) = mcp_server_from_tool_name(&props.tool_name) {
+                     if let Some(projection) = stage
+                         .mcp_servers
+@@ -1232,9 +1246,11 @@ mod tests {
+         AgentSessionEndedProps, AgentSessionStartedProps, AgentSkillActivatedProps,
+         AgentSkillActivationSource, AgentSkillSummary, AgentSkillsDiscoveredProps,
+         AgentSubClosedProps, AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps,
+-        AgentToolStartedProps, CheckpointCompletedProps, InterviewCompletedProps, InterviewOption,
+-        InterviewStartedProps, RunCompletedProps, RunControlEffectProps, StageCompletedProps,
+-        StageFailedProps, StagePromptProps, StageRetryingProps, StageStartedProps,
++        AgentToolCategory, AgentToolSource, AgentToolStartedProps, AgentToolSummary,
++        AgentToolsAvailableProps, CheckpointCompletedProps, InterviewCompletedProps,
++        InterviewOption, InterviewStartedProps, RunCompletedProps, RunControlEffectProps,
++        StageCompletedProps, StageFailedProps, StagePromptProps, StageRetryingProps,
++        StageStartedProps,
+     };
+     use fabro_types::{
+         AgentBackend, BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint,
+@@ -4599,6 +4615,117 @@ mod tests {
+             assert_eq!(legacy_stage.permission_level, None);
+         }
+ 
++        fn agent_tool(name: &str, category: AgentToolCategory, invoked: bool) -> AgentToolSummary {
++            AgentToolSummary {
++                name: name.to_string(),
++                description: format!("{name} description"),
++                source: AgentToolSource::Native,
++                category,
++                invoked,
++            }
++        }
++
++        #[test]
++        fn agent_tools_available_replaces_stage_agent_tools() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++
++            state
++                .apply_event(&test_stage_event(
++                    1,
++                    EventBody::AgentToolsAvailable(AgentToolsAvailableProps {
++                        tools: vec![
++                            agent_tool("read_file", AgentToolCategory::Read, false),
++                            agent_tool("apply_patch", AgentToolCategory::Write, false),
++                        ],
++                        visit: 1,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++            state
++                .apply_event(&test_stage_event(
++                    2,
++                    EventBody::AgentToolsAvailable(AgentToolsAvailableProps {
++                        tools: vec![agent_tool("grep", AgentToolCategory::Read, false)],
++                        visit: 1,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            let stage = state.stage(&stage_id).unwrap();
++            assert_eq!(stage.agent_tools, vec![agent_tool(
++                "grep",
++                AgentToolCategory::Read,
++                false
++            )]);
++        }
++
++        #[test]
++        fn agent_tool_started_marks_only_matching_available_tool_invoked() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++
++            state
++                .apply_event(&test_stage_event(
++                    1,
++                    EventBody::AgentToolsAvailable(AgentToolsAvailableProps {
++                        tools: vec![
++                            agent_tool("read_file", AgentToolCategory::Read, false),
++                            agent_tool("apply_patch", AgentToolCategory::Write, false),
++                        ],
++                        visit: 1,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++            state
++                .apply_event(&test_stage_event(
++                    2,
++                    EventBody::AgentToolStarted(AgentToolStartedProps {
++                        tool_name:         "apply_patch".to_string(),
++                        tool_call_id:      "call_patch".to_string(),
++                        arguments:         serde_json::json!({}),
++                        visit:             1,
++                        tool_call:         None,
++                        turn_id:           None,
++                        parent_message_id: None,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            let stage = state.stage(&stage_id).unwrap();
++            assert!(!stage.agent_tools[0].invoked);
++            assert!(stage.agent_tools[1].invoked);
++        }
++
++        #[test]
++        fn legacy_tool_started_without_available_tools_does_not_synthesize_tool_list() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++
++            state
++                .apply_event(&test_stage_event(
++                    1,
++                    EventBody::AgentToolStarted(AgentToolStartedProps {
++                        tool_name:         "apply_patch".to_string(),
++                        tool_call_id:      "call_patch".to_string(),
++                        arguments:         serde_json::json!({}),
++                        visit:             1,
++                        tool_call:         None,
++                        turn_id:           None,
++                        parent_message_id: None,
++                    }),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            let stage = state.stage(&stage_id).unwrap();
++            assert!(stage.agent_tools.is_empty());
++        }
++
+         #[test]
+         fn mcp_server_events_update_stage_projection() {
+             let mut state = initialized_projection();
+diff --git a/lib/crates/fabro-types/src/lib.rs b/lib/crates/fabro-types/src/lib.rs
+index 622e8729f..d2bbdfbcd 100644
+--- a/lib/crates/fabro-types/src/lib.rs
++++ b/lib/crates/fabro-types/src/lib.rs
+@@ -96,9 +96,10 @@ pub use run::{
+ pub use run_blob_id::RunBlobId;
+ pub use run_event::{
+     AgentMcpToolSummary, AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary,
+-    EventBody, ExecOutputTail, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase,
+-    RunEvent, RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason,
+-    RunRunnableSource, SessionCapability, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
++    AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody,
++    ExecOutputTail, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent,
++    RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource,
++    SessionCapability, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+ };
+ pub use run_failure::RunFailure;
+ pub use run_id::{RunId, fixtures};
+diff --git a/lib/crates/fabro-types/src/run_event/agent.rs b/lib/crates/fabro-types/src/run_event/agent.rs
+index d172b2c9e..cbd994690 100644
+--- a/lib/crates/fabro-types/src/run_event/agent.rs
++++ b/lib/crates/fabro-types/src/run_event/agent.rs
+@@ -1,6 +1,7 @@
+ use fabro_model::{ReasoningEffort, Speed};
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
++use strum::{Display, EnumString, IntoStaticStr};
+ 
+ use super::BilledTokenCounts;
+ use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
+@@ -53,6 +54,56 @@ pub struct AgentSessionDeactivatedProps {
+     pub visit: u32,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AgentToolsAvailableProps {
++    #[serde(default)]
++    pub tools: Vec<AgentToolSummary>,
++    pub visit: u32,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AgentToolSummary {
++    pub name:        String,
++    pub description: String,
++    pub source:      AgentToolSource,
++    pub category:    AgentToolCategory,
++    pub invoked:     bool,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum AgentToolSource {
++    Native,
++    Mcp {
++        server_name:   String,
++        original_name: String,
++    },
++    Skill,
++}
++
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    PartialEq,
++    Eq,
++    Hash,
++    Serialize,
++    Deserialize,
++    Display,
++    EnumString,
++    IntoStaticStr,
++)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum AgentToolCategory {
++    Read,
++    Write,
++    Shell,
++    Subagent,
++    Other,
++}
++
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct AgentProcessingEndProps {
+     pub visit: u32,
+diff --git a/lib/crates/fabro-types/src/run_event/mod.rs b/lib/crates/fabro-types/src/run_event/mod.rs
+index 84a58ef16..4b35947f2 100644
+--- a/lib/crates/fabro-types/src/run_event/mod.rs
++++ b/lib/crates/fabro-types/src/run_event/mod.rs
+@@ -198,6 +198,8 @@ pub enum EventBody {
+     AgentSessionStarted(AgentSessionStartedProps),
+     #[serde(rename = "agent.session.activated")]
+     AgentSessionActivated(AgentSessionActivatedProps),
++    #[serde(rename = "agent.tools.available")]
++    AgentToolsAvailable(AgentToolsAvailableProps),
+     #[serde(rename = "agent.session.deactivated")]
+     AgentSessionDeactivated(AgentSessionDeactivatedProps),
+     #[serde(rename = "agent.session.ended")]
+@@ -500,6 +502,7 @@ impl EventBody {
+             Self::PromptCompleted(_) => "prompt.completed",
+             Self::AgentSessionStarted(_) => "agent.session.started",
+             Self::AgentSessionActivated(_) => "agent.session.activated",
++            Self::AgentToolsAvailable(_) => "agent.tools.available",
+             Self::AgentSessionDeactivated(_) => "agent.session.deactivated",
+             Self::AgentSessionEnded(_) => "agent.session.ended",
+             Self::AgentProcessingEnd(_) => "agent.processing.end",
+@@ -682,6 +685,7 @@ fn is_known_event_name(event: &str) -> bool {
+             | "prompt.completed"
+             | "agent.session.started"
+             | "agent.session.activated"
++            | "agent.tools.available"
+             | "agent.session.deactivated"
+             | "agent.session.ended"
+             | "agent.processing.end"
+@@ -2261,4 +2265,76 @@ mod tests {
+             "empty tools should be omitted for legacy parity"
+         );
+     }
++
++    #[test]
++    fn agent_tools_available_round_trips_without_parameter_schemas() {
++        let body = EventBody::AgentToolsAvailable(AgentToolsAvailableProps {
++            tools: vec![
++                AgentToolSummary {
++                    name:        "apply_patch".to_string(),
++                    description: "Apply a unified diff patch".to_string(),
++                    source:      AgentToolSource::Native,
++                    category:    AgentToolCategory::Write,
++                    invoked:     false,
++                },
++                AgentToolSummary {
++                    name:        "mcp__filesystem__read_file".to_string(),
++                    description: "Read a file through the filesystem MCP server".to_string(),
++                    source:      AgentToolSource::Mcp {
++                        server_name:   "filesystem".to_string(),
++                        original_name: "read_file".to_string(),
++                    },
++                    category:    AgentToolCategory::Other,
++                    invoked:     false,
++                },
++            ],
++            visit: 1,
++        });
++
++        let value = serde_json::to_value(&body).unwrap();
++        assert_eq!(value["event"], "agent.tools.available");
++        assert_eq!(value["properties"]["visit"], 1);
++        assert_eq!(value["properties"]["tools"][0]["name"], "apply_patch");
++        assert_eq!(value["properties"]["tools"][0]["source"]["kind"], "native");
++        assert_eq!(value["properties"]["tools"][0]["category"], "write");
++        assert!(
++            value["properties"]["tools"][0]
++                .as_object()
++                .unwrap()
++                .get("parameters")
++                .is_none(),
++            "StageProjection tool summaries must not expose full parameter schemas"
++        );
++
++        let parsed: EventBody = serde_json::from_value(value).unwrap();
++        assert_eq!(parsed, body);
++    }
++
++    #[test]
++    fn agent_tool_source_and_category_use_public_json_shape() {
++        assert_eq!(
++            serde_json::to_value(AgentToolCategory::Read).unwrap(),
++            json!("read")
++        );
++        assert_eq!(
++            serde_json::to_value(AgentToolCategory::Subagent).unwrap(),
++            json!("subagent")
++        );
++        assert_eq!(
++            serde_json::to_value(AgentToolSource::Skill).unwrap(),
++            json!({ "kind": "skill" })
++        );
++        assert_eq!(
++            serde_json::to_value(AgentToolSource::Mcp {
++                server_name:   "github".to_string(),
++                original_name: "create_issue".to_string(),
++            })
++            .unwrap(),
++            json!({
++                "kind": "mcp",
++                "server_name": "github",
++                "original_name": "create_issue"
++            })
++        );
++    }
+ }
+diff --git a/lib/crates/fabro-types/src/run_projection.rs b/lib/crates/fabro-types/src/run_projection.rs
+index fca145920..3bba6d43e 100644
+--- a/lib/crates/fabro-types/src/run_projection.rs
++++ b/lib/crates/fabro-types/src/run_projection.rs
+@@ -9,10 +9,10 @@ use strum::{Display, EnumString, IntoStaticStr};
+ use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
+ use crate::{
+     AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
+-    BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord, InvalidTransition,
+-    ModelRef, PermissionLevel, PullRequestLink, RunApproval, RunControlAction, RunDiff, RunId,
+-    RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler, StageId, StageState,
+-    StageTiming, StartRecord, TodoListProjection,
++    AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
++    InvalidTransition, ModelRef, PermissionLevel, PullRequestLink, RunApproval, RunControlAction,
++    RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler,
++    StageId, StageState, StageTiming, StartRecord, TodoListProjection,
+ };
+ 
+ #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+@@ -360,6 +360,8 @@ pub struct StageProjection {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub permission_level:  Option<PermissionLevel>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub agent_tools:       Vec<AgentToolSummary>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub mcp_servers:       Vec<McpServerProjection>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub context_window:    Option<StageContextWindowProjection>,
+@@ -440,6 +442,7 @@ impl StageProjection {
+             subagents: Vec::new(),
+             skills: SkillsProjection::default(),
+             permission_level: None,
++            agent_tools: Vec::new(),
+             mcp_servers: Vec::new(),
+             context_window: None,
+             provider_used: None,
+@@ -744,9 +747,10 @@ mod iter_stages_tests {
+     use std::num::NonZeroU32;
+ 
+     use chrono::Utc;
++    use serde_json::json;
+ 
+     use super::RunProjection;
+-    use crate::{Graph, RunId, RunSpec, WorkflowSettings};
++    use crate::{Graph, RunId, RunSpec, StageProjection, WorkflowSettings};
+ 
+     fn seq(n: u32) -> NonZeroU32 {
+         NonZeroU32::new(n).unwrap()
+@@ -817,6 +821,23 @@ mod iter_stages_tests {
+         assert_eq!(order, vec!["a", "b", "c"]);
+     }
+ 
++    #[test]
++    fn stage_projection_defaults_missing_agent_tools_to_empty_and_omits_empty_list() {
++        let value = json!({
++            "first_event_seq": 1,
++            "state": "running"
++        });
++
++        let stage: StageProjection = serde_json::from_value(value).unwrap();
++        assert!(stage.agent_tools.is_empty());
++
++        let serialized = serde_json::to_value(stage).unwrap();
++        assert!(
++            serialized.as_object().unwrap().get("agent_tools").is_none(),
++            "empty agent_tools should be omitted from StageProjection JSON"
++        );
++    }
++
+     #[test]
+     fn iter_stages_tie_breaks_same_first_event_seq_by_stage_id() {
+         for _ in 0..128 {
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index ff098e6f0..de4998a5f 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -1174,6 +1174,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
+             capabilities:     capabilities.clone(),
+             visit:            *visit,
+         }),
++        Event::AgentToolsAvailable { tools, visit, .. } => {
++            EventBody::AgentToolsAvailable(fabro_types::AgentToolsAvailableProps {
++                tools: tools.clone(),
++                visit: *visit,
++            })
++        }
+         Event::AgentSessionDeactivated { visit, .. } => {
+             EventBody::AgentSessionDeactivated(fabro_types::AgentSessionDeactivatedProps {
+                 visit: *visit,
+@@ -1594,6 +1600,31 @@ mod tests {
+         assert_eq!(properties["visit"], 2);
+     }
+ 
++    #[test]
++    fn run_event_agent_tools_available_moves_session_and_stage_metadata_to_header() {
++        let stored = to_run_event(&fixtures::RUN_4, &Event::AgentToolsAvailable {
++            node_id:    "code".to_string(),
++            visit:      2,
++            session_id: "ses_root".to_string(),
++            tools:      vec![::fabro_types::AgentToolSummary {
++                name:        "apply_patch".to_string(),
++                description: "Apply a unified diff patch".to_string(),
++                source:      ::fabro_types::AgentToolSource::Native,
++                category:    ::fabro_types::AgentToolCategory::Write,
++                invoked:     false,
++            }],
++        });
++
++        assert_eq!(stored.event_name(), "agent.tools.available");
++        assert_eq!(stored.node_id.as_deref(), Some("code"));
++        assert_eq!(stored.stage_id, Some(StageId::new("code", 2)));
++        assert_eq!(stored.session_id.as_deref(), Some("ses_root"));
++        let properties = stored.properties().unwrap();
++        assert_eq!(properties["visit"], 2);
++        assert_eq!(properties["tools"][0]["name"], "apply_patch");
++        assert_eq!(properties["tools"][0]["category"], "write");
++    }
++
+     #[test]
+     fn run_event_sandbox_event_keeps_properties_nested() {
+         let stored = to_run_event(&fixtures::RUN_5, &Event::Sandbox {
+diff --git a/lib/crates/fabro-workflow/src/event/events.rs b/lib/crates/fabro-workflow/src/event/events.rs
+index e91686d22..a38b184bb 100644
+--- a/lib/crates/fabro-workflow/src/event/events.rs
++++ b/lib/crates/fabro-workflow/src/event/events.rs
+@@ -619,6 +619,14 @@ pub enum Event {
+         permission_level: Option<PermissionLevel>,
+         capabilities:     Vec<fabro_types::SessionCapability>,
+     },
++    /// Effective model-callable tools for a stage session after profile setup,
++    /// optional registrations, MCP integration, and access-policy filtering.
++    AgentToolsAvailable {
++        node_id:    String,
++        visit:      u32,
++        session_id: String,
++        tools:      Vec<fabro_types::AgentToolSummary>,
++    },
+     /// A stage's steerable live session binding ended.
+     AgentSessionDeactivated {
+         node_id:    String,
+@@ -1466,6 +1474,20 @@ impl Event {
+             } => {
+                 debug!(node_id, visit, session_id, "Agent session activated");
+             }
++            Self::AgentToolsAvailable {
++                node_id,
++                visit,
++                session_id,
++                tools,
++            } => {
++                debug!(
++                    node_id,
++                    visit,
++                    session_id,
++                    tool_count = tools.len(),
++                    "Agent tools available"
++                );
++            }
+             Self::AgentSessionDeactivated {
+                 node_id,
+                 visit,
+diff --git a/lib/crates/fabro-workflow/src/event/names.rs b/lib/crates/fabro-workflow/src/event/names.rs
+index 958f8fdeb..ae645dcf9 100644
+--- a/lib/crates/fabro-workflow/src/event/names.rs
++++ b/lib/crates/fabro-workflow/src/event/names.rs
+@@ -140,6 +140,7 @@ pub fn event_name(event: &Event) -> &'static str {
+         Event::CommandCompleted { .. } => "command.completed",
+         Event::AgentSessionStarted { .. } => "agent.session.started",
+         Event::AgentSessionActivated { .. } => "agent.session.activated",
++        Event::AgentToolsAvailable { .. } => "agent.tools.available",
+         Event::AgentSessionDeactivated { .. } => "agent.session.deactivated",
+         Event::AgentSessionEnded { .. } => "agent.session.ended",
+         Event::AgentInterruptInjected { .. } => "agent.interrupt.injected",
+@@ -202,6 +203,15 @@ mod tests {
+             }),
+             "agent.sub.spawned"
+         );
++        assert_eq!(
++            event_name(&Event::AgentToolsAvailable {
++                node_id:    "code".to_string(),
++                visit:      1,
++                session_id: "session-1".to_string(),
++                tools:      Vec::new(),
++            }),
++            "agent.tools.available"
++        );
+     }
+ 
+     #[test]
+diff --git a/lib/crates/fabro-workflow/src/event/stored_fields.rs b/lib/crates/fabro-workflow/src/event/stored_fields.rs
+index f993035de..94fba25ad 100644
+--- a/lib/crates/fabro-workflow/src/event/stored_fields.rs
++++ b/lib/crates/fabro-workflow/src/event/stored_fields.rs
+@@ -161,6 +161,12 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
+             session_id,
+             ..
+         }
++        | Event::AgentToolsAvailable {
++            node_id,
++            visit,
++            session_id,
++            ..
++        }
+         | Event::AgentSessionDeactivated {
+             node_id,
+             visit,
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index 42dc0e1f5..135b5e3b7 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex};
+ 
+ use async_trait::async_trait;
+ use fabro_agent::subagent::{SessionFactory, SubAgentManager};
+-use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
++use fabro_agent::tool_registry::{
++    RegisteredTool, ToolContext, ToolDefinitionWithSource, ToolRegistry, ToolSource,
++};
+ use fabro_agent::{
+     AgentEvent, AgentProfile, AnthropicProfile, CompletionCoordinator, GeminiProfile,
+     Message as AgentMessage, OpenAiProfile, Sandbox, Session, SessionOptions, StaticEnvProvider,
+-    ToolEnvProvider, register_question_tools,
++    ToolEnvProvider, register_question_tools, tool_permissions,
+ };
+ use fabro_auth::{CredentialSource, EnvCredentialSource};
+ use fabro_graphviz::graph::{AttrValue, Node};
+@@ -21,7 +23,10 @@ use fabro_mcp::config::McpServerSettings;
+ use fabro_model::catalog::LlmCatalogSettings;
+ use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderId};
+ use fabro_types::settings::run::RunModelControls;
+-use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId};
++use fabro_types::{
++    AgentToolCategory, AgentToolSource, AgentToolSummary, PermissionLevel, RunId,
++    SessionCapability, StageId,
++};
+ use serde::de::DeserializeOwned;
+ use tokio::sync::Mutex as TokioMutex;
+ use tokio::task::JoinHandle;
+@@ -496,6 +501,61 @@ fn last_assistant_response(session: &Session) -> String {
+         .unwrap_or_default()
+ }
+ 
++fn agent_tool_summaries_from_definitions(
++    tools: &[ToolDefinitionWithSource],
++) -> Vec<AgentToolSummary> {
++    let mut summaries: Vec<_> = tools
++        .iter()
++        .map(|tool| AgentToolSummary {
++            name:        tool.definition.name.clone(),
++            description: tool.definition.description.clone(),
++            source:      agent_tool_source(&tool.definition.name, &tool.source),
++            category:    agent_tool_category(&tool.definition.name),
++            invoked:     false,
++        })
++        .collect();
++    summaries.sort_by(|left, right| left.name.cmp(&right.name));
++    summaries
++}
++
++fn agent_tool_source(name: &str, source: &ToolSource) -> AgentToolSource {
++    match source {
++        ToolSource::Native => AgentToolSource::Native,
++        ToolSource::Mcp { server_name } => AgentToolSource::Mcp {
++            server_name:   server_name.clone(),
++            original_name: fabro_mcp::connection_manager::parse_qualified_name(name)
++                .map(|(_, original_name)| original_name)
++                .unwrap_or_else(|| name.to_string()),
++        },
++        ToolSource::Skill => AgentToolSource::Skill,
++    }
++}
++
++fn agent_tool_category(name: &str) -> AgentToolCategory {
++    match tool_permissions::known_tool_category(name) {
++        Some("read") => AgentToolCategory::Read,
++        Some("write") => AgentToolCategory::Write,
++        Some("shell") => AgentToolCategory::Shell,
++        Some("subagent") => AgentToolCategory::Subagent,
++        Some(_) | None => AgentToolCategory::Other,
++    }
++}
++
++fn emit_agent_tools_available(
++    session: &Session,
++    node_id: &str,
++    stage_id: &StageId,
++    emitter: &Arc<Emitter>,
++) {
++    let tools = agent_tool_summaries_from_definitions(&session.available_tools());
++    emitter.emit(&Event::AgentToolsAvailable {
++        node_id: node_id.to_string(),
++        visit: stage_id.visit(),
++        session_id: session.id().to_string(),
++        tools,
++    });
++}
++
+ /// Spawn a task that subscribes to session events and:
+ /// 1. Tracks file changes (write_file/edit_file tool calls) into shared state.
+ /// 2. Forwards non-streaming agent events to the pipeline emitter.
+@@ -1197,6 +1257,7 @@ impl CodergenBackend for AgentApiBackend {
+                         return Err(err);
+                     }
+                 }
++                emit_agent_tools_available(&session, &node.id, &stage_id, emitter);
+                 session
+                     .process_input_with_runtime(prompt, agent_tool_runtime.clone())
+                     .await
+@@ -1323,6 +1384,7 @@ impl CodergenBackend for AgentApiBackend {
+                                 return Err(err);
+                             }
+                         }
++                        emit_agent_tools_available(&session, &node.id, &stage_id, emitter);
+                         match session
+                             .process_input_with_runtime(prompt, agent_tool_runtime.clone())
+                             .await
+@@ -1500,6 +1562,7 @@ mod tests {
+ 
+     use chrono::TimeZone;
+     use fabro_agent::subagent::SessionFactory;
++    use fabro_agent::tool_registry::ToolDefinitionWithSource;
+     use fabro_agent::{AgentProfile, LocalSandbox, ToolRegistry};
+     use fabro_api::types;
+     use fabro_auth::{EnvCredentialSource, VaultCredentialSource};
+@@ -1566,6 +1629,68 @@ mod tests {
+         }
+     }
+ 
++    fn test_tool_with_source(name: &str, source: ToolSource) -> ToolDefinitionWithSource {
++        ToolDefinitionWithSource {
++            definition: LlmToolDefinition {
++                name:        name.to_string(),
++                description: format!("{name} description"),
++                parameters:  serde_json::json!({
++                    "type": "object",
++                    "properties": {
++                        "path": { "type": "string" }
++                    }
++                }),
++            },
++            source,
++        }
++    }
++
++    #[test]
++    fn agent_tool_summaries_map_known_native_categories_without_schemas() {
++        let summaries = agent_tool_summaries_from_definitions(&[
++            test_tool_with_source("apply_patch", ToolSource::Native),
++            test_tool_with_source("grep", ToolSource::Native),
++            test_tool_with_source("glob", ToolSource::Native),
++            test_tool_with_source("spawn_agent", ToolSource::Native),
++            test_tool_with_source("unknown_native", ToolSource::Native),
++        ]);
++
++        assert_eq!(summaries[0].name, "apply_patch");
++        assert_eq!(summaries[0].description, "apply_patch description");
++        assert_eq!(summaries[0].source, fabro_types::AgentToolSource::Native);
++        assert_eq!(summaries[0].category, fabro_types::AgentToolCategory::Write);
++        assert!(!summaries[0].invoked);
++        assert_eq!(summaries[1].category, fabro_types::AgentToolCategory::Read);
++        assert_eq!(summaries[2].category, fabro_types::AgentToolCategory::Read);
++        assert_eq!(
++            summaries[3].category,
++            fabro_types::AgentToolCategory::Subagent
++        );
++        assert_eq!(summaries[4].category, fabro_types::AgentToolCategory::Other);
++
++        let json = serde_json::to_value(&summaries[0]).unwrap();
++        assert!(
++            json.as_object().unwrap().get("parameters").is_none(),
++            "agent tool summaries should not include tool parameter schemas"
++        );
++    }
++
++    #[test]
++    fn agent_tool_summaries_map_mcp_source_and_original_name_from_qualified_name() {
++        let summaries = agent_tool_summaries_from_definitions(&[test_tool_with_source(
++            "mcp__filesystem__read_file",
++            ToolSource::Mcp {
++                server_name: "filesystem".to_string(),
++            },
++        )]);
++
++        assert_eq!(summaries[0].source, fabro_types::AgentToolSource::Mcp {
++            server_name:   "filesystem".to_string(),
++            original_name: "read_file".to_string(),
++        });
++        assert_eq!(summaries[0].category, fabro_types::AgentToolCategory::Other);
++    }
++
+     struct ShutdownTestProvider;
+ 
+     #[async_trait]
+diff --git a/lib/crates/fabro-workflow/src/operations/fork.rs b/lib/crates/fabro-workflow/src/operations/fork.rs
+index b4ed04d30..513975d71 100644
+--- a/lib/crates/fabro-workflow/src/operations/fork.rs
++++ b/lib/crates/fabro-workflow/src/operations/fork.rs
+@@ -230,6 +230,7 @@ fn replay_event_for_fork_projection(body: &EventBody) -> bool {
+             | EventBody::InterviewTimeout(_)
+             | EventBody::InterviewInterrupted(_)
+             | EventBody::AgentSessionActivated(_)
++            | EventBody::AgentToolsAvailable(_)
+             | EventBody::AgentAcpStarted(_)
+             | EventBody::AgentAcpCancelled(_)
+             | EventBody::AgentAcpTimedOut(_)
+@@ -310,6 +311,12 @@ mod tests {
+                 visit:            1,
+             })
+         ));
++        assert!(replay_event_for_fork_projection(
++            &EventBody::AgentToolsAvailable(fabro_types::run_event::AgentToolsAvailableProps {
++                tools: Vec::new(),
++                visit: 1,
++            })
++        ));
+         assert!(!replay_event_for_fork_projection(
+             &EventBody::AgentSessionStarted(fabro_types::run_event::AgentSessionStartedProps {
+                 provider: Some("openai".to_string()),
+diff --git a/lib/packages/fabro-api-client/src/.openapi-generator/FILES b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+index f8d333e14..c07a09e4c 100644
+--- a/lib/packages/fabro-api-client/src/.openapi-generator/FILES
++++ b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+@@ -27,6 +27,13 @@ models/agent-permissions.ts
+ models/agent-session-activated-props.ts
+ models/agent-skill-activation-source.ts
+ models/agent-skill-summary.ts
++models/agent-tool-category.ts
++models/agent-tool-source-mcp.ts
++models/agent-tool-source-native.ts
++models/agent-tool-source-skill.ts
++models/agent-tool-source.ts
++models/agent-tool-summary.ts
++models/agent-tools-available-props.ts
+ models/aggregate-billing-totals.ts
+ models/aggregate-billing.ts
+ models/api-question.ts
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-category.ts b/lib/packages/fabro-api-client/src/models/agent-tool-category.ts
+new file mode 100644
+index 000000000..8e1eda4b0
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-category.ts
+@@ -0,0 +1,29 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++/**
++ * Coarse tool category for display and grouping.
++ */
++
++export const AgentToolCategory = {
++    READ: 'read',
++    WRITE: 'write',
++    SHELL: 'shell',
++    SUBAGENT: 'subagent',
++    OTHER: 'other'
++} as const;
++
++export type AgentToolCategory = typeof AgentToolCategory[keyof typeof AgentToolCategory];
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-source-mcp.ts b/lib/packages/fabro-api-client/src/models/agent-tool-source-mcp.ts
+new file mode 100644
+index 000000000..3f8089a92
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-source-mcp.ts
+@@ -0,0 +1,33 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++export interface AgentToolSourceMcp {
++    'kind': AgentToolSourceMcpKindEnum;
++    /**
++     * MCP server name that provided the tool.
++     */
++    'server_name': string;
++    /**
++     * Tool name before MCP qualification.
++     */
++    'original_name': string;
++}
++
++export const AgentToolSourceMcpKindEnum = {
++    MCP: 'mcp'
++} as const;
++
++export type AgentToolSourceMcpKindEnum = typeof AgentToolSourceMcpKindEnum[keyof typeof AgentToolSourceMcpKindEnum];
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-source-native.ts b/lib/packages/fabro-api-client/src/models/agent-tool-source-native.ts
+new file mode 100644
+index 000000000..4ea94bead
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-source-native.ts
+@@ -0,0 +1,25 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++export interface AgentToolSourceNative {
++    'kind': AgentToolSourceNativeKindEnum;
++}
++
++export const AgentToolSourceNativeKindEnum = {
++    NATIVE: 'native'
++} as const;
++
++export type AgentToolSourceNativeKindEnum = typeof AgentToolSourceNativeKindEnum[keyof typeof AgentToolSourceNativeKindEnum];
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-source-skill.ts b/lib/packages/fabro-api-client/src/models/agent-tool-source-skill.ts
+new file mode 100644
+index 000000000..e150e8591
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-source-skill.ts
+@@ -0,0 +1,25 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++export interface AgentToolSourceSkill {
++    'kind': AgentToolSourceSkillKindEnum;
++}
++
++export const AgentToolSourceSkillKindEnum = {
++    SKILL: 'skill'
++} as const;
++
++export type AgentToolSourceSkillKindEnum = typeof AgentToolSourceSkillKindEnum[keyof typeof AgentToolSourceSkillKindEnum];
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-source.ts b/lib/packages/fabro-api-client/src/models/agent-tool-source.ts
+new file mode 100644
+index 000000000..391f72fd5
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-source.ts
+@@ -0,0 +1,30 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSourceMcp } from './agent-tool-source-mcp';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSourceNative } from './agent-tool-source-native';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSourceSkill } from './agent-tool-source-skill';
++
++/**
++ * @type AgentToolSource
++ * Origin of an effective agent tool.
++ */
++export type AgentToolSource = { kind: 'mcp' } & AgentToolSourceMcp | { kind: 'native' } & AgentToolSourceNative | { kind: 'skill' } & AgentToolSourceSkill;
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tool-summary.ts b/lib/packages/fabro-api-client/src/models/agent-tool-summary.ts
+new file mode 100644
+index 000000000..b52e220c0
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tool-summary.ts
+@@ -0,0 +1,41 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolCategory } from './agent-tool-category';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSource } from './agent-tool-source';
++
++/**
++ * Summary of one effective model-callable tool exposed to an agent stage.
++ */
++export interface AgentToolSummary {
++    /**
++     * Exposed model-facing tool name, for example `apply_patch` or `mcp__filesystem__read_file`.
++     */
++    'name': string;
++    /**
++     * Model-facing tool description.
++     */
++    'description': string;
++    'source': AgentToolSource;
++    'category': AgentToolCategory;
++    /**
++     * True once this tool has been invoked during the stage.
++     */
++    'invoked': boolean;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/agent-tools-available-props.ts b/lib/packages/fabro-api-client/src/models/agent-tools-available-props.ts
+new file mode 100644
+index 000000000..1231a8aa8
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/agent-tools-available-props.ts
+@@ -0,0 +1,29 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSummary } from './agent-tool-summary';
++
++/**
++ * Properties for the `agent.tools.available` event.
++ */
++export interface AgentToolsAvailableProps {
++    /**
++     * Effective model-callable tools exposed to the stage session.
++     */
++    'tools': Array<AgentToolSummary>;
++    'visit': number;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/index.ts b/lib/packages/fabro-api-client/src/models/index.ts
+index 78d106d70..1a153e0e7 100644
+--- a/lib/packages/fabro-api-client/src/models/index.ts
++++ b/lib/packages/fabro-api-client/src/models/index.ts
+@@ -4,6 +4,13 @@ export * from './agent-permissions';
+ export * from './agent-session-activated-props';
+ export * from './agent-skill-activation-source';
+ export * from './agent-skill-summary';
++export * from './agent-tool-category';
++export * from './agent-tool-source';
++export * from './agent-tool-source-mcp';
++export * from './agent-tool-source-native';
++export * from './agent-tool-source-skill';
++export * from './agent-tool-summary';
++export * from './agent-tools-available-props';
+ export * from './aggregate-billing';
+ export * from './aggregate-billing-totals';
+ export * from './api-question';
+diff --git a/lib/packages/fabro-api-client/src/models/stage-projection.ts b/lib/packages/fabro-api-client/src/models/stage-projection.ts
+index 24df4baed..b49e864ca 100644
+--- a/lib/packages/fabro-api-client/src/models/stage-projection.ts
++++ b/lib/packages/fabro-api-client/src/models/stage-projection.ts
+@@ -13,6 +13,9 @@
+  */
+ 
+ 
++// May contain unused imports in some cases
++// @ts-ignore
++import type { AgentToolSummary } from './agent-tool-summary';
+ // May contain unused imports in some cases
+ // @ts-ignore
+ import type { BilledTokenCounts } from './billed-token-counts';
+@@ -96,6 +99,10 @@ export interface StageProjection {
+      */
+     'skills'?: SkillsProjection;
+     'permission_level'?: PermissionLevel | null;
++    /**
++     * Effective model-callable tools exposed to this agent stage session. Tool parameter schemas are intentionally omitted from this projection.
++     */
++    'agent_tools'?: Array<AgentToolSummary>;
+     /**
+      * MCP servers observed by this stage.
+      */

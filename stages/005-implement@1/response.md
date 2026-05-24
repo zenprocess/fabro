@@ -1,0 +1,1 @@
+The TS generator is pinned now, but this sandbox lacks Java, which OpenAPI Generator needs. I’ll install a headless JRE and rerun generation.
