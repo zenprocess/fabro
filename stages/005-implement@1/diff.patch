@@ -1,0 +1,187 @@
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index 92d76c397..a764a3556 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -3722,6 +3722,14 @@ mod tests {
+                 .expect("stage todos present")
+         }
+ 
++        fn child_session_event(
++            mut event: EventEnvelope,
++            parent_session_id: &str,
++        ) -> EventEnvelope {
++            event.event.parent_session_id = Some(parent_session_id.to_string());
++            event
++        }
++
+         fn created(
+             list: &str,
+             list_kind: TodoListKind,
+@@ -3842,6 +3850,167 @@ mod tests {
+             assert_eq!(projection.items[0].id, "b");
+         }
+ 
++        #[test]
++        fn child_openai_plan_does_not_replace_root_plan_or_block_later_root_updates() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++            let root_list = "openai_plan:root-session";
++            let child_list = "openai_plan:child-session";
++
++            state
++                .apply_event(&test_stage_event(
++                    1,
++                    created(root_list, TodoListKind::OpenAiPlan, "root-1", 0, "root first"),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++            state
++                .apply_event(&test_stage_event(
++                    2,
++                    created(
++                        root_list,
++                        TodoListKind::OpenAiPlan,
++                        "root-2",
++                        1,
++                        "root second",
++                    ),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            for (seq, id, order) in [(3, "child-1", 0), (4, "child-2", 1), (5, "child-3", 2)] {
++                state
++                    .apply_event(&child_session_event(
++                        test_stage_event(
++                            seq,
++                            created(
++                                child_list,
++                                TodoListKind::OpenAiPlan,
++                                id,
++                                order,
++                                "child todo",
++                            ),
++                            stage_id.clone(),
++                        ),
++                        "root-session",
++                    ))
++                    .unwrap();
++            }
++
++            state
++                .apply_event(&test_stage_event(
++                    6,
++                    updated_status(
++                        root_list,
++                        TodoListKind::OpenAiPlan,
++                        "root-1",
++                        TodoStatus::Completed,
++                    ),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++            state
++                .apply_event(&test_stage_event(
++                    7,
++                    updated_status(
++                        root_list,
++                        TodoListKind::OpenAiPlan,
++                        "root-2",
++                        TodoStatus::Completed,
++                    ),
++                    stage_id.clone(),
++                ))
++                .unwrap();
++
++            let projection = stage_todos(&state, &stage_id);
++            assert_eq!(projection.kind, TodoListKind::OpenAiPlan);
++            assert_eq!(projection.list_id, root_list);
++            assert_eq!(projection.items.len(), 2);
++            assert!(
++                projection
++                    .items
++                    .iter()
++                    .all(|todo| todo.status == TodoStatus::Completed)
++            );
++            assert_eq!(projection.items[0].id, "root-1");
++            assert_eq!(projection.items[1].id, "root-2");
++        }
++
++        #[test]
++        fn child_openai_plan_alone_does_not_create_stage_todos() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++
++            state
++                .apply_event(&child_session_event(
++                    test_stage_event(
++                        1,
++                        created(
++                            "openai_plan:child-session",
++                            TodoListKind::OpenAiPlan,
++                            "child-1",
++                            0,
++                            "child todo",
++                        ),
++                        stage_id.clone(),
++                    ),
++                    "root-session",
++                ))
++                .unwrap();
++
++            assert!(
++                state
++                    .stage(&stage_id)
++                    .is_none_or(|stage| stage.todos.is_none())
++            );
++        }
++
++        #[test]
++        fn anthropic_child_session_tasks_still_project() {
++            let mut state = initialized_projection();
++            let stage_id = stage_id();
++            let list = "anthropic_tasks:root-session";
++
++            state
++                .apply_event(&child_session_event(
++                    test_stage_event(
++                        1,
++                        created(
++                            list,
++                            TodoListKind::AnthropicTasks,
++                            "task-1",
++                            0,
++                            "shared task",
++                        ),
++                        stage_id.clone(),
++                    ),
++                    "root-session",
++                ))
++                .unwrap();
++            state
++                .apply_event(&child_session_event(
++                    test_stage_event(
++                        2,
++                        updated_status(
++                            list,
++                            TodoListKind::AnthropicTasks,
++                            "task-1",
++                            TodoStatus::Completed,
++                        ),
++                        stage_id.clone(),
++                    ),
++                    "root-session",
++                ))
++                .unwrap();
++
++            let projection = stage_todos(&state, &stage_id);
++            assert_eq!(projection.kind, TodoListKind::AnthropicTasks);
++            assert_eq!(projection.list_id, list);
++            assert_eq!(projection.items.len(), 1);
++            assert_eq!(projection.items[0].id, "task-1");
++            assert_eq!(projection.items[0].status, TodoStatus::Completed);
++        }
++
+         #[test]
+         fn stage_todo_lists_stay_isolated() {
+             let mut state = initialized_projection();
