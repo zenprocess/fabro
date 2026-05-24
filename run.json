@@ -494,7 +494,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-24T17:26:07.203998Z",
-  "last_event_at": "2026-05-24T17:28:18.679582Z",
+  "last_event_at": "2026-05-24T18:01:18.824864Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -661,9 +661,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 49,
       "checkpoint": {
-        "timestamp": "2026-05-24T17:30:35.656217Z",
+        "timestamp": "2026-05-24T17:30:39.150789Z",
         "current_node": "preflight_lint",
         "completed_nodes": [
           "start",
@@ -673,18 +673,104 @@
         ],
         "node_retries": {},
         "context_values": {
+          "failure_class": "",
+          "internal.retry_count.toolchain": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "graph.goal": "# Fold Context Window Into Agent Messages Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Remove the chatty `agent.context_window.snapshot` event and persist context-window data through existing `agent.message` events.\n\n**Architecture:** Compute the context-window breakdown locally while the agent still has the exact request, attach the final content-free projection to the next `agent.message`, and let the run projection reducer store that latest projection for `GET /runs/{id}/stages/{stageId}/context-window`. Do not call provider token-count APIs during normal execution.\n\n**Tech Stack:** Rust, Serde, Fabro agent/session events, Fabro workflow event conversion, Fabro store projections, OpenAPI/progenitor, generated TypeScript client, React/SWR.\n\n---\n\n## Scope And Decisions\n\n- Remove `agent.context_window.snapshot` completely from new code. This is a greenfield/no-prod app, so do not preserve backward-compatible deserialization or frontend handling for old snapshot events.\n- Keep `StageContextWindowProjection`, `StageContextWindow`, `StageProjection.context_window`, and the existing context-window GET endpoint.\n- Add optional `context_window` data to `agent.message` properties.\n- Normal execution uses only local estimates and token usage returned by normal LLM responses.\n- Do not call `Client::count_input_tokens` from `fabro-agent::Session`.\n- The GET endpoint remains projection-backed for this pass. It must not require an in-memory session and must not trigger provider token-count API calls.\n- Failed-before-response turns do not persist context-window data.\n- Live pre-response context-window updates are not required. The UI updates after `agent.message`.\n\n## File Map\n\n- Modify `lib/crates/fabro-types/src/run_event/agent.rs`\n  - Add `context_window: Option<StageContextWindowProjection>` to `AgentMessageProps`.\n  - Remove `AgentContextWindowSnapshotProps`.\n- Modify `lib/crates/fabro-types/src/run_event/mod.rs`\n  - Remove the `AgentContextWindowSnapshot` event variant, name mapping, known-event entry, and serde tests.\n  - Update `agent.message` serde tests to cover optional context-window data.\n- Modify `lib/crates/fabro-agent/src/types.rs`\n  - Remove `AgentEvent::ContextWindowSnapshot`.\n  - Add `context_window: Option<StageContextWindowProjection>` to `AgentEvent::AssistantMessage`.\n- Modify `lib/crates/fabro-agent/src/session.rs`\n  - Remove async provider-count task and response-usage snapshot event emission.\n  - Keep local context-window snapshot construction at request-build time.\n  - Attach the scaled or local projection to `AssistantMessage`.\n- Keep `lib/crates/fabro-agent/src/context_window.rs`\n  - Reuse `build_local_snapshot` and `scaled_snapshot`.\n  - Remove only tests or helpers that exist solely for provider-count snapshot emission.\n- Modify `lib/crates/fabro-workflow/src/event/convert.rs`\n  - Remove conversion for `AgentEvent::ContextWindowSnapshot`.\n  - Copy `context_window` from `AgentEvent::AssistantMessage` into `AgentMessageProps`.\n- Modify `lib/crates/fabro-workflow/src/event/names.rs`\n  - Remove the snapshot event name.\n- Modify `lib/crates/fabro-store/src/run_state.rs`\n  - Remove reducer support for `EventBody::AgentContextWindowSnapshot`.\n  - When reducing `EventBody::AgentMessage`, copy `props.context_window` into `stage.context_window` when present and stamp `event_seq`.\n- Modify `lib/crates/fabro-server/src/server/tests.rs`\n  - Seed context-window endpoint tests with `agent.message` events that include context-window data.\n- Modify `docs/public/api-reference/fabro-api.yaml`\n  - Add optional `context_window` to `AgentMessageProps`.\n  - Remove the snapshot event schema/variant.\n- Regenerate/update `lib/packages/fabro-api-client/src`.\n- Modify `apps/fabro-web/app/lib/run-events.ts` and tests\n  - Remove special handling for `agent.context_window.snapshot`.\n  - Rely on existing `agent.message` invalidation for stage events and context-window data.\n\n## Implementation Steps\n\n### Task 1: Move The Event Contract Onto `agent.message`\n\n- [ ] Add optional `context_window` to Rust `AgentMessageProps`.\n- [ ] Remove `AgentContextWindowSnapshotProps` and the `agent.context_window.snapshot` `EventBody` variant.\n- [ ] Update run-event serde tests so `agent.message` round-trips with and without `context_window`.\n- [ ] Remove tests whose only assertion is that `agent.context_window.snapshot` is known or serializes.\n\n### Task 2: Stop Emitting Snapshot Events\n\n- [ ] Remove `AgentEvent::ContextWindowSnapshot` and its trace/debug handling.\n- [ ] Change `AgentEvent::AssistantMessage` to carry `context_window: Option<StageContextWindowProjection>`.\n- [ ] In `Session::run_single_input`, keep the local context-window snapshot returned from request construction.\n- [ ] Delete the spawned `count_input_tokens(... PreferProvider)` task and its fingerprint suppression state.\n- [ ] After the normal LLM response arrives, compute:\n  - `ResponseUsageScaledBreakdown` when response input/cache usage is positive.\n  - `LocalEstimate` when response usage has no usable input tokens.\n- [ ] Attach that projection to the emitted `AssistantMessage`.\n\n### Task 3: Update Workflow Conversion And Store Projection\n\n- [ ] Remove snapshot event name/conversion branches.\n- [ ] Include `context_window` when converting `AgentEvent::AssistantMessage` to `EventBody::AgentMessage`.\n- [ ] In the store reducer, update `stage.context_window` from `AgentMessageProps.context_window`.\n- [ ] Stamp the copied projection with the `agent.message` event sequence.\n- [ ] Replace store tests for snapshot replacement with message-carried context-window tests.\n\n### Task 4: Keep The GET Endpoint Projection-Backed\n\n- [ ] Keep the endpoint route and response type unchanged.\n- [ ] Keep existing `not_agent_stage`, `not_observed`, and terminal `stored` behavior.\n- [ ] Update endpoint tests to seed context-window data via `agent.message`.\n- [ ] Do not add endpoint-time provider token-count calls.\n\n### Task 5: Remove Frontend And API Trace\n\n- [ ] Remove frontend constants/tests for `agent.context_window.snapshot`.\n- [ ] Ensure `agent.message` still invalidates `stageContextWindow` through existing stage activity handling.\n- [ ] Update OpenAPI and regenerated TypeScript client so no snapshot event model remains.\n- [ ] Run a final search for `agent.context_window.snapshot`, `AgentContextWindowSnapshot`, and `ContextWindowSnapshot`; only historical docs or this plan may remain.\n\n## Test Plan\n\n- Run `cargo build -p fabro-api` after OpenAPI/Rust type changes.\n- Run targeted Rust tests:\n  - `cargo nextest run -p fabro-agent`\n  - `cargo nextest run -p fabro-workflow`\n  - `cargo nextest run -p fabro-store`\n  - `cargo nextest run -p fabro-server get_run_stage_context_window`\n  - `cargo nextest run -p fabro-types agent_message`\n- Regenerate TypeScript client with `cd lib/packages/fabro-api-client && bun run generate`.\n- Run web checks:\n  - `cd apps/fabro-web && bun test`\n  - `cd apps/fabro-web && bun run typecheck`\n  - `cd lib/packages/fabro-api-client && bun run typecheck`\n- Run final targeted searches:\n  - `rg -n \"agent\\\\.context_window\\\\.snapshot|AgentContextWindowSnapshot|ContextWindowSnapshot\" lib/crates apps/fabro-web lib/packages docs/public/api-reference/fabro-api.yaml`\n  - Expected: no implementation/API/frontend matches.\n\n## Acceptance Criteria\n\n- Normal agent runs do not emit `agent.context_window.snapshot`.\n- Normal agent runs do not call provider token-count endpoints for context-window reporting.\n- `agent.message` includes context-window data when the agent produced a response.\n- `GET /runs/{id}/stages/{stageId}/context-window` still returns the latest context-window projection.\n- The event log contains no standalone context-window snapshot events.\n- Public API/client/types no longer expose `agent.context_window.snapshot`.\n",
+          "internal.retry_count.start": 0,
           "internal.run_id": "01KSDGB3G5YAPQMCXKE23SF08C",
+          "internal.thread_id": "preflight_compile",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.retry_count.preflight_compile": 0,
+          "failure_signature": "",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.preflight_lint": 0,
+          "current_node": "preflight_lint",
+          "graph.rankdir": "LR",
+          "outcome": "succeeded",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.fidelity": "compact",
+          "internal.node_visit_count": 1,
+          "thread.start.current_node": "toolchain",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+        },
+        "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "implement",
+        "git_commit_sha": "73934615a54b1da6d2456498f70d9df891a8c8c7",
+        "node_visits": {
+          "preflight_compile": 1,
+          "start": 1,
+          "toolchain": 1,
+          "preflight_lint": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-24T18:01:18.863624Z",
+        "current_node": "implement",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.run_id": "01KSDGB3G5YAPQMCXKE23SF08C",
+          "response.implement": "Implemented the plan end-to-end.\n\nSummary:\n- Removed standalone `agent.context_window.snapshot` event from Rust event contracts, workflow conversion, event names, store reducer, frontend invalidation, OpenAPI/API client surface.\n- Added optional `context_window` to `agent.message`:\n  - `fabro-types::AgentMessageProps`\n  - `fabro-agent::AgentEvent::AssistantMessage`\n  - workflow conversion into `EventBody::AgentMessage`\n- Updated `Session::run_single_input` so context-window projection is computed locally from the exact request and attached only after a successful assistant response.\n- Removed normal-execution provider token-count API calls from `fabro-agent::Session`.\n- Updated store projection to persist latest `AgentMessageProps.context_window` and stamp `event_seq`.\n- Kept the context-window GET endpoint projection-backed and updated endpoint tests to seed data via `agent.message`.\n- Regenerated the TS API client and added generated `AgentMessageProps`.\n- Removed frontend snapshot event handling/tests; `agent.message` continues to invalidate stage context-window queries via stage activity handling.\n- Used red/green TDD: first added a failing `fabro-agent` test proving standalone snapshot events were still emitted, then implemented until green.\n- Used subagent-driven development for read-only investigation of Rust/API/frontend surfaces.\n\nValidation run:\n- `cargo build -p fabro-api`\n- `cargo nextest run -p fabro-types agent_message`\n- `cargo nextest run -p fabro-agent`\n- `cargo nextest run -p fabro-workflow`\n- `cargo nextest run -p fabro-store`\n- `cargo nextest run -p fabro-server get_run_stage_context_window`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun run test`\n- Final search: `agent\\.context_window\\.snapshot|AgentContextWindowSnapshot|ContextWindowSnapshot` — no matches.\n\nNote:\n- I pinned the API client `generate` script to `@openapitools/openapi-generator-cli@2.20.2` because current `bunx` was resolving the unpinned command to an incompatible latest wrapper in this environment.",
           "graph.goal": "# Fold Context Window Into Agent Messages Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Remove the chatty `agent.context_window.snapshot` event and persist context-window data through existing `agent.message` events.\n\n**Architecture:** Compute the context-window breakdown locally while the agent still has the exact request, attach the final content-free projection to the next `agent.message`, and let the run projection reducer store that latest projection for `GET /runs/{id}/stages/{stageId}/context-window`. Do not call provider token-count APIs during normal execution.\n\n**Tech Stack:** Rust, Serde, Fabro agent/session events, Fabro workflow event conversion, Fabro store projections, OpenAPI/progenitor, generated TypeScript client, React/SWR.\n\n---\n\n## Scope And Decisions\n\n- Remove `agent.context_window.snapshot` completely from new code. This is a greenfield/no-prod app, so do not preserve backward-compatible deserialization or frontend handling for old snapshot events.\n- Keep `StageContextWindowProjection`, `StageContextWindow`, `StageProjection.context_window`, and the existing context-window GET endpoint.\n- Add optional `context_window` data to `agent.message` properties.\n- Normal execution uses only local estimates and token usage returned by normal LLM responses.\n- Do not call `Client::count_input_tokens` from `fabro-agent::Session`.\n- The GET endpoint remains projection-backed for this pass. It must not require an in-memory session and must not trigger provider token-count API calls.\n- Failed-before-response turns do not persist context-window data.\n- Live pre-response context-window updates are not required. The UI updates after `agent.message`.\n\n## File Map\n\n- Modify `lib/crates/fabro-types/src/run_event/agent.rs`\n  - Add `context_window: Option<StageContextWindowProjection>` to `AgentMessageProps`.\n  - Remove `AgentContextWindowSnapshotProps`.\n- Modify `lib/crates/fabro-types/src/run_event/mod.rs`\n  - Remove the `AgentContextWindowSnapshot` event variant, name mapping, known-event entry, and serde tests.\n  - Update `agent.message` serde tests to cover optional context-window data.\n- Modify `lib/crates/fabro-agent/src/types.rs`\n  - Remove `AgentEvent::ContextWindowSnapshot`.\n  - Add `context_window: Option<StageContextWindowProjection>` to `AgentEvent::AssistantMessage`.\n- Modify `lib/crates/fabro-agent/src/session.rs`\n  - Remove async provider-count task and response-usage snapshot event emission.\n  - Keep local context-window snapshot construction at request-build time.\n  - Attach the scaled or local projection to `AssistantMessage`.\n- Keep `lib/crates/fabro-agent/src/context_window.rs`\n  - Reuse `build_local_snapshot` and `scaled_snapshot`.\n  - Remove only tests or helpers that exist solely for provider-count snapshot emission.\n- Modify `lib/crates/fabro-workflow/src/event/convert.rs`\n  - Remove conversion for `AgentEvent::ContextWindowSnapshot`.\n  - Copy `context_window` from `AgentEvent::AssistantMessage` into `AgentMessageProps`.\n- Modify `lib/crates/fabro-workflow/src/event/names.rs`\n  - Remove the snapshot event name.\n- Modify `lib/crates/fabro-store/src/run_state.rs`\n  - Remove reducer support for `EventBody::AgentContextWindowSnapshot`.\n  - When reducing `EventBody::AgentMessage`, copy `props.context_window` into `stage.context_window` when present and stamp `event_seq`.\n- Modify `lib/crates/fabro-server/src/server/tests.rs`\n  - Seed context-window endpoint tests with `agent.message` events that include context-window data.\n- Modify `docs/public/api-reference/fabro-api.yaml`\n  - Add optional `context_window` to `AgentMessageProps`.\n  - Remove the snapshot event schema/variant.\n- Regenerate/update `lib/packages/fabro-api-client/src`.\n- Modify `apps/fabro-web/app/lib/run-events.ts` and tests\n  - Remove special handling for `agent.context_window.snapshot`.\n  - Rely on existing `agent.message` invalidation for stage events and context-window data.\n\n## Implementation Steps\n\n### Task 1: Move The Event Contract Onto `agent.message`\n\n- [ ] Add optional `context_window` to Rust `AgentMessageProps`.\n- [ ] Remove `AgentContextWindowSnapshotProps` and the `agent.context_window.snapshot` `EventBody` variant.\n- [ ] Update run-event serde tests so `agent.message` round-trips with and without `context_window`.\n- [ ] Remove tests whose only assertion is that `agent.context_window.snapshot` is known or serializes.\n\n### Task 2: Stop Emitting Snapshot Events\n\n- [ ] Remove `AgentEvent::ContextWindowSnapshot` and its trace/debug handling.\n- [ ] Change `AgentEvent::AssistantMessage` to carry `context_window: Option<StageContextWindowProjection>`.\n- [ ] In `Session::run_single_input`, keep the local context-window snapshot returned from request construction.\n- [ ] Delete the spawned `count_input_tokens(... PreferProvider)` task and its fingerprint suppression state.\n- [ ] After the normal LLM response arrives, compute:\n  - `ResponseUsageScaledBreakdown` when response input/cache usage is positive.\n  - `LocalEstimate` when response usage has no usable input tokens.\n- [ ] Attach that projection to the emitted `AssistantMessage`.\n\n### Task 3: Update Workflow Conversion And Store Projection\n\n- [ ] Remove snapshot event name/conversion branches.\n- [ ] Include `context_window` when converting `AgentEvent::AssistantMessage` to `EventBody::AgentMessage`.\n- [ ] In the store reducer, update `stage.context_window` from `AgentMessageProps.context_window`.\n- [ ] Stamp the copied projection with the `agent.message` event sequence.\n- [ ] Replace store tests for snapshot replacement with message-carried context-window tests.\n\n### Task 4: Keep The GET Endpoint Projection-Backed\n\n- [ ] Keep the endpoint route and response type unchanged.\n- [ ] Keep existing `not_agent_stage`, `not_observed`, and terminal `stored` behavior.\n- [ ] Update endpoint tests to seed context-window data via `agent.message`.\n- [ ] Do not add endpoint-time provider token-count calls.\n\n### Task 5: Remove Frontend And API Trace\n\n- [ ] Remove frontend constants/tests for `agent.context_window.snapshot`.\n- [ ] Ensure `agent.message` still invalidates `stageContextWindow` through existing stage activity handling.\n- [ ] Update OpenAPI and regenerated TypeScript client so no snapshot event model remains.\n- [ ] Run a final search for `agent.context_window.snapshot`, `AgentContextWindowSnapshot`, and `ContextWindowSnapshot`; only historical docs or this plan may remain.\n\n## Test Plan\n\n- Run `cargo build -p fabro-api` after OpenAPI/Rust type changes.\n- Run targeted Rust tests:\n  - `cargo nextest run -p fabro-agent`\n  - `cargo nextest run -p fabro-workflow`\n  - `cargo nextest run -p fabro-store`\n  - `cargo nextest run -p fabro-server get_run_stage_context_window`\n  - `cargo nextest run -p fabro-types agent_message`\n- Regenerate TypeScript client with `cd lib/packages/fabro-api-client && bun run generate`.\n- Run web checks:\n  - `cd apps/fabro-web && bun test`\n  - `cd apps/fabro-web && bun run typecheck`\n  - `cd lib/packages/fabro-api-client && bun run typecheck`\n- Run final targeted searches:\n  - `rg -n \"agent\\\\.context_window\\\\.snapshot|AgentContextWindowSnapshot|ContextWindowSnapshot\" lib/crates apps/fabro-web lib/packages docs/public/api-reference/fabro-api.yaml`\n  - Expected: no implementation/API/frontend matches.\n\n## Acceptance Criteria\n\n- Normal agent runs do not emit `agent.context_window.snapshot`.\n- Normal agent runs do not call provider token-count endpoints for context-window reporting.\n- `agent.message` includes context-window data when the agent produced a response.\n- `GET /runs/{id}/stages/{stageId}/context-window` still returns the latest context-window projection.\n- The event log contains no standalone context-window snapshot events.\n- Public API/client/types no longer expose `agent.context_window.snapshot`.\n",
           "graph.rankdir": "LR",
-          "internal.thread_id": "preflight_compile",
-          "current_node": "preflight_lint",
+          "internal.thread_id": "preflight_lint",
+          "current_node": "implement",
           "outcome": "succeeded",
           "thread.preflight_compile.current_node": "preflight_lint",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "failure_signature": "",
+          "thread.preflight_lint.current_node": "implement",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "last_response": "Implemented the plan end-to-end.\n\nSummary:\n- Removed standalone `agent.context_window.snapshot` event from Rust event contracts, workflow conversion, event names, store reducer, frontend invalidation,",
           "failure_class": "",
+          "internal.retry_count.implement": 0,
           "internal.retry_count.toolchain": 0,
           "internal.fidelity": "compact",
           "thread.toolchain.current_node": "preflight_compile",
@@ -692,9 +778,40 @@
           "internal.retry_count.preflight_compile": 0,
           "internal.retry_count.preflight_lint": 0,
           "internal.retry_count.start": 0,
-          "thread.start.current_node": "toolchain"
+          "thread.start.current_node": "toolchain",
+          "last_stage": "implement"
         },
         "node_outcomes": {
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.implement": "Implemented the plan end-to-end.\n\nSummary:\n- Removed standalone `agent.context_window.snapshot` event from Rust event contracts, workflow conversion, event names, store reducer, frontend invalidation, OpenAPI/API client surface.\n- Added optional `context_window` to `agent.message`:\n  - `fabro-types::AgentMessageProps`\n  - `fabro-agent::AgentEvent::AssistantMessage`\n  - workflow conversion into `EventBody::AgentMessage`\n- Updated `Session::run_single_input` so context-window projection is computed locally from the exact request and attached only after a successful assistant response.\n- Removed normal-execution provider token-count API calls from `fabro-agent::Session`.\n- Updated store projection to persist latest `AgentMessageProps.context_window` and stamp `event_seq`.\n- Kept the context-window GET endpoint projection-backed and updated endpoint tests to seed data via `agent.message`.\n- Regenerated the TS API client and added generated `AgentMessageProps`.\n- Removed frontend snapshot event handling/tests; `agent.message` continues to invalidate stage context-window queries via stage activity handling.\n- Used red/green TDD: first added a failing `fabro-agent` test proving standalone snapshot events were still emitted, then implemented until green.\n- Used subagent-driven development for read-only investigation of Rust/API/frontend surfaces.\n\nValidation run:\n- `cargo build -p fabro-api`\n- `cargo nextest run -p fabro-types agent_message`\n- `cargo nextest run -p fabro-agent`\n- `cargo nextest run -p fabro-workflow`\n- `cargo nextest run -p fabro-store`\n- `cargo nextest run -p fabro-server get_run_stage_context_window`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun run test`\n- Final search: `agent\\.context_window\\.snapshot|AgentContextWindowSnapshot|ContextWindowSnapshot` — no matches.\n\nNote:\n- I pinned the API client `generate` script to `@openapitools/openapi-generator-cli@2.20.2` because current `bunx` was resolving the unpinned command to an incompatible latest wrapper in this environment.",
+              "last_stage": "implement",
+              "last_response": "Implemented the plan end-to-end.\n\nSummary:\n- Removed standalone `agent.context_window.snapshot` event from Rust event contracts, workflow conversion, event names, store reducer, frontend invalidation,"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 6519068,
+                    "output_tokens": 22077,
+                    "reasoning_tokens": 11268,
+                    "cache_read_tokens": 22441472,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 44816426
+            }
+          },
           "preflight_compile": {
             "status": "succeeded",
             "context_updates": {
@@ -724,8 +841,9 @@
             "usage": null
           }
         },
-        "next_node_id": "implement",
+        "next_node_id": "simplify_opus",
         "node_visits": {
+          "implement": 1,
           "start": 1,
           "preflight_compile": 1,
           "toolchain": 1,
@@ -759,7 +877,12 @@
       "first_event_seq": 42,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T17:30:35.655485Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -767,11 +890,27 @@
         "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 136967,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-24T17:28:18.679351Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 136972,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -780,7 +919,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_compile@1": {
       "first_event_seq": 32,
@@ -829,6 +968,136 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "implement@1": {
+      "first_event_seq": 52,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-24T17:30:39.152621Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 6727226,
+        "output_tokens": 24101,
+        "total_tokens": 29240073,
+        "reasoning_tokens": 11946,
+        "cache_read_tokens": 22476800,
+        "cache_write_tokens": 0
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:86b85820-0f1b-49a2-8d04-b9472488e2a5",
+        "items": [
+          {
+            "id": "268791fe070b5295",
+            "status": "completed",
+            "order": 0,
+            "subject": "Inspect current event, session, projection, OpenAPI, and frontend implementations"
+          },
+          {
+            "id": "06a5dd2db5da3e74",
+            "status": "completed",
+            "order": 1,
+            "subject": "Add/update focused tests to expect context_window on agent.message and no snapshot event"
+          },
+          {
+            "id": "e44db3303ca5f0fb",
+            "status": "completed",
+            "order": 2,
+            "subject": "Implement Rust event/session/workflow/store/server changes"
+          },
+          {
+            "id": "e30bc9b20f930274",
+            "status": "completed",
+            "order": 3,
+            "subject": "Update OpenAPI, regenerate TypeScript client, and remove frontend snapshot handling"
+          },
+          {
+            "id": "b7e21b4863d2924b",
+            "status": "completed",
+            "order": 4,
+            "subject": "Run targeted Rust/web/API tests and final searches"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "4425ae1b",
+          "depth": 1,
+          "task": "Read-only investigation for task: remove agent.context_window.snapshot and move context_window onto agent.message. Inspect Rust crates fabro-types, fabro-agent, fabro-workflow, fabro-store, fabro-server tests. Do not edit files. Report concrete files/functions/tests to update and any pitfalls. Also note commands for targeted tests.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 21
+          }
+        },
+        {
+          "agent_id": "d9c09b4b",
+          "depth": 1,
+          "task": "Read-only investigation for task: remove agent.context_window.snapshot from OpenAPI/generated TS/frontend and rely on agent.message context_window. Inspect docs/public/api-reference/fabro-api.yaml, lib/packages/fabro-api-client/src, apps/fabro-web app/lib tests. Do not edit files. Report exact schemas/tests/constants to update and regeneration commands/pitfalls.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 21
+          }
+        }
+      ],
+      "permission_level": "full",
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 1050000,
+        "input_tokens": 263840,
+        "usage_percent": 25.12761904761905,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-24T18:01:18.824627Z",
+        "event_seq": 1509,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 942,
+            "usage_percent": 0.08971428571428572
+          },
+          {
+            "category": "tools",
+            "tokens": 1349,
+            "usage_percent": 0.12847619047619047
+          },
+          {
+            "category": "memory",
+            "tokens": 3156,
+            "usage_percent": 0.30057142857142854
+          },
+          {
+            "category": "conversation",
+            "tokens": 258386,
+            "usage_percent": 24.608190476190476
+          },
+          {
+            "category": "other",
+            "tokens": 7,
+            "usage_percent": 0.0006666666666666666
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
     },
     "start@1": {
       "first_event_seq": 18,
