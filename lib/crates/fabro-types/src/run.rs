@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::AutomationRef;
 use crate::WorkflowSettings;
 use crate::graph::Graph;
 use crate::principal::Principal;
@@ -90,6 +91,8 @@ pub struct RunSpec {
     pub source_directory: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels:           HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation:       Option<AutomationRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance:       Option<RunProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

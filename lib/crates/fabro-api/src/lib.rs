@@ -14,6 +14,11 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/codegen.rs"));
 }
 pub mod types {
+    pub use fabro_automation::{
+        ApiTrigger as AutomationApiTrigger, Automation, AutomationDraft as CreateAutomationRequest,
+        AutomationPatch as PatchAutomationRequest, AutomationReplace as ReplaceAutomationRequest,
+        AutomationTarget, AutomationTrigger, ScheduleTrigger as AutomationScheduleTrigger,
+    };
     pub use fabro_model::{
         Model, ModelCosts, ModelFeatures, ModelLimits, ModelRef as BillingModelRef, ModelTestMode,
         Provider, ReasoningEffort, ReasoningEffortFeature, Speed as BillingSpeed,

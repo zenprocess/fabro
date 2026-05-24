@@ -638,6 +638,7 @@ mod tests {
                     push_outcome: PreRunPushOutcome::NotAttempted,
                 }),
                 labels:           HashMap::new(),
+                automation:       None,
                 provenance:       None,
                 manifest_blob:    None,
                 definition_blob:  None,

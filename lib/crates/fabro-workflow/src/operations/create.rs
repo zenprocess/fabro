@@ -13,7 +13,7 @@ use fabro_graphviz::graph::{AttrValue, Graph};
 use fabro_model::{Catalog, ProviderId};
 use fabro_store::Database;
 use fabro_types::{
-    ForkSourceRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
+    AutomationRef, ForkSourceRef, GitContext, ManifestPath, RunId, RunProvenance, WorkflowSettings,
 };
 use fabro_util::json::normalize_json_value;
 use tokio::task::spawn_blocking;
@@ -44,6 +44,7 @@ pub struct CreateRunInput {
     pub git: Option<GitContext>,
     pub fork_source_ref: Option<ForkSourceRef>,
     pub parent_id: Option<RunId>,
+    pub automation: Option<AutomationRef>,
     pub provenance: Option<RunProvenance>,
     pub configured_providers: Vec<ProviderId>,
     /// Public URL where this run can be viewed in the web UI, when the server
@@ -70,6 +71,7 @@ struct PersistCreateOptions {
     source_directory:     Option<String>,
     git:                  Option<GitContext>,
     fork_source_ref:      Option<ForkSourceRef>,
+    automation:           Option<AutomationRef>,
     provenance:           Option<RunProvenance>,
     configured_providers: Vec<ProviderId>,
     catalog:              Arc<Catalog>,
@@ -105,6 +107,7 @@ pub async fn create(
         git,
         fork_source_ref,
         parent_id,
+        automation,
         provenance,
         configured_providers,
         web_url,
@@ -146,6 +149,7 @@ pub async fn create(
                 source_directory,
                 git,
                 fork_source_ref,
+                automation,
                 provenance,
                 configured_providers,
                 catalog,
@@ -245,6 +249,7 @@ async fn persist_created_run(
             manifest_blob,
             git: record.git.clone(),
             fork_source_ref: record.fork_source_ref.clone(),
+            automation: record.automation.clone(),
             retried_from: None,
             parent_id,
             web_url,
@@ -358,6 +363,7 @@ fn persist_validated(
         source_directory,
         git,
         fork_source_ref,
+        automation,
         provenance,
         configured_providers,
         catalog,
@@ -386,6 +392,7 @@ fn persist_validated(
         definition_blob: None,
         git,
         fork_source_ref,
+        automation,
     };
 
     pipeline::persist(validated, PersistOptions { run_dir, run_spec })
@@ -1099,6 +1106,7 @@ mod tests {
                 git: None,
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1166,6 +1174,7 @@ mod tests {
                 }),
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1277,6 +1286,7 @@ mod tests {
                 git: None,
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1322,6 +1332,7 @@ mod tests {
                 }),
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1389,6 +1400,7 @@ mod tests {
                 git: None,
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1435,6 +1447,7 @@ mod tests {
                 git: None,
                 fork_source_ref: None,
                 parent_id: None,
+                automation: None,
                 provenance: Some(fabro_types::RunProvenance {
                     server:  Some(fabro_types::RunServerProvenance {
                         version: "0.9.0".to_string(),

@@ -55,6 +55,7 @@ pub async fn retry_run(
         definition_blob,
         git,
         fork_source_ref,
+        automation,
     } = source.spec;
 
     let settings = serde_json::to_value(&settings).map_err(|err| Error::engine(err.to_string()))?;
@@ -81,6 +82,7 @@ pub async fn retry_run(
         manifest_blob,
         git,
         fork_source_ref,
+        automation,
         retried_from: Some(source_run_id),
         parent_id,
         web_url: input.web_url.clone(),
@@ -196,6 +198,7 @@ mod tests {
             manifest_blob,
             git: Some(git_context()),
             fork_source_ref,
+            automation: None,
             retried_from: None,
             parent_id: None,
             web_url: None,

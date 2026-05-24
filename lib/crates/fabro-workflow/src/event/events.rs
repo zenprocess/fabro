@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use ::fabro_types::{
-    BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary, FailureReason,
+    AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary, FailureReason,
     ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind, PairTarget,
     ParallelBranchId, PendingReason, PermissionLevel, Principal, PullRequestLink, RunBlobId,
     RunFailure, RunId, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunProvenance,
@@ -47,6 +47,8 @@ pub enum Event {
         git:              Option<GitContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_source_ref:  Option<ForkSourceRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        automation:       Option<AutomationRef>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retried_from:     Option<RunId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

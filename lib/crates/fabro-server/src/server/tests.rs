@@ -127,6 +127,18 @@ methods = ["dev-token"]
     )
 }
 
+#[tokio::test]
+async fn automations_store_starts_empty_when_directory_is_absent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let active_config_path = temp.path().join("settings.toml");
+
+    let state = TestAppStateBuilder::new()
+        .active_config_path(active_config_path)
+        .build();
+
+    assert!(state.automation_store().list().await.is_empty());
+}
+
 async fn body_json(body: Body) -> serde_json::Value {
     let bytes = to_bytes(body, usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -3149,6 +3161,7 @@ async fn append_default_run_created(run_store: &fabro_store::RunDatabase, run_id
         manifest_blob: None,
         git: None,
         fork_source_ref: None,
+        automation: None,
         retried_from: None,
         parent_id: None,
         web_url: None,
@@ -3194,6 +3207,7 @@ async fn create_slack_notification_run(
         manifest_blob: None,
         git: None,
         fork_source_ref: None,
+        automation: None,
         retried_from: None,
         parent_id: None,
         web_url: None,
@@ -4199,6 +4213,7 @@ async fn list_run_stages_distinguishes_visits() {
             manifest_blob: None,
             git: None,
             fork_source_ref: None,
+            automation: None,
             retried_from: None,
             parent_id: None,
             web_url: None,
@@ -5183,6 +5198,7 @@ async fn create_completed_run_ready_for_pull_request(
         source_directory: Some("/tmp/project".to_string()),
         git: git.clone(),
         labels: HashMap::new(),
+        automation: None,
         provenance: None,
         manifest_blob: None,
         definition_blob: None,
@@ -5206,6 +5222,7 @@ async fn create_completed_run_ready_for_pull_request(
             manifest_blob: None,
             git,
             fork_source_ref: None,
+            automation: None,
             retried_from: None,
             parent_id: None,
             web_url: None,
@@ -10837,6 +10854,7 @@ async fn create_preserved_local_sandbox_run(state: &Arc<AppState>, run_id: RunId
             manifest_blob: None,
             git: None,
             fork_source_ref: None,
+            automation: None,
             retried_from: None,
             parent_id: None,
             web_url: None,
@@ -11586,6 +11604,7 @@ async fn delete_run_retry_after_missing_provider_resource_removes_metadata() {
             manifest_blob: None,
             git: None,
             fork_source_ref: None,
+            automation: None,
             retried_from: None,
             parent_id: None,
             web_url: None,

@@ -130,6 +130,7 @@ fn run_spec_json() -> serde_json::Value {
         workflow_slug:    None,
         source_directory: None,
         labels:           std::collections::HashMap::new(),
+        automation:       None,
         provenance:       None,
         manifest_blob:    None,
         definition_blob:  None,

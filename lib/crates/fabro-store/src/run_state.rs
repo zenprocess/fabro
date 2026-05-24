@@ -781,6 +781,7 @@ fn projection_from_created(event: &EventEnvelope) -> Result<RunProjection> {
         workflow_slug: props.workflow_slug.clone(),
         source_directory: props.source_directory.clone(),
         labels,
+        automation: props.automation.clone(),
         provenance: props.provenance.clone(),
         manifest_blob: props.manifest_blob,
         definition_blob: None,
@@ -937,7 +938,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
             edge_count: i64::try_from(state.spec.graph.edges.len())
                 .expect("graph edge count should fit in i64"),
         },
-        automation: None,
+        automation: state.spec.automation.clone(),
         repository: Some(RepositoryRef::from_origin_and_source(
             repo_origin_url,
             source_directory.as_deref(),
@@ -1248,7 +1249,7 @@ mod tests {
         StagePromptProps, StageRetryingProps, StageStartedProps,
     };
     use fabro_types::{
-        AgentBackend, BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint,
+        AgentBackend, AutomationRef, BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint,
         CheckpointRecord, CommandTermination, EventBody, FailureCategory, FailureDetail,
         FailureReason, Graph, McpServerStatus, Outcome, PendingReason, PermissionLevel,
         PullRequestLink, QuestionType, ReasoningEffort, RunApprovalState, RunBlobId,
@@ -1337,6 +1338,7 @@ mod tests {
             workflow_slug:    None,
             source_directory: None,
             labels:           HashMap::new(),
+            automation:       None,
             provenance:       None,
             manifest_blob:    None,
             definition_blob:  None,
@@ -1391,6 +1393,38 @@ mod tests {
         assert_eq!(
             build_summary(&projection, &fixtures::RUN_1).retried_from,
             None
+        );
+    }
+
+    #[test]
+    fn run_created_automation_projects_into_summary() {
+        let event = test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "settings": WorkflowSettings::default(),
+                "graph": Graph::new("test"),
+                "labels": {},
+                "automation": {
+                    "id": "nightly-deps",
+                    "name": "Nightly dependency update",
+                    "trigger_id": "api"
+                },
+                "run_dir": "/tmp/run"
+            }),
+            None,
+        );
+
+        let projection = RunProjection::apply_events(&[event]).unwrap();
+        let expected = Some(AutomationRef {
+            id:         "nightly-deps".to_string(),
+            name:       Some("Nightly dependency update".to_string()),
+            trigger_id: Some("api".to_string()),
+        });
+        assert_eq!(projection.spec.automation, expected);
+        assert_eq!(
+            build_summary(&projection, &fixtures::RUN_1).automation,
+            expected
         );
     }
 
@@ -2606,6 +2640,7 @@ mod tests {
             source_directory: Some("/tmp/repo".to_string()),
             git:              None,
             labels:           HashMap::new(),
+            automation:       None,
             provenance:       None,
             manifest_blob:    None,
             definition_blob:  None,
@@ -2631,6 +2666,7 @@ mod tests {
             source_directory: Some("/tmp/repo".to_string()),
             git:              None,
             labels:           HashMap::new(),
+            automation:       None,
             provenance:       None,
             manifest_blob:    None,
             definition_blob:  None,

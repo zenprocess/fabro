@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use super::{ApiError, AppState, IntoResponse, Response, StatusCode, demo};
 
 mod artifacts;
+mod automations;
 mod billing;
 mod completions;
 pub(in crate::server) mod events;
@@ -148,6 +149,7 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .route("/insights/execute", post(not_implemented))
         .route("/insights/history", get(not_implemented))
         .merge(runs::routes())
+        .merge(automations::routes())
         .merge(events::routes())
         .merge(billing::routes())
         .merge(pull_requests::routes())

@@ -541,6 +541,7 @@ mod tests {
             workflow_slug: Some("night-sky".to_string()),
             source_directory: Some(format!("/tmp/{label}")),
             labels: std::collections::HashMap::from([("team".to_string(), "infra".to_string())]),
+            automation: None,
             provenance: None,
             manifest_blob: None,
             definition_blob: None,

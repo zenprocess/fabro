@@ -863,6 +863,7 @@ mod tests {
                     push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
                 }),
                 labels: HashMap::new(),
+                automation: None,
                 provenance: None,
                 manifest_blob: None,
                 definition_blob: None,

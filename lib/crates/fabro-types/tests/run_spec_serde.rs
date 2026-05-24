@@ -22,6 +22,7 @@ fn run_spec_round_trips_templated_settings() {
         workflow_slug:    Some("demo".to_string()),
         source_directory: Some("/Users/client/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
+        automation:       None,
         provenance:       None,
         manifest_blob:    None,
         definition_blob:  None,

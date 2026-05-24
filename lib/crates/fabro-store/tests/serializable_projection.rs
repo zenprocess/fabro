@@ -21,6 +21,7 @@ fn sample_run_spec() -> RunSpec {
         workflow_slug:    Some("demo".to_string()),
         source_directory: Some("/tmp/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
+        automation:       None,
         provenance:       None,
         manifest_blob:    None,
         definition_blob:  None,

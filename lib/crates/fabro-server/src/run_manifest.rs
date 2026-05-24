@@ -216,6 +216,7 @@ pub(crate) fn create_run_input(
         git: prepared.git,
         fork_source_ref: None,
         parent_id: prepared.parent_id,
+        automation: None,
         provenance: None,
         configured_providers,
         web_url,

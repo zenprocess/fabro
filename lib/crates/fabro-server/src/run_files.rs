@@ -2374,6 +2374,7 @@ index 1111111..2222222 160000
                 workflow_slug:    None,
                 source_directory: None,
                 labels:           HashMap::default(),
+                automation:       None,
                 provenance:       None,
                 manifest_blob:    None,
                 definition_blob:  None,

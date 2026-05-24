@@ -45,6 +45,7 @@ pub use fabro_api::types::{
     SystemRunCounts, TimelineEntryResponse, VncPreviewResponse, WriteBlobResponse,
 };
 use fabro_auth::{CredentialSource, VaultCredentialSource, auth_issue_message};
+use fabro_automation::AutomationStore;
 #[cfg(test)]
 use fabro_config::RunSettingsBuilder;
 use fabro_config::daemon::ServerDaemon;
@@ -933,6 +934,7 @@ pub struct AppState {
     runs: Mutex<HashMap<RunId, ManagedRun>>,
     aggregate_billing: Mutex<BillingAccumulator>,
     store: Arc<Database>,
+    automation_store: Arc<AutomationStore>,
     session_runtimes: SessionRuntimeManager,
     artifact_store: ArtifactStore,
     worker_tokens: WorkerTokenKeys,
@@ -1261,6 +1263,10 @@ impl AppState {
     /// without cross-module state coupling on the `AppState` field layout.
     pub(crate) fn store_ref(&self) -> &Arc<Database> {
         &self.store
+    }
+
+    pub(crate) fn automation_store(&self) -> Arc<AutomationStore> {
+        Arc::clone(&self.automation_store)
     }
 
     pub(crate) fn session_runtimes(&self) -> &SessionRuntimeManager {
@@ -2154,10 +2160,19 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     };
     let worker_tokens = worker_token_keys_from_server_secrets(&server_secrets)?;
     let github_api_base_url = github_api_base_url.unwrap_or_else(fabro_github::github_api_base_url);
+    let automation_dir = active_config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("automations");
+    let automation_store = Arc::new(
+        AutomationStore::load_blocking(automation_dir.clone())
+            .with_context(|| format!("load automation store {}", automation_dir.display()))?,
+    );
     Ok(Arc::new(AppState {
         runs: Mutex::new(HashMap::new()),
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         store,
+        automation_store,
         session_runtimes: SessionRuntimeManager::new(),
         artifact_store,
         worker_tokens,

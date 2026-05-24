@@ -573,6 +573,7 @@ mod stage_events_tests {
             manifest_blob:    None,
             git:              None,
             fork_source_ref:  None,
+            automation:       None,
             retried_from:     None,
             parent_id:        None,
             web_url:          None,

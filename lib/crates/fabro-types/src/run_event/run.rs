@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::{BilledTokenCounts, ExecOutputTail, RunNoticeLevel};
 use crate::status::{BlockedReason, PendingReason, SuccessReason};
 use crate::{
-    DiffSummary, ForkSourceRef, GitContext, Graph, PairId, PairTarget, RunBlobId, RunControlAction,
-    RunFailure, RunId, RunProvenance, RunTiming, WorkflowSettings,
+    AutomationRef, DiffSummary, ForkSourceRef, GitContext, Graph, PairId, PairTarget, RunBlobId,
+    RunControlAction, RunFailure, RunId, RunProvenance, RunTiming, WorkflowSettings,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +21,8 @@ pub struct RunCreatedProps {
     pub workflow_config:  Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels:           BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation:       Option<AutomationRef>,
     pub run_dir:          String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_directory: Option<String>,
