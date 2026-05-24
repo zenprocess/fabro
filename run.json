@@ -492,7 +492,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-24T15:40:28.469766Z",
-  "last_event_at": "2026-05-24T15:46:00.151978Z",
+  "last_event_at": "2026-05-24T15:49:49.707679Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -876,9 +876,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 116,
       "checkpoint": {
-        "timestamp": "2026-05-24T15:46:18.097673Z",
+        "timestamp": "2026-05-24T15:46:21.752931Z",
         "current_node": "preflight_lint",
         "completed_nodes": [
           "start",
@@ -890,42 +890,34 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.retry_count.start": 0,
-          "graph.goal": "---\ntitle: fix: Prefer root stage TODO projection\ntype: fix\nstatus: active\ndate: 2026-05-24\n---\n\n# fix: Prefer Root Stage TODO Projection\n\n## Overview\n\nFix stage TODO projection so `StageProjection.todos` represents the selected\nstage agent's root session plan. Today a child OpenAI session can emit its own\n`todo.created` events on the same `stage_id`, replacing the root list and\ncausing later root `todo.updated` completions to be ignored. The visible\nsymptom is an agent sidebar showing a stale child TODO list such as `0/3`\ncompleted even though the root stage plan completed.\n\n## Problem Frame\n\nOpenAI `update_plan` lists are scoped per agent session as\n`openai_plan:<session_id>`. A stage may contain both the root agent session and\nchild/subagent sessions. `StageProjection` currently has only one\n`todos: Option<TodoListProjection>`, so the reducer must choose which list is\nthe stage-level list. The stage sidebar is a stage-agent summary, so it should\nshow the root stage session's list rather than whichever session most recently\ncreated todos.\n\n## Requirements Trace\n\n- R1. Root OpenAI plan TODOs must remain the projected `stage.todos` list even\n  when child OpenAI sessions emit TODO events on the same stage.\n- R2. Later root OpenAI `todo.updated` and `todo.deleted` events must continue\n  to apply after child OpenAI TODO events are observed.\n- R3. Child OpenAI TODO lists must not create, replace, or mutate\n  `StageProjection.todos`.\n- R4. Anthropic task projection must remain unchanged because Anthropic task\n  lists are intentionally scoped to the root session and shared across\n  subagents.\n- R5. Do not change public API shapes, generated API types, or frontend\n  rendering code for this fix.\n\n## Scope Boundaries\n\n- Do not add a multi-list TODO projection in this change.\n- Do not expose child/subagent TODO lists in the sidebar in this change.\n- Do not change `TodoListProjection`, `StageProjection`, or OpenAPI schemas.\n- Do not change event serialization, event names, or the agent `update_plan`\n  tool behavior.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- `lib/crates/fabro-agent/src/todo_tools.rs` scopes OpenAI plans by\n  `session_id`, producing `openai_plan:<session_id>`.\n- `lib/crates/fabro-types/src/run_event/mod.rs` already carries\n  `session_id` and `parent_session_id` on event envelopes.\n- `lib/crates/fabro-store/src/run_state.rs` owns the persisted-event reducer\n  that updates `StageProjection.todos` from `todo.created`, `todo.updated`,\n  and `todo.deleted`.\n- The existing `todo_reducer` test module in `run_state.rs` is the right place\n  for focused regression coverage.\n- `apps/fabro-web/app/routes/run-stages.tsx` and\n  `apps/fabro-web/app/components/stage-insights-sidebar.tsx` already render\n  `stage.todos`; no UI change is needed if the projection is corrected.\n\n### Observed Failing Case\n\nFor run `01KSBT48J14ZMK9HQN48SVMG3T`, stage `simplify_gpt@1` had:\n\n- Root list `openai_plan:2f4458b9-1128-4a96-8dfa-bff4b73b9c33`: five root\n  todos, all completed by later `todo.updated` events.\n- Child list `openai_plan:a09b9432-823d-4068-91fa-5c6185578e8e`: three child\n  todos, created with `parent_session_id` set and never updated.\n\nThe child `todo.created` events replaced `stage.todos`, so the sidebar showed\nthe child list as `0/3` even after the root list completed.\n\n## Key Technical Decisions\n\n- Use `parent_session_id` as the root-vs-child signal for OpenAI plan\n  projection. A root stage session has `parent_session_id == None`; child\n  sessions have `parent_session_id != None`.\n- Ignore child OpenAI plan events for `StageProjection.todos`. This preserves\n  the current single-list schema while making the selected list match the\n  stage sidebar's meaning.\n- Keep Anthropic task projection unchanged. Anthropic tasks use\n  `anthropic_tasks:<root_session_id>`, so child-session envelopes should still\n  be allowed to update the shared root task list.\n- Treat legacy OpenAI events without `parent_session_id` as root-compatible for\n  backwards compatibility.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add reducer policy for projectable stage TODO events**\n\n**Goal:** Make the reducer distinguish root OpenAI plan events from child\nOpenAI plan events before mutating `stage.todos`.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Add a small helper near the TODO reducer functions, for example\n  `should_project_stage_todo_event(stored: &RunEvent, list_kind:\n  TodoListKind) -> bool`.\n- Return `false` only when `list_kind == TodoListKind::OpenAiPlan` and\n  `stored.parent_session_id.is_some()`.\n- Return `true` for root OpenAI events and all Anthropic task events.\n- Call this helper in the `EventBody::TodoCreated`,\n  `EventBody::TodoUpdated`, and `EventBody::TodoDeleted` match arms before\n  resolving or mutating the stage projection.\n- Leave `apply_todo_created`, `apply_todo_updated`, and\n  `apply_todo_deleted` focused on list mutation once the caller has decided\n  the event is projectable.\n\n**Test scenarios:**\n- Root OpenAI events with no `parent_session_id` still create and update\n  `stage.todos`.\n- Child OpenAI events with `parent_session_id` do not create `stage.todos`\n  when no root list exists.\n- Child OpenAI events do not replace an existing root OpenAI list.\n- Root OpenAI updates still apply after ignored child OpenAI events.\n\n- [ ] **Unit 2: Add focused reducer regression tests**\n\n**Goal:** Lock the intended root-list behavior so future TODO projection work\ndoes not regress the sidebar.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Extend the existing `todo_reducer` module rather than creating a new test\n  file.\n- Add a test helper or local event setup that sets\n  `event.event.parent_session_id = Some(parent_session_id.to_string())` for\n  child-session events.\n- Add one regression test that reproduces the failing sequence:\n  root OpenAI creates list, child OpenAI creates a different list on the same\n  stage, root OpenAI completes its items. Assert the final projection is the\n  root list and all root statuses are completed.\n- Add one test proving child OpenAI events alone do not create a stage TODO\n  projection.\n- Add one test proving Anthropic child-session task events still project.\n\n**Verification:**\n- `cargo nextest run -p fabro-store todo_reducer`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n\n## System-Wide Impact\n\n- **API compatibility:** No response schema changes. Existing consumers of\n  `StageProjection.todos` continue to receive a single list.\n- **UI behavior:** The sidebar should show the root agent's TODO progress for\n  the selected stage. Child OpenAI session plans remain available only in the\n  raw event stream for now.\n- **Historical runs:** Replaying existing event logs should produce corrected\n  projections because the decision uses envelope fields already persisted on\n  child events.\n- **Future extensibility:** If child/subagent TODO display is needed later,\n  add a multi-list projection separately rather than overloading\n  `stage.todos`.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Some legacy child OpenAI events lack `parent_session_id` and still project as root | Accept this for backwards compatibility; only events with explicit child-session evidence are filtered. |\n| Anthropic child task updates could be accidentally filtered | Gate only `TodoListKind::OpenAiPlan`; add a regression test for `TodoListKind::AnthropicTasks`. |\n| Root list replacement semantics become ambiguous if a root stage emits multiple OpenAI list IDs | Preserve current root replacement behavior; the fix only prevents child lists from replacing root lists. |\n\n## Assumptions\n\n- `parent_session_id == None` is the canonical signal for the root stage agent\n  session in stored event envelopes.\n- Child OpenAI TODO lists are not part of the current stage sidebar contract.\n- The correct near-term fix is projection selection, not a frontend workaround\n  or a schema expansion.\n",
-          "graph.rankdir": "LR",
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "internal.fidelity": "compact",
-          "failure_class": "",
-          "thread.preflight_compile.current_node": "preflight_lint",
-          "outcome": "succeeded",
-          "internal.retry_count.preflight_compile": 0,
-          "internal.retry_count.preflight_lint": 0,
-          "internal.retry_count.fix_lints": 0,
-          "response.fix_lints": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_matches_openapi_shape`: set to `Some(\"ANTHROPIC_API_KEY\".to_string())` to match Anthropic's vault credential, plus a matching `assert_eq!` on the serialized JSON.\n- In `provider_omits_optional_fields_when_absent`: set to `None` with an additional assertion that the field is omitted from the serialized JSON (it's marked `#[serde(skip_serializing_if = \"Option::is_none\")]`).\n\n`cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` now succeeds with exit code 0.",
-          "thread.fix_lints.current_node": "preflight_lint",
-          "internal.run_id": "01KSDA9MC4S975D4KT95FZZXV4",
-          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
-          "internal.node_visit_count": 2,
           "current_node": "preflight_lint",
+          "internal.thread_id": "fix_lints",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "last_response": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_m",
+          "outcome": "succeeded",
+          "thread.fix_lints.current_node": "preflight_lint",
           "failure_signature": "",
+          "graph.goal": "---\ntitle: fix: Prefer root stage TODO projection\ntype: fix\nstatus: active\ndate: 2026-05-24\n---\n\n# fix: Prefer Root Stage TODO Projection\n\n## Overview\n\nFix stage TODO projection so `StageProjection.todos` represents the selected\nstage agent's root session plan. Today a child OpenAI session can emit its own\n`todo.created` events on the same `stage_id`, replacing the root list and\ncausing later root `todo.updated` completions to be ignored. The visible\nsymptom is an agent sidebar showing a stale child TODO list such as `0/3`\ncompleted even though the root stage plan completed.\n\n## Problem Frame\n\nOpenAI `update_plan` lists are scoped per agent session as\n`openai_plan:<session_id>`. A stage may contain both the root agent session and\nchild/subagent sessions. `StageProjection` currently has only one\n`todos: Option<TodoListProjection>`, so the reducer must choose which list is\nthe stage-level list. The stage sidebar is a stage-agent summary, so it should\nshow the root stage session's list rather than whichever session most recently\ncreated todos.\n\n## Requirements Trace\n\n- R1. Root OpenAI plan TODOs must remain the projected `stage.todos` list even\n  when child OpenAI sessions emit TODO events on the same stage.\n- R2. Later root OpenAI `todo.updated` and `todo.deleted` events must continue\n  to apply after child OpenAI TODO events are observed.\n- R3. Child OpenAI TODO lists must not create, replace, or mutate\n  `StageProjection.todos`.\n- R4. Anthropic task projection must remain unchanged because Anthropic task\n  lists are intentionally scoped to the root session and shared across\n  subagents.\n- R5. Do not change public API shapes, generated API types, or frontend\n  rendering code for this fix.\n\n## Scope Boundaries\n\n- Do not add a multi-list TODO projection in this change.\n- Do not expose child/subagent TODO lists in the sidebar in this change.\n- Do not change `TodoListProjection`, `StageProjection`, or OpenAPI schemas.\n- Do not change event serialization, event names, or the agent `update_plan`\n  tool behavior.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- `lib/crates/fabro-agent/src/todo_tools.rs` scopes OpenAI plans by\n  `session_id`, producing `openai_plan:<session_id>`.\n- `lib/crates/fabro-types/src/run_event/mod.rs` already carries\n  `session_id` and `parent_session_id` on event envelopes.\n- `lib/crates/fabro-store/src/run_state.rs` owns the persisted-event reducer\n  that updates `StageProjection.todos` from `todo.created`, `todo.updated`,\n  and `todo.deleted`.\n- The existing `todo_reducer` test module in `run_state.rs` is the right place\n  for focused regression coverage.\n- `apps/fabro-web/app/routes/run-stages.tsx` and\n  `apps/fabro-web/app/components/stage-insights-sidebar.tsx` already render\n  `stage.todos`; no UI change is needed if the projection is corrected.\n\n### Observed Failing Case\n\nFor run `01KSBT48J14ZMK9HQN48SVMG3T`, stage `simplify_gpt@1` had:\n\n- Root list `openai_plan:2f4458b9-1128-4a96-8dfa-bff4b73b9c33`: five root\n  todos, all completed by later `todo.updated` events.\n- Child list `openai_plan:a09b9432-823d-4068-91fa-5c6185578e8e`: three child\n  todos, created with `parent_session_id` set and never updated.\n\nThe child `todo.created` events replaced `stage.todos`, so the sidebar showed\nthe child list as `0/3` even after the root list completed.\n\n## Key Technical Decisions\n\n- Use `parent_session_id` as the root-vs-child signal for OpenAI plan\n  projection. A root stage session has `parent_session_id == None`; child\n  sessions have `parent_session_id != None`.\n- Ignore child OpenAI plan events for `StageProjection.todos`. This preserves\n  the current single-list schema while making the selected list match the\n  stage sidebar's meaning.\n- Keep Anthropic task projection unchanged. Anthropic tasks use\n  `anthropic_tasks:<root_session_id>`, so child-session envelopes should still\n  be allowed to update the shared root task list.\n- Treat legacy OpenAI events without `parent_session_id` as root-compatible for\n  backwards compatibility.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add reducer policy for projectable stage TODO events**\n\n**Goal:** Make the reducer distinguish root OpenAI plan events from child\nOpenAI plan events before mutating `stage.todos`.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Add a small helper near the TODO reducer functions, for example\n  `should_project_stage_todo_event(stored: &RunEvent, list_kind:\n  TodoListKind) -> bool`.\n- Return `false` only when `list_kind == TodoListKind::OpenAiPlan` and\n  `stored.parent_session_id.is_some()`.\n- Return `true` for root OpenAI events and all Anthropic task events.\n- Call this helper in the `EventBody::TodoCreated`,\n  `EventBody::TodoUpdated`, and `EventBody::TodoDeleted` match arms before\n  resolving or mutating the stage projection.\n- Leave `apply_todo_created`, `apply_todo_updated`, and\n  `apply_todo_deleted` focused on list mutation once the caller has decided\n  the event is projectable.\n\n**Test scenarios:**\n- Root OpenAI events with no `parent_session_id` still create and update\n  `stage.todos`.\n- Child OpenAI events with `parent_session_id` do not create `stage.todos`\n  when no root list exists.\n- Child OpenAI events do not replace an existing root OpenAI list.\n- Root OpenAI updates still apply after ignored child OpenAI events.\n\n- [ ] **Unit 2: Add focused reducer regression tests**\n\n**Goal:** Lock the intended root-list behavior so future TODO projection work\ndoes not regress the sidebar.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Extend the existing `todo_reducer` module rather than creating a new test\n  file.\n- Add a test helper or local event setup that sets\n  `event.event.parent_session_id = Some(parent_session_id.to_string())` for\n  child-session events.\n- Add one regression test that reproduces the failing sequence:\n  root OpenAI creates list, child OpenAI creates a different list on the same\n  stage, root OpenAI completes its items. Assert the final projection is the\n  root list and all root statuses are completed.\n- Add one test proving child OpenAI events alone do not create a stage TODO\n  projection.\n- Add one test proving Anthropic child-session task events still project.\n\n**Verification:**\n- `cargo nextest run -p fabro-store todo_reducer`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n\n## System-Wide Impact\n\n- **API compatibility:** No response schema changes. Existing consumers of\n  `StageProjection.todos` continue to receive a single list.\n- **UI behavior:** The sidebar should show the root agent's TODO progress for\n  the selected stage. Child OpenAI session plans remain available only in the\n  raw event stream for now.\n- **Historical runs:** Replaying existing event logs should produce corrected\n  projections because the decision uses envelope fields already persisted on\n  child events.\n- **Future extensibility:** If child/subagent TODO display is needed later,\n  add a multi-list projection separately rather than overloading\n  `stage.todos`.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Some legacy child OpenAI events lack `parent_session_id` and still project as root | Accept this for backwards compatibility; only events with explicit child-session evidence are filtered. |\n| Anthropic child task updates could be accidentally filtered | Gate only `TodoListKind::OpenAiPlan`; add a regression test for `TodoListKind::AnthropicTasks`. |\n| Root list replacement semantics become ambiguous if a root stage emits multiple OpenAI list IDs | Preserve current root replacement behavior; the fix only prevents child lists from replacing root lists. |\n\n## Assumptions\n\n- `parent_session_id == None` is the canonical signal for the root stage agent\n  session in stored event envelopes.\n- Child OpenAI TODO lists are not part of the current stage sidebar contract.\n- The correct near-term fix is projection selection, not a frontend workaround\n  or a schema expansion.\n",
+          "internal.run_id": "01KSDA9MC4S975D4KT95FZZXV4",
+          "response.fix_lints": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_matches_openapi_shape`: set to `Some(\"ANTHROPIC_API_KEY\".to_string())` to match Anthropic's vault credential, plus a matching `assert_eq!` on the serialized JSON.\n- In `provider_omits_optional_fields_when_absent`: set to `None` with an additional assertion that the field is omitted from the serialized JSON (it's marked `#[serde(skip_serializing_if = \"Option::is_none\")]`).\n\n`cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` now succeeds with exit code 0.",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.node_visit_count": 2,
+          "internal.retry_count.preflight_compile": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "thread.start.current_node": "toolchain",
+          "internal.retry_count.preflight_lint": 0,
           "thread.toolchain.current_node": "preflight_compile",
           "internal.retry_count.toolchain": 0,
-          "last_stage": "fix_lints",
           "thread.preflight_lint.current_node": "fix_lints",
-          "last_response": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_m",
-          "internal.thread_id": "fix_lints"
+          "internal.retry_count.start": 0,
+          "internal.retry_count.fix_lints": 0,
+          "graph.rankdir": "LR",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "last_stage": "fix_lints",
+          "failure_class": ""
         },
         "node_outcomes": {
-          "toolchain": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
-            },
-            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-            "usage": null
-          },
           "preflight_compile": {
             "status": "succeeded",
             "context_updates": {
@@ -934,8 +926,12 @@
             "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
           },
-          "start": {
+          "toolchain": {
             "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
             "usage": null
           },
           "preflight_lint": {
@@ -944,6 +940,10 @@
               "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
             },
             "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
             "usage": null
           },
           "fix_lints": {
@@ -983,11 +983,173 @@
           }
         },
         "next_node_id": "implement",
+        "git_commit_sha": "f5244608ad31accbf492c67f5e69a3e4fa97b531",
+        "loop_failure_signatures": {
+          "preflight_lint|deterministic|script failed with exit code: <n> ## output error[e0063]: missing field `expected_secret_name` in initializer of `fabro_model::provider` --> lib/crates/fabro-api/tests/provider_round_trip.rs:<n>:<n> | <n> | let provider = provider { | ^^^^^": 1
+        },
+        "node_visits": {
+          "preflight_lint": 2,
+          "start": 1,
+          "preflight_compile": 1,
+          "fix_lints": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 1,
+          "additions": 24,
+          "deletions": 20
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-24T15:49:49.742941Z",
+        "current_node": "implement",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "fix_lints",
+          "preflight_lint",
+          "implement"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "graph.goal": "---\ntitle: fix: Prefer root stage TODO projection\ntype: fix\nstatus: active\ndate: 2026-05-24\n---\n\n# fix: Prefer Root Stage TODO Projection\n\n## Overview\n\nFix stage TODO projection so `StageProjection.todos` represents the selected\nstage agent's root session plan. Today a child OpenAI session can emit its own\n`todo.created` events on the same `stage_id`, replacing the root list and\ncausing later root `todo.updated` completions to be ignored. The visible\nsymptom is an agent sidebar showing a stale child TODO list such as `0/3`\ncompleted even though the root stage plan completed.\n\n## Problem Frame\n\nOpenAI `update_plan` lists are scoped per agent session as\n`openai_plan:<session_id>`. A stage may contain both the root agent session and\nchild/subagent sessions. `StageProjection` currently has only one\n`todos: Option<TodoListProjection>`, so the reducer must choose which list is\nthe stage-level list. The stage sidebar is a stage-agent summary, so it should\nshow the root stage session's list rather than whichever session most recently\ncreated todos.\n\n## Requirements Trace\n\n- R1. Root OpenAI plan TODOs must remain the projected `stage.todos` list even\n  when child OpenAI sessions emit TODO events on the same stage.\n- R2. Later root OpenAI `todo.updated` and `todo.deleted` events must continue\n  to apply after child OpenAI TODO events are observed.\n- R3. Child OpenAI TODO lists must not create, replace, or mutate\n  `StageProjection.todos`.\n- R4. Anthropic task projection must remain unchanged because Anthropic task\n  lists are intentionally scoped to the root session and shared across\n  subagents.\n- R5. Do not change public API shapes, generated API types, or frontend\n  rendering code for this fix.\n\n## Scope Boundaries\n\n- Do not add a multi-list TODO projection in this change.\n- Do not expose child/subagent TODO lists in the sidebar in this change.\n- Do not change `TodoListProjection`, `StageProjection`, or OpenAPI schemas.\n- Do not change event serialization, event names, or the agent `update_plan`\n  tool behavior.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- `lib/crates/fabro-agent/src/todo_tools.rs` scopes OpenAI plans by\n  `session_id`, producing `openai_plan:<session_id>`.\n- `lib/crates/fabro-types/src/run_event/mod.rs` already carries\n  `session_id` and `parent_session_id` on event envelopes.\n- `lib/crates/fabro-store/src/run_state.rs` owns the persisted-event reducer\n  that updates `StageProjection.todos` from `todo.created`, `todo.updated`,\n  and `todo.deleted`.\n- The existing `todo_reducer` test module in `run_state.rs` is the right place\n  for focused regression coverage.\n- `apps/fabro-web/app/routes/run-stages.tsx` and\n  `apps/fabro-web/app/components/stage-insights-sidebar.tsx` already render\n  `stage.todos`; no UI change is needed if the projection is corrected.\n\n### Observed Failing Case\n\nFor run `01KSBT48J14ZMK9HQN48SVMG3T`, stage `simplify_gpt@1` had:\n\n- Root list `openai_plan:2f4458b9-1128-4a96-8dfa-bff4b73b9c33`: five root\n  todos, all completed by later `todo.updated` events.\n- Child list `openai_plan:a09b9432-823d-4068-91fa-5c6185578e8e`: three child\n  todos, created with `parent_session_id` set and never updated.\n\nThe child `todo.created` events replaced `stage.todos`, so the sidebar showed\nthe child list as `0/3` even after the root list completed.\n\n## Key Technical Decisions\n\n- Use `parent_session_id` as the root-vs-child signal for OpenAI plan\n  projection. A root stage session has `parent_session_id == None`; child\n  sessions have `parent_session_id != None`.\n- Ignore child OpenAI plan events for `StageProjection.todos`. This preserves\n  the current single-list schema while making the selected list match the\n  stage sidebar's meaning.\n- Keep Anthropic task projection unchanged. Anthropic tasks use\n  `anthropic_tasks:<root_session_id>`, so child-session envelopes should still\n  be allowed to update the shared root task list.\n- Treat legacy OpenAI events without `parent_session_id` as root-compatible for\n  backwards compatibility.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add reducer policy for projectable stage TODO events**\n\n**Goal:** Make the reducer distinguish root OpenAI plan events from child\nOpenAI plan events before mutating `stage.todos`.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Add a small helper near the TODO reducer functions, for example\n  `should_project_stage_todo_event(stored: &RunEvent, list_kind:\n  TodoListKind) -> bool`.\n- Return `false` only when `list_kind == TodoListKind::OpenAiPlan` and\n  `stored.parent_session_id.is_some()`.\n- Return `true` for root OpenAI events and all Anthropic task events.\n- Call this helper in the `EventBody::TodoCreated`,\n  `EventBody::TodoUpdated`, and `EventBody::TodoDeleted` match arms before\n  resolving or mutating the stage projection.\n- Leave `apply_todo_created`, `apply_todo_updated`, and\n  `apply_todo_deleted` focused on list mutation once the caller has decided\n  the event is projectable.\n\n**Test scenarios:**\n- Root OpenAI events with no `parent_session_id` still create and update\n  `stage.todos`.\n- Child OpenAI events with `parent_session_id` do not create `stage.todos`\n  when no root list exists.\n- Child OpenAI events do not replace an existing root OpenAI list.\n- Root OpenAI updates still apply after ignored child OpenAI events.\n\n- [ ] **Unit 2: Add focused reducer regression tests**\n\n**Goal:** Lock the intended root-list behavior so future TODO projection work\ndoes not regress the sidebar.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Extend the existing `todo_reducer` module rather than creating a new test\n  file.\n- Add a test helper or local event setup that sets\n  `event.event.parent_session_id = Some(parent_session_id.to_string())` for\n  child-session events.\n- Add one regression test that reproduces the failing sequence:\n  root OpenAI creates list, child OpenAI creates a different list on the same\n  stage, root OpenAI completes its items. Assert the final projection is the\n  root list and all root statuses are completed.\n- Add one test proving child OpenAI events alone do not create a stage TODO\n  projection.\n- Add one test proving Anthropic child-session task events still project.\n\n**Verification:**\n- `cargo nextest run -p fabro-store todo_reducer`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n\n## System-Wide Impact\n\n- **API compatibility:** No response schema changes. Existing consumers of\n  `StageProjection.todos` continue to receive a single list.\n- **UI behavior:** The sidebar should show the root agent's TODO progress for\n  the selected stage. Child OpenAI session plans remain available only in the\n  raw event stream for now.\n- **Historical runs:** Replaying existing event logs should produce corrected\n  projections because the decision uses envelope fields already persisted on\n  child events.\n- **Future extensibility:** If child/subagent TODO display is needed later,\n  add a multi-list projection separately rather than overloading\n  `stage.todos`.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Some legacy child OpenAI events lack `parent_session_id` and still project as root | Accept this for backwards compatibility; only events with explicit child-session evidence are filtered. |\n| Anthropic child task updates could be accidentally filtered | Gate only `TodoListKind::OpenAiPlan`; add a regression test for `TodoListKind::AnthropicTasks`. |\n| Root list replacement semantics become ambiguous if a root stage emits multiple OpenAI list IDs | Preserve current root replacement behavior; the fix only prevents child lists from replacing root lists. |\n\n## Assumptions\n\n- `parent_session_id == None` is the canonical signal for the root stage agent\n  session in stored event envelopes.\n- Child OpenAI TODO lists are not part of the current stage sidebar contract.\n- The correct near-term fix is projection selection, not a frontend workaround\n  or a schema expansion.\n",
+          "graph.rankdir": "LR",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.fidelity": "compact",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.preflight_lint": 0,
+          "response.fix_lints": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_matches_openapi_shape`: set to `Some(\"ANTHROPIC_API_KEY\".to_string())` to match Anthropic's vault credential, plus a matching `assert_eq!` on the serialized JSON.\n- In `provider_omits_optional_fields_when_absent`: set to `None` with an additional assertion that the field is omitted from the serialized JSON (it's marked `#[serde(skip_serializing_if = \"Option::is_none\")]`).\n\n`cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` now succeeds with exit code 0.",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.node_visit_count": 1,
+          "failure_signature": "",
+          "last_response": "Implemented the root-stage TODO projection fix in `lib/crates/fabro-store/src/run_state.rs`.\n\nWhat changed:\n- Added `should_project_stage_todo_event(...)`.\n- The reducer now ignores `TodoCreated`, `To",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.toolchain": 0,
+          "response.implement": "Implemented the root-stage TODO projection fix in `lib/crates/fabro-store/src/run_state.rs`.\n\nWhat changed:\n- Added `should_project_stage_todo_event(...)`.\n- The reducer now ignores `TodoCreated`, `TodoUpdated`, and `TodoDeleted` events when:\n  - `list_kind == TodoListKind::OpenAiPlan`\n  - and `parent_session_id.is_some()`\n- Anthropic task events remain projectable even from child-session envelopes.\n- No API, schema, event serialization, or frontend changes.\n\nAdded focused regression coverage:\n- Root OpenAI plan remains projected after child OpenAI plan events.\n- Child OpenAI plan events alone do not create `stage.todos`.\n- Anthropic child-session task events still project and update.\n\nTDD verification:\n- Red: `cargo nextest run -p fabro-store todo_reducer` failed as expected before the fix.\n- Green:\n  - `cargo nextest run -p fabro-store todo_reducer` ✅\n  - `cargo +nightly-2026-04-14 fmt --check --all` ✅\n\nOnly changed file:\n- `lib/crates/fabro-store/src/run_state.rs`",
+          "internal.thread_id": "preflight_lint",
+          "internal.retry_count.start": 0,
+          "failure_class": "",
+          "thread.fix_lints.current_node": "preflight_lint",
+          "outcome": "succeeded",
+          "internal.retry_count.fix_lints": 0,
+          "internal.run_id": "01KSDA9MC4S975D4KT95FZZXV4",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "current_node": "implement",
+          "last_stage": "implement",
+          "thread.start.current_node": "toolchain",
+          "internal.retry_count.implement": 0,
+          "thread.preflight_lint.current_node": "implement"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.implement": "Implemented the root-stage TODO projection fix in `lib/crates/fabro-store/src/run_state.rs`.\n\nWhat changed:\n- Added `should_project_stage_todo_event(...)`.\n- The reducer now ignores `TodoCreated`, `TodoUpdated`, and `TodoDeleted` events when:\n  - `list_kind == TodoListKind::OpenAiPlan`\n  - and `parent_session_id.is_some()`\n- Anthropic task events remain projectable even from child-session envelopes.\n- No API, schema, event serialization, or frontend changes.\n\nAdded focused regression coverage:\n- Root OpenAI plan remains projected after child OpenAI plan events.\n- Child OpenAI plan events alone do not create `stage.todos`.\n- Anthropic child-session task events still project and update.\n\nTDD verification:\n- Red: `cargo nextest run -p fabro-store todo_reducer` failed as expected before the fix.\n- Green:\n  - `cargo nextest run -p fabro-store todo_reducer` ✅\n  - `cargo +nightly-2026-04-14 fmt --check --all` ✅\n\nOnly changed file:\n- `lib/crates/fabro-store/src/run_state.rs`",
+              "last_stage": "implement",
+              "last_response": "Implemented the root-stage TODO projection fix in `lib/crates/fabro-store/src/run_state.rs`.\n\nWhat changed:\n- Added `should_project_stage_todo_event(...)`.\n- The reducer now ignores `TodoCreated`, `To"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 539217,
+                    "output_tokens": 3852,
+                    "reasoning_tokens": 2109,
+                    "cache_read_tokens": 274944,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 3012387
+            }
+          },
+          "fix_lints": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "fix_lints",
+              "last_response": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_m",
+              "response.fix_lints": "Clippy passes cleanly. The fix:\n\nAdded the missing `expected_secret_name` field to the two `Provider` struct initializers in `lib/crates/fabro-api/tests/provider_round_trip.rs`:\n\n- In `provider_json_matches_openapi_shape`: set to `Some(\"ANTHROPIC_API_KEY\".to_string())` to match Anthropic's vault credential, plus a matching `assert_eq!` on the serialized JSON.\n- In `provider_omits_optional_fields_when_absent`: set to `None` with an additional assertion that the field is omitted from the serialized JSON (it's marked `#[serde(skip_serializing_if = \"Option::is_none\")]`).\n\n`cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` now succeeds with exit code 0."
+            },
+            "notes": "Stage completed: fix_lints",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 10464,
+                    "output_tokens": 2881,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 106015,
+                    "cache_write_tokens": 22210
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 22210,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 316164
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-api/tests/provider_round_trip.rs"
+            ]
+          }
+        },
+        "next_node_id": "simplify_opus",
         "node_visits": {
           "toolchain": 1,
           "start": 1,
           "fix_lints": 1,
           "preflight_lint": 2,
+          "implement": 1,
           "preflight_compile": 1
         }
       },
@@ -1014,6 +1176,115 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "implement@1": {
+      "first_event_seq": 119,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-24T15:46:21.754558Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 539217,
+        "output_tokens": 3852,
+        "total_tokens": 820122,
+        "reasoning_tokens": 2109,
+        "cache_read_tokens": 274944,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 3012387
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:f5689778-6099-4bb4-82d6-91a23fa68e10",
+        "items": [
+          {
+            "id": "6e7cefd020e6ff0e",
+            "status": "completed",
+            "order": 0,
+            "subject": "Inspect existing TODO reducer and test helpers"
+          },
+          {
+            "id": "da2bcaa50eec7ebb",
+            "status": "completed",
+            "order": 1,
+            "subject": "Add regression tests for root-vs-child TODO projection"
+          },
+          {
+            "id": "f2a1629c7cb246f1",
+            "status": "completed",
+            "order": 2,
+            "subject": "Run targeted todo_reducer tests and confirm they fail before the fix"
+          },
+          {
+            "id": "e6329829583cf144",
+            "status": "completed",
+            "order": 3,
+            "subject": "Implement root OpenAI TODO projection policy in reducer"
+          },
+          {
+            "id": "36bebc40b643b983",
+            "status": "completed",
+            "order": 4,
+            "subject": "Run targeted tests and rustfmt check"
+          }
+        ]
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 1050000,
+        "input_tokens": 40356,
+        "usage_percent": 3.8434285714285714,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-24T15:49:49.707439Z",
+        "event_seq": 306,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 919,
+            "usage_percent": 0.08752380952380952
+          },
+          {
+            "category": "tools",
+            "tokens": 1320,
+            "usage_percent": 0.12571428571428572
+          },
+          {
+            "category": "memory",
+            "tokens": 3087,
+            "usage_percent": 0.294
+          },
+          {
+            "category": "conversation",
+            "tokens": 35024,
+            "usage_percent": 3.3356190476190477
+          },
+          {
+            "category": "other",
+            "tokens": 6,
+            "usage_percent": 0.0005714285714285715
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
     "fix_lints@1": {
       "first_event_seq": 52,
       "prompt": null,
@@ -1231,7 +1502,12 @@
       "first_event_seq": 109,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-24T15:46:18.096901Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -1239,11 +1515,27 @@
         "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 17939,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-24T15:46:00.151676Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 17945,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -1252,7 +1544,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "toolchain@1": {
       "first_event_seq": 22,
