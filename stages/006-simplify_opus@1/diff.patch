@@ -1,0 +1,87 @@
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index a764a3556..f19614594 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -15,7 +15,7 @@ use fabro_types::{
+     RunDiff, RunEvent, RunId, RunLifecycle, RunLinks, RunModel, RunOrigin, RunProjection,
+     RunSandbox, RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps, SandboxProvider,
+     StageCompletion, StageHandler, StageId, StageModelUsage, StageOutcome, StageProjection,
+-    StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListProjection,
++    StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
+     TodoProjection, WorkflowRef, first_event_seq,
+ };
+ use fabro_util::error::render_compact_with_causes;
+@@ -482,18 +482,27 @@ impl RunProjectionReducer for RunProjection {
+                 stage.parallel_results = Some(parallel_results);
+             }
+             EventBody::TodoCreated(props) => {
++                if !should_project_stage_todo_event(stored, props.list_kind) {
++                    return Ok(());
++                }
+                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                     return Ok(());
+                 };
+                 apply_todo_created(stage, props);
+             }
+             EventBody::TodoUpdated(props) => {
++                if !should_project_stage_todo_event(stored, props.list_kind) {
++                    return Ok(());
++                }
+                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                     return Ok(());
+                 };
+                 apply_todo_updated(stage, props);
+             }
+             EventBody::TodoDeleted(props) => {
++                if !should_project_stage_todo_event(stored, props.list_kind) {
++                    return Ok(());
++                }
+                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                     return Ok(());
+                 };
+@@ -619,6 +628,18 @@ impl RunProjectionReducer for RunProjection {
+     }
+ }
+ 
++/// Decide whether a TODO event should mutate `StageProjection.todos`.
++///
++/// OpenAI plan lists are scoped per agent session (`openai_plan:<session_id>`),
++/// so a child/subagent session can emit its own list against the same stage.
++/// The stage sidebar reflects the root agent's plan, so we drop OpenAI plan
++/// events that come from child sessions (signaled by `parent_session_id` being
++/// set). Anthropic task lists are shared across sessions on the root list id,
++/// so child-session Anthropic events must still apply.
++fn should_project_stage_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
++    !(list_kind == TodoListKind::OpenAiPlan && stored.parent_session_id.is_some())
++}
++
+ fn apply_todo_created(stage: &mut StageProjection, props: &TodoCreatedProps) {
+     if stage
+         .todos
+@@ -3722,10 +3743,7 @@ mod tests {
+                 .expect("stage todos present")
+         }
+ 
+-        fn child_session_event(
+-            mut event: EventEnvelope,
+-            parent_session_id: &str,
+-        ) -> EventEnvelope {
++        fn child_session_event(mut event: EventEnvelope, parent_session_id: &str) -> EventEnvelope {
+             event.event.parent_session_id = Some(parent_session_id.to_string());
+             event
+         }
+@@ -3860,7 +3878,13 @@ mod tests {
+             state
+                 .apply_event(&test_stage_event(
+                     1,
+-                    created(root_list, TodoListKind::OpenAiPlan, "root-1", 0, "root first"),
++                    created(
++                        root_list,
++                        TodoListKind::OpenAiPlan,
++                        "root-1",
++                        0,
++                        "root first",
++                    ),
+                     stage_id.clone(),
+                 ))
+                 .unwrap();
