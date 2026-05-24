@@ -1,0 +1,516 @@
+{
+  "title": "---",
+  "spec": {
+    "run_id": "01KSD31NTGQGN0KEB7D88MDEFX",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "---\ntitle: fix: Prefer root stage TODO projection\ntype: fix\nstatus: active\ndate: 2026-05-24\n---\n\n# fix: Prefer Root Stage TODO Projection\n\n## Overview\n\nFix stage TODO projection so `StageProjection.todos` represents the selected\nstage agent's root session plan. Today a child OpenAI session can emit its own\n`todo.created` events on the same `stage_id`, replacing the root list and\ncausing later root `todo.updated` completions to be ignored. The visible\nsymptom is an agent sidebar showing a stale child TODO list such as `0/3`\ncompleted even though the root stage plan completed.\n\n## Problem Frame\n\nOpenAI `update_plan` lists are scoped per agent session as\n`openai_plan:<session_id>`. A stage may contain both the root agent session and\nchild/subagent sessions. `StageProjection` currently has only one\n`todos: Option<TodoListProjection>`, so the reducer must choose which list is\nthe stage-level list. The stage sidebar is a stage-agent summary, so it should\nshow the root stage session's list rather than whichever session most recently\ncreated todos.\n\n## Requirements Trace\n\n- R1. Root OpenAI plan TODOs must remain the projected `stage.todos` list even\n  when child OpenAI sessions emit TODO events on the same stage.\n- R2. Later root OpenAI `todo.updated` and `todo.deleted` events must continue\n  to apply after child OpenAI TODO events are observed.\n- R3. Child OpenAI TODO lists must not create, replace, or mutate\n  `StageProjection.todos`.\n- R4. Anthropic task projection must remain unchanged because Anthropic task\n  lists are intentionally scoped to the root session and shared across\n  subagents.\n- R5. Do not change public API shapes, generated API types, or frontend\n  rendering code for this fix.\n\n## Scope Boundaries\n\n- Do not add a multi-list TODO projection in this change.\n- Do not expose child/subagent TODO lists in the sidebar in this change.\n- Do not change `TodoListProjection`, `StageProjection`, or OpenAPI schemas.\n- Do not change event serialization, event names, or the agent `update_plan`\n  tool behavior.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- `lib/crates/fabro-agent/src/todo_tools.rs` scopes OpenAI plans by\n  `session_id`, producing `openai_plan:<session_id>`.\n- `lib/crates/fabro-types/src/run_event/mod.rs` already carries\n  `session_id` and `parent_session_id` on event envelopes.\n- `lib/crates/fabro-store/src/run_state.rs` owns the persisted-event reducer\n  that updates `StageProjection.todos` from `todo.created`, `todo.updated`,\n  and `todo.deleted`.\n- The existing `todo_reducer` test module in `run_state.rs` is the right place\n  for focused regression coverage.\n- `apps/fabro-web/app/routes/run-stages.tsx` and\n  `apps/fabro-web/app/components/stage-insights-sidebar.tsx` already render\n  `stage.todos`; no UI change is needed if the projection is corrected.\n\n### Observed Failing Case\n\nFor run `01KSBT48J14ZMK9HQN48SVMG3T`, stage `simplify_gpt@1` had:\n\n- Root list `openai_plan:2f4458b9-1128-4a96-8dfa-bff4b73b9c33`: five root\n  todos, all completed by later `todo.updated` events.\n- Child list `openai_plan:a09b9432-823d-4068-91fa-5c6185578e8e`: three child\n  todos, created with `parent_session_id` set and never updated.\n\nThe child `todo.created` events replaced `stage.todos`, so the sidebar showed\nthe child list as `0/3` even after the root list completed.\n\n## Key Technical Decisions\n\n- Use `parent_session_id` as the root-vs-child signal for OpenAI plan\n  projection. A root stage session has `parent_session_id == None`; child\n  sessions have `parent_session_id != None`.\n- Ignore child OpenAI plan events for `StageProjection.todos`. This preserves\n  the current single-list schema while making the selected list match the\n  stage sidebar's meaning.\n- Keep Anthropic task projection unchanged. Anthropic tasks use\n  `anthropic_tasks:<root_session_id>`, so child-session envelopes should still\n  be allowed to update the shared root task list.\n- Treat legacy OpenAI events without `parent_session_id` as root-compatible for\n  backwards compatibility.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add reducer policy for projectable stage TODO events**\n\n**Goal:** Make the reducer distinguish root OpenAI plan events from child\nOpenAI plan events before mutating `stage.todos`.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Add a small helper near the TODO reducer functions, for example\n  `should_project_stage_todo_event(stored: &RunEvent, list_kind:\n  TodoListKind) -> bool`.\n- Return `false` only when `list_kind == TodoListKind::OpenAiPlan` and\n  `stored.parent_session_id.is_some()`.\n- Return `true` for root OpenAI events and all Anthropic task events.\n- Call this helper in the `EventBody::TodoCreated`,\n  `EventBody::TodoUpdated`, and `EventBody::TodoDeleted` match arms before\n  resolving or mutating the stage projection.\n- Leave `apply_todo_created`, `apply_todo_updated`, and\n  `apply_todo_deleted` focused on list mutation once the caller has decided\n  the event is projectable.\n\n**Test scenarios:**\n- Root OpenAI events with no `parent_session_id` still create and update\n  `stage.todos`.\n- Child OpenAI events with `parent_session_id` do not create `stage.todos`\n  when no root list exists.\n- Child OpenAI events do not replace an existing root OpenAI list.\n- Root OpenAI updates still apply after ignored child OpenAI events.\n\n- [ ] **Unit 2: Add focused reducer regression tests**\n\n**Goal:** Lock the intended root-list behavior so future TODO projection work\ndoes not regress the sidebar.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Extend the existing `todo_reducer` module rather than creating a new test\n  file.\n- Add a test helper or local event setup that sets\n  `event.event.parent_session_id = Some(parent_session_id.to_string())` for\n  child-session events.\n- Add one regression test that reproduces the failing sequence:\n  root OpenAI creates list, child OpenAI creates a different list on the same\n  stage, root OpenAI completes its items. Assert the final projection is the\n  root list and all root statuses are completed.\n- Add one test proving child OpenAI events alone do not create a stage TODO\n  projection.\n- Add one test proving Anthropic child-session task events still project.\n\n**Verification:**\n- `cargo nextest run -p fabro-store todo_reducer`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n\n## System-Wide Impact\n\n- **API compatibility:** No response schema changes. Existing consumers of\n  `StageProjection.todos` continue to receive a single list.\n- **UI behavior:** The sidebar should show the root agent's TODO progress for\n  the selected stage. Child OpenAI session plans remain available only in the\n  raw event stream for now.\n- **Historical runs:** Replaying existing event logs should produce corrected\n  projections because the decision uses envelope fields already persisted on\n  child events.\n- **Future extensibility:** If child/subagent TODO display is needed later,\n  add a multi-list projection separately rather than overloading\n  `stage.todos`.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Some legacy child OpenAI events lack `parent_session_id` and still project as root | Accept this for backwards compatibility; only events with explicit child-session evidence are filtered. |\n| Anthropic child task updates could be accidentally filtered | Gate only `TodoListKind::OpenAiPlan`; add a regression test for `TodoListKind::AnthropicTasks`. |\n| Root list replacement semantics become ambiguous if a root stage emits multiple OpenAI list IDs | Preserve current root replacement behavior; the fix only prevents child lists from replacing root lists. |\n\n## Assumptions\n\n- `parent_session_id == None` is the canonical signal for the root stage agent\n  session in stored event envelopes.\n- Child OpenAI TODO lists are not part of the current stage sidebar contract.\n- The correct near-term fix is projection selection, not a frontend workaround\n  or a schema expansion.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "ref": "fabro-v12",
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {},
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "reasoning_effort": {
+              "String": "xhigh"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "label": {
+              "String": "Fixup"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures."
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Exit"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "max_visits": {
+              "Integer": 3
+            },
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Start"
+            },
+            "shape": {
+              "String": "Mdiamond"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "label": {
+              "String": "Verify"
+            },
+            "script": {
+              "String": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "retry_target": {
+              "String": "fixup"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "rankdir": {
+          "String": "LR"
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "goal": {
+          "String": "---\ntitle: fix: Prefer root stage TODO projection\ntype: fix\nstatus: active\ndate: 2026-05-24\n---\n\n# fix: Prefer Root Stage TODO Projection\n\n## Overview\n\nFix stage TODO projection so `StageProjection.todos` represents the selected\nstage agent's root session plan. Today a child OpenAI session can emit its own\n`todo.created` events on the same `stage_id`, replacing the root list and\ncausing later root `todo.updated` completions to be ignored. The visible\nsymptom is an agent sidebar showing a stale child TODO list such as `0/3`\ncompleted even though the root stage plan completed.\n\n## Problem Frame\n\nOpenAI `update_plan` lists are scoped per agent session as\n`openai_plan:<session_id>`. A stage may contain both the root agent session and\nchild/subagent sessions. `StageProjection` currently has only one\n`todos: Option<TodoListProjection>`, so the reducer must choose which list is\nthe stage-level list. The stage sidebar is a stage-agent summary, so it should\nshow the root stage session's list rather than whichever session most recently\ncreated todos.\n\n## Requirements Trace\n\n- R1. Root OpenAI plan TODOs must remain the projected `stage.todos` list even\n  when child OpenAI sessions emit TODO events on the same stage.\n- R2. Later root OpenAI `todo.updated` and `todo.deleted` events must continue\n  to apply after child OpenAI TODO events are observed.\n- R3. Child OpenAI TODO lists must not create, replace, or mutate\n  `StageProjection.todos`.\n- R4. Anthropic task projection must remain unchanged because Anthropic task\n  lists are intentionally scoped to the root session and shared across\n  subagents.\n- R5. Do not change public API shapes, generated API types, or frontend\n  rendering code for this fix.\n\n## Scope Boundaries\n\n- Do not add a multi-list TODO projection in this change.\n- Do not expose child/subagent TODO lists in the sidebar in this change.\n- Do not change `TodoListProjection`, `StageProjection`, or OpenAPI schemas.\n- Do not change event serialization, event names, or the agent `update_plan`\n  tool behavior.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- `lib/crates/fabro-agent/src/todo_tools.rs` scopes OpenAI plans by\n  `session_id`, producing `openai_plan:<session_id>`.\n- `lib/crates/fabro-types/src/run_event/mod.rs` already carries\n  `session_id` and `parent_session_id` on event envelopes.\n- `lib/crates/fabro-store/src/run_state.rs` owns the persisted-event reducer\n  that updates `StageProjection.todos` from `todo.created`, `todo.updated`,\n  and `todo.deleted`.\n- The existing `todo_reducer` test module in `run_state.rs` is the right place\n  for focused regression coverage.\n- `apps/fabro-web/app/routes/run-stages.tsx` and\n  `apps/fabro-web/app/components/stage-insights-sidebar.tsx` already render\n  `stage.todos`; no UI change is needed if the projection is corrected.\n\n### Observed Failing Case\n\nFor run `01KSBT48J14ZMK9HQN48SVMG3T`, stage `simplify_gpt@1` had:\n\n- Root list `openai_plan:2f4458b9-1128-4a96-8dfa-bff4b73b9c33`: five root\n  todos, all completed by later `todo.updated` events.\n- Child list `openai_plan:a09b9432-823d-4068-91fa-5c6185578e8e`: three child\n  todos, created with `parent_session_id` set and never updated.\n\nThe child `todo.created` events replaced `stage.todos`, so the sidebar showed\nthe child list as `0/3` even after the root list completed.\n\n## Key Technical Decisions\n\n- Use `parent_session_id` as the root-vs-child signal for OpenAI plan\n  projection. A root stage session has `parent_session_id == None`; child\n  sessions have `parent_session_id != None`.\n- Ignore child OpenAI plan events for `StageProjection.todos`. This preserves\n  the current single-list schema while making the selected list match the\n  stage sidebar's meaning.\n- Keep Anthropic task projection unchanged. Anthropic tasks use\n  `anthropic_tasks:<root_session_id>`, so child-session envelopes should still\n  be allowed to update the shared root task list.\n- Treat legacy OpenAI events without `parent_session_id` as root-compatible for\n  backwards compatibility.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add reducer policy for projectable stage TODO events**\n\n**Goal:** Make the reducer distinguish root OpenAI plan events from child\nOpenAI plan events before mutating `stage.todos`.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Add a small helper near the TODO reducer functions, for example\n  `should_project_stage_todo_event(stored: &RunEvent, list_kind:\n  TodoListKind) -> bool`.\n- Return `false` only when `list_kind == TodoListKind::OpenAiPlan` and\n  `stored.parent_session_id.is_some()`.\n- Return `true` for root OpenAI events and all Anthropic task events.\n- Call this helper in the `EventBody::TodoCreated`,\n  `EventBody::TodoUpdated`, and `EventBody::TodoDeleted` match arms before\n  resolving or mutating the stage projection.\n- Leave `apply_todo_created`, `apply_todo_updated`, and\n  `apply_todo_deleted` focused on list mutation once the caller has decided\n  the event is projectable.\n\n**Test scenarios:**\n- Root OpenAI events with no `parent_session_id` still create and update\n  `stage.todos`.\n- Child OpenAI events with `parent_session_id` do not create `stage.todos`\n  when no root list exists.\n- Child OpenAI events do not replace an existing root OpenAI list.\n- Root OpenAI updates still apply after ignored child OpenAI events.\n\n- [ ] **Unit 2: Add focused reducer regression tests**\n\n**Goal:** Lock the intended root-list behavior so future TODO projection work\ndoes not regress the sidebar.\n\n**Files:**\n- Modify: `lib/crates/fabro-store/src/run_state.rs`\n\n**Approach:**\n- Extend the existing `todo_reducer` module rather than creating a new test\n  file.\n- Add a test helper or local event setup that sets\n  `event.event.parent_session_id = Some(parent_session_id.to_string())` for\n  child-session events.\n- Add one regression test that reproduces the failing sequence:\n  root OpenAI creates list, child OpenAI creates a different list on the same\n  stage, root OpenAI completes its items. Assert the final projection is the\n  root list and all root statuses are completed.\n- Add one test proving child OpenAI events alone do not create a stage TODO\n  projection.\n- Add one test proving Anthropic child-session task events still project.\n\n**Verification:**\n- `cargo nextest run -p fabro-store todo_reducer`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n\n## System-Wide Impact\n\n- **API compatibility:** No response schema changes. Existing consumers of\n  `StageProjection.todos` continue to receive a single list.\n- **UI behavior:** The sidebar should show the root agent's TODO progress for\n  the selected stage. Child OpenAI session plans remain available only in the\n  raw event stream for now.\n- **Historical runs:** Replaying existing event logs should produce corrected\n  projections because the decision uses envelope fields already persisted on\n  child events.\n- **Future extensibility:** If child/subagent TODO display is needed later,\n  add a multi-list projection separately rather than overloading\n  `stage.todos`.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Some legacy child OpenAI events lack `parent_session_id` and still project as root | Accept this for backwards compatibility; only events with explicit child-session evidence are filtered. |\n| Anthropic child task updates could be accidentally filtered | Gate only `TodoListKind::OpenAiPlan`; add a regression test for `TodoListKind::AnthropicTasks`. |\n| Root list replacement semantics become ambiguous if a root stage emits multiple OpenAI list IDs | Preserve current root replacement behavior; the fix only prevents child lists from replacing root lists. |\n\n## Assumptions\n\n- `parent_session_id == None` is the canonical signal for the root stage agent\n  session in stored event envelopes.\n- Child OpenAI TODO lists are not part of the current stage sidebar contract.\n- The correct near-term fix is projection selection, not a frontend workaround\n  or a schema expansion.\n"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\", model=\"gpt-55\", reasoning_effort=\"xhigh\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\\\"disabled\\\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures.\", max_visits=3]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> exit  [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.243.0-nightly.1"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.243.0-nightly.1",
+        "name": "fabro-cli",
+        "version": "0.243.0-nightly.1"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "5c3c8a8e7dc950fcffbd7cf16394265c790419e067eb7a5c5a882bc1f587b36a",
+    "definition_blob": "f13f100f4f1f386c63f22b375c331077f1c1b3bd2df0dd17388b26786f23b9a6",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "95ca1b96196a4fba2f8381eb96b62691f9ce5afd",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "succeeded",
+        "remote": "origin",
+        "branch": "main"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KSD31NTGQGN0KEB7D88MDEFX",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-24T13:33:30.886602Z",
+  "last_event_at": "2026-05-24T13:33:46.819437Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "snapshot": "fabro-v12",
+    "runtime": {
+      "id": "fabro-01KSD31NTGQGN0KEB7D88MDEFX",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
