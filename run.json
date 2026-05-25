@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-25T21:44:07.291338Z",
-  "last_event_at": "2026-05-25T22:28:28.199360Z",
+  "last_event_at": "2026-05-25T22:28:31.841760Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1031,9 +1031,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1080,
       "checkpoint": {
-        "timestamp": "2026-05-25T22:28:28.224342Z",
+        "timestamp": "2026-05-25T22:28:31.840023Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1046,6 +1046,200 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.node_visit_count": 1,
+          "internal.fidelity": "compact",
+          "outcome": "succeeded",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.retry_count.simplify_opus": 0,
+          "internal.retry_count.toolchain": 0,
+          "last_stage": "simplify_gpt",
+          "failure_signature": "",
+          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.rankdir": "LR",
+          "internal.retry_count.implement": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean.",
+          "internal.retry_count.simplify_gpt": 0,
+          "internal.thread_id": "simplify_opus",
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "internal.retry_count.start": 0,
+          "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+          "failure_class": "",
+          "last_response": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean",
+          "internal.run_id": "01KSGHG9F2BGEF3J9K8SKA59TQ",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.preflight_compile": 0,
+          "thread.start.current_node": "toolchain",
+          "current_node": "simplify_gpt",
+          "internal.retry_count.preflight_lint": 0,
+          "thread.implement.current_node": "simplify_opus",
+          "thread.preflight_lint.current_node": "implement",
+          "response.simplify_gpt": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean.\n\nVerification run:\n\n- `cargo nextest run -p fabro-server test_providers` — passed, 7/7\n- `cargo nextest run -p fabro-server diagnostics` — passed, 14/14\n- `cargo build -p fabro-api` — passed\n- `cd apps/fabro-web && bun run typecheck` — passed\n\n`git status --short` is clean."
+        },
+        "node_outcomes": {
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean",
+              "response.simplify_gpt": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean.\n\nVerification run:\n\n- `cargo nextest run -p fabro-server test_providers` — passed, 7/7\n- `cargo nextest run -p fabro-server diagnostics` — passed, 14/14\n- `cargo build -p fabro-api` — passed\n- `cd apps/fabro-web && bun run typecheck` — passed\n\n`git status --short` is clean.",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 790971,
+                    "output_tokens": 2377,
+                    "reasoning_tokens": 1296,
+                    "cache_read_tokens": 475648,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 4302869
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+              "last_response": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestS"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 4615566,
+                    "output_tokens": 18811,
+                    "reasoning_tokens": 14666,
+                    "cache_read_tokens": 13300224,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 30732252
+            }
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_opus",
+              "last_response": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes ",
+              "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean."
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 90712,
+                    "output_tokens": 26816,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 3609397,
+                    "cache_write_tokens": 459227
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 459227,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 5798826
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/diagnostics.rs"
+            ]
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "49e8e38ec5d0ea1ec5bb0452aa9e1a8b65da1dd3",
+        "node_visits": {
+          "preflight_lint": 1,
+          "preflight_compile": 1,
+          "simplify_gpt": 1,
+          "simplify_opus": 1,
+          "start": 1,
+          "implement": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 11,
+          "additions": 943,
+          "deletions": 91
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-25T22:37:37.567293Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
           "failure_signature": "",
           "internal.retry_count.simplify_opus": 0,
           "response.simplify_gpt": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean.\n\nVerification run:\n\n- `cargo nextest run -p fabro-server test_providers` — passed, 7/7\n- `cargo nextest run -p fabro-server diagnostics` — passed, 14/14\n- `cargo build -p fabro-api` — passed\n- `cd apps/fabro-web && bun run typecheck` — passed\n\n`git status --short` is clean.",
@@ -1054,12 +1248,13 @@
           "thread.preflight_lint.current_node": "implement",
           "internal.fidelity": "compact",
           "internal.node_visit_count": 1,
+          "internal.retry_count.verify": 0,
           "internal.retry_count.toolchain": 0,
           "internal.retry_count.preflight_lint": 0,
           "graph.rankdir": "LR",
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "thread.toolchain.current_node": "preflight_compile",
-          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9",
           "internal.retry_count.implement": 0,
           "last_stage": "simplify_gpt",
           "internal.work_dir": "/home/daytona/workspace/fabro",
@@ -1068,13 +1263,14 @@
           "failure_class": "",
           "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
           "thread.implement.current_node": "simplify_opus",
+          "thread.simplify_gpt.current_node": "verify",
           "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean.",
           "internal.retry_count.preflight_compile": 0,
           "thread.simplify_opus.current_node": "simplify_gpt",
           "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
           "outcome": "succeeded",
           "last_response": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean",
-          "internal.thread_id": "simplify_opus",
+          "internal.thread_id": "simplify_gpt",
           "thread.start.current_node": "toolchain",
           "internal.retry_count.simplify_gpt": 0
         },
@@ -1190,6 +1386,14 @@
               "total_usd_micros": 4302869
             }
           },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9"
+            },
+            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+            "usage": null
+          },
           "start": {
             "status": "succeeded",
             "usage": null
@@ -1203,15 +1407,16 @@
             "usage": null
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "exit",
         "node_visits": {
-          "simplify_opus": 1,
           "start": 1,
           "simplify_gpt": 1,
           "toolchain": 1,
+          "simplify_opus": 1,
           "preflight_compile": 1,
-          "preflight_lint": 1,
-          "implement": 1
+          "verify": 1,
+          "implement": 1,
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -1271,6 +1476,54 @@
       "handler": "command",
       "timing": {
         "wall_time_ms": 1369,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 42,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T21:48:46.096183Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 139138,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-25T21:46:26.946586Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 139145,
         "inference_time_ms": 0,
         "tool_time_ms": 0,
         "active_time_ms": 0
@@ -1569,6 +1822,321 @@
       },
       "state": "succeeded"
     },
+    "simplify_gpt@1": {
+      "first_event_seq": 892,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_gpt",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T22:28:28.223757Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-25T22:25:47.700626Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 160521,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 790971,
+        "output_tokens": 2377,
+        "total_tokens": 1270292,
+        "reasoning_tokens": 1296,
+        "cache_read_tokens": 475648,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 4302869
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:1fc56163-3d66-43e4-9afc-8db9e9733c2e",
+        "items": [
+          {
+            "id": "4d6b2569493a9cb7",
+            "status": "in_progress",
+            "order": 0,
+            "subject": "Load repository instructions and diff context"
+          },
+          {
+            "id": "bdb8e0da0b4f71d9",
+            "status": "pending",
+            "order": 1,
+            "subject": "Inspect changed files for code quality issues"
+          },
+          {
+            "id": "dbd709a95683999a",
+            "status": "pending",
+            "order": 2,
+            "subject": "Return concise findings with file/line references and fixes"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "4f518fe6",
+          "depth": 1,
+          "task": "Code Reuse Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for newly added provider test endpoint changes. Search for existing utilities/helpers that could replace new code, flag duplicate functions or inline logic that should use existing utilities. Return concise findings with file/line references and suggested fixes. Do not modify files.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 7
+          }
+        },
+        {
+          "agent_id": "c99cc70c",
+          "depth": 1,
+          "task": "Code Quality Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for hacky patterns: redundant state, parameter sprawl, copy-paste, leaky abstractions, stringly typed code. Return concise findings with file/line references and suggested fixes. Do not modify files.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 7
+          }
+        },
+        {
+          "agent_id": "808e5c12",
+          "depth": 1,
+          "task": "Efficiency Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for unnecessary work, missed concurrency, hot path bloat, TOCTOU, memory issues, overly broad operations. Return concise findings with file/line references and suggested fixes. Do not modify files.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 7
+          }
+        }
+      ],
+      "permission_level": "full",
+      "agent_tools": [
+        {
+          "name": "apply_patch",
+          "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        },
+        {
+          "name": "close_agent",
+          "description": "Close a running subagent that is no longer needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "glob",
+          "description": "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "grep",
+          "description": "Search file contents with a regex pattern. Use path to choose the search root, glob_filter to limit matching files, case_insensitive for case folding, and max_results to cap output.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "read_file",
+          "description": "Read files before editing them. Returns line-numbered text and supports offset/limit for large files. Use this instead of shell cat, head, tail, or sed when inspecting repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "request_user_input",
+          "description": "Ask the human one or more questions and wait for their answers before continuing this stage.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "send_input",
+          "description": "Send a follow-up message to a running subagent when new information or corrected instructions are needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "shell",
+          "description": "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "shell",
+          "invoked": true
+        },
+        {
+          "name": "spawn_agent",
+          "description": "Spawn a subagent for independent work or context isolation. Use it for tasks that can proceed separately, and avoid duplicating the same work in the parent session.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "update_plan",
+          "description": "Update the multi-step plan for the current task. Submit the entire plan; existing steps are reconciled by exact step text.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": true
+        },
+        {
+          "name": "wait",
+          "description": "Wait for a subagent to complete, then use the result to synthesize the outcome for the user.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "web_fetch",
+          "description": "Fetch content from a URL that starts with http:// or https://. Pass a prompt to extract specific information or summarize the page; omit prompt to return the page content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "web_search",
+          "description": "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "write_file",
+          "description": "Create new files, or overwrite an existing file only when replacement is explicitly intended. Prefer edit_file for targeted changes to existing files because write_file overwrites the full file content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        }
+      ],
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 272000,
+        "input_tokens": 54207,
+        "usage_percent": 19.92904411764706,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-25T22:28:28.199118Z",
+        "event_seq": 1073,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 1048,
+            "usage_percent": 0.38529411764705884
+          },
+          {
+            "category": "tools",
+            "tokens": 1484,
+            "usage_percent": 0.5455882352941176
+          },
+          {
+            "category": "memory",
+            "tokens": 3511,
+            "usage_percent": 1.2908088235294117
+          },
+          {
+            "category": "conversation",
+            "tokens": 48158,
+            "usage_percent": 17.70514705882353
+          },
+          {
+            "category": "other",
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
+          }
+        ],
+        "warnings": []
+      },
+      "state": "succeeded"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 32,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T21:46:23.244540Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 128987,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-25T21:44:14.250394Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 128992,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
     "implement@1": {
       "first_event_seq": 52,
       "prompt": null,
@@ -1829,262 +2397,6 @@
       },
       "state": "succeeded"
     },
-    "simplify_gpt@1": {
-      "first_event_seq": 892,
-      "prompt": null,
-      "response": null,
-      "completion": null,
-      "provider_used": {
-        "mode": "agent",
-        "provider": "openai",
-        "model": "gpt-5.5"
-      },
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-25T22:25:47.700626Z",
-      "handler": "agent",
-      "usage": {
-        "input_tokens": 790971,
-        "output_tokens": 2377,
-        "total_tokens": 1270292,
-        "reasoning_tokens": 1296,
-        "cache_read_tokens": 475648,
-        "cache_write_tokens": 0,
-        "total_usd_micros": 4302869
-      },
-      "model": {
-        "provider": "openai",
-        "model_id": "gpt-5.5"
-      },
-      "todos": {
-        "kind": "openai_plan",
-        "list_id": "openai_plan:1fc56163-3d66-43e4-9afc-8db9e9733c2e",
-        "items": [
-          {
-            "id": "4d6b2569493a9cb7",
-            "status": "in_progress",
-            "order": 0,
-            "subject": "Load repository instructions and diff context"
-          },
-          {
-            "id": "bdb8e0da0b4f71d9",
-            "status": "pending",
-            "order": 1,
-            "subject": "Inspect changed files for code quality issues"
-          },
-          {
-            "id": "dbd709a95683999a",
-            "status": "pending",
-            "order": 2,
-            "subject": "Return concise findings with file/line references and fixes"
-          }
-        ]
-      },
-      "subagents": [
-        {
-          "agent_id": "4f518fe6",
-          "depth": 1,
-          "task": "Code Reuse Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for newly added provider test endpoint changes. Search for existing utilities/helpers that could replace new code, flag duplicate functions or inline logic that should use existing utilities. Return concise findings with file/line references and suggested fixes. Do not modify files.",
-          "status": {
-            "kind": "completed",
-            "success": true,
-            "turns_used": 7
-          }
-        },
-        {
-          "agent_id": "c99cc70c",
-          "depth": 1,
-          "task": "Code Quality Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for hacky patterns: redundant state, parameter sprawl, copy-paste, leaky abstractions, stringly typed code. Return concise findings with file/line references and suggested fixes. Do not modify files.",
-          "status": {
-            "kind": "completed",
-            "success": true,
-            "turns_used": 7
-          }
-        },
-        {
-          "agent_id": "808e5c12",
-          "depth": 1,
-          "task": "Efficiency Review. Review the full diff in /tmp/fabro-provider-test.diff (origin/main...HEAD) for unnecessary work, missed concurrency, hot path bloat, TOCTOU, memory issues, overly broad operations. Return concise findings with file/line references and suggested fixes. Do not modify files.",
-          "status": {
-            "kind": "completed",
-            "success": true,
-            "turns_used": 7
-          }
-        }
-      ],
-      "permission_level": "full",
-      "agent_tools": [
-        {
-          "name": "apply_patch",
-          "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "write",
-          "invoked": false
-        },
-        {
-          "name": "close_agent",
-          "description": "Close a running subagent that is no longer needed.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "subagent",
-          "invoked": false
-        },
-        {
-          "name": "glob",
-          "description": "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "read",
-          "invoked": true
-        },
-        {
-          "name": "grep",
-          "description": "Search file contents with a regex pattern. Use path to choose the search root, glob_filter to limit matching files, case_insensitive for case folding, and max_results to cap output.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "read",
-          "invoked": true
-        },
-        {
-          "name": "read_file",
-          "description": "Read files before editing them. Returns line-numbered text and supports offset/limit for large files. Use this instead of shell cat, head, tail, or sed when inspecting repository files.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "read",
-          "invoked": true
-        },
-        {
-          "name": "request_user_input",
-          "description": "Ask the human one or more questions and wait for their answers before continuing this stage.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "other",
-          "invoked": false
-        },
-        {
-          "name": "send_input",
-          "description": "Send a follow-up message to a running subagent when new information or corrected instructions are needed.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "subagent",
-          "invoked": false
-        },
-        {
-          "name": "shell",
-          "description": "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "shell",
-          "invoked": true
-        },
-        {
-          "name": "spawn_agent",
-          "description": "Spawn a subagent for independent work or context isolation. Use it for tasks that can proceed separately, and avoid duplicating the same work in the parent session.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "subagent",
-          "invoked": true
-        },
-        {
-          "name": "update_plan",
-          "description": "Update the multi-step plan for the current task. Submit the entire plan; existing steps are reconciled by exact step text.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "other",
-          "invoked": true
-        },
-        {
-          "name": "wait",
-          "description": "Wait for a subagent to complete, then use the result to synthesize the outcome for the user.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "subagent",
-          "invoked": true
-        },
-        {
-          "name": "web_fetch",
-          "description": "Fetch content from a URL that starts with http:// or https://. Pass a prompt to extract specific information or summarize the page; omit prompt to return the page content.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "other",
-          "invoked": false
-        },
-        {
-          "name": "web_search",
-          "description": "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "other",
-          "invoked": false
-        },
-        {
-          "name": "write_file",
-          "description": "Create new files, or overwrite an existing file only when replacement is explicitly intended. Prefer edit_file for targeted changes to existing files because write_file overwrites the full file content.",
-          "source": {
-            "kind": "native"
-          },
-          "category": "write",
-          "invoked": false
-        }
-      ],
-      "context_window": {
-        "provider": "openai",
-        "model": "gpt-5.5",
-        "context_window_tokens": 272000,
-        "input_tokens": 54207,
-        "usage_percent": 19.92904411764706,
-        "count_method": "response_usage_scaled_breakdown",
-        "staleness": "live",
-        "generated_at": "2026-05-25T22:28:28.199118Z",
-        "event_seq": 1073,
-        "breakdown": [
-          {
-            "category": "system_prompt",
-            "tokens": 1048,
-            "usage_percent": 0.38529411764705884
-          },
-          {
-            "category": "tools",
-            "tokens": 1484,
-            "usage_percent": 0.5455882352941176
-          },
-          {
-            "category": "memory",
-            "tokens": 3511,
-            "usage_percent": 1.2908088235294117
-          },
-          {
-            "category": "conversation",
-            "tokens": 48158,
-            "usage_percent": 17.70514705882353
-          },
-          {
-            "category": "other",
-            "tokens": 6,
-            "usage_percent": 0.0022058823529411764
-          }
-        ],
-        "warnings": []
-      },
-      "state": "running"
-    },
     "start@1": {
       "first_event_seq": 18,
       "prompt": null,
@@ -2119,44 +2431,23 @@
       },
       "state": "succeeded"
     },
-    "preflight_lint@1": {
-      "first_event_seq": 42,
+    "verify@1": {
+      "first_event_seq": 1083,
       "prompt": null,
       "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-25T21:48:46.096183Z"
-      },
+      "completion": null,
       "provider_used": null,
       "diff": null,
       "script_invocation": {
-        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "script": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
         "language": "shell"
       },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 139138,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
+      "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-25T21:46:26.946586Z",
+      "started_at": "2026-05-25T22:28:31.841484Z",
       "handler": "command",
-      "timing": {
-        "wall_time_ms": 139145,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -2165,55 +2456,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "succeeded"
-    },
-    "preflight_compile@1": {
-      "first_event_seq": 32,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo check -q --workspace 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-25T21:46:23.244540Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 128987,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-25T21:44:14.250394Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 128992,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
+      "state": "running"
     }
   }
 }
