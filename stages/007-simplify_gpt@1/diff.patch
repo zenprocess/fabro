@@ -1,0 +1,364 @@
+diff --git a/lib/crates/fabro-cli/src/commands/runs/approval.rs b/lib/crates/fabro-cli/src/commands/runs/approval.rs
+index 01017c007..075059f63 100644
+--- a/lib/crates/fabro-cli/src/commands/runs/approval.rs
++++ b/lib/crates/fabro-cli/src/commands/runs/approval.rs
+@@ -1,103 +1,38 @@
+-use anyhow::{Result, bail};
++use anyhow::Result;
++use futures::FutureExt as _;
+ 
+-use super::short_run_id;
++use super::{RunBatchAction, run_resolved_run_batch};
+ use crate::args::{RunsApproveArgs, RunsDenyArgs};
+ use crate::command_context::CommandContext;
+-use crate::shared::print_json_pretty;
+ 
+ pub(crate) async fn approve_command(
+     args: &RunsApproveArgs,
+     base_ctx: &CommandContext,
+ ) -> Result<()> {
+     let ctx = base_ctx.with_target(&args.server)?;
+-    run_bulk(Action::Approve, &args.runs, None, &ctx).await
++    run_resolved_run_batch(
++        RunBatchAction {
++            past:     "approved",
++            json_key: "approved",
++        },
++        &args.runs,
++        &ctx,
++        |client, run_id| client.approve_run(run_id).boxed(),
++    )
++    .await
+ }
+ 
+ pub(crate) async fn deny_command(args: &RunsDenyArgs, base_ctx: &CommandContext) -> Result<()> {
+     let ctx = base_ctx.with_target(&args.server)?;
+-    run_bulk(Action::Deny, &args.runs, args.reason.clone(), &ctx).await
+-}
+-
+-#[derive(Clone, Copy)]
+-enum Action {
+-    Approve,
+-    Deny,
+-}
+-
+-impl Action {
+-    fn past(self) -> &'static str {
+-        match self {
+-            Self::Approve => "approved",
+-            Self::Deny => "denied",
+-        }
+-    }
+-}
+-
+-async fn run_bulk(
+-    action: Action,
+-    identifiers: &[String],
+-    reason: Option<String>,
+-    ctx: &CommandContext,
+-) -> Result<()> {
+-    let client = ctx.server().await?;
+-    let client = client.as_ref();
+-    let json = ctx.json_output();
+-    let printer = ctx.printer();
+-    let mut had_errors = false;
+-    let mut changed = Vec::new();
+-    let mut errors = Vec::new();
+-
+-    for identifier in identifiers {
+-        let run = match client.resolve_run(identifier).await {
+-            Ok(run) => run,
+-            Err(err) => {
+-                if !json {
+-                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
+-                }
+-                errors.push(serde_json::json!({
+-                    "identifier": identifier,
+-                    "error": err.to_string(),
+-                }));
+-                had_errors = true;
+-                continue;
+-            }
+-        };
+-
+-        let run_id = run.id;
+-        let result = match action {
+-            Action::Approve => client.approve_run(&run_id).await,
+-            Action::Deny => client.deny_run(&run_id, reason.clone()).await,
+-        };
+-        match result {
+-            Ok(_) => {
+-                let run_id_string = run_id.to_string();
+-                changed.push(run_id_string.clone());
+-                if !json {
+-                    fabro_util::printerr!(printer, "{}", short_run_id(&run_id_string));
+-                }
+-            }
+-            Err(err) => {
+-                if !json {
+-                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
+-                }
+-                errors.push(serde_json::json!({
+-                    "identifier": identifier,
+-                    "error": err.to_string(),
+-                }));
+-                had_errors = true;
+-            }
+-        }
+-    }
+-
+-    if json {
+-        let mut body = serde_json::Map::new();
+-        body.insert(action.past().to_string(), serde_json::json!(changed));
+-        body.insert("errors".to_string(), serde_json::json!(errors));
+-        print_json_pretty(&serde_json::Value::Object(body))?;
+-    }
+-
+-    if had_errors {
+-        bail!("some runs could not be {}", action.past());
+-    }
+-    Ok(())
++    let reason = args.reason.clone();
++    run_resolved_run_batch(
++        RunBatchAction {
++            past:     "denied",
++            json_key: "denied",
++        },
++        &args.runs,
++        &ctx,
++        move |client, run_id| client.deny_run(run_id, reason.clone()).boxed(),
++    )
++    .await
+ }
+diff --git a/lib/crates/fabro-cli/src/commands/runs/archive.rs b/lib/crates/fabro-cli/src/commands/runs/archive.rs
+index 38a5308fe..2ce5743a9 100644
+--- a/lib/crates/fabro-cli/src/commands/runs/archive.rs
++++ b/lib/crates/fabro-cli/src/commands/runs/archive.rs
+@@ -1,16 +1,25 @@
+-use anyhow::{Result, bail};
++use anyhow::Result;
++use futures::FutureExt as _;
+ 
+-use super::short_run_id;
++use super::{RunBatchAction, run_resolved_run_batch};
+ use crate::args::{RunsArchiveArgs, RunsUnarchiveArgs};
+ use crate::command_context::CommandContext;
+-use crate::shared::print_json_pretty;
+ 
+ pub(crate) async fn archive_command(
+     args: &RunsArchiveArgs,
+     base_ctx: &CommandContext,
+ ) -> Result<()> {
+     let ctx = base_ctx.with_target(&args.server)?;
+-    run_bulk(Action::Archive, &args.runs, &ctx).await
++    run_resolved_run_batch(
++        RunBatchAction {
++            past:     "archived",
++            json_key: "archived",
++        },
++        &args.runs,
++        &ctx,
++        |client, run_id| client.archive_run(run_id).boxed(),
++    )
++    .await
+ }
+ 
+ pub(crate) async fn unarchive_command(
+@@ -18,88 +27,14 @@ pub(crate) async fn unarchive_command(
+     base_ctx: &CommandContext,
+ ) -> Result<()> {
+     let ctx = base_ctx.with_target(&args.server)?;
+-    run_bulk(Action::Unarchive, &args.runs, &ctx).await
+-}
+-
+-#[derive(Clone, Copy)]
+-enum Action {
+-    Archive,
+-    Unarchive,
+-}
+-
+-impl Action {
+-    fn past(self) -> &'static str {
+-        match self {
+-            Self::Archive => "archived",
+-            Self::Unarchive => "unarchived",
+-        }
+-    }
+-
+-    fn json_key(self) -> &'static str {
+-        self.past()
+-    }
+-}
+-
+-async fn run_bulk(action: Action, identifiers: &[String], ctx: &CommandContext) -> Result<()> {
+-    let client = ctx.server().await?;
+-    let client = client.as_ref();
+-    let json = ctx.json_output();
+-    let printer = ctx.printer();
+-    let mut had_errors = false;
+-    let mut changed = Vec::new();
+-    let mut errors = Vec::new();
+-
+-    for identifier in identifiers {
+-        let run = match client.resolve_run(identifier).await {
+-            Ok(run) => run,
+-            Err(err) => {
+-                if !json {
+-                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
+-                }
+-                errors.push(serde_json::json!({
+-                    "identifier": identifier,
+-                    "error": err.to_string(),
+-                }));
+-                had_errors = true;
+-                continue;
+-            }
+-        };
+-
+-        let run_id = run.id;
+-        let result = match action {
+-            Action::Archive => client.archive_run(&run_id).await,
+-            Action::Unarchive => client.unarchive_run(&run_id).await,
+-        };
+-        match result {
+-            Ok(_) => {
+-                let run_id_string = run_id.to_string();
+-                changed.push(run_id_string.clone());
+-                if !json {
+-                    fabro_util::printerr!(printer, "{}", short_run_id(&run_id_string));
+-                }
+-            }
+-            Err(err) => {
+-                if !json {
+-                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
+-                }
+-                errors.push(serde_json::json!({
+-                    "identifier": identifier,
+-                    "error": err.to_string(),
+-                }));
+-                had_errors = true;
+-            }
+-        }
+-    }
+-
+-    if json {
+-        let mut body = serde_json::Map::new();
+-        body.insert(action.json_key().to_string(), serde_json::json!(changed));
+-        body.insert("errors".to_string(), serde_json::json!(errors));
+-        print_json_pretty(&serde_json::Value::Object(body))?;
+-    }
+-
+-    if had_errors {
+-        bail!("some runs could not be {}", action.past());
+-    }
+-    Ok(())
++    run_resolved_run_batch(
++        RunBatchAction {
++            past:     "unarchived",
++            json_key: "unarchived",
++        },
++        &args.runs,
++        &ctx,
++        |client, run_id| client.unarchive_run(run_id).boxed(),
++    )
++    .await
+ }
+diff --git a/lib/crates/fabro-cli/src/commands/runs/mod.rs b/lib/crates/fabro-cli/src/commands/runs/mod.rs
+index eaa6d250c..86d9d4967 100644
+--- a/lib/crates/fabro-cli/src/commands/runs/mod.rs
++++ b/lib/crates/fabro-cli/src/commands/runs/mod.rs
+@@ -1,8 +1,12 @@
+-use anyhow::Result;
++use anyhow::{Result, bail};
++use fabro_client::Client;
++use fabro_types::{Run, RunId};
+ use fabro_util::terminal::Styles;
++use futures::future::BoxFuture;
+ 
+ use crate::args::RunsCommands;
+ use crate::command_context::CommandContext;
++use crate::shared::print_json_pretty;
+ 
+ pub(crate) mod approval;
+ pub(crate) mod archive;
+@@ -29,6 +33,80 @@ pub(super) fn short_run_id(id: &str) -> &str {
+     if id.len() > 12 { &id[..12] } else { id }
+ }
+ 
++#[derive(Clone, Copy)]
++pub(super) struct RunBatchAction {
++    pub(super) past:     &'static str,
++    pub(super) json_key: &'static str,
++}
++
++pub(super) async fn run_resolved_run_batch<F>(
++    action: RunBatchAction,
++    identifiers: &[String],
++    ctx: &CommandContext,
++    mut apply: F,
++) -> Result<()>
++where
++    F: for<'a> FnMut(&'a Client, &'a RunId) -> BoxFuture<'a, Result<Run>>,
++{
++    let client = ctx.server().await?;
++    let client = client.as_ref();
++    let json = ctx.json_output();
++    let printer = ctx.printer();
++    let mut had_errors = false;
++    let mut changed = Vec::new();
++    let mut errors = Vec::new();
++
++    for identifier in identifiers {
++        let run = match client.resolve_run(identifier).await {
++            Ok(run) => run,
++            Err(err) => {
++                if !json {
++                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
++                }
++                errors.push(serde_json::json!({
++                    "identifier": identifier,
++                    "error": err.to_string(),
++                }));
++                had_errors = true;
++                continue;
++            }
++        };
++
++        let run_id = run.id;
++        match apply(client, &run_id).await {
++            Ok(_) => {
++                let run_id_string = run_id.to_string();
++                changed.push(run_id_string.clone());
++                if !json {
++                    fabro_util::printerr!(printer, "{}", short_run_id(&run_id_string));
++                }
++            }
++            Err(err) => {
++                if !json {
++                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
++                }
++                errors.push(serde_json::json!({
++                    "identifier": identifier,
++                    "error": err.to_string(),
++                }));
++                had_errors = true;
++            }
++        }
++    }
++
++    if json {
++        let mut body = serde_json::Map::new();
++        body.insert(action.json_key.to_string(), serde_json::json!(changed));
++        body.insert("errors".to_string(), serde_json::json!(errors));
++        print_json_pretty(&serde_json::Value::Object(body))?;
++    }
++
++    if had_errors {
++        bail!("some runs could not be {}", action.past);
++    }
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::args::parse_duration;
