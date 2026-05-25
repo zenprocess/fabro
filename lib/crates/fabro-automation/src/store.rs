@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[expect(
+    clippy::disallowed_types,
+    reason = "atomic_write writes through spawn_blocking + NamedTempFile, which only exposes std::io::Write."
+)]
+use std::io::Write as _;
+use std::path::PathBuf;
 
-use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt as _;
+use tempfile::NamedTempFile;
 use tokio::sync::RwLock;
+use tokio::{fs, task};
 
 use crate::error::{AutomationStoreError, AutomationValidationError};
 use crate::id::AutomationId;
@@ -114,9 +117,7 @@ impl AutomationStore {
         if items.contains_key(&id) {
             return Err(AutomationStoreError::AlreadyExists(id));
         }
-
-        let automation = Automation::from_draft(draft, AutomationRevision::from_bytes(b""))?;
-        let automation = self.persist_with_revision(automation).await?;
+        let automation = self.persist(id.clone(), draft.into_replace()).await?;
         items.insert(id, automation.clone());
         Ok(automation)
     }
@@ -132,9 +133,7 @@ impl AutomationStore {
             .get(id)
             .ok_or_else(|| AutomationStoreError::NotFound(id.clone()))?;
         ensure_revision(current, expected)?;
-
-        let automation = draft.into_automation(id.clone(), AutomationRevision::from_bytes(b""))?;
-        let automation = self.persist_with_revision(automation).await?;
+        let automation = self.persist(id.clone(), draft).await?;
         items.insert(id.clone(), automation.clone());
         Ok(automation)
     }
@@ -150,10 +149,8 @@ impl AutomationStore {
             .get(id)
             .ok_or_else(|| AutomationStoreError::NotFound(id.clone()))?;
         ensure_revision(current, expected)?;
-
-        let draft = patch.apply_to(current);
-        let automation = draft.into_automation(id.clone(), AutomationRevision::from_bytes(b""))?;
-        let automation = self.persist_with_revision(automation).await?;
+        let replace = patch.apply_to(current);
+        let automation = self.persist(id.clone(), replace).await?;
         items.insert(id.clone(), automation.clone());
         Ok(automation)
     }
@@ -179,19 +176,22 @@ impl AutomationStore {
         Ok(())
     }
 
-    async fn persist_with_revision(
+    /// Validate the replace value, render canonical TOML, write atomically,
+    /// and return the assembled `Automation` whose revision matches the
+    /// bytes that landed on disk.
+    async fn persist(
         &self,
-        automation: Automation,
+        id: AutomationId,
+        replace: AutomationReplace,
     ) -> Result<Automation, AutomationStoreError> {
-        let bytes = automation
+        let bytes = replace
             .to_toml_bytes()
-            .map_err(|err| AutomationValidationError::InvalidWorkflowSelector(err.to_string()))?;
-        atomic_write(&self.dir, &self.path_for(&automation.id), &bytes).await?;
+            .map_err(|err| AutomationStoreError::Serialize(err.to_string()))?;
         let revision = AutomationRevision::from_bytes(&bytes);
-        Ok(Automation {
-            revision,
-            ..automation
-        })
+        let automation = Automation::assemble(id, revision, replace)?;
+        let path = self.path_for(&automation.id);
+        atomic_write(&self.dir, &path, bytes).await?;
+        Ok(automation)
     }
 
     fn path_for(&self, id: &AutomationId) -> PathBuf {
@@ -214,51 +214,32 @@ fn ensure_revision(
 }
 
 async fn atomic_write(
-    dir: &Path,
-    final_path: &Path,
-    bytes: &[u8],
+    dir: &std::path::Path,
+    final_path: &std::path::Path,
+    bytes: Vec<u8>,
 ) -> Result<(), AutomationStoreError> {
     fs::create_dir_all(dir)
         .await
         .map_err(|err| AutomationStoreError::io(dir, err))?;
 
-    let temp_path = temp_path_for(dir, final_path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-        .map_err(|err| AutomationStoreError::io(&temp_path, err))?;
-    let write_result = async {
-        file.write_all(bytes).await?;
-        file.flush().await?;
-        file.sync_all().await
-    }
-    .await;
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(AutomationStoreError::io(&temp_path, err));
-    }
-    drop(file);
-
-    if let Err(err) = fs::rename(&temp_path, final_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(AutomationStoreError::io(final_path, err));
-    }
+    let dir = dir.to_path_buf();
+    let final_path = final_path.to_path_buf();
+    let join_dir = dir.clone();
+    task::spawn_blocking(move || -> Result<(), AutomationStoreError> {
+        let mut temp =
+            NamedTempFile::new_in(&dir).map_err(|err| AutomationStoreError::io(&dir, err))?;
+        temp.write_all(&bytes)
+            .map_err(|err| AutomationStoreError::io(temp.path(), err))?;
+        temp.as_file()
+            .sync_all()
+            .map_err(|err| AutomationStoreError::io(temp.path(), err))?;
+        temp.persist(&final_path)
+            .map_err(|err| AutomationStoreError::io(final_path, err.error))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| AutomationStoreError::io(join_dir, std::io::Error::other(err)))??;
     Ok(())
-}
-
-fn temp_path_for(dir: &Path, final_path: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let stem = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("automation.toml");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".{stem}.{now}.{counter}.tmp"))
 }
 
 #[cfg(test)]

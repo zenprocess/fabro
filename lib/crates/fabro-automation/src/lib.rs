@@ -1,7 +1,6 @@
-pub mod error;
-pub mod id;
-pub mod model;
-
+mod error;
+mod id;
+mod model;
 mod store;
 
 pub use error::{AutomationStoreError, AutomationValidationError};

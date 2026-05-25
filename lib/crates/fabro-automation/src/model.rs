@@ -127,6 +127,14 @@ impl AutomationRevision {
         Self(hex::encode(Sha256::digest(bytes)))
     }
 
+    /// Wrap a client-supplied revision string (e.g. from an `If-Match`
+    /// header). The value is compared bytewise against a stored revision; no
+    /// validation is performed here.
+    #[must_use]
+    pub fn from_raw(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -165,28 +173,28 @@ impl Automation {
     pub fn from_toml_bytes(id: AutomationId, bytes: &[u8]) -> Result<Self, TomlDeError> {
         let source = std::str::from_utf8(bytes).map_err(TomlDeError::custom)?;
         let persisted = toml::from_str::<PersistedAutomation>(source)?;
-        // serde has already validated newtypes and trigger shapes. This call
-        // checks cross-field invariants.
-        persisted
-            .into_automation(id, AutomationRevision::from_bytes(bytes))
-            .map_err(TomlDeError::custom)
+        let revision = AutomationRevision::from_bytes(bytes);
+        Self::assemble(id, revision, persisted.into_replace()).map_err(TomlDeError::custom)
     }
 
-    pub fn from_draft(
-        draft: AutomationDraft,
+    /// Build, validate, and assign a revision to an `Automation` in one
+    /// step. Used by the store immediately after persisting canonical TOML
+    /// bytes so the in-memory revision always matches what is on disk.
+    pub(crate) fn assemble(
+        id: AutomationId,
         revision: AutomationRevision,
+        replace: AutomationReplace,
     ) -> Result<Self, AutomationValidationError> {
-        let automation = Self {
-            id: draft.id,
+        validate_common(&replace.name, &replace.triggers)?;
+        Ok(Self {
+            id,
             revision,
-            name: draft.name,
-            description: draft.description,
-            enabled: draft.enabled.unwrap_or(true),
-            target: draft.target,
-            triggers: draft.triggers,
-        };
-        automation.validate()?;
-        Ok(automation)
+            name: replace.name,
+            description: replace.description,
+            enabled: replace.enabled,
+            target: replace.target,
+            triggers: replace.triggers,
+        })
     }
 
     #[must_use]
@@ -200,15 +208,6 @@ impl Automation {
         }
     }
 
-    pub fn to_toml_bytes(&self) -> Result<Vec<u8>, TomlEditSerError> {
-        let persisted = PersistedAutomation::from(self);
-        to_document(&persisted).map(|document| document.to_string().into_bytes())
-    }
-
-    pub fn validate(&self) -> Result<(), AutomationValidationError> {
-        validate_common(&self.name, &self.triggers)
-    }
-
     #[must_use]
     pub fn api_trigger(&self) -> Option<&ApiTrigger> {
         self.triggers.iter().find_map(|trigger| match trigger {
@@ -218,23 +217,29 @@ impl Automation {
     }
 }
 
-impl AutomationReplace {
-    pub(crate) fn into_automation(
-        self,
-        id: AutomationId,
-        revision: AutomationRevision,
-    ) -> Result<Automation, AutomationValidationError> {
-        let automation = Automation {
-            id,
-            revision,
-            name: self.name,
+impl AutomationDraft {
+    /// Drop the `id` (which becomes the storage filename) and surface the
+    /// remaining fields in the canonical replace shape, applying the
+    /// `enabled` default.
+    #[must_use]
+    pub fn into_replace(self) -> AutomationReplace {
+        AutomationReplace {
+            name:        self.name,
             description: self.description,
-            enabled: self.enabled,
-            target: self.target,
-            triggers: self.triggers,
-        };
-        automation.validate()?;
-        Ok(automation)
+            enabled:     self.enabled.unwrap_or(true),
+            target:      self.target,
+            triggers:    self.triggers,
+        }
+    }
+}
+
+impl AutomationReplace {
+    /// Serialize this replace value into canonical TOML bytes. The
+    /// representation matches `PersistedAutomation` so on-disk and in-memory
+    /// shapes stay aligned without an extra clone.
+    pub(crate) fn to_toml_bytes(&self) -> Result<Vec<u8>, TomlEditSerError> {
+        to_document(&PersistedAutomationRef::from(self))
+            .map(|document| document.to_string().into_bytes())
     }
 }
 
@@ -253,33 +258,36 @@ impl AutomationPatch {
 }
 
 impl PersistedAutomation {
-    pub(crate) fn into_automation(
-        self,
-        id: AutomationId,
-        revision: AutomationRevision,
-    ) -> Result<Automation, AutomationValidationError> {
-        let automation = Automation {
-            id,
-            revision,
-            name: self.name,
+    fn into_replace(self) -> AutomationReplace {
+        AutomationReplace {
+            name:        self.name,
             description: self.description,
-            enabled: self.enabled,
-            target: self.target,
-            triggers: self.triggers,
-        };
-        automation.validate()?;
-        Ok(automation)
+            enabled:     self.enabled,
+            target:      self.target,
+            triggers:    self.triggers,
+        }
     }
 }
 
-impl From<&Automation> for PersistedAutomation {
-    fn from(value: &Automation) -> Self {
+#[derive(Debug, Serialize)]
+struct PersistedAutomationRef<'a> {
+    name:        &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    enabled:     bool,
+    target:      &'a AutomationTarget,
+    #[serde(default, skip_serializing_if = "<[_]>::is_empty")]
+    triggers:    &'a [AutomationTrigger],
+}
+
+impl<'a> From<&'a AutomationReplace> for PersistedAutomationRef<'a> {
+    fn from(value: &'a AutomationReplace) -> Self {
         Self {
-            name:        value.name.clone(),
-            description: value.description.clone(),
+            name:        &value.name,
+            description: value.description.as_deref(),
             enabled:     value.enabled,
-            target:      value.target.clone(),
-            triggers:    value.triggers.clone(),
+            target:      &value.target,
+            triggers:    &value.triggers,
         }
     }
 }
@@ -455,14 +463,6 @@ impl AsRef<str> for AutomationRevision {
 impl fmt::Display for AutomationRevision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for AutomationRevision {
-    type Err = AutomationValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
     }
 }
 
@@ -680,7 +680,14 @@ expression = "0 3 * * *"
 "#,
         ))
         .expect("draft should deserialize");
-        assert!(Automation::from_draft(draft, AutomationRevision::from_bytes(b"")).is_err());
+        assert!(
+            Automation::assemble(
+                draft.id.clone(),
+                AutomationRevision::from_bytes(b""),
+                draft.into_replace(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -698,7 +705,14 @@ type = "api"
 "#,
         ))
         .expect("draft should deserialize");
-        assert!(Automation::from_draft(draft, AutomationRevision::from_bytes(b"")).is_err());
+        assert!(
+            Automation::assemble(
+                draft.id.clone(),
+                AutomationRevision::from_bytes(b""),
+                draft.into_replace(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -725,7 +739,14 @@ expression = "* * * * * *"
 "#,
         ))
         .expect("draft should deserialize");
-        assert!(Automation::from_draft(draft, AutomationRevision::from_bytes(b"")).is_err());
+        assert!(
+            Automation::assemble(
+                draft.id.clone(),
+                AutomationRevision::from_bytes(b""),
+                draft.into_replace(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

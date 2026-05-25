@@ -4,15 +4,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_api::types::RunManifest;
-use fabro_automation::{AutomationId, AutomationTarget};
+use fabro_automation::AutomationTarget;
 use fabro_config::Storage;
+use fabro_redact::DisplaySafeUrl;
+use fabro_sandbox::redact::redact_auth_url;
 use fabro_types::RunId;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio::{fs, task};
 
 pub(crate) struct AutomationRunMaterializeInput {
-    pub automation_id:      AutomationId,
     pub target:             AutomationTarget,
     pub run_id:             RunId,
     pub user_settings_path: PathBuf,
@@ -31,8 +32,6 @@ pub(crate) enum AutomationRunMaterializeError {
     InvalidTarget(String),
     #[error("failed to clone automation repository: {0}")]
     CloneFailed(String),
-    #[error("failed to resolve automation workflow: {0}")]
-    WorkflowNotFound(String),
     #[error("failed to build run manifest: {0}")]
     Manifest(String),
 }
@@ -80,9 +79,10 @@ impl AutomationRunMaterializer for GitAutomationRunMaterializer {
             ));
         }
         let sanitized_clone_url = github_clone_url(owner, repo);
-        let clone_url = self
-            .authenticated_clone_url(owner, repo, &sanitized_clone_url)
-            .await?;
+        let auth_url = self.authenticated_clone_url(&sanitized_clone_url).await?;
+        let clone_url = auth_url
+            .as_ref()
+            .map_or_else(|| sanitized_clone_url.clone(), DisplaySafeUrl::raw_string);
 
         fs::create_dir_all(&input.temp_root).await.map_err(|err| {
             AutomationRunMaterializeError::CloneFailed(format!(
@@ -91,38 +91,38 @@ impl AutomationRunMaterializer for GitAutomationRunMaterializer {
             ))
         })?;
         let checkout_dir = input.temp_root.join(input.run_id.to_string());
-        run_git(
-            git_clone_args(&clone_url, &checkout_dir),
-            self.git_timeout,
-            "git clone",
-        )
-        .await?;
-        run_git(
-            git_remote_set_url_args(&checkout_dir, &sanitized_clone_url),
-            self.git_timeout,
-            "git remote set-url origin",
-        )
-        .await?;
-        run_git(
-            git_checkout_args(&checkout_dir, input.target.ref_.as_str()),
-            self.git_timeout,
-            "git checkout",
-        )
-        .await?;
-
-        build_manifest_from_checkout(input, checkout_dir).await
+        let result = self
+            .run_checkout(
+                &input,
+                &checkout_dir,
+                &clone_url,
+                &sanitized_clone_url,
+                auth_url.as_ref(),
+            )
+            .await;
+        // Always clean up the materialized clone: callers don't need the
+        // working tree after the manifest is built, and a failed clone
+        // (e.g. partial fetch) should not leak gigabytes into scratch.
+        if let Err(err) = fs::remove_dir_all(&checkout_dir).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %err,
+                    path = %checkout_dir.display(),
+                    "Failed to clean up automation checkout",
+                );
+            }
+        }
+        result
     }
 }
 
 impl GitAutomationRunMaterializer {
     async fn authenticated_clone_url(
         &self,
-        owner: &str,
-        repo: &str,
         sanitized_clone_url: &str,
-    ) -> Result<String, AutomationRunMaterializeError> {
+    ) -> Result<Option<DisplaySafeUrl>, AutomationRunMaterializeError> {
         let Some(credentials) = self.github_credentials.as_ref() else {
-            return Ok(sanitized_clone_url.to_string());
+            return Ok(None);
         };
         let ctx = match self.http_client.clone() {
             Some(client) => fabro_github::GitHubContext::with_http_client(
@@ -132,15 +132,42 @@ impl GitAutomationRunMaterializer {
             ),
             None => fabro_github::GitHubContext::new(credentials, &self.github_api_base_url),
         };
-        let (_username, token) = fabro_github::resolve_clone_credentials(&ctx, owner, repo)
+        fabro_github::resolve_authenticated_url(&ctx, sanitized_clone_url)
             .await
-            .map_err(|err| AutomationRunMaterializeError::CloneFailed(err.to_string()))?;
-        match token {
-            Some(token) => fabro_github::embed_token_in_url(sanitized_clone_url, &token)
-                .map(|url| url.raw_string())
-                .map_err(|err| AutomationRunMaterializeError::CloneFailed(err.to_string())),
-            None => Ok(sanitized_clone_url.to_string()),
-        }
+            .map(Some)
+            .map_err(|err| AutomationRunMaterializeError::CloneFailed(err.to_string()))
+    }
+
+    async fn run_checkout(
+        &self,
+        input: &AutomationRunMaterializeInput,
+        checkout_dir: &Path,
+        clone_url: &str,
+        sanitized_clone_url: &str,
+        auth_url: Option<&DisplaySafeUrl>,
+    ) -> Result<AutomationRunMaterialized, AutomationRunMaterializeError> {
+        run_git(
+            git_clone_args(clone_url, checkout_dir),
+            self.git_timeout,
+            "git clone",
+            auth_url,
+        )
+        .await?;
+        run_git(
+            git_remote_set_url_args(checkout_dir, sanitized_clone_url),
+            self.git_timeout,
+            "git remote set-url origin",
+            auth_url,
+        )
+        .await?;
+        run_git(
+            git_checkout_args(checkout_dir, input.target.ref_.as_str()),
+            self.git_timeout,
+            "git checkout",
+            auth_url,
+        )
+        .await?;
+        build_manifest_from_checkout(input, checkout_dir).await
     }
 }
 
@@ -187,6 +214,7 @@ async fn run_git(
     args: Vec<OsString>,
     git_timeout: Duration,
     label: &'static str,
+    auth_url: Option<&DisplaySafeUrl>,
 ) -> Result<(), AutomationRunMaterializeError> {
     let mut command = Command::new("git");
     command.args(&args);
@@ -200,45 +228,40 @@ async fn run_git(
                 git_timeout.as_secs()
             ))
         })?
-        .map_err(|err| AutomationRunMaterializeError::CloneFailed(format!("{label}: {err}")))?;
+        .map_err(|err| {
+            AutomationRunMaterializeError::CloneFailed(redact_auth_url(
+                &format!("{label}: {err}"),
+                auth_url,
+            ))
+        })?;
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if stderr.is_empty() { stdout } else { stderr };
-    Err(AutomationRunMaterializeError::CloneFailed(format!(
-        "{label} exited with status {}: {}",
-        output.status,
-        redact_command_output(&detail)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(AutomationRunMaterializeError::CloneFailed(redact_auth_url(
+        &format!("{label} exited with status {}: {detail}", output.status),
+        auth_url,
     )))
 }
 
-fn redact_command_output(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(redact_url_token)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_url_token(value: &str) -> String {
-    fabro_redact::DisplaySafeUrl::parse(value)
-        .map_or_else(|_| value.to_string(), |url| url.redacted_string())
-}
-
 async fn build_manifest_from_checkout(
-    input: AutomationRunMaterializeInput,
-    checkout_dir: PathBuf,
+    input: &AutomationRunMaterializeInput,
+    checkout_dir: &Path,
 ) -> Result<AutomationRunMaterialized, AutomationRunMaterializeError> {
     let workflow = PathBuf::from(input.target.workflow.as_str());
-    let user_settings_path = input.user_settings_path;
+    let user_settings_path = input.user_settings_path.clone();
     let run_id = input.run_id;
-    let automation_id = input.automation_id.to_string();
+    let cwd = checkout_dir.to_path_buf();
     let built = task::spawn_blocking(move || {
         fabro_manifest::build_run_manifest(fabro_manifest::ManifestBuildInput {
             workflow,
-            cwd: checkout_dir,
+            cwd,
             run_id: Some(run_id),
             user_settings_path: Some(user_settings_path),
             ..fabro_manifest::ManifestBuildInput::default()
@@ -246,28 +269,13 @@ async fn build_manifest_from_checkout(
     })
     .await
     .map_err(|err| AutomationRunMaterializeError::Manifest(err.to_string()))?
-    .map_err(|err| classify_manifest_error(&automation_id, &err))?;
+    .map_err(|err| AutomationRunMaterializeError::Manifest(err.to_string()))?;
     let submitted_manifest_bytes = serde_json::to_vec(&built.manifest)
         .map_err(|err| AutomationRunMaterializeError::Manifest(err.to_string()))?;
     Ok(AutomationRunMaterialized {
         manifest: built.manifest,
         submitted_manifest_bytes,
     })
-}
-
-fn classify_manifest_error(
-    automation_id: &str,
-    err: &anyhow::Error,
-) -> AutomationRunMaterializeError {
-    let message = err.to_string();
-    if err
-        .chain()
-        .any(|cause| cause.to_string().contains("workflow") && cause.to_string().contains("not"))
-    {
-        AutomationRunMaterializeError::WorkflowNotFound(format!("{automation_id}: {message}"))
-    } else {
-        AutomationRunMaterializeError::Manifest(message)
-    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -305,7 +313,7 @@ impl AutomationRunMaterializer for StaticAutomationRunMaterializer {
 mod tests {
     use std::str::FromStr as _;
 
-    use fabro_automation::{AutomationId, GitRefSelector, RepositorySlug, WorkflowSlug};
+    use fabro_automation::{GitRefSelector, RepositorySlug, WorkflowSlug};
 
     use super::*;
 
@@ -318,12 +326,17 @@ mod tests {
     }
 
     #[test]
-    fn redact_command_output_strips_credentials() {
-        let redacted = redact_command_output(
-            "fatal: https://x-access-token:ghs_secret@github.com/acme/widgets.git failed",
+    fn redact_auth_url_strips_credentials_from_stderr() {
+        let auth_url =
+            DisplaySafeUrl::parse("https://x-access-token:ghs_secret@github.com/acme/widgets.git")
+                .expect("auth url should parse");
+        let redacted = redact_auth_url(
+            "fatal: https://x-access-token:ghs_secret@github.com/acme/widgets.git\nremote: denied",
+            Some(&auth_url),
         );
-        assert!(redacted.contains("https://x-access-token:***@github.com/acme/widgets.git"));
         assert!(!redacted.contains("ghs_secret"));
+        // Newlines are preserved (unlike a whitespace-collapse redactor).
+        assert!(redacted.contains('\n'));
     }
 
     #[test]
@@ -359,14 +372,13 @@ mod tests {
         };
         let run_id = RunId::new();
         let input = AutomationRunMaterializeInput {
-            automation_id: AutomationId::from_str("nightly").unwrap(),
             target,
             run_id,
             user_settings_path: dir.path().join("settings.toml"),
             temp_root: dir.path().join("tmp"),
         };
 
-        let materialized = build_manifest_from_checkout(input, dir.path().to_path_buf())
+        let materialized = build_manifest_from_checkout(&input, dir.path())
             .await
             .expect("manifest should build");
 

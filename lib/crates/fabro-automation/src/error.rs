@@ -37,8 +37,6 @@ pub enum AutomationStoreError {
     NotFound(AutomationId),
     #[error("automation already exists: {0}")]
     AlreadyExists(AutomationId),
-    #[error("missing automation revision")]
-    MissingRevision,
     #[error("automation revision mismatch")]
     RevisionMismatch {
         expected: AutomationRevision,
@@ -51,6 +49,8 @@ pub enum AutomationStoreError {
         path:   PathBuf,
         source: TomlDeError,
     },
+    #[error("failed to serialize automation TOML: {0}")]
+    Serialize(String),
     #[error("I/O error at {}: {source}", path.display())]
     Io {
         path:   PathBuf,

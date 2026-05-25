@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::str::FromStr as _;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -149,8 +148,9 @@ fn default_true() -> bool {
 }
 
 async fn list_automations(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
-    let mut automations = state.automation_store().list().await;
-    automations.sort_by(|left, right| left.id.cmp(&right.id));
+    // `AutomationStore::list` already yields entries in `AutomationId` order
+    // (BTreeMap iteration); no additional sort is required.
+    let automations = state.automation_store().list().await;
     let total = automations.len() as u64;
     (
         StatusCode::OK,
@@ -367,7 +367,6 @@ async fn create_automation_run(
     let materialized = match state
         .automation_materializer()
         .materialize(AutomationRunMaterializeInput {
-            automation_id: id.clone(),
             target: automation.target.clone(),
             run_id,
             user_settings_path: state.active_config_path().to_path_buf(),
@@ -441,8 +440,7 @@ fn parse_if_match(headers: &HeaderMap) -> Result<AutomationRevision, ApiError> {
             "If-Match revision must not be empty.",
         ));
     }
-    Ok(AutomationRevision::from_str(revision)
-        .expect("AutomationRevision accepts any non-empty string"))
+    Ok(AutomationRevision::from_raw(revision))
 }
 
 fn with_etag(status: StatusCode, automation: Automation) -> Response {
@@ -461,29 +459,22 @@ fn store_error(err: AutomationStoreError) -> ApiError {
         AutomationStoreError::AlreadyExists(_) => {
             ApiError::new(StatusCode::CONFLICT, "Automation already exists.")
         }
-        AutomationStoreError::MissingRevision => ApiError::new(
-            StatusCode::PRECONDITION_REQUIRED,
-            "If-Match header is required.",
-        ),
         AutomationStoreError::RevisionMismatch { .. } => {
             ApiError::new(StatusCode::CONFLICT, "Automation revision mismatch.")
         }
         AutomationStoreError::Validation(err) => validation_error(&err),
-        AutomationStoreError::Parse { .. } | AutomationStoreError::Io { .. } => {
+        AutomationStoreError::Parse { .. }
+        | AutomationStoreError::Serialize(_)
+        | AutomationStoreError::Io { .. } => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
         }
     }
 }
 
 fn materialize_error(err: &AutomationRunMaterializeError) -> ApiError {
-    match err {
-        AutomationRunMaterializeError::InvalidTarget(_)
-        | AutomationRunMaterializeError::CloneFailed(_)
-        | AutomationRunMaterializeError::WorkflowNotFound(_)
-        | AutomationRunMaterializeError::Manifest(_) => {
-            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
-        }
-    }
+    // All current variants surface as 422 — they describe automation
+    // misconfiguration or repository state that the caller can correct.
+    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
 }
 
 impl TryFrom<RawAutomationTarget> for AutomationTarget {

@@ -27,7 +27,7 @@ fn automation_api_reuses_domain_types() {
 fn automation_json_matches_openapi_shape() {
     let automation = Automation {
         id:          "nightly-deps".parse().unwrap(),
-        revision:    AutomationRevision::from_str("abc123").unwrap(),
+        revision:    AutomationRevision::from_raw("abc123"),
         name:        "Nightly dependency update".to_string(),
         description: Some("Open a PR for dependency updates.".to_string()),
         enabled:     true,
