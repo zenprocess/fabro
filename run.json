@@ -1,0 +1,530 @@
+{
+  "title": "---",
+  "spec": {
+    "run_id": "01KSFYCA4W7NCM7F70FRM1PX7N",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "---\ntitle: \"feat: Add run approval controls to MCP and CLI\"\ntype: feat\nstatus: active\ndate: 2026-05-25\n---\n\n# feat: Add run approval controls to MCP and CLI\n\n## Summary\n\nFabro already has pre-execution run approval state and REST endpoints:\n\n- `POST /api/v1/runs/{id}/approve`\n- `POST /api/v1/runs/{id}/deny`\n\nThis plan exposes that capability through the existing human run-management surfaces:\n\n- `fabro_run_interact` gains `approve` and `deny` actions.\n- The CLI gains top-level batch commands:\n  - `fabro approve <RUNS>...`\n  - `fabro deny [--reason <REASON>] <RUNS>...`\n\nApproval remains a human/user action. Workflow-agent `fabro_tools` must not be able to approve or deny child runs it created.\n\n## Key Interface Changes\n\n### MCP\n\nExtend `fabro_run_interact`:\n\n- Add actions: `approve`, `deny`.\n- Add optional parameter: `reason: string | null`.\n- `reason` is valid only for `deny`; trim whitespace and send `None` for absent or blank values.\n- `approve` and `deny` return the updated run summary using the existing `result.summary` shape.\n- Update the tool description to include approval actions.\n\nExample:\n\n```json\n{\n  \"run_id\": \"nightly\",\n  \"action\": \"approve\"\n}\n```\n\n```json\n{\n  \"run_id\": \"nightly\",\n  \"action\": \"deny\",\n  \"reason\": \"Not approved for execution\"\n}\n```\n\n### CLI\n\nAdd flattened top-level commands, alongside `archive` and `unarchive`:\n\n```bash\nfabro approve <RUNS>...\nfabro deny [--reason <REASON>] <RUNS>...\n```\n\nBatch behavior:\n\n- Resolve each argument using the same selector path as archive/unarchive.\n- Attempt every requested run even if earlier runs fail.\n- Text mode prints each successful short run id to stderr.\n- If any run fails, exit non-zero after processing all runs.\n\nJSON output:\n\n```json\n{\n  \"approved\": [\"01K...\"],\n  \"errors\": []\n}\n```\n\n```json\n{\n  \"denied\": [\"01K...\"],\n  \"errors\": []\n}\n```\n\nErrors use the existing batch shape:\n\n```json\n{\n  \"identifier\": \"nightly\",\n  \"error\": \"Run is not pending approval.\"\n}\n```\n\n`fabro deny --reason <REASON>` applies the same reason to every run in the batch.\n\n## Implementation Plan\n\n### 1. Add client and shared tool backend methods\n\nFiles:\n\n- `lib/crates/fabro-client/src/client.rs`\n- `lib/crates/fabro-tool/src/common.rs`\n- `lib/crates/fabro-tool/src/fabro_client.rs`\n- Mock `FabroToolBackend` impls in tests under `fabro-tool` and `fabro-workflow`\n\nChanges:\n\n- Add `Client::approve_run(&RunId) -> Result<Run>`.\n- Add `Client::deny_run(&RunId, Option<String>) -> Result<Run>`.\n- Implement them by calling the generated `approve_run` and `deny_run` OpenAPI client methods.\n- Add matching methods to `FabroToolBackend`.\n- Implement them in `ClientBackend`.\n- For `deny_run`, build `types::DenyRunRequest { reason }` only when the generated client requires a body; preserve the API behavior that omitted, null, empty, or whitespace-only reasons are stored as absent.\n\nNo OpenAPI or generated-client regeneration is expected because the endpoints and DTO already exist.\n\n### 2. Extend `fabro_run_interact`\n\nFiles:\n\n- `lib/crates/fabro-tool/src/interact.rs`\n- `lib/crates/fabro-tool/src/common.rs`\n- `lib/crates/fabro-tool/src/lib.rs`\n- `lib/crates/fabro-mcp-server/src/server.rs`\n\nChanges:\n\n- Add `RunInteractAction::Approve` and `RunInteractAction::Deny`.\n- Add `reason: Option<String>` to `FabroRunInteractParams`.\n- Add `ValidatedInteractAction::Approve` and `ValidatedInteractAction::Deny { reason: Option<String> }`.\n- Validate `reason` by trimming whitespace and dropping blank values.\n- Dispatch:\n  - `Approve` -> `backend.approve_run(&run_id)`\n  - `Deny` -> `backend.deny_run(&run_id, reason)`\n- Return `json!({ \"summary\": common::run_summary_result(&summary) })`.\n- Update `interact_run_text` output automatically through the action name; no special summary text is required.\n- Update tool descriptions from “start, message, interrupt, cancel…” to include “approve, deny”.\n\n### 3. Block workflow-agent self-approval\n\nFiles:\n\n- `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Existing run-tool tests in the same file\n\nChanges:\n\n- In `execute_fabro_run_tool`, parse `FabroRunInteractParams` before dispatching.\n- If the tool call is `fabro_run_interact` with action `approve` or `deny`, return a `ToolError` explaining that run approval must be performed by a user through the API, CLI, web UI, or human MCP server.\n- Do not rely only on server auth for this guard; the tool error should be immediate and explicit for workflow agents.\n- Keep server `approve_run` and `deny_run` handlers on `RequiredUser`.\n- Keep the existing server negative test that run-tools workers cannot call user-only routes, and extend it to include `/runs/{id}/deny`.\n\n### 4. Add CLI approval commands\n\nFiles:\n\n- `lib/crates/fabro-cli/src/args.rs`\n- `lib/crates/fabro-cli/src/commands/runs/mod.rs`\n- Create `lib/crates/fabro-cli/src/commands/runs/approval.rs`\n\nChanges:\n\n- Add:\n  - `RunsApproveArgs { server: ServerTargetArgs, runs: Vec<String> }`\n  - `RunsDenyArgs { server: ServerTargetArgs, reason: Option<String>, runs: Vec<String> }`\n- Add `RunsCommands::Approve(RunsApproveArgs)` and `RunsCommands::Deny(RunsDenyArgs)`.\n- Command help:\n  - approve: “Approve pending workflow runs.”\n  - deny: “Deny pending workflow runs.”\n  - run args: “Run IDs or workflow names to approve/deny.”\n  - reason flag: “Reason for denying execution.”\n- Implement shared batch logic in `commands/runs/approval.rs`, patterned after `archive.rs`:\n  - Resolve each identifier with `client.resolve_run`.\n  - Call `client.approve_run` or `client.deny_run`.\n  - Collect successes and per-identifier errors.\n  - Print short run ids to stderr in text mode.\n  - Print JSON only in JSON mode.\n  - Fail at the end with `some runs could not be approved` or `some runs could not be denied`.\n- Register the new dispatch arms in `commands/runs/mod.rs`.\n- Update command-name reporting in `RunsCommands::name()`.\n\n### 5. Update docs\n\nFiles:\n\n- `docs/public/agents/mcp.mdx`\n- `docs/public/reference/cli.mdx`\n\nChanges:\n\n- Update the `fabro_run_interact` row to include approve/deny.\n- Add a short MCP example for approving or denying a pending run.\n- Add generated or manually updated CLI reference sections for:\n  - `fabro approve`\n  - `fabro deny`\n- If `docs/public/reference/cli.mdx` is generated from `fabro __cli-reference`, regenerate it after the CLI args are implemented.\n\n## Test Plan\n\n### `fabro-tool`\n\n- Add unit tests for action validation:\n  - `approve` validates with only `run_id` and action.\n  - `deny` validates with absent reason as `None`.\n  - `deny` trims a nonblank reason.\n  - `deny` converts blank reason to `None`.\n- Add dispatch tests with a mock backend:\n  - `approve` calls `approve_run` and returns `result.summary`.\n  - `deny` calls `deny_run` with the expected reason and returns `result.summary`.\n- Update schema/tool-definition assertions to prove `approve`, `deny`, and `reason` appear in the `fabro_run_interact` schema.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-tool interact\n```\n\n### MCP integration\n\nFile:\n\n- `lib/crates/fabro-cli/tests/it/cmd/mcp.rs`\n\nScenarios:\n\n- `fabro_run_interact` action `approve`:\n  - resolves selector through `/api/v1/runs/resolve`\n  - posts to `/api/v1/runs/{id}/approve`\n  - returns updated summary\n- `fabro_run_interact` action `deny`:\n  - resolves selector\n  - posts to `/api/v1/runs/{id}/deny`\n  - sends `{ \"reason\": \"Not approved for execution\" }` when reason is supplied\n  - returns updated summary\n- Existing tool-list/schema test checks the new actions and parameter.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli mcp_interact\n```\n\n### CLI command tests\n\nFiles:\n\n- Create `lib/crates/fabro-cli/tests/it/cmd/approve.rs`\n- Create `lib/crates/fabro-cli/tests/it/cmd/deny.rs`\n- Modify `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n\nScenarios:\n\n- Help snapshots for `fabro approve --help` and `fabro deny --help`.\n- Required-argument snapshots for missing `<RUNS>...`.\n- Mock-server success path:\n  - resolve `nightly-build`\n  - call approve/deny endpoint\n  - print short run id in text mode\n- JSON success path:\n  - approve returns `approved`\n  - deny returns `denied`\n  - both include `errors: []`\n- Partial-error path:\n  - one selector or endpoint fails\n  - remaining runs are still attempted\n  - JSON includes both successes and errors\n  - process exits non-zero\n- `fabro deny --reason \"Needs review\"` sends that reason in the request body.\n- Top-level help snapshot includes `approve` and `deny`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli approve deny fabro::help\n```\n\n### Server auth regression\n\nFile:\n\n- `lib/crates/fabro-server/src/server/tests.rs`\n\nScenario:\n\n- Extend `run_tools_worker_cannot_call_user_only_non_mcp_routes` so a run-tools worker remains rejected for:\n  - `POST /runs/{target}/approve`\n  - `POST /runs/{target}/deny`\n  - an existing user-only route such as timeline\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server run_tools_worker_cannot_call_user_only_non_mcp_routes\n```\n\n### Final verification\n\nRun targeted checks first:\n\n```bash\ncargo nextest run -p fabro-tool -p fabro-cli -p fabro-server\n```\n\nBefore merge, run:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nRun full workspace tests if the client/backend trait changes produce broad compile churn:\n\n```bash\ncargo nextest run --workspace\n```\n\n## Assumptions\n\n- Approval and denial remain user-authorized operations.\n- Human MCP clients use normal CLI/server user auth and may approve or deny.\n- Workflow-agent `fabro_tools` may inspect pending runs but must not approve or deny them.\n- `fabro deny --reason <REASON>` applies one reason to every run in the batch.\n- No API contract change is required because the REST approval endpoints already exist.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "ref": "fabro-v12",
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "label": {
+              "String": "Implement"
+            },
+            "reasoning_effort": {
+              "String": "xhigh"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "provider": {
+              "String": "openai"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "script": {
+              "String": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Verify"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "retry_target": {
+              "String": "fixup"
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "label": {
+              "String": "Toolchain"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Start"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "label": {
+              "String": "Fixup"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "label": {
+              "String": "Exit"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "goal": {
+          "String": "---\ntitle: \"feat: Add run approval controls to MCP and CLI\"\ntype: feat\nstatus: active\ndate: 2026-05-25\n---\n\n# feat: Add run approval controls to MCP and CLI\n\n## Summary\n\nFabro already has pre-execution run approval state and REST endpoints:\n\n- `POST /api/v1/runs/{id}/approve`\n- `POST /api/v1/runs/{id}/deny`\n\nThis plan exposes that capability through the existing human run-management surfaces:\n\n- `fabro_run_interact` gains `approve` and `deny` actions.\n- The CLI gains top-level batch commands:\n  - `fabro approve <RUNS>...`\n  - `fabro deny [--reason <REASON>] <RUNS>...`\n\nApproval remains a human/user action. Workflow-agent `fabro_tools` must not be able to approve or deny child runs it created.\n\n## Key Interface Changes\n\n### MCP\n\nExtend `fabro_run_interact`:\n\n- Add actions: `approve`, `deny`.\n- Add optional parameter: `reason: string | null`.\n- `reason` is valid only for `deny`; trim whitespace and send `None` for absent or blank values.\n- `approve` and `deny` return the updated run summary using the existing `result.summary` shape.\n- Update the tool description to include approval actions.\n\nExample:\n\n```json\n{\n  \"run_id\": \"nightly\",\n  \"action\": \"approve\"\n}\n```\n\n```json\n{\n  \"run_id\": \"nightly\",\n  \"action\": \"deny\",\n  \"reason\": \"Not approved for execution\"\n}\n```\n\n### CLI\n\nAdd flattened top-level commands, alongside `archive` and `unarchive`:\n\n```bash\nfabro approve <RUNS>...\nfabro deny [--reason <REASON>] <RUNS>...\n```\n\nBatch behavior:\n\n- Resolve each argument using the same selector path as archive/unarchive.\n- Attempt every requested run even if earlier runs fail.\n- Text mode prints each successful short run id to stderr.\n- If any run fails, exit non-zero after processing all runs.\n\nJSON output:\n\n```json\n{\n  \"approved\": [\"01K...\"],\n  \"errors\": []\n}\n```\n\n```json\n{\n  \"denied\": [\"01K...\"],\n  \"errors\": []\n}\n```\n\nErrors use the existing batch shape:\n\n```json\n{\n  \"identifier\": \"nightly\",\n  \"error\": \"Run is not pending approval.\"\n}\n```\n\n`fabro deny --reason <REASON>` applies the same reason to every run in the batch.\n\n## Implementation Plan\n\n### 1. Add client and shared tool backend methods\n\nFiles:\n\n- `lib/crates/fabro-client/src/client.rs`\n- `lib/crates/fabro-tool/src/common.rs`\n- `lib/crates/fabro-tool/src/fabro_client.rs`\n- Mock `FabroToolBackend` impls in tests under `fabro-tool` and `fabro-workflow`\n\nChanges:\n\n- Add `Client::approve_run(&RunId) -> Result<Run>`.\n- Add `Client::deny_run(&RunId, Option<String>) -> Result<Run>`.\n- Implement them by calling the generated `approve_run` and `deny_run` OpenAPI client methods.\n- Add matching methods to `FabroToolBackend`.\n- Implement them in `ClientBackend`.\n- For `deny_run`, build `types::DenyRunRequest { reason }` only when the generated client requires a body; preserve the API behavior that omitted, null, empty, or whitespace-only reasons are stored as absent.\n\nNo OpenAPI or generated-client regeneration is expected because the endpoints and DTO already exist.\n\n### 2. Extend `fabro_run_interact`\n\nFiles:\n\n- `lib/crates/fabro-tool/src/interact.rs`\n- `lib/crates/fabro-tool/src/common.rs`\n- `lib/crates/fabro-tool/src/lib.rs`\n- `lib/crates/fabro-mcp-server/src/server.rs`\n\nChanges:\n\n- Add `RunInteractAction::Approve` and `RunInteractAction::Deny`.\n- Add `reason: Option<String>` to `FabroRunInteractParams`.\n- Add `ValidatedInteractAction::Approve` and `ValidatedInteractAction::Deny { reason: Option<String> }`.\n- Validate `reason` by trimming whitespace and dropping blank values.\n- Dispatch:\n  - `Approve` -> `backend.approve_run(&run_id)`\n  - `Deny` -> `backend.deny_run(&run_id, reason)`\n- Return `json!({ \"summary\": common::run_summary_result(&summary) })`.\n- Update `interact_run_text` output automatically through the action name; no special summary text is required.\n- Update tool descriptions from “start, message, interrupt, cancel…” to include “approve, deny”.\n\n### 3. Block workflow-agent self-approval\n\nFiles:\n\n- `lib/crates/fabro-workflow/src/handler/llm/api.rs`\n- Existing run-tool tests in the same file\n\nChanges:\n\n- In `execute_fabro_run_tool`, parse `FabroRunInteractParams` before dispatching.\n- If the tool call is `fabro_run_interact` with action `approve` or `deny`, return a `ToolError` explaining that run approval must be performed by a user through the API, CLI, web UI, or human MCP server.\n- Do not rely only on server auth for this guard; the tool error should be immediate and explicit for workflow agents.\n- Keep server `approve_run` and `deny_run` handlers on `RequiredUser`.\n- Keep the existing server negative test that run-tools workers cannot call user-only routes, and extend it to include `/runs/{id}/deny`.\n\n### 4. Add CLI approval commands\n\nFiles:\n\n- `lib/crates/fabro-cli/src/args.rs`\n- `lib/crates/fabro-cli/src/commands/runs/mod.rs`\n- Create `lib/crates/fabro-cli/src/commands/runs/approval.rs`\n\nChanges:\n\n- Add:\n  - `RunsApproveArgs { server: ServerTargetArgs, runs: Vec<String> }`\n  - `RunsDenyArgs { server: ServerTargetArgs, reason: Option<String>, runs: Vec<String> }`\n- Add `RunsCommands::Approve(RunsApproveArgs)` and `RunsCommands::Deny(RunsDenyArgs)`.\n- Command help:\n  - approve: “Approve pending workflow runs.”\n  - deny: “Deny pending workflow runs.”\n  - run args: “Run IDs or workflow names to approve/deny.”\n  - reason flag: “Reason for denying execution.”\n- Implement shared batch logic in `commands/runs/approval.rs`, patterned after `archive.rs`:\n  - Resolve each identifier with `client.resolve_run`.\n  - Call `client.approve_run` or `client.deny_run`.\n  - Collect successes and per-identifier errors.\n  - Print short run ids to stderr in text mode.\n  - Print JSON only in JSON mode.\n  - Fail at the end with `some runs could not be approved` or `some runs could not be denied`.\n- Register the new dispatch arms in `commands/runs/mod.rs`.\n- Update command-name reporting in `RunsCommands::name()`.\n\n### 5. Update docs\n\nFiles:\n\n- `docs/public/agents/mcp.mdx`\n- `docs/public/reference/cli.mdx`\n\nChanges:\n\n- Update the `fabro_run_interact` row to include approve/deny.\n- Add a short MCP example for approving or denying a pending run.\n- Add generated or manually updated CLI reference sections for:\n  - `fabro approve`\n  - `fabro deny`\n- If `docs/public/reference/cli.mdx` is generated from `fabro __cli-reference`, regenerate it after the CLI args are implemented.\n\n## Test Plan\n\n### `fabro-tool`\n\n- Add unit tests for action validation:\n  - `approve` validates with only `run_id` and action.\n  - `deny` validates with absent reason as `None`.\n  - `deny` trims a nonblank reason.\n  - `deny` converts blank reason to `None`.\n- Add dispatch tests with a mock backend:\n  - `approve` calls `approve_run` and returns `result.summary`.\n  - `deny` calls `deny_run` with the expected reason and returns `result.summary`.\n- Update schema/tool-definition assertions to prove `approve`, `deny`, and `reason` appear in the `fabro_run_interact` schema.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-tool interact\n```\n\n### MCP integration\n\nFile:\n\n- `lib/crates/fabro-cli/tests/it/cmd/mcp.rs`\n\nScenarios:\n\n- `fabro_run_interact` action `approve`:\n  - resolves selector through `/api/v1/runs/resolve`\n  - posts to `/api/v1/runs/{id}/approve`\n  - returns updated summary\n- `fabro_run_interact` action `deny`:\n  - resolves selector\n  - posts to `/api/v1/runs/{id}/deny`\n  - sends `{ \"reason\": \"Not approved for execution\" }` when reason is supplied\n  - returns updated summary\n- Existing tool-list/schema test checks the new actions and parameter.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli mcp_interact\n```\n\n### CLI command tests\n\nFiles:\n\n- Create `lib/crates/fabro-cli/tests/it/cmd/approve.rs`\n- Create `lib/crates/fabro-cli/tests/it/cmd/deny.rs`\n- Modify `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n\nScenarios:\n\n- Help snapshots for `fabro approve --help` and `fabro deny --help`.\n- Required-argument snapshots for missing `<RUNS>...`.\n- Mock-server success path:\n  - resolve `nightly-build`\n  - call approve/deny endpoint\n  - print short run id in text mode\n- JSON success path:\n  - approve returns `approved`\n  - deny returns `denied`\n  - both include `errors: []`\n- Partial-error path:\n  - one selector or endpoint fails\n  - remaining runs are still attempted\n  - JSON includes both successes and errors\n  - process exits non-zero\n- `fabro deny --reason \"Needs review\"` sends that reason in the request body.\n- Top-level help snapshot includes `approve` and `deny`.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli approve deny fabro::help\n```\n\n### Server auth regression\n\nFile:\n\n- `lib/crates/fabro-server/src/server/tests.rs`\n\nScenario:\n\n- Extend `run_tools_worker_cannot_call_user_only_non_mcp_routes` so a run-tools worker remains rejected for:\n  - `POST /runs/{target}/approve`\n  - `POST /runs/{target}/deny`\n  - an existing user-only route such as timeline\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server run_tools_worker_cannot_call_user_only_non_mcp_routes\n```\n\n### Final verification\n\nRun targeted checks first:\n\n```bash\ncargo nextest run -p fabro-tool -p fabro-cli -p fabro-server\n```\n\nBefore merge, run:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nRun full workspace tests if the client/backend trait changes produce broad compile churn:\n\n```bash\ncargo nextest run --workspace\n```\n\n## Assumptions\n\n- Approval and denial remain user-authorized operations.\n- Human MCP clients use normal CLI/server user auth and may approve or deny.\n- Workflow-agent `fabro_tools` may inspect pending runs but must not approve or deny them.\n- `fabro deny --reason <REASON>` applies one reason to every run in the batch.\n- No API contract change is required because the REST approval endpoints already exist.\n"
+        },
+        "rankdir": {
+          "String": "LR"
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\", model=\"gpt-55\", reasoning_effort=\"xhigh\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\\\"disabled\\\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures.\", max_visits=3]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> exit  [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.243.0-nightly.1"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.243.0-nightly.1",
+        "name": "fabro-cli",
+        "version": "0.243.0-nightly.1"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "b6023e5eaff61ffb7bc3fd0f3827810ada287160b20f73cac9f6d978de18ca7c",
+    "definition_blob": "303626c83b308220ef99468ae5d93ca4e254084c746b7c13fb24072fe5b0bfb2",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "7cc38e2f8d0e384e5e8dccfe51c614201a7242d9",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "failed",
+        "remote": "origin",
+        "branch": "main",
+        "message": "Engine error: git push failed: To github.com:fabro-sh/fabro.git\n ! [rejected]            main -> main (fetch first)\nerror: failed to push some refs to 'github.com:fabro-sh/fabro.git'\nhint: Updates were rejected because the remote contains work that you do not\nhint: have locally. This is usually caused by another repository pushing to\nhint: the same ref. If you want to integrate the remote changes, use\nhint: 'git pull' before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.\n"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KSFYCA4W7NCM7F70FRM1PX7N",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-25T16:09:39.794548Z",
+  "last_event_at": "2026-05-25T16:09:54.142703Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "snapshot": "fabro-v12",
+    "runtime": {
+      "id": "fabro-01KSFYCA4W7NCM7F70FRM1PX7N",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
