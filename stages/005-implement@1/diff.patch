@@ -1,0 +1,2935 @@
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index dfa032fe0..eb9f2f3ef 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -15,6 +15,8 @@ tags:
+     description: Browser authentication
+   - name: Runs
+     description: Run management operations
++  - name: Sandboxes
++    description: Provider-backed sandbox inventory
+   - name: Sessions
+     description: Ask Fabro sessions bound to runs
+   - name: Human-in-the-Loop
+@@ -3632,6 +3634,67 @@ paths:
+               schema:
+                 $ref: "#/components/schemas/ErrorResponse"
+ 
++  /api/v1/sandboxes:
++    get:
++      operationId: listSandboxes
++      tags: [Sandboxes]
++      summary: List Sandboxes
++      description: Lists Fabro-managed sandboxes directly from configured sandbox providers.
++      responses:
++        "200":
++          description: Provider-backed sandbox inventory
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/SandboxListResponse"
++
++  /api/v1/sandboxes/{id}:
++    get:
++      operationId: retrieveSandbox
++      tags: [Sandboxes]
++      summary: Retrieve Sandbox
++      description: Retrieves a Fabro-managed sandbox by provider-native id by searching all configured sandbox providers.
++      parameters:
++        - in: path
++          name: id
++          required: true
++          schema:
++            type: string
++      responses:
++        "200":
++          description: Sandbox found
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/SandboxInfo"
++        "404":
++          description: No provider found a Fabro-managed sandbox with this id
++          headers:
++            x-request-id:
++              $ref: "#/components/headers/XRequestId"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ErrorResponse"
++        "409":
++          description: More than one provider matched this sandbox id
++          headers:
++            x-request-id:
++              $ref: "#/components/headers/XRequestId"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ErrorResponse"
++        "502":
++          description: Provider lookup failed before a definitive result could be determined
++          headers:
++            x-request-id:
++              $ref: "#/components/headers/XRequestId"
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ErrorResponse"
++
+   /api/v1/runs/{id}/sandbox:
+     get:
+       operationId: retrieveRunSandbox
+@@ -10100,6 +10163,14 @@ components:
+         - docker
+         - daytona
+ 
++    SandboxProviderKind:
++      description: Sandbox provider inventory discriminator.
++      type: string
++      enum:
++        - local
++        - docker
++        - daytona
++
+     RunSandbox:
+       description: Canonical sandbox environment record for a run.
+       type: object
+@@ -11012,6 +11083,95 @@ components:
+         timestamps:
+           $ref: "#/components/schemas/SandboxTimestamps"
+ 
++    SandboxInfo:
++      description: Provider-backed inventory record for a Fabro-managed sandbox.
++      type: object
++      required:
++        - provider
++        - id
++        - state
++        - resources
++        - network
++        - labels
++        - timestamps
++      properties:
++        provider:
++          $ref: "#/components/schemas/SandboxProviderKind"
++        id:
++          type: string
++          description: Provider-native sandbox id.
++        display_name:
++          type: ["string", "null"]
++          description: Provider display name when distinct from the native id.
++        state:
++          $ref: "#/components/schemas/SandboxState"
++        native_state:
++          type: ["string", "null"]
++          description: Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
++        image:
++          type: ["string", "null"]
++          description: Provider image when surfaced by the sandbox provider.
++        snapshot:
++          type: ["string", "null"]
++          description: Provider snapshot when surfaced by the sandbox provider.
++        region:
++          type: ["string", "null"]
++          description: Provider region or target. Null for local-style providers.
++        web_url:
++          type: ["string", "null"]
++          description: Provider dashboard URL for this sandbox when available.
++        working_directory:
++          type: ["string", "null"]
++          description: Provider-reported or Fabro-default working directory when available.
++        resources:
++          $ref: "#/components/schemas/SandboxResources"
++        network:
++          $ref: "#/components/schemas/SandboxNetwork"
++        labels:
++          type: object
++          additionalProperties:
++            type: string
++          description: Provider-reported labels.
++        timestamps:
++          $ref: "#/components/schemas/SandboxTimestamps"
++
++    SandboxProviderLookupError:
++      description: Provider error captured during fail-soft sandbox inventory lookup.
++      type: object
++      required:
++        - provider
++        - message
++      properties:
++        provider:
++          $ref: "#/components/schemas/SandboxProviderKind"
++        message:
++          type: string
++
++    SandboxListMeta:
++      description: Metadata for provider-backed sandbox inventory.
++      type: object
++      required:
++        - provider_errors
++      properties:
++        provider_errors:
++          type: array
++          items:
++            $ref: "#/components/schemas/SandboxProviderLookupError"
++
++    SandboxListResponse:
++      description: Non-paginated provider-backed sandbox inventory response.
++      type: object
++      required:
++        - data
++        - meta
++      properties:
++        data:
++          type: array
++          items:
++            $ref: "#/components/schemas/SandboxInfo"
++        meta:
++          $ref: "#/components/schemas/SandboxListMeta"
++
+     SandboxFileEntry:
+       description: A directory entry in a run sandbox.
+       type: object
+diff --git a/lib/crates/fabro-api/build.rs b/lib/crates/fabro-api/build.rs
+index 14d13d70e..5784828d3 100644
+--- a/lib/crates/fabro-api/build.rs
++++ b/lib/crates/fabro-api/build.rs
+@@ -531,8 +531,25 @@ fn main() {
+         ("DirtyStatus", "fabro_types::DirtyStatus", &[]),
+         ("GitContext", "fabro_types::GitContext", &[]),
+         ("SandboxProvider", "fabro_types::SandboxProvider", &[]),
++        (
++            "SandboxProviderKind",
++            "fabro_types::SandboxProviderKind",
++            &[],
++        ),
+         ("RunSandbox", "fabro_types::RunSandbox", &[]),
+         ("SandboxDetails", "fabro_types::SandboxDetails", &[]),
++        ("SandboxInfo", "fabro_types::SandboxInfo", &[]),
++        (
++            "SandboxProviderLookupError",
++            "fabro_types::SandboxProviderLookupError",
++            &[],
++        ),
++        ("SandboxListMeta", "fabro_types::SandboxListMeta", &[]),
++        (
++            "SandboxListResponse",
++            "fabro_types::SandboxListResponse",
++            &[],
++        ),
+         ("SandboxNetwork", "fabro_types::SandboxNetwork", &[]),
+         (
+             "SandboxNetworkPolicy",
+diff --git a/lib/crates/fabro-api/src/lib.rs b/lib/crates/fabro-api/src/lib.rs
+index 9b40a152c..18d262fe1 100644
+--- a/lib/crates/fabro-api/src/lib.rs
++++ b/lib/crates/fabro-api/src/lib.rs
+@@ -47,12 +47,13 @@ pub mod types {
+         QuestionType, RepositoryRef, Run, RunApproval, RunApprovalState, RunClientProvenance,
+         RunEvent, RunEventDetailContentKind, RunEventDetailResponse, RunFailure,
+         RunPairStatusResponse, RunProjection, RunProvenance, RunRunnableSource, RunSandbox,
+-        RunSandboxRuntime, RunServerProvenance, RunSize, SandboxDetails, SandboxNetwork,
+-        SandboxNetworkPolicy, SandboxNetworkPolicyMode, SandboxProvider, SandboxResources,
+-        SandboxService, SandboxServiceListResponse, SandboxState, SandboxTimestamps,
+-        SecretMetadata, SecretType, ServerSettings, SessionDetail, SessionId, SessionMessage,
+-        SessionRecord, SessionStatus, SessionSummary, SessionTurn, SkillsProjection,
+-        StageCompletion, StageContextWindow, StageContextWindowBreakdownItem,
++        RunSandboxRuntime, RunServerProvenance, RunSize, SandboxDetails, SandboxInfo,
++        SandboxListMeta, SandboxListResponse, SandboxNetwork, SandboxNetworkPolicy,
++        SandboxNetworkPolicyMode, SandboxProvider, SandboxProviderKind, SandboxProviderLookupError,
++        SandboxResources, SandboxService, SandboxServiceListResponse, SandboxState,
++        SandboxTimestamps, SecretMetadata, SecretType, ServerSettings, SessionDetail, SessionId,
++        SessionMessage, SessionRecord, SessionStatus, SessionSummary, SessionTurn,
++        SkillsProjection, StageCompletion, StageContextWindow, StageContextWindowBreakdownItem,
+         StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
+         StageContextWindowStaleness, StageContextWindowUnavailableReason,
+         StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageProjection,
+diff --git a/lib/crates/fabro-api/tests/sandbox_inventory_round_trip.rs b/lib/crates/fabro-api/tests/sandbox_inventory_round_trip.rs
+new file mode 100644
+index 000000000..85f6de00a
+--- /dev/null
++++ b/lib/crates/fabro-api/tests/sandbox_inventory_round_trip.rs
+@@ -0,0 +1,123 @@
++use std::any::{TypeId, type_name};
++use std::collections::BTreeMap;
++
++use chrono::{TimeZone, Utc};
++use fabro_api::types::{
++    SandboxInfo as ApiSandboxInfo, SandboxListMeta as ApiSandboxListMeta,
++    SandboxListResponse as ApiSandboxListResponse, SandboxProviderKind as ApiSandboxProviderKind,
++    SandboxProviderLookupError as ApiSandboxProviderLookupError,
++};
++use fabro_types::{
++    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxNetwork, SandboxNetworkPolicy,
++    SandboxProviderKind, SandboxProviderLookupError, SandboxResources, SandboxState,
++    SandboxTimestamps,
++};
++use serde_json::json;
++
++#[test]
++fn sandbox_inventory_round_trip_reuses_domain_types() {
++    assert_same_type::<ApiSandboxProviderKind, SandboxProviderKind>();
++    assert_same_type::<ApiSandboxInfo, SandboxInfo>();
++    assert_same_type::<ApiSandboxProviderLookupError, SandboxProviderLookupError>();
++    assert_same_type::<ApiSandboxListMeta, SandboxListMeta>();
++    assert_same_type::<ApiSandboxListResponse, SandboxListResponse>();
++}
++
++#[test]
++fn sandbox_inventory_round_trip_json_matches_openapi_shape() {
++    let created_at = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
++    let response = SandboxListResponse {
++        data: vec![SandboxInfo {
++            provider:          SandboxProviderKind::Daytona,
++            id:                "sandbox-abc123".to_string(),
++            display_name:      Some("fabro-01KSGHGMCFM8W2FHXNMJ7MVY65".to_string()),
++            state:             SandboxState::Running,
++            native_state:      Some("started".to_string()),
++            image:             None,
++            snapshot:          Some("daytona-medium".to_string()),
++            region:            Some("us".to_string()),
++            web_url:           Some(
++                "https://app.daytona.io/dashboard/sandboxes?sandboxId=sandbox-abc123".to_string(),
++            ),
++            working_directory: Some("/home/daytona/workspace".to_string()),
++            resources:         SandboxResources {
++                cpu_cores:    Some(2.0),
++                memory_bytes: Some(4 * 1024 * 1024 * 1024),
++                disk_bytes:   Some(20 * 1024 * 1024 * 1024),
++            },
++            network:           SandboxNetwork {
++                egress:  SandboxNetworkPolicy::open(),
++                ingress: SandboxNetworkPolicy::blocked(),
++            },
++            labels:            BTreeMap::from([(
++                "sh.fabro.managed".to_string(),
++                "true".to_string(),
++            )]),
++            timestamps:        SandboxTimestamps {
++                created_at:       Some(created_at),
++                last_activity_at: Some(created_at),
++            },
++        }],
++        meta: SandboxListMeta {
++            provider_errors: vec![SandboxProviderLookupError {
++                provider: SandboxProviderKind::Docker,
++                message:  "Failed to connect to Docker daemon".to_string(),
++            }],
++        },
++    };
++
++    assert_eq!(
++        serde_json::to_value(&response).unwrap(),
++        json!({
++            "data": [{
++                "provider": "daytona",
++                "id": "sandbox-abc123",
++                "display_name": "fabro-01KSGHGMCFM8W2FHXNMJ7MVY65",
++                "state": "running",
++                "native_state": "started",
++                "snapshot": "daytona-medium",
++                "region": "us",
++                "web_url": "https://app.daytona.io/dashboard/sandboxes?sandboxId=sandbox-abc123",
++                "working_directory": "/home/daytona/workspace",
++                "resources": {
++                    "cpu_cores": 2.0,
++                    "memory_bytes": 4_294_967_296_u64,
++                    "disk_bytes": 21_474_836_480_u64
++                },
++                "network": {
++                    "egress": {
++                        "mode": "open",
++                        "cidrs": []
++                    },
++                    "ingress": {
++                        "mode": "blocked",
++                        "cidrs": []
++                    }
++                },
++                "labels": {
++                    "sh.fabro.managed": "true"
++                },
++                "timestamps": {
++                    "created_at": "2026-05-25T12:00:00Z",
++                    "last_activity_at": "2026-05-25T12:00:00Z"
++                }
++            }],
++            "meta": {
++                "provider_errors": [{
++                    "provider": "docker",
++                    "message": "Failed to connect to Docker daemon"
++                }]
++            }
++        })
++    );
++}
++
++fn assert_same_type<T: 'static, U: 'static>() {
++    assert_eq!(
++        TypeId::of::<T>(),
++        TypeId::of::<U>(),
++        "{} should be the same type as {}",
++        type_name::<T>(),
++        type_name::<U>()
++    );
++}
+diff --git a/lib/crates/fabro-sandbox/src/daytona/mod.rs b/lib/crates/fabro-sandbox/src/daytona/mod.rs
+index 9609c4000..3f7faceca 100644
+--- a/lib/crates/fabro-sandbox/src/daytona/mod.rs
++++ b/lib/crates/fabro-sandbox/src/daytona/mod.rs
+@@ -128,7 +128,7 @@ async fn build_daytona_client(
+     build_daytona_client_with(api_key, None, None, None).await
+ }
+ 
+-async fn build_daytona_client_with(
++pub(crate) async fn build_daytona_client_with(
+     api_key: Option<String>,
+     api_url: Option<String>,
+     organization_id: Option<String>,
+diff --git a/lib/crates/fabro-sandbox/src/details.rs b/lib/crates/fabro-sandbox/src/details.rs
+index 1aa057802..c9d3323df 100644
+--- a/lib/crates/fabro-sandbox/src/details.rs
++++ b/lib/crates/fabro-sandbox/src/details.rs
+@@ -66,7 +66,7 @@ fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
+ }
+ 
+ #[cfg(feature = "docker")]
+-mod docker {
++pub(crate) mod docker {
+     use std::collections::BTreeMap;
+ 
+     use anyhow::{Context, Result, anyhow};
+@@ -74,11 +74,12 @@ mod docker {
+     use bollard::container::InspectContainerOptions;
+     use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
+     use fabro_types::{
+-        RunId, RunSandbox, SandboxDetails, SandboxNetwork, SandboxNetworkPolicy, SandboxResources,
+-        SandboxState, SandboxTimestamps,
++        RunId, RunSandbox, SandboxDetails, SandboxInfo, SandboxNetwork, SandboxNetworkPolicy,
++        SandboxProviderKind, SandboxResources, SandboxState, SandboxTimestamps,
+     };
+ 
+     use super::parse_rfc3339_utc;
++    use crate::docker::WORKING_DIRECTORY;
+ 
+     pub(super) async fn docker_details(
+         record: &RunSandbox,
+@@ -94,13 +95,66 @@ mod docker {
+             .inspect_container(&runtime.id, None::<InspectContainerOptions>)
+             .await
+             .map_err(|err| anyhow!("Failed to inspect Docker container '{}': {err}", runtime.id))?;
+-        Ok(map_docker_inspect(inspect, record))
++        Ok(map_docker_inspect(&inspect, record))
+     }
+ 
+-    fn map_docker_inspect(
+-        inspect: ContainerInspectResponse,
++    pub(crate) fn docker_info_from_inspect(inspect: &ContainerInspectResponse) -> SandboxInfo {
++        let fields = docker_fields_from_inspect(inspect);
++        SandboxInfo {
++            provider:          SandboxProviderKind::Docker,
++            id:                fields.id,
++            display_name:      fields.display_name,
++            state:             fields.state,
++            native_state:      fields.native_state,
++            image:             fields.image,
++            snapshot:          None,
++            region:            None,
++            web_url:           None,
++            working_directory: fields.working_directory,
++            resources:         fields.resources,
++            network:           fields.network,
++            labels:            fields.labels,
++            timestamps:        fields.timestamps,
++        }
++    }
++
++    pub(super) fn map_docker_inspect(
++        inspect: &ContainerInspectResponse,
+         record: &RunSandbox,
+     ) -> SandboxDetails {
++        let fields = docker_fields_from_inspect(inspect);
++        let image = fields.image.clone().or_else(|| record.image.clone());
++
++        SandboxDetails {
++            sandbox:      RunSandbox {
++                image,
++                ..record.clone()
++            },
++            state:        fields.state,
++            native_state: fields.native_state,
++            region:       None,
++            web_url:      None,
++            resources:    fields.resources,
++            network:      fields.network,
++            labels:       fields.labels,
++            timestamps:   fields.timestamps,
++        }
++    }
++
++    struct DockerFields {
++        id:                String,
++        display_name:      Option<String>,
++        state:             SandboxState,
++        native_state:      Option<String>,
++        image:             Option<String>,
++        working_directory: Option<String>,
++        resources:         SandboxResources,
++        network:           SandboxNetwork,
++        labels:            BTreeMap<String, String>,
++        timestamps:        SandboxTimestamps,
++    }
++
++    fn docker_fields_from_inspect(inspect: &ContainerInspectResponse) -> DockerFields {
+         let status_enum = inspect
+             .state
+             .as_ref()
+@@ -124,23 +178,44 @@ mod docker {
+ 
+         let labels: BTreeMap<String, String> = inspect
+             .config
+-            .and_then(|config| config.labels)
++            .as_ref()
++            .and_then(|config| config.labels.clone())
+             .map(|map| map.into_iter().collect())
+             .unwrap_or_default();
+ 
+-        let image = inspect.image;
++        let image = inspect
++            .config
++            .as_ref()
++            .and_then(|config| config.image.clone())
++            .or_else(|| inspect.image.clone())
++            .filter(|value| !value.is_empty());
++        let working_directory = inspect
++            .config
++            .as_ref()
++            .and_then(|config| config.working_dir.clone())
++            .filter(|value| !value.is_empty())
++            .or_else(|| Some(WORKING_DIRECTORY.to_string()));
++
++        let id = inspect
++            .id
++            .clone()
++            .or_else(|| inspect.name.as_ref().map(|name| trim_container_name(name)))
++            .unwrap_or_default();
++        let display_name = inspect
++            .name
++            .as_ref()
++            .map(|name| trim_container_name(name))
++            .filter(|name| !name.is_empty());
+ 
+         let created_at = inspect.created.as_deref().and_then(parse_rfc3339_utc);
+ 
+-        SandboxDetails {
+-            sandbox: RunSandbox {
+-                image: image.or_else(|| record.image.clone()),
+-                ..record.clone()
+-            },
++        DockerFields {
++            id,
++            display_name,
+             state: normalized_state,
+             native_state,
+-            region: None,
+-            web_url: None,
++            image,
++            working_directory,
+             resources,
+             network,
+             labels,
+@@ -151,6 +226,10 @@ mod docker {
+         }
+     }
+ 
++    fn trim_container_name(name: &str) -> String {
++        name.strip_prefix('/').unwrap_or(name).to_string()
++    }
++
+     fn docker_network(host_config: Option<&HostConfig>) -> SandboxNetwork {
+         match host_config.and_then(|host| host.network_mode.as_deref()) {
+             Some("none") => {
+@@ -258,7 +337,7 @@ mod docker {
+                 }),
+                 ..Default::default()
+             };
+-            let details = map_docker_inspect(inspect, &record());
++            let details = map_docker_inspect(&inspect, &record());
+             assert_eq!(details.resources.memory_bytes, None);
+         }
+ 
+@@ -271,7 +350,7 @@ mod docker {
+                 }),
+                 ..Default::default()
+             };
+-            let details = map_docker_inspect(inspect, &record());
++            let details = map_docker_inspect(&inspect, &record());
+             assert_eq!(details.resources.memory_bytes, Some(2_147_483_648));
+         }
+ 
+@@ -284,7 +363,7 @@ mod docker {
+                 }),
+                 ..Default::default()
+             };
+-            let details = map_docker_inspect(inspect, &record());
++            let details = map_docker_inspect(&inspect, &record());
+             assert_eq!(details.network.egress, SandboxNetworkPolicy::blocked());
+             assert_eq!(details.network.ingress, SandboxNetworkPolicy::blocked());
+         }
+@@ -298,7 +377,7 @@ mod docker {
+                 }),
+                 ..Default::default()
+             };
+-            let details = map_docker_inspect(inspect, &record());
++            let details = map_docker_inspect(&inspect, &record());
+             assert_eq!(details.network, SandboxNetwork::unknown());
+         }
+ 
+@@ -308,12 +387,31 @@ mod docker {
+                 name: Some("/fabro-run-abc".to_string()),
+                 ..Default::default()
+             };
+-            let details = map_docker_inspect(inspect, &record());
++            let details = map_docker_inspect(&inspect, &record());
+             let runtime = details.sandbox.runtime.expect("runtime");
+             assert_eq!(runtime.id, "container-abc123");
+             assert_eq!(runtime.working_directory, "/workspace");
+         }
+ 
++        #[test]
++        fn inventory_identity_uses_native_id_and_display_name() {
++            let inspect = ContainerInspectResponse {
++                id: Some("container-abc123".to_string()),
++                name: Some("/fabro-run-abc".to_string()),
++                ..Default::default()
++            };
++            let info = docker_info_from_inspect(&inspect);
++            assert_eq!(info.id, "container-abc123");
++            assert_eq!(info.display_name.as_deref(), Some("fabro-run-abc"));
++        }
++
++        #[test]
++        fn inventory_working_directory_defaults_to_fabro_workspace() {
++            let inspect = ContainerInspectResponse::default();
++            let info = docker_info_from_inspect(&inspect);
++            assert_eq!(info.working_directory.as_deref(), Some("/workspace"));
++        }
++
+         #[test]
+         fn empty_status_is_unknown() {
+             assert_eq!(
+@@ -392,18 +490,18 @@ mod docker {
+ }
+ 
+ #[cfg(feature = "daytona")]
+-mod daytona {
++pub(crate) mod daytona {
+     use std::collections::BTreeMap;
+ 
+     use anyhow::{Context, Result, anyhow};
+     use daytona_api_client::models::SandboxState as DaytonaState;
+     use fabro_types::{
+-        RunSandbox, SandboxDetails, SandboxNetwork, SandboxNetworkPolicy, SandboxResources,
+-        SandboxState, SandboxTimestamps,
++        RunSandbox, SandboxDetails, SandboxInfo, SandboxNetwork, SandboxNetworkPolicy,
++        SandboxProviderKind, SandboxResources, SandboxState, SandboxTimestamps,
+     };
+ 
+     use super::parse_rfc3339_utc;
+-    use crate::daytona::{DAYTONA_DASHBOARD_SANDBOXES_URL, DaytonaSandbox};
++    use crate::daytona::{DAYTONA_DASHBOARD_SANDBOXES_URL, DaytonaSandbox, WORKING_DIRECTORY};
+ 
+     pub(super) async fn daytona_details(
+         record: &RunSandbox,
+@@ -434,7 +532,58 @@ mod daytona {
+         Ok(map_daytona_sandbox(sdk_sandbox, record))
+     }
+ 
+-    fn map_daytona_sandbox(sandbox: &daytona_sdk::Sandbox, record: &RunSandbox) -> SandboxDetails {
++    pub(crate) fn daytona_info_from_sdk_sandbox(sandbox: &daytona_sdk::Sandbox) -> SandboxInfo {
++        let fields = daytona_fields_from_sdk_sandbox(sandbox);
++        SandboxInfo {
++            provider:          SandboxProviderKind::Daytona,
++            id:                sandbox.id.clone(),
++            display_name:      Some(sandbox.name.clone()).filter(|name| !name.is_empty()),
++            state:             fields.state,
++            native_state:      fields.native_state,
++            image:             None,
++            snapshot:          sandbox.snapshot.clone(),
++            region:            fields.region,
++            web_url:           Some(daytona_dashboard_url(&sandbox.id)),
++            working_directory: Some(WORKING_DIRECTORY.to_string()),
++            resources:         fields.resources,
++            network:           fields.network,
++            labels:            fields.labels,
++            timestamps:        fields.timestamps,
++        }
++    }
++
++    pub(super) fn map_daytona_sandbox(
++        sandbox: &daytona_sdk::Sandbox,
++        record: &RunSandbox,
++    ) -> SandboxDetails {
++        let fields = daytona_fields_from_sdk_sandbox(sandbox);
++        SandboxDetails {
++            sandbox:      RunSandbox {
++                snapshot: sandbox.snapshot.clone().or_else(|| record.snapshot.clone()),
++                ..record.clone()
++            },
++            state:        fields.state,
++            native_state: fields.native_state,
++            region:       fields.region,
++            web_url:      Some(daytona_dashboard_url(&sandbox.id)),
++            resources:    fields.resources,
++            network:      fields.network,
++            labels:       fields.labels,
++            timestamps:   fields.timestamps,
++        }
++    }
++
++    struct DaytonaFields {
++        state:        SandboxState,
++        native_state: Option<String>,
++        region:       Option<String>,
++        resources:    SandboxResources,
++        network:      SandboxNetwork,
++        labels:       BTreeMap<String, String>,
++        timestamps:   SandboxTimestamps,
++    }
++
++    fn daytona_fields_from_sdk_sandbox(sandbox: &daytona_sdk::Sandbox) -> DaytonaFields {
+         let normalized_state = sandbox
+             .state
+             .map_or(SandboxState::Unknown, normalize_daytona_state);
+@@ -459,15 +608,10 @@ mod daytona {
+             Some(target)
+         };
+ 
+-        SandboxDetails {
+-            sandbox: RunSandbox {
+-                snapshot: sandbox.snapshot.clone().or_else(|| record.snapshot.clone()),
+-                ..record.clone()
+-            },
++        DaytonaFields {
+             state: normalized_state,
+             native_state,
+             region,
+-            web_url: Some(daytona_dashboard_url(&sandbox.id)),
+             resources,
+             network: daytona_network(
+                 sandbox.network_block_all,
+diff --git a/lib/crates/fabro-sandbox/src/lib.rs b/lib/crates/fabro-sandbox/src/lib.rs
+index 3d3fe4a64..f9baee88f 100644
+--- a/lib/crates/fabro-sandbox/src/lib.rs
++++ b/lib/crates/fabro-sandbox/src/lib.rs
+@@ -2,6 +2,7 @@ pub mod config;
+ pub mod error;
+ #[cfg(any(feature = "docker", feature = "daytona"))]
+ pub mod from_environment;
++pub mod provider;
+ pub mod sandbox;
+ pub mod sandbox_spec;
+ 
+@@ -39,8 +40,16 @@ pub use details::sandbox_details;
+ #[cfg(feature = "docker")]
+ pub use docker::{DockerSandbox, DockerSandboxOptions};
+ pub use error::{Error, Result, default_redacted_output_tail, display_for_log};
+-pub use fabro_types::{RunSandbox, SandboxProvider};
++pub use fabro_types::{RunSandbox, SandboxProviderKind};
+ pub use local::LocalSandbox;
++#[cfg(feature = "daytona")]
++pub use provider::daytona::DaytonaSandboxProvider;
++#[cfg(feature = "docker")]
++pub use provider::docker::DockerSandboxProvider;
++pub use provider::{
++    LocalSandboxProvider, SandboxCreateSpec, SandboxListFilter, SandboxLookupError,
++    SandboxProvider, SandboxProviderRegistry,
++};
+ pub use read_guard::ReadBeforeWriteSandbox;
+ pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
+ pub use sandbox::{
+diff --git a/lib/crates/fabro-sandbox/src/provider.rs b/lib/crates/fabro-sandbox/src/provider.rs
+new file mode 100644
+index 000000000..cfb9f09cf
+--- /dev/null
++++ b/lib/crates/fabro-sandbox/src/provider.rs
+@@ -0,0 +1,438 @@
++#[cfg(feature = "daytona")]
++pub mod daytona;
++#[cfg(feature = "docker")]
++pub mod docker;
++
++use std::fmt::Write as _;
++use std::sync::Arc;
++
++use async_trait::async_trait;
++#[cfg(any(feature = "docker", feature = "daytona"))]
++use fabro_github::GitHubCredentials;
++#[cfg(any(feature = "docker", feature = "daytona"))]
++use fabro_types::RunId;
++use fabro_types::{
++    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderKind,
++    SandboxProviderLookupError,
++};
++
++#[cfg(feature = "daytona")]
++use crate::daytona::DaytonaConfig;
++#[cfg(feature = "docker")]
++use crate::docker::DockerSandboxOptions;
++
++#[derive(Debug, Clone, Default)]
++pub struct SandboxListFilter;
++
++pub enum SandboxCreateSpec {
++    Local,
++    #[cfg(feature = "docker")]
++    Docker {
++        config:           DockerSandboxOptions,
++        github_app:       Option<GitHubCredentials>,
++        run_id:           Option<RunId>,
++        clone_origin_url: Option<String>,
++        clone_branch:     Option<String>,
++    },
++    #[cfg(feature = "daytona")]
++    Daytona {
++        config:           Box<DaytonaConfig>,
++        github_app:       Option<GitHubCredentials>,
++        run_id:           Option<RunId>,
++        clone_origin_url: Option<String>,
++        clone_branch:     Option<String>,
++        api_key:          Option<String>,
++    },
++}
++
++#[async_trait]
++pub trait SandboxProvider: Send + Sync {
++    fn kind(&self) -> SandboxProviderKind;
++
++    async fn list(&self, filter: SandboxListFilter) -> crate::Result<Vec<SandboxInfo>>;
++    async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>>;
++    async fn create(&self, spec: SandboxCreateSpec) -> crate::Result<SandboxInfo>;
++    async fn delete(&self, id: &str) -> crate::Result<()>;
++}
++
++#[derive(Clone, Default)]
++pub struct SandboxProviderRegistry {
++    providers: Vec<Arc<dyn SandboxProvider>>,
++}
++
++impl SandboxProviderRegistry {
++    pub fn new(providers: Vec<Arc<dyn SandboxProvider>>) -> Self {
++        Self { providers }
++    }
++
++    pub fn empty() -> Self {
++        Self::default()
++    }
++
++    pub fn providers(&self) -> &[Arc<dyn SandboxProvider>] {
++        &self.providers
++    }
++
++    pub async fn list_managed(&self) -> SandboxListResponse {
++        let mut data = Vec::new();
++        let mut provider_errors = Vec::new();
++
++        for provider in &self.providers {
++            match provider.list(SandboxListFilter).await {
++                Ok(mut sandboxes) => data.append(&mut sandboxes),
++                Err(err) => provider_errors.push(provider_error(provider.kind(), &err)),
++            }
++        }
++
++        SandboxListResponse {
++            data,
++            meta: SandboxListMeta { provider_errors },
++        }
++    }
++
++    pub async fn get_managed_by_native_id(
++        &self,
++        id: &str,
++    ) -> Result<SandboxInfo, SandboxLookupError> {
++        let mut matches = Vec::new();
++        let mut provider_errors = Vec::new();
++
++        for provider in &self.providers {
++            match provider.get(id).await {
++                Ok(Some(sandbox)) => matches.push(sandbox),
++                Ok(None) => {}
++                Err(err) => provider_errors.push(provider_error(provider.kind(), &err)),
++            }
++        }
++
++        match matches.len() {
++            1 => Ok(matches.remove(0)),
++            0 if provider_errors.is_empty() => {
++                Err(SandboxLookupError::NotFound { id: id.to_string() })
++            }
++            0 => Err(SandboxLookupError::ProviderUnavailable {
++                id: id.to_string(),
++                provider_errors,
++            }),
++            _ => Err(SandboxLookupError::Conflict {
++                id:        id.to_string(),
++                providers: matches
++                    .into_iter()
++                    .map(|sandbox| sandbox.provider)
++                    .collect(),
++            }),
++        }
++    }
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum SandboxLookupError {
++    #[error("sandbox '{id}' was not found by any configured provider")]
++    NotFound { id: String },
++    #[error("sandbox '{id}' matched more than one configured provider")]
++    Conflict {
++        id:        String,
++        providers: Vec<SandboxProviderKind>,
++    },
++    #[error("sandbox '{id}' could not be found definitively because one or more providers failed")]
++    ProviderUnavailable {
++        id:              String,
++        provider_errors: Vec<SandboxProviderLookupError>,
++    },
++}
++
++#[derive(Debug, Clone, Copy, Default)]
++pub struct LocalSandboxProvider;
++
++#[async_trait]
++impl SandboxProvider for LocalSandboxProvider {
++    fn kind(&self) -> SandboxProviderKind {
++        SandboxProviderKind::Local
++    }
++
++    async fn list(&self, _filter: SandboxListFilter) -> crate::Result<Vec<SandboxInfo>> {
++        Ok(Vec::new())
++    }
++
++    async fn get(&self, _id: &str) -> crate::Result<Option<SandboxInfo>> {
++        Ok(None)
++    }
++
++    async fn create(&self, _spec: SandboxCreateSpec) -> crate::Result<SandboxInfo> {
++        Err(crate::Error::message(
++            "local sandbox provider has no provider-managed inventory",
++        ))
++    }
++
++    async fn delete(&self, _id: &str) -> crate::Result<()> {
++        Ok(())
++    }
++}
++
++fn provider_error(
++    provider: SandboxProviderKind,
++    err: &(dyn std::error::Error + 'static),
++) -> SandboxProviderLookupError {
++    SandboxProviderLookupError {
++        provider,
++        message: render_error(err),
++    }
++}
++
++fn render_error(err: &(dyn std::error::Error + 'static)) -> String {
++    let mut message = err.to_string();
++    let mut source = err.source();
++    while let Some(err) = source {
++        let _ = write!(message, ": {err}");
++        source = err.source();
++    }
++    message
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeMap;
++
++    use fabro_types::{SandboxNetwork, SandboxResources, SandboxState, SandboxTimestamps};
++
++    use super::*;
++
++    #[derive(Clone)]
++    enum FakeList {
++        Ok(Vec<SandboxInfo>),
++        Err(&'static str),
++    }
++
++    #[derive(Clone)]
++    enum FakeGet {
++        Found(Box<SandboxInfo>),
++        Missing,
++        Err(&'static str),
++    }
++
++    struct FakeProvider {
++        kind: SandboxProviderKind,
++        list: FakeList,
++        get:  FakeGet,
++    }
++
++    impl FakeProvider {
++        fn new(kind: SandboxProviderKind, list: FakeList, get: FakeGet) -> Self {
++            Self { kind, list, get }
++        }
++    }
++
++    #[async_trait]
++    impl SandboxProvider for FakeProvider {
++        fn kind(&self) -> SandboxProviderKind {
++            self.kind
++        }
++
++        async fn list(&self, _filter: SandboxListFilter) -> crate::Result<Vec<SandboxInfo>> {
++            match &self.list {
++                FakeList::Ok(sandboxes) => Ok(sandboxes.clone()),
++                FakeList::Err(message) => Err(crate::Error::message(*message)),
++            }
++        }
++
++        async fn get(&self, _id: &str) -> crate::Result<Option<SandboxInfo>> {
++            match &self.get {
++                FakeGet::Found(sandbox) => Ok(Some((**sandbox).clone())),
++                FakeGet::Missing => Ok(None),
++                FakeGet::Err(message) => Err(crate::Error::message(*message)),
++            }
++        }
++
++        async fn create(&self, _spec: SandboxCreateSpec) -> crate::Result<SandboxInfo> {
++            Err(crate::Error::message("not implemented"))
++        }
++
++        async fn delete(&self, _id: &str) -> crate::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn registry(providers: Vec<FakeProvider>) -> SandboxProviderRegistry {
++        SandboxProviderRegistry::new(
++            providers
++                .into_iter()
++                .map(|provider| Arc::new(provider) as Arc<dyn SandboxProvider>)
++                .collect(),
++        )
++    }
++
++    fn info(provider: SandboxProviderKind, id: &str) -> SandboxInfo {
++        SandboxInfo {
++            provider,
++            id: id.to_string(),
++            display_name: None,
++            state: SandboxState::Running,
++            native_state: None,
++            image: None,
++            snapshot: None,
++            region: None,
++            web_url: None,
++            working_directory: None,
++            resources: SandboxResources::default(),
++            network: SandboxNetwork::unknown(),
++            labels: BTreeMap::new(),
++            timestamps: SandboxTimestamps::default(),
++        }
++    }
++
++    #[tokio::test]
++    async fn list_returns_aggregate_data_from_successful_providers() {
++        let docker = info(SandboxProviderKind::Docker, "docker-1");
++        let daytona = info(SandboxProviderKind::Daytona, "daytona-1");
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(vec![docker.clone()]),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(vec![daytona.clone()]),
++                FakeGet::Missing,
++            ),
++        ]);
++
++        let response = registry.list_managed().await;
++
++        assert_eq!(response.data, vec![docker, daytona]);
++        assert!(response.meta.provider_errors.is_empty());
++    }
++
++    #[tokio::test]
++    async fn list_includes_provider_error_metadata_when_one_provider_fails() {
++        let docker = info(SandboxProviderKind::Docker, "docker-1");
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(vec![docker.clone()]),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Err("daytona unavailable"),
++                FakeGet::Missing,
++            ),
++        ]);
++
++        let response = registry.list_managed().await;
++
++        assert_eq!(response.data, vec![docker]);
++        assert_eq!(response.meta.provider_errors, vec![
++            SandboxProviderLookupError {
++                provider: SandboxProviderKind::Daytona,
++                message:  "daytona unavailable".to_string(),
++            }
++        ]);
++    }
++
++    #[tokio::test]
++    async fn get_returns_one_matching_sandbox() {
++        let docker = info(SandboxProviderKind::Docker, "same-id");
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(docker.clone())),
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++        ]);
++
++        assert_eq!(
++            registry.get_managed_by_native_id("same-id").await.unwrap(),
++            docker
++        );
++    }
++
++    #[tokio::test]
++    async fn get_returns_not_found_when_all_providers_miss() {
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++        ]);
++
++        let err = registry
++            .get_managed_by_native_id("missing")
++            .await
++            .unwrap_err();
++
++        assert!(matches!(err, SandboxLookupError::NotFound { id } if id == "missing"));
++    }
++
++    #[tokio::test]
++    async fn get_returns_conflict_when_two_providers_match() {
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(info(SandboxProviderKind::Docker, "same-id"))),
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(info(SandboxProviderKind::Daytona, "same-id"))),
++            ),
++        ]);
++
++        let err = registry
++            .get_managed_by_native_id("same-id")
++            .await
++            .unwrap_err();
++
++        assert!(matches!(
++            err,
++            SandboxLookupError::Conflict { id, providers }
++                if id == "same-id"
++                    && providers == vec![SandboxProviderKind::Docker, SandboxProviderKind::Daytona]
++        ));
++    }
++
++    #[tokio::test]
++    async fn get_returns_provider_unavailable_when_no_match_and_one_provider_fails() {
++        let registry = registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Err("daytona unavailable"),
++            ),
++        ]);
++
++        let err = registry
++            .get_managed_by_native_id("maybe-missing")
++            .await
++            .unwrap_err();
++
++        assert!(matches!(
++            err,
++            SandboxLookupError::ProviderUnavailable {
++                id,
++                provider_errors
++            } if id == "maybe-missing"
++                && provider_errors == vec![SandboxProviderLookupError {
++                    provider: SandboxProviderKind::Daytona,
++                    message: "daytona unavailable".to_string(),
++                }]
++        ));
++    }
++}
+diff --git a/lib/crates/fabro-sandbox/src/provider/daytona.rs b/lib/crates/fabro-sandbox/src/provider/daytona.rs
+new file mode 100644
+index 000000000..b38c48009
+--- /dev/null
++++ b/lib/crates/fabro-sandbox/src/provider/daytona.rs
+@@ -0,0 +1,171 @@
++use std::collections::HashMap;
++
++use async_trait::async_trait;
++use daytona_sdk::DaytonaError;
++use fabro_static::EnvVars;
++use fabro_types::{SandboxInfo, SandboxProviderKind};
++
++use super::{SandboxCreateSpec, SandboxListFilter, SandboxProvider};
++use crate::daytona::{self, DaytonaSandbox};
++use crate::managed_labels::MANAGED_LABEL;
++use crate::{Sandbox, details};
++
++const DAYTONA_LIST_PAGE_SIZE: i32 = 100;
++
++#[derive(Clone)]
++pub struct DaytonaSandboxProvider {
++    api_key:         Option<String>,
++    api_url:         Option<String>,
++    organization_id: Option<String>,
++    http_client:     Option<fabro_http::HttpClient>,
++}
++
++impl DaytonaSandboxProvider {
++    pub fn new(
++        api_key: Option<String>,
++        api_url: Option<String>,
++        organization_id: Option<String>,
++        http_client: Option<fabro_http::HttpClient>,
++    ) -> Self {
++        Self {
++            api_key,
++            api_url,
++            organization_id,
++            http_client,
++        }
++    }
++
++    async fn client(&self) -> crate::Result<daytona_sdk::Client> {
++        let api_key = self.api_key.clone().ok_or_else(|| {
++            crate::Error::message(format!("{} is not configured", EnvVars::DAYTONA_API_KEY))
++        })?;
++        daytona::build_daytona_client_with(
++            Some(api_key),
++            self.api_url.clone(),
++            self.organization_id.clone(),
++            self.http_client.clone(),
++        )
++        .await
++        .map_err(|err| crate::Error::context("Failed to create Daytona client", err))
++    }
++}
++
++#[async_trait]
++impl SandboxProvider for DaytonaSandboxProvider {
++    fn kind(&self) -> SandboxProviderKind {
++        SandboxProviderKind::Daytona
++    }
++
++    async fn list(&self, _filter: SandboxListFilter) -> crate::Result<Vec<SandboxInfo>> {
++        let client = self.client().await?;
++        let labels = HashMap::from([(MANAGED_LABEL.to_string(), "true".to_string())]);
++        let mut page = 1;
++        let mut sandboxes = Vec::new();
++
++        loop {
++            let result = client
++                .list(Some(&labels), Some(page), Some(DAYTONA_LIST_PAGE_SIZE))
++                .await
++                .map_err(|err| crate::Error::context("Failed to list Daytona sandboxes", err))?;
++            sandboxes.extend(
++                result
++                    .items
++                    .iter()
++                    .filter(|sandbox| managed_from_sdk_sandbox(sandbox))
++                    .map(details::daytona::daytona_info_from_sdk_sandbox),
++            );
++
++            if result.total_pages <= i64::from(page) {
++                break;
++            }
++            page += 1;
++        }
++
++        Ok(sandboxes)
++    }
++
++    async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>> {
++        let client = self.client().await?;
++        let sandbox = match client.get(id).await {
++            Ok(sandbox) => sandbox,
++            Err(err) if daytona_not_found(&err) => return Ok(None),
++            Err(err) => {
++                return Err(crate::Error::context(
++                    format!("Failed to get Daytona sandbox '{id}'"),
++                    err,
++                ));
++            }
++        };
++
++        if !managed_from_sdk_sandbox(&sandbox) {
++            return Ok(None);
++        }
++        Ok(Some(details::daytona::daytona_info_from_sdk_sandbox(
++            &sandbox,
++        )))
++    }
++
++    async fn create(&self, spec: SandboxCreateSpec) -> crate::Result<SandboxInfo> {
++        let SandboxCreateSpec::Daytona {
++            config,
++            github_app,
++            run_id,
++            clone_origin_url,
++            clone_branch,
++            api_key,
++        } = spec
++        else {
++            return Err(crate::Error::message(
++                "Daytona sandbox provider can only create Daytona sandboxes",
++            ));
++        };
++
++        let api_key = api_key.or_else(|| self.api_key.clone()).ok_or_else(|| {
++            crate::Error::message(format!("{} is not configured", EnvVars::DAYTONA_API_KEY))
++        })?;
++        let sandbox = DaytonaSandbox::new(
++            config.as_ref().clone(),
++            github_app,
++            run_id,
++            clone_origin_url,
++            clone_branch,
++            Some(api_key),
++        )
++        .await?;
++        sandbox.initialize().await?;
++        let sdk_sandbox = sandbox.sandbox_handle().ok_or_else(|| {
++            crate::Error::message("Daytona sandbox was created but no SDK handle is available")
++        })?;
++        Ok(details::daytona::daytona_info_from_sdk_sandbox(sdk_sandbox))
++    }
++
++    async fn delete(&self, id: &str) -> crate::Result<()> {
++        let client = self.client().await?;
++        let sandbox = match client.get(id).await {
++            Ok(sandbox) => sandbox,
++            Err(err) if daytona_not_found(&err) => return Ok(()),
++            Err(err) => {
++                return Err(crate::Error::context(
++                    format!("Failed to get Daytona sandbox '{id}' before delete"),
++                    err,
++                ));
++            }
++        };
++        if !managed_from_sdk_sandbox(&sandbox) {
++            return Err(crate::Error::message(format!(
++                "Refusing to delete Daytona sandbox '{id}' because it is missing label {MANAGED_LABEL}=true"
++            )));
++        }
++        client.delete(&sandbox.id).await.map_err(|err| {
++            crate::Error::context(format!("Failed to delete Daytona sandbox '{id}'"), err)
++        })
++    }
++}
++
++fn managed_from_sdk_sandbox(sandbox: &daytona_sdk::Sandbox) -> bool {
++    sandbox.labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
++}
++
++fn daytona_not_found(err: &DaytonaError) -> bool {
++    matches!(err, DaytonaError::NotFound { .. }) || err.status_code() == Some(404)
++}
+diff --git a/lib/crates/fabro-sandbox/src/provider/docker.rs b/lib/crates/fabro-sandbox/src/provider/docker.rs
+new file mode 100644
+index 000000000..fc9461ec6
+--- /dev/null
++++ b/lib/crates/fabro-sandbox/src/provider/docker.rs
+@@ -0,0 +1,168 @@
++use std::collections::HashMap;
++
++use async_trait::async_trait;
++use bollard::Docker;
++use bollard::container::{InspectContainerOptions, ListContainersOptions, RemoveContainerOptions};
++use bollard::errors::Error as DockerError;
++use bollard::models::ContainerInspectResponse;
++use fabro_types::{SandboxInfo, SandboxProviderKind};
++
++use super::{SandboxCreateSpec, SandboxListFilter, SandboxProvider};
++use crate::docker::{DockerSandbox, DockerSandboxOptions};
++use crate::managed_labels::MANAGED_LABEL;
++use crate::{Sandbox, details};
++
++#[derive(Debug, Clone)]
++pub struct DockerSandboxProvider {
++    _default_config: DockerSandboxOptions,
++}
++
++impl DockerSandboxProvider {
++    pub fn new(default_config: DockerSandboxOptions) -> Self {
++        Self {
++            _default_config: default_config,
++        }
++    }
++
++    fn docker_client() -> crate::Result<Docker> {
++        Docker::connect_with_local_defaults().map_err(crate::Error::docker_connect)
++    }
++
++    async fn inspect(&self, id: &str) -> crate::Result<Option<ContainerInspectResponse>> {
++        let docker = Self::docker_client()?;
++        match docker
++            .inspect_container(id, None::<InspectContainerOptions>)
++            .await
++        {
++            Ok(inspect) => Ok(Some(inspect)),
++            Err(err) if docker_not_found(&err) => Ok(None),
++            Err(err) => Err(crate::Error::context(
++                format!("Failed to inspect Docker container '{id}'"),
++                err,
++            )),
++        }
++    }
++}
++
++impl Default for DockerSandboxProvider {
++    fn default() -> Self {
++        Self::new(DockerSandboxOptions::default())
++    }
++}
++
++#[async_trait]
++impl SandboxProvider for DockerSandboxProvider {
++    fn kind(&self) -> SandboxProviderKind {
++        SandboxProviderKind::Docker
++    }
++
++    async fn list(&self, _filter: SandboxListFilter) -> crate::Result<Vec<SandboxInfo>> {
++        let docker = Self::docker_client()?;
++        let mut filters = HashMap::new();
++        filters.insert("label".to_string(), vec![format!("{MANAGED_LABEL}=true")]);
++        let options = ListContainersOptions::<String> {
++            all: true,
++            filters,
++            ..Default::default()
++        };
++        let containers = docker
++            .list_containers(Some(options))
++            .await
++            .map_err(|err| crate::Error::context("Failed to list Docker containers", err))?;
++
++        let mut sandboxes = Vec::new();
++        for container in containers {
++            let Some(id) = container.id else {
++                continue;
++            };
++            let Some(inspect) = self.inspect(&id).await? else {
++                continue;
++            };
++            if managed_from_inspect(&inspect) {
++                sandboxes.push(details::docker::docker_info_from_inspect(&inspect));
++            }
++        }
++        Ok(sandboxes)
++    }
++
++    async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>> {
++        let Some(inspect) = self.inspect(id).await? else {
++            return Ok(None);
++        };
++        if !managed_from_inspect(&inspect) {
++            return Ok(None);
++        }
++        Ok(Some(details::docker::docker_info_from_inspect(&inspect)))
++    }
++
++    async fn create(&self, spec: SandboxCreateSpec) -> crate::Result<SandboxInfo> {
++        let SandboxCreateSpec::Docker {
++            config,
++            github_app,
++            run_id,
++            clone_origin_url,
++            clone_branch,
++        } = spec
++        else {
++            return Err(crate::Error::message(
++                "Docker sandbox provider can only create Docker sandboxes",
++            ));
++        };
++
++        let sandbox =
++            DockerSandbox::new(config, github_app, run_id, clone_origin_url, clone_branch)?;
++        sandbox.initialize().await?;
++        let container_id = sandbox.container_identifier()?.to_string();
++        self.get(&container_id).await?.ok_or_else(|| {
++            crate::Error::message(format!(
++                "Docker sandbox '{container_id}' was created but is not visible in provider inventory"
++            ))
++        })
++    }
++
++    async fn delete(&self, id: &str) -> crate::Result<()> {
++        let Some(inspect) = self.inspect(id).await? else {
++            return Ok(());
++        };
++        if !managed_from_inspect(&inspect) {
++            return Err(crate::Error::message(format!(
++                "Refusing to delete Docker container '{id}' because it is missing label {MANAGED_LABEL}=true"
++            )));
++        }
++
++        let docker = Self::docker_client()?;
++        let container_id = inspect.id.as_deref().unwrap_or(id);
++        docker
++            .remove_container(
++                container_id,
++                Some(RemoveContainerOptions {
++                    force: true,
++                    ..Default::default()
++                }),
++            )
++            .await
++            .map_err(|err| {
++                crate::Error::context(
++                    format!("Failed to remove Docker container '{container_id}'"),
++                    err,
++                )
++            })
++    }
++}
++
++fn managed_from_inspect(inspect: &ContainerInspectResponse) -> bool {
++    inspect
++        .config
++        .as_ref()
++        .and_then(|config| config.labels.as_ref())
++        .and_then(|labels| labels.get(MANAGED_LABEL))
++        .map(String::as_str)
++        == Some("true")
++}
++
++fn docker_not_found(error: &DockerError) -> bool {
++    matches!(error, DockerError::DockerResponseServerError {
++        status_code: 404,
++        ..
++    })
++}
+diff --git a/lib/crates/fabro-sandbox/src/sandbox_spec.rs b/lib/crates/fabro-sandbox/src/sandbox_spec.rs
+index 377f94962..a8d251f5a 100644
+--- a/lib/crates/fabro-sandbox/src/sandbox_spec.rs
++++ b/lib/crates/fabro-sandbox/src/sandbox_spec.rs
+@@ -266,9 +266,12 @@ fn runtime_layout_metadata(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(feature = "docker")]
+     use fabro_types::RunId;
+ 
++    #[cfg(feature = "docker")]
+     use super::*;
++    #[cfg(feature = "docker")]
+     use crate::test_support::MockSandbox;
+ 
+     #[cfg(feature = "docker")]
+diff --git a/lib/crates/fabro-sandbox/src/terminal.rs b/lib/crates/fabro-sandbox/src/terminal.rs
+index de31c9e45..34fc59748 100644
+--- a/lib/crates/fabro-sandbox/src/terminal.rs
++++ b/lib/crates/fabro-sandbox/src/terminal.rs
+@@ -1,15 +1,15 @@
+ use async_trait::async_trait;
+ #[cfg(feature = "daytona")]
+ use fabro_static::EnvVars;
+-use fabro_types::RunId;
++use fabro_types::{RunId, SandboxProvider};
+ 
++use crate::RunSandbox;
+ #[cfg(any(feature = "daytona", feature = "docker"))]
+ use crate::Sandbox;
+ #[cfg(feature = "daytona")]
+ use crate::daytona::{DEFAULT_DAYTONA_API_URL, DaytonaSandbox};
+ #[cfg(feature = "docker")]
+ use crate::docker::DockerSandbox;
+-use crate::{RunSandbox, SandboxProvider};
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct TerminalSize {
+diff --git a/lib/crates/fabro-server/src/run_manifest.rs b/lib/crates/fabro-server/src/run_manifest.rs
+index e59a79124..ff898bea0 100644
+--- a/lib/crates/fabro-server/src/run_manifest.rs
++++ b/lib/crates/fabro-server/src/run_manifest.rs
+@@ -21,12 +21,12 @@ use fabro_sandbox::from_environment::{
+     daytona_config_from_environment, docker_config_from_environment,
+ };
+ use fabro_sandbox::redact::redact_auth_url;
+-use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxProvider, SandboxSpec};
++use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
+ use fabro_static::EnvVars;
+ use fabro_types::settings::cli::OutputVerbosity;
+ use fabro_types::settings::interp::InterpString;
+ use fabro_types::settings::run::{EnvironmentProvider, RunGoal, RunNamespace};
+-use fabro_types::{ManifestPath, RunId, ServerSettings, WorkflowSettings};
++use fabro_types::{ManifestPath, RunId, SandboxProvider, ServerSettings, WorkflowSettings};
+ use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
+ use fabro_validate::Severity;
+ use fabro_workflow::Error as WorkflowError;
+diff --git a/lib/crates/fabro-server/src/serve.rs b/lib/crates/fabro-server/src/serve.rs
+index 39212138a..f274aadff 100644
+--- a/lib/crates/fabro-server/src/serve.rs
++++ b/lib/crates/fabro-server/src/serve.rs
+@@ -810,6 +810,7 @@ where
+         github_api_base_url: None,
+         active_config_path,
+         http_client: None,
++        sandbox_provider_registry: None,
+         shutdown: shutdown.clone(),
+     })?;
+     let reconciled = reconcile_incomplete_runs_on_startup(&state).await?;
+diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs
+index 0c6c602d0..be14a88e1 100644
+--- a/lib/crates/fabro-server/src/server.rs
++++ b/lib/crates/fabro-server/src/server.rs
+@@ -64,8 +64,12 @@ use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderI
+ use fabro_redact::redact_jsonl_line;
+ use fabro_sandbox::daytona::{self, DaytonaSandbox};
+ use fabro_sandbox::details::sandbox_details;
++use fabro_sandbox::provider::SandboxProvider as RuntimeSandboxProvider;
+ use fabro_sandbox::reconnect::reconnect_for_run;
+-use fabro_sandbox::{Sandbox, SandboxProvider};
++use fabro_sandbox::{
++    DaytonaSandboxProvider, DockerSandboxOptions, DockerSandboxProvider, LocalSandboxProvider,
++    Sandbox, SandboxProviderRegistry, from_environment,
++};
+ use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
+ use fabro_slack::config::{
+     SlackCredentialResolution,
+@@ -89,8 +93,8 @@ use fabro_types::settings::{InterpString, RunNamespace};
+ use fabro_types::{
+     AgentBackend, AskFabro, AskFabroUnavailableReason, EventBody, InterviewQuestionRecord, PairId,
+     PairMessageId, PairTarget, PendingReason, Principal, PullRequestLink, QuestionType, RunBlobId,
+-    RunControlAction, RunEvent, RunId, RunRunnableSource, ServerSettings, SessionCapability,
+-    StageModelUsage,
++    RunControlAction, RunEvent, RunId, RunRunnableSource, SandboxProvider, ServerSettings,
++    SessionCapability, StageModelUsage,
+ };
+ use fabro_util::error::{
+     SharedError, collect_causes, render_compact_with_causes, render_with_causes,
+@@ -960,6 +964,7 @@ pub struct AppState {
+     pub(crate) github_api_base_url: String,
+     active_config_path: PathBuf,
+     http_client: Option<fabro_http::HttpClient>,
++    sandbox_provider_registry: SandboxProviderRegistry,
+     shutdown: CancellationToken,
+     shutting_down: AtomicBool,
+     registry_factory_override: Option<Box<RegistryFactoryOverride>>,
+@@ -1060,6 +1065,7 @@ pub(crate) struct AppStateConfig {
+     pub(crate) github_api_base_url:       Option<String>,
+     pub(crate) active_config_path:        PathBuf,
+     pub(crate) http_client:               Option<fabro_http::HttpClient>,
++    pub(crate) sandbox_provider_registry: Option<SandboxProviderRegistry>,
+     pub(crate) shutdown:                  CancellationToken,
+ }
+ 
+@@ -1260,6 +1266,10 @@ impl AppState {
+         &self.session_runtimes
+     }
+ 
++    pub(crate) fn sandbox_provider_registry(&self) -> &SandboxProviderRegistry {
++        &self.sandbox_provider_registry
++    }
++
+     pub(crate) fn server_secret(&self, name: &str) -> Option<String> {
+         self.server_secrets.get(name)
+     }
+@@ -2050,6 +2060,49 @@ fn worker_token_keys_from_server_secrets(
+         .map_err(|err| jwt_auth::session_secret_key_error(&err))
+ }
+ 
++fn build_sandbox_provider_registry(
++    server_settings: &ServerSettings,
++    manifest_run_settings: Option<&RunNamespace>,
++    vault: &Vault,
++    env_lookup: &EnvLookup,
++    http_client: Option<fabro_http::HttpClient>,
++) -> SandboxProviderRegistry {
++    let provider_settings = &server_settings.server.sandbox.providers;
++    let mut providers: Vec<Arc<dyn RuntimeSandboxProvider>> = Vec::new();
++
++    if provider_settings.local.enabled {
++        providers.push(Arc::new(LocalSandboxProvider));
++    }
++
++    if provider_settings.docker.enabled {
++        let default_config =
++            manifest_run_settings.map_or_else(DockerSandboxOptions::default, |settings| {
++                from_environment::docker_config_from_environment(
++                    &settings.environment,
++                    !settings.clone.enabled,
++                )
++            });
++        providers.push(Arc::new(DockerSandboxProvider::new(default_config)));
++    }
++
++    if provider_settings.daytona.enabled {
++        let api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
++        if api_key.is_some() {
++            let api_url = env_lookup(EnvVars::DAYTONA_API_URL)
++                .or_else(|| env_lookup(EnvVars::DAYTONA_SERVER_URL));
++            let organization_id = env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
++            providers.push(Arc::new(DaytonaSandboxProvider::new(
++                api_key,
++                api_url,
++                organization_id,
++                http_client,
++            )));
++        }
++    }
++
++    SandboxProviderRegistry::new(providers)
++}
++
+ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppState>> {
+     let AppStateConfig {
+         resolved_settings,
+@@ -2064,6 +2117,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+         github_api_base_url,
+         active_config_path,
+         http_client,
++        sandbox_provider_registry,
+         shutdown,
+     } = config;
+ 
+@@ -2084,6 +2138,18 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+         Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
+             .context("building LLM model catalog")?,
+     );
++    let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
++        build_sandbox_provider_registry(
++            current_server_settings.as_ref(),
++            current_manifest_run_settings.as_ref().ok(),
++            vault
++                .try_read()
++                .as_deref()
++                .expect("startup vault should not be locked while building app state"),
++            &env_lookup,
++            http_client.clone(),
++        )
++    });
+     let slack_service = {
+         let default_channel = current_server_settings
+             .server
+@@ -2153,6 +2219,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+         github_api_base_url,
+         active_config_path,
+         http_client,
++        sandbox_provider_registry,
+         shutdown,
+         shutting_down: AtomicBool::new(false),
+         registry_factory_override,
+diff --git a/lib/crates/fabro-server/src/server/handler/mod.rs b/lib/crates/fabro-server/src/server/handler/mod.rs
+index 2f07ff0bf..3f7231722 100644
+--- a/lib/crates/fabro-server/src/server/handler/mod.rs
++++ b/lib/crates/fabro-server/src/server/handler/mod.rs
+@@ -16,6 +16,7 @@ mod pair;
+ mod pull_requests;
+ mod runs;
+ mod sandbox;
++mod sandboxes;
+ mod secrets;
+ mod sessions;
+ mod steer;
+@@ -153,6 +154,7 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
+         .merge(pull_requests::routes())
+         .merge(artifacts::routes())
+         .merge(sandbox::routes())
++        .merge(sandboxes::routes())
+         .merge(lifecycle::routes())
+         .merge(steer::routes())
+         .merge(pair::routes())
+diff --git a/lib/crates/fabro-server/src/server/handler/sandbox.rs b/lib/crates/fabro-server/src/server/handler/sandbox.rs
+index 458e36720..b8cf8a668 100644
+--- a/lib/crates/fabro-server/src/server/handler/sandbox.rs
++++ b/lib/crates/fabro-server/src/server/handler/sandbox.rs
+@@ -5,7 +5,7 @@ use std::sync::Arc;
+ 
+ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+ use fabro_sandbox::{TerminalSize, open_terminal_for_run};
+-use fabro_types::{SandboxServiceDiscoverySource, SandboxServiceListMeta};
++use fabro_types::{SandboxProvider, SandboxServiceDiscoverySource, SandboxServiceListMeta};
+ use futures_util::FutureExt;
+ use futures_util::future::BoxFuture;
+ 
+@@ -13,10 +13,10 @@ use super::super::{
+     ApiError, AppState, Bytes, DaytonaSandbox, EnvVars, HeaderMap, IntoResponse, Json,
+     NamedTempFile, Path, PreviewUrlRequest, PreviewUrlResponse, Query, RequiredUser, Response,
+     Router, RunId, Sandbox, SandboxDetails, SandboxFileEntry, SandboxFileListResponse,
+-    SandboxProvider, SandboxService, SandboxServiceListResponse, SshAccessRequest,
+-    SshAccessResponse, State, StatusCode, VncPreviewResponse, collect_causes, fs, get,
+-    octet_stream_response, parse_run_id_path, post, reconnect_for_run, reject_if_archived,
+-    render_with_causes, sandbox_details,
++    SandboxService, SandboxServiceListResponse, SshAccessRequest, SshAccessResponse, State,
++    StatusCode, VncPreviewResponse, collect_causes, fs, get, octet_stream_response,
++    parse_run_id_path, post, reconnect_for_run, reject_if_archived, render_with_causes,
++    sandbox_details,
+ };
+ 
+ const MAX_TERMINAL_CONTROL_BYTES: usize = 4096;
+diff --git a/lib/crates/fabro-server/src/server/handler/sandboxes.rs b/lib/crates/fabro-server/src/server/handler/sandboxes.rs
+new file mode 100644
+index 000000000..9e9aa9603
+--- /dev/null
++++ b/lib/crates/fabro-server/src/server/handler/sandboxes.rs
+@@ -0,0 +1,330 @@
++use std::sync::Arc;
++
++use axum::extract::{Path, State};
++use axum::http::StatusCode;
++use axum::routing::get;
++use axum::{Json, Router};
++use fabro_sandbox::SandboxLookupError;
++use fabro_types::{SandboxInfo, SandboxListResponse, SandboxProviderKind};
++
++use super::super::AppState;
++use crate::error::ApiError;
++use crate::principal_middleware::RequiredRunManagementActor;
++
++pub(super) fn routes() -> Router<Arc<AppState>> {
++    Router::new()
++        .route("/sandboxes", get(list_sandboxes))
++        .route("/sandboxes/{id}", get(retrieve_sandbox))
++}
++
++async fn list_sandboxes(
++    State(state): State<Arc<AppState>>,
++    _auth: RequiredRunManagementActor,
++) -> Json<SandboxListResponse> {
++    Json(state.sandbox_provider_registry().list_managed().await)
++}
++
++async fn retrieve_sandbox(
++    State(state): State<Arc<AppState>>,
++    Path(id): Path<String>,
++    _auth: RequiredRunManagementActor,
++) -> Result<Json<SandboxInfo>, ApiError> {
++    state
++        .sandbox_provider_registry()
++        .get_managed_by_native_id(&id)
++        .await
++        .map(Json)
++        .map_err(sandbox_lookup_error)
++}
++
++fn sandbox_lookup_error(err: SandboxLookupError) -> ApiError {
++    match err {
++        SandboxLookupError::NotFound { id } => ApiError::new(
++            StatusCode::NOT_FOUND,
++            format!("No provider found a Fabro-managed sandbox with id '{id}'."),
++        ),
++        SandboxLookupError::Conflict { id, providers } => ApiError::new(
++            StatusCode::CONFLICT,
++            format!(
++                "More than one provider matched sandbox id '{id}': {}.",
++                provider_list(&providers)
++            ),
++        ),
++        SandboxLookupError::ProviderUnavailable {
++            id,
++            provider_errors,
++        } => ApiError::new(
++            StatusCode::BAD_GATEWAY,
++            format!(
++                "Provider lookup for sandbox id '{id}' failed before a definitive result could be determined: {}.",
++                provider_errors
++                    .iter()
++                    .map(|error| format!("{}: {}", error.provider, error.message))
++                    .collect::<Vec<_>>()
++                    .join("; ")
++            ),
++        ),
++    }
++}
++
++fn provider_list(providers: &[SandboxProviderKind]) -> String {
++    providers
++        .iter()
++        .map(ToString::to_string)
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeMap;
++    use std::sync::Arc;
++
++    use async_trait::async_trait;
++    use axum::body::{Body, to_bytes};
++    use axum::http::{Request, StatusCode};
++    use fabro_sandbox::provider::{SandboxCreateSpec, SandboxListFilter};
++    use fabro_sandbox::{SandboxProvider as SandboxProviderTrait, SandboxProviderRegistry};
++    use fabro_types::{
++        SandboxInfo, SandboxNetwork, SandboxProviderKind, SandboxResources, SandboxState,
++        SandboxTimestamps,
++    };
++    use serde_json::{Value, json};
++    use tower::ServiceExt;
++
++    use crate::test_support::{TestAppStateBuilder, build_test_router};
++
++    #[derive(Clone)]
++    enum FakeList {
++        Ok(Vec<SandboxInfo>),
++    }
++
++    #[derive(Clone)]
++    enum FakeGet {
++        Found(Box<SandboxInfo>),
++        Missing,
++        Err(&'static str),
++    }
++
++    struct FakeProvider {
++        kind: SandboxProviderKind,
++        list: FakeList,
++        get:  FakeGet,
++    }
++
++    impl FakeProvider {
++        fn new(kind: SandboxProviderKind, list: FakeList, get: FakeGet) -> Self {
++            Self { kind, list, get }
++        }
++    }
++
++    #[async_trait]
++    impl SandboxProviderTrait for FakeProvider {
++        fn kind(&self) -> SandboxProviderKind {
++            self.kind
++        }
++
++        async fn list(
++            &self,
++            _filter: SandboxListFilter,
++        ) -> fabro_sandbox::Result<Vec<SandboxInfo>> {
++            match &self.list {
++                FakeList::Ok(sandboxes) => Ok(sandboxes.clone()),
++            }
++        }
++
++        async fn get(&self, _id: &str) -> fabro_sandbox::Result<Option<SandboxInfo>> {
++            match &self.get {
++                FakeGet::Found(sandbox) => Ok(Some((**sandbox).clone())),
++                FakeGet::Missing => Ok(None),
++                FakeGet::Err(message) => Err(fabro_sandbox::Error::message(*message)),
++            }
++        }
++
++        async fn create(&self, _spec: SandboxCreateSpec) -> fabro_sandbox::Result<SandboxInfo> {
++            Err(fabro_sandbox::Error::message("not implemented"))
++        }
++
++        async fn delete(&self, _id: &str) -> fabro_sandbox::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn info(provider: SandboxProviderKind, id: &str) -> SandboxInfo {
++        SandboxInfo {
++            provider,
++            id: id.to_string(),
++            display_name: Some(format!("{provider}-{id}")),
++            state: SandboxState::Running,
++            native_state: Some("running".to_string()),
++            image: Some("buildpack-deps:noble".to_string()),
++            snapshot: None,
++            region: None,
++            web_url: None,
++            working_directory: Some("/workspace".to_string()),
++            resources: SandboxResources::default(),
++            network: SandboxNetwork::unknown(),
++            labels: BTreeMap::from([("sh.fabro.managed".to_string(), "true".to_string())]),
++            timestamps: SandboxTimestamps::default(),
++        }
++    }
++
++    fn registry(providers: Vec<FakeProvider>) -> SandboxProviderRegistry {
++        SandboxProviderRegistry::new(
++            providers
++                .into_iter()
++                .map(|provider| Arc::new(provider) as Arc<dyn SandboxProviderTrait>)
++                .collect(),
++        )
++    }
++
++    fn app_with_registry(registry: SandboxProviderRegistry) -> axum::Router {
++        let state = TestAppStateBuilder::new()
++            .sandbox_provider_registry(registry)
++            .build();
++        build_test_router(state)
++    }
++
++    fn req_get(uri: &str) -> Request<Body> {
++        Request::builder()
++            .method("GET")
++            .uri(uri)
++            .body(Body::empty())
++            .expect("sandbox inventory GET request should build")
++    }
++
++    async fn body_json(response: axum::response::Response) -> Value {
++        let bytes = to_bytes(response.into_body(), usize::MAX)
++            .await
++            .expect("response body should fit in memory");
++        serde_json::from_slice(&bytes).expect("response body should be valid JSON")
++    }
++
++    #[tokio::test]
++    async fn list_returns_provider_backed_data_without_run_projection_state() {
++        let docker = info(SandboxProviderKind::Docker, "docker-native-id");
++        let app = app_with_registry(registry(vec![FakeProvider::new(
++            SandboxProviderKind::Docker,
++            FakeList::Ok(vec![docker]),
++            FakeGet::Missing,
++        )]));
++
++        let response = app.oneshot(req_get("/api/v1/sandboxes")).await.unwrap();
++
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = body_json(response).await;
++        assert_eq!(body["data"][0]["id"], "docker-native-id");
++        assert_eq!(body["data"][0]["provider"], "docker");
++        assert_eq!(body["meta"]["provider_errors"], json!([]));
++    }
++
++    #[tokio::test]
++    async fn retrieve_searches_all_configured_providers() {
++        let daytona = info(SandboxProviderKind::Daytona, "native-id");
++        let app = app_with_registry(registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(daytona)),
++            ),
++        ]));
++
++        let response = app
++            .oneshot(req_get("/api/v1/sandboxes/native-id"))
++            .await
++            .unwrap();
++
++        assert_eq!(response.status(), StatusCode::OK);
++        let body = body_json(response).await;
++        assert_eq!(body["id"], "native-id");
++        assert_eq!(body["provider"], "daytona");
++    }
++
++    #[tokio::test]
++    async fn no_matching_sandbox_returns_404() {
++        let app = app_with_registry(registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++        ]));
++
++        let response = app
++            .oneshot(req_get("/api/v1/sandboxes/missing"))
++            .await
++            .unwrap();
++
++        assert_eq!(response.status(), StatusCode::NOT_FOUND);
++    }
++
++    #[tokio::test]
++    async fn duplicate_native_ids_return_409() {
++        let app = app_with_registry(registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(info(SandboxProviderKind::Docker, "same-id"))),
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Found(Box::new(info(SandboxProviderKind::Daytona, "same-id"))),
++            ),
++        ]));
++
++        let response = app
++            .oneshot(req_get("/api/v1/sandboxes/same-id"))
++            .await
++            .unwrap();
++
++        assert_eq!(response.status(), StatusCode::CONFLICT);
++        let body = body_json(response).await;
++        assert!(
++            body["errors"][0]["detail"]
++                .as_str()
++                .unwrap_or_default()
++                .contains("More than one provider matched")
++        );
++    }
++
++    #[tokio::test]
++    async fn provider_lookup_uncertainty_returns_502() {
++        let app = app_with_registry(registry(vec![
++            FakeProvider::new(
++                SandboxProviderKind::Docker,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Missing,
++            ),
++            FakeProvider::new(
++                SandboxProviderKind::Daytona,
++                FakeList::Ok(Vec::new()),
++                FakeGet::Err("daytona unavailable"),
++            ),
++        ]));
++
++        let response = app
++            .oneshot(req_get("/api/v1/sandboxes/maybe-missing"))
++            .await
++            .unwrap();
++
++        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
++        let body = body_json(response).await;
++        assert!(
++            body["errors"][0]["detail"]
++                .as_str()
++                .unwrap_or_default()
++                .contains("daytona unavailable")
++        );
++    }
++}
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index b8ba80cbd..0cb9be7e7 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -1659,6 +1659,7 @@ fn slack_app_state_with_secret_sources(
+         github_api_base_url: None,
+         active_config_path: tempfile::tempdir().unwrap().path().join("settings.toml"),
+         http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
++        sandbox_provider_registry: None,
+         shutdown: tokio_util::sync::CancellationToken::new(),
+     })
+     .expect("slack test app state should build")
+@@ -1999,6 +2000,7 @@ methods = ["dev-token"]
+         github_api_base_url: None,
+         active_config_path: tempfile::tempdir().unwrap().path().join("settings.toml"),
+         http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
++        sandbox_provider_registry: None,
+         shutdown: tokio_util::sync::CancellationToken::new(),
+     }) else {
+         panic!("build_app_state should require SESSION_SECRET")
+@@ -2124,6 +2126,7 @@ fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc
+         github_api_base_url: None,
+         active_config_path: tempfile::tempdir().unwrap().path().join("settings.toml"),
+         http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
++        sandbox_provider_registry: None,
+         shutdown: tokio_util::sync::CancellationToken::new(),
+     })
+ }
+@@ -5215,6 +5218,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
+         github_api_base_url,
+         active_config_path: tempfile::tempdir().unwrap().path().join("settings.toml"),
+         http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
++        sandbox_provider_registry: None,
+         shutdown: tokio_util::sync::CancellationToken::new(),
+     };
+     let state = build_app_state(config).expect("test app state should build");
+diff --git a/lib/crates/fabro-server/src/test_support.rs b/lib/crates/fabro-server/src/test_support.rs
+index b61f01df8..b4e2c9df9 100644
+--- a/lib/crates/fabro-server/src/test_support.rs
++++ b/lib/crates/fabro-server/src/test_support.rs
+@@ -16,6 +16,7 @@ use chrono::Duration as ChronoDuration;
+ use fabro_config::{RunLayer, RunSettingsBuilder, ServerSettingsBuilder, envfile};
+ use fabro_interview::Interviewer;
+ use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
++use fabro_sandbox::SandboxProviderRegistry;
+ use fabro_static::EnvVars;
+ use fabro_store::{ArtifactStore, Database};
+ use fabro_types::settings::ServerAuthMethod;
+@@ -61,6 +62,7 @@ pub struct TestAppStateBuilder {
+     manifest_run_defaults:     RunLayer,
+     max_concurrent_runs:       usize,
+     registry_factory_override: Option<Box<RegistryFactoryOverride>>,
++    sandbox_provider_registry: Option<SandboxProviderRegistry>,
+     store_bundle:              Option<(Arc<Database>, ArtifactStore)>,
+     vault_path:                Option<PathBuf>,
+     vault_entries:             Vec<(String, String)>,
+@@ -78,6 +80,7 @@ impl Default for TestAppStateBuilder {
+             manifest_run_defaults:     RunLayer::default(),
+             max_concurrent_runs:       5,
+             registry_factory_override: None,
++            sandbox_provider_registry: None,
+             store_bundle:              None,
+             vault_path:                None,
+             vault_entries:             Vec::new(),
+@@ -121,6 +124,14 @@ impl TestAppStateBuilder {
+         self
+     }
+ 
++    pub fn sandbox_provider_registry(
++        mut self,
++        sandbox_provider_registry: SandboxProviderRegistry,
++    ) -> Self {
++        self.sandbox_provider_registry = Some(sandbox_provider_registry);
++        self
++    }
++
+     pub fn env_lookup(
+         mut self,
+         env_lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+@@ -222,6 +233,7 @@ impl TestAppStateBuilder {
+             http_client: Some(
+                 fabro_http::test_http_client().expect("test HTTP client should build"),
+             ),
++            sandbox_provider_registry: self.sandbox_provider_registry,
+             shutdown: CancellationToken::new(),
+         })
+         .expect("test app state should build")
+diff --git a/lib/crates/fabro-types/src/lib.rs b/lib/crates/fabro-types/src/lib.rs
+index d2bbdfbcd..7e5a471be 100644
+--- a/lib/crates/fabro-types/src/lib.rs
++++ b/lib/crates/fabro-types/src/lib.rs
+@@ -31,6 +31,7 @@ pub mod run_sandbox;
+ pub mod run_summary;
+ pub mod run_title;
+ pub mod sandbox_details;
++pub mod sandbox_inventory;
+ pub mod sandbox_provider;
+ pub mod sandbox_services;
+ pub mod secret;
+@@ -123,7 +124,10 @@ pub use sandbox_details::{
+     SandboxDetails, SandboxNetwork, SandboxNetworkPolicy, SandboxNetworkPolicyMode,
+     SandboxResources, SandboxState, SandboxTimestamps,
+ };
+-pub use sandbox_provider::SandboxProvider;
++pub use sandbox_inventory::{
++    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderLookupError,
++};
++pub use sandbox_provider::{SandboxProvider, SandboxProvider as SandboxProviderKind};
+ pub use sandbox_services::{
+     SandboxService, SandboxServiceDiscoverySource, SandboxServiceListMeta,
+     SandboxServiceListResponse,
+diff --git a/lib/crates/fabro-types/src/sandbox_inventory.rs b/lib/crates/fabro-types/src/sandbox_inventory.rs
+new file mode 100644
+index 000000000..3acef2a78
+--- /dev/null
++++ b/lib/crates/fabro-types/src/sandbox_inventory.rs
+@@ -0,0 +1,52 @@
++use std::collections::BTreeMap;
++
++use serde::{Deserialize, Serialize};
++
++use crate::{
++    SandboxNetwork, SandboxProviderKind, SandboxResources, SandboxState, SandboxTimestamps,
++};
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct SandboxInfo {
++    pub provider:          SandboxProviderKind,
++    pub id:                String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub display_name:      Option<String>,
++    pub state:             SandboxState,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub native_state:      Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub image:             Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub snapshot:          Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub region:            Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub web_url:           Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub working_directory: Option<String>,
++    pub resources:         SandboxResources,
++    #[serde(default)]
++    pub network:           SandboxNetwork,
++    #[serde(default)]
++    pub labels:            BTreeMap<String, String>,
++    pub timestamps:        SandboxTimestamps,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct SandboxProviderLookupError {
++    pub provider: SandboxProviderKind,
++    pub message:  String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
++pub struct SandboxListMeta {
++    #[serde(default)]
++    pub provider_errors: Vec<SandboxProviderLookupError>,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct SandboxListResponse {
++    pub data: Vec<SandboxInfo>,
++    pub meta: SandboxListMeta,
++}
+diff --git a/lib/crates/fabro-types/tests/sandbox_inventory_serde.rs b/lib/crates/fabro-types/tests/sandbox_inventory_serde.rs
+new file mode 100644
+index 000000000..10931b65d
+--- /dev/null
++++ b/lib/crates/fabro-types/tests/sandbox_inventory_serde.rs
+@@ -0,0 +1,119 @@
++use std::collections::BTreeMap;
++
++use chrono::{TimeZone, Utc};
++use fabro_types::{
++    SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxNetwork, SandboxNetworkPolicy,
++    SandboxProviderKind, SandboxProviderLookupError, SandboxResources, SandboxState,
++    SandboxTimestamps,
++};
++use serde_json::json;
++
++#[test]
++fn sandbox_inventory_serializes_provider_backed_shape() {
++    let created_at = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
++    let response = SandboxListResponse {
++        data: vec![SandboxInfo {
++            provider:          SandboxProviderKind::Docker,
++            id:                "container-abc123".to_string(),
++            display_name:      Some("fabro-run-abc".to_string()),
++            state:             SandboxState::Running,
++            native_state:      Some("running".to_string()),
++            image:             Some("buildpack-deps:noble".to_string()),
++            snapshot:          None,
++            region:            None,
++            web_url:           None,
++            working_directory: Some("/workspace".to_string()),
++            resources:         SandboxResources {
++                cpu_cores:    Some(2.0),
++                memory_bytes: Some(4 * 1024 * 1024 * 1024),
++                disk_bytes:   None,
++            },
++            network:           SandboxNetwork {
++                egress:  SandboxNetworkPolicy::open(),
++                ingress: SandboxNetworkPolicy::blocked(),
++            },
++            labels:            BTreeMap::from([(
++                "sh.fabro.managed".to_string(),
++                "true".to_string(),
++            )]),
++            timestamps:        SandboxTimestamps {
++                created_at:       Some(created_at),
++                last_activity_at: None,
++            },
++        }],
++        meta: SandboxListMeta {
++            provider_errors: vec![SandboxProviderLookupError {
++                provider: SandboxProviderKind::Daytona,
++                message:  "Daytona API key is not configured".to_string(),
++            }],
++        },
++    };
++
++    assert_eq!(
++        serde_json::to_value(&response).unwrap(),
++        json!({
++            "data": [{
++                "provider": "docker",
++                "id": "container-abc123",
++                "display_name": "fabro-run-abc",
++                "state": "running",
++                "native_state": "running",
++                "image": "buildpack-deps:noble",
++                "working_directory": "/workspace",
++                "resources": {
++                    "cpu_cores": 2.0,
++                    "memory_bytes": 4_294_967_296_u64
++                },
++                "network": {
++                    "egress": {
++                        "mode": "open",
++                        "cidrs": []
++                    },
++                    "ingress": {
++                        "mode": "blocked",
++                        "cidrs": []
++                    }
++                },
++                "labels": {
++                    "sh.fabro.managed": "true"
++                },
++                "timestamps": {
++                    "created_at": "2026-05-25T12:00:00Z"
++                }
++            }],
++            "meta": {
++                "provider_errors": [{
++                    "provider": "daytona",
++                    "message": "Daytona API key is not configured"
++                }]
++            }
++        })
++    );
++}
++
++#[test]
++fn sandbox_inventory_deserializes_when_optional_fields_are_absent() {
++    let info: SandboxInfo = serde_json::from_value(json!({
++        "provider": "local",
++        "id": "local:01KSGHGMCFM8W2FHXNMJ7MVY65",
++        "state": "unknown",
++        "resources": {},
++        "timestamps": {}
++    }))
++    .unwrap();
++
++    assert_eq!(info.provider, SandboxProviderKind::Local);
++    assert_eq!(info.id, "local:01KSGHGMCFM8W2FHXNMJ7MVY65");
++    assert_eq!(info.state, SandboxState::Unknown);
++    assert!(info.display_name.is_none());
++    assert!(info.native_state.is_none());
++    assert!(info.image.is_none());
++    assert!(info.snapshot.is_none());
++    assert!(info.region.is_none());
++    assert!(info.web_url.is_none());
++    assert!(info.working_directory.is_none());
++    assert_eq!(info.resources, SandboxResources::default());
++    assert_eq!(info.network, SandboxNetwork::unknown());
++    assert!(info.labels.is_empty());
++    assert_eq!(info.timestamps, SandboxTimestamps::default());
++}
+diff --git a/lib/crates/fabro-workflow/src/operations/start.rs b/lib/crates/fabro-workflow/src/operations/start.rs
+index 66f1a5fc4..5fe6edd5b 100644
+--- a/lib/crates/fabro-workflow/src/operations/start.rs
++++ b/lib/crates/fabro-workflow/src/operations/start.rs
+@@ -12,7 +12,7 @@ use fabro_sandbox::daytona::DaytonaConfig;
+ use fabro_sandbox::from_environment::{
+     daytona_config_from_environment, docker_config_from_environment,
+ };
+-use fabro_sandbox::{DockerSandboxOptions, SandboxProvider, SandboxSpec};
++use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
+ use fabro_static::EnvVars;
+ use fabro_types::settings::run::{
+     ApprovalMode, HookDefinition as ResolvedHookDefinition, HookEvent as ResolvedHookEvent,
+@@ -22,7 +22,7 @@ use fabro_types::settings::run::{
+     TlsMode as ResolvedTlsMode,
+ };
+ use fabro_types::settings::{InterpString, ModelRegistry, ResolvedModelRef};
+-use fabro_types::{ManifestPath, RunId, RunRunnableSource};
++use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProvider};
+ use fabro_vault::Vault;
+ use tokio::runtime::Handle;
+ use tokio::sync::RwLock as AsyncRwLock;
+diff --git a/lib/packages/fabro-api-client/src/.openapi-generator/FILES b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+index 9f907ebba..16f8027dc 100644
+--- a/lib/packages/fabro-api-client/src/.openapi-generator/FILES
++++ b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+@@ -12,6 +12,7 @@ api/repos-api.ts
+ api/run-internals-api.ts
+ api/run-outputs-api.ts
+ api/runs-api.ts
++api/sandboxes-api.ts
+ api/secrets-api.ts
+ api/sessions-api.ts
+ api/settings-api.ts
+@@ -366,9 +367,14 @@ models/run.ts
+ models/sandbox-details.ts
+ models/sandbox-file-entry.ts
+ models/sandbox-file-list-response.ts
++models/sandbox-info.ts
++models/sandbox-list-meta.ts
++models/sandbox-list-response.ts
+ models/sandbox-network-policy-mode.ts
+ models/sandbox-network-policy.ts
+ models/sandbox-network.ts
++models/sandbox-provider-kind.ts
++models/sandbox-provider-lookup-error.ts
+ models/sandbox-provider.ts
+ models/sandbox-resources.ts
+ models/sandbox-service-discovery-source.ts
+diff --git a/lib/packages/fabro-api-client/src/api.ts b/lib/packages/fabro-api-client/src/api.ts
+index bda32eb1e..22fabf4d5 100644
+--- a/lib/packages/fabro-api-client/src/api.ts
++++ b/lib/packages/fabro-api-client/src/api.ts
+@@ -27,6 +27,7 @@ export * from './api/repos-api';
+ export * from './api/run-internals-api';
+ export * from './api/run-outputs-api';
+ export * from './api/runs-api';
++export * from './api/sandboxes-api';
+ export * from './api/secrets-api';
+ export * from './api/sessions-api';
+ export * from './api/settings-api';
+diff --git a/lib/packages/fabro-api-client/src/api/sandboxes-api.ts b/lib/packages/fabro-api-client/src/api/sandboxes-api.ts
+new file mode 100644
+index 000000000..87ddcd56a
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/api/sandboxes-api.ts
+@@ -0,0 +1,200 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++import type { Configuration } from '../configuration';
++import type { AxiosPromise, AxiosInstance, RawAxiosRequestConfig } from 'axios';
++import globalAxios from 'axios';
++// Some imports not used depending on template conditions
++// @ts-ignore
++import { DUMMY_BASE_URL, assertParamExists, setApiKeyToObject, setBasicAuthToObject, setBearerAuthToObject, setOAuthToObject, setSearchParams, serializeDataIfNeeded, toPathString, createRequestFunction, replaceWithSerializableTypeIfNeeded } from '../common';
++// @ts-ignore
++import { BASE_PATH, COLLECTION_FORMATS, type RequestArgs, BaseAPI, RequiredError, operationServerMap } from '../base';
++// @ts-ignore
++import type { ErrorResponse } from '../models';
++// @ts-ignore
++import type { SandboxInfo } from '../models';
++// @ts-ignore
++import type { SandboxListResponse } from '../models';
++/**
++ * SandboxesApi - axios parameter creator
++ */
++export const SandboxesApiAxiosParamCreator = function (configuration?: Configuration) {
++    return {
++        /**
++         * Lists Fabro-managed sandboxes directly from configured sandbox providers.
++         * @summary List Sandboxes
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        listSandboxes: async (options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
++            const localVarPath = `/api/v1/sandboxes`;
++            // use dummy base URL string because the URL constructor only accepts absolute URLs.
++            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
++            let baseOptions;
++            if (configuration) {
++                baseOptions = configuration.baseOptions;
++            }
++
++            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
++            const localVarHeaderParameter = {} as any;
++            const localVarQueryParameter = {} as any;
++
++            // authentication SessionCookie required
++
++            // authentication BearerAuth required
++            // http bearer authentication required
++            await setBearerAuthToObject(localVarHeaderParameter, configuration)
++
++            localVarHeaderParameter['Accept'] = 'application/json';
++
++            setSearchParams(localVarUrlObj, localVarQueryParameter);
++            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
++            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
++
++            return {
++                url: toPathString(localVarUrlObj),
++                options: localVarRequestOptions,
++            };
++        },
++        /**
++         * Retrieves a Fabro-managed sandbox by provider-native id by searching all configured sandbox providers.
++         * @summary Retrieve Sandbox
++         * @param {string} id
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        retrieveSandbox: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
++            // verify required parameter 'id' is not null or undefined
++            assertParamExists('retrieveSandbox', 'id', id)
++            const localVarPath = `/api/v1/sandboxes/{id}`
++                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
++            // use dummy base URL string because the URL constructor only accepts absolute URLs.
++            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
++            let baseOptions;
++            if (configuration) {
++                baseOptions = configuration.baseOptions;
++            }
++
++            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
++            const localVarHeaderParameter = {} as any;
++            const localVarQueryParameter = {} as any;
++
++            // authentication SessionCookie required
++
++            // authentication BearerAuth required
++            // http bearer authentication required
++            await setBearerAuthToObject(localVarHeaderParameter, configuration)
++
++            localVarHeaderParameter['Accept'] = 'application/json';
++
++            setSearchParams(localVarUrlObj, localVarQueryParameter);
++            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
++            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
++
++            return {
++                url: toPathString(localVarUrlObj),
++                options: localVarRequestOptions,
++            };
++        },
++    }
++};
++
++/**
++ * SandboxesApi - functional programming interface
++ */
++export const SandboxesApiFp = function(configuration?: Configuration) {
++    const localVarAxiosParamCreator = SandboxesApiAxiosParamCreator(configuration)
++    return {
++        /**
++         * Lists Fabro-managed sandboxes directly from configured sandbox providers.
++         * @summary List Sandboxes
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        async listSandboxes(options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<SandboxListResponse>> {
++            const localVarAxiosArgs = await localVarAxiosParamCreator.listSandboxes(options);
++            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
++            const localVarOperationServerBasePath = operationServerMap['SandboxesApi.listSandboxes']?.[localVarOperationServerIndex]?.url;
++            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
++        },
++        /**
++         * Retrieves a Fabro-managed sandbox by provider-native id by searching all configured sandbox providers.
++         * @summary Retrieve Sandbox
++         * @param {string} id
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        async retrieveSandbox(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<SandboxInfo>> {
++            const localVarAxiosArgs = await localVarAxiosParamCreator.retrieveSandbox(id, options);
++            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
++            const localVarOperationServerBasePath = operationServerMap['SandboxesApi.retrieveSandbox']?.[localVarOperationServerIndex]?.url;
++            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
++        },
++    }
++};
++
++/**
++ * SandboxesApi - factory interface
++ */
++export const SandboxesApiFactory = function (configuration?: Configuration, basePath?: string, axios?: AxiosInstance) {
++    const localVarFp = SandboxesApiFp(configuration)
++    return {
++        /**
++         * Lists Fabro-managed sandboxes directly from configured sandbox providers.
++         * @summary List Sandboxes
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        listSandboxes(options?: RawAxiosRequestConfig): AxiosPromise<SandboxListResponse> {
++            return localVarFp.listSandboxes(options).then((request) => request(axios, basePath));
++        },
++        /**
++         * Retrieves a Fabro-managed sandbox by provider-native id by searching all configured sandbox providers.
++         * @summary Retrieve Sandbox
++         * @param {string} id
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        retrieveSandbox(id: string, options?: RawAxiosRequestConfig): AxiosPromise<SandboxInfo> {
++            return localVarFp.retrieveSandbox(id, options).then((request) => request(axios, basePath));
++        },
++    };
++};
++
++/**
++ * SandboxesApi - object-oriented interface
++ */
++export class SandboxesApi extends BaseAPI {
++    /**
++     * Lists Fabro-managed sandboxes directly from configured sandbox providers.
++     * @summary List Sandboxes
++     * @param {*} [options] Override http request option.
++     * @throws {RequiredError}
++     */
++    public listSandboxes(options?: RawAxiosRequestConfig) {
++        return SandboxesApiFp(this.configuration).listSandboxes(options).then((request) => request(this.axios, this.basePath));
++    }
++
++    /**
++     * Retrieves a Fabro-managed sandbox by provider-native id by searching all configured sandbox providers.
++     * @summary Retrieve Sandbox
++     * @param {string} id
++     * @param {*} [options] Override http request option.
++     * @throws {RequiredError}
++     */
++    public retrieveSandbox(id: string, options?: RawAxiosRequestConfig) {
++        return SandboxesApiFp(this.configuration).retrieveSandbox(id, options).then((request) => request(this.axios, this.basePath));
++    }
++}
+diff --git a/lib/packages/fabro-api-client/src/models/index.ts b/lib/packages/fabro-api-client/src/models/index.ts
+index b9542d1ab..26a9ed72c 100644
+--- a/lib/packages/fabro-api-client/src/models/index.ts
++++ b/lib/packages/fabro-api-client/src/models/index.ts
+@@ -342,10 +342,15 @@ export * from './run-timing';
+ export * from './sandbox-details';
+ export * from './sandbox-file-entry';
+ export * from './sandbox-file-list-response';
++export * from './sandbox-info';
++export * from './sandbox-list-meta';
++export * from './sandbox-list-response';
+ export * from './sandbox-network';
+ export * from './sandbox-network-policy';
+ export * from './sandbox-network-policy-mode';
+ export * from './sandbox-provider';
++export * from './sandbox-provider-kind';
++export * from './sandbox-provider-lookup-error';
+ export * from './sandbox-resources';
+ export * from './sandbox-service';
+ export * from './sandbox-service-discovery-source';
+diff --git a/lib/packages/fabro-api-client/src/models/sandbox-info.ts b/lib/packages/fabro-api-client/src/models/sandbox-info.ts
+new file mode 100644
+index 000000000..9f026d745
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/sandbox-info.ts
+@@ -0,0 +1,77 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxNetwork } from './sandbox-network';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxProviderKind } from './sandbox-provider-kind';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxResources } from './sandbox-resources';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxState } from './sandbox-state';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxTimestamps } from './sandbox-timestamps';
++
++/**
++ * Provider-backed inventory record for a Fabro-managed sandbox.
++ */
++export interface SandboxInfo {
++    'provider': SandboxProviderKind;
++    /**
++     * Provider-native sandbox id.
++     */
++    'id': string;
++    /**
++     * Provider display name when distinct from the native id.
++     */
++    'display_name'?: string | null;
++    'state': SandboxState;
++    /**
++     * Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
++     */
++    'native_state'?: string | null;
++    /**
++     * Provider image when surfaced by the sandbox provider.
++     */
++    'image'?: string | null;
++    /**
++     * Provider snapshot when surfaced by the sandbox provider.
++     */
++    'snapshot'?: string | null;
++    /**
++     * Provider region or target. Null for local-style providers.
++     */
++    'region'?: string | null;
++    /**
++     * Provider dashboard URL for this sandbox when available.
++     */
++    'web_url'?: string | null;
++    /**
++     * Provider-reported or Fabro-default working directory when available.
++     */
++    'working_directory'?: string | null;
++    'resources': SandboxResources;
++    'network': SandboxNetwork;
++    /**
++     * Provider-reported labels.
++     */
++    'labels': { [key: string]: string; };
++    'timestamps': SandboxTimestamps;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/sandbox-list-meta.ts b/lib/packages/fabro-api-client/src/models/sandbox-list-meta.ts
+new file mode 100644
+index 000000000..a8258b994
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/sandbox-list-meta.ts
+@@ -0,0 +1,25 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxProviderLookupError } from './sandbox-provider-lookup-error';
++
++/**
++ * Metadata for provider-backed sandbox inventory.
++ */
++export interface SandboxListMeta {
++    'provider_errors': Array<SandboxProviderLookupError>;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/sandbox-list-response.ts b/lib/packages/fabro-api-client/src/models/sandbox-list-response.ts
+new file mode 100644
+index 000000000..7ac3f6824
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/sandbox-list-response.ts
+@@ -0,0 +1,29 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxInfo } from './sandbox-info';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxListMeta } from './sandbox-list-meta';
++
++/**
++ * Non-paginated provider-backed sandbox inventory response.
++ */
++export interface SandboxListResponse {
++    'data': Array<SandboxInfo>;
++    'meta': SandboxListMeta;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/sandbox-provider-kind.ts b/lib/packages/fabro-api-client/src/models/sandbox-provider-kind.ts
+new file mode 100644
+index 000000000..cd01d4243
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/sandbox-provider-kind.ts
+@@ -0,0 +1,27 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++/**
++ * Sandbox provider inventory discriminator.
++ */
++
++export const SandboxProviderKind = {
++    LOCAL: 'local',
++    DOCKER: 'docker',
++    DAYTONA: 'daytona'
++} as const;
++
++export type SandboxProviderKind = typeof SandboxProviderKind[keyof typeof SandboxProviderKind];
+diff --git a/lib/packages/fabro-api-client/src/models/sandbox-provider-lookup-error.ts b/lib/packages/fabro-api-client/src/models/sandbox-provider-lookup-error.ts
+new file mode 100644
+index 000000000..d5fee5806
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/sandbox-provider-lookup-error.ts
+@@ -0,0 +1,26 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { SandboxProviderKind } from './sandbox-provider-kind';
++
++/**
++ * Provider error captured during fail-soft sandbox inventory lookup.
++ */
++export interface SandboxProviderLookupError {
++    'provider': SandboxProviderKind;
++    'message': string;
++}
