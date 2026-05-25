@@ -1,0 +1,1287 @@
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index dfa032fe0..d71f84d1d 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -4466,6 +4466,22 @@ paths:
+               schema:
+                 $ref: "#/components/schemas/ProviderList"
+ 
++  /api/v1/providers/test:
++    post:
++      operationId: testProviders
++      tags: [Models]
++      summary: Test Providers
++      description: >
++        Tests every configured LLM provider once using the catalog probe model.
++        Provider-level failures are returned in the response body with HTTP 200.
++      responses:
++        "200":
++          description: Provider test results
++          content:
++            application/json:
++              schema:
++                $ref: "#/components/schemas/ProviderTestList"
++
+   # ── Completions ───────────────────────────────────────────────────────
+ 
+   /api/v1/completions:
+@@ -6177,6 +6193,75 @@ components:
+           items:
+             $ref: "#/components/schemas/Provider"
+ 
++    ProviderTestList:
++      description: Results from testing all configured LLM providers.
++      type: object
++      required:
++        - data
++        - summary
++      properties:
++        data:
++          type: array
++          items:
++            $ref: "#/components/schemas/ProviderTestResult"
++        summary:
++          $ref: "#/components/schemas/ProviderTestSummary"
++
++    ProviderTestResult:
++      description: Result of testing one configured LLM provider.
++      type: object
++      required:
++        - provider
++        - model_id
++        - status
++        - error_message
++      properties:
++        provider:
++          $ref: "#/components/schemas/ProviderId"
++        model_id:
++          type: ["string", "null"]
++          description: Catalog probe model ID used for the provider, or null when no probe was sent.
++          example: "gpt-5.4-mini"
++        status:
++          $ref: "#/components/schemas/ProviderTestStatus"
++        error_message:
++          type: ["string", "null"]
++          description: Error details when status is "error".
++
++    ProviderTestSummary:
++      description: Aggregate provider test status and counts.
++      type: object
++      required:
++        - status
++        - total
++        - passed
++        - failed
++      properties:
++        status:
++          $ref: "#/components/schemas/ProviderTestStatus"
++        total:
++          type: integer
++          format: int32
++          minimum: 0
++          description: Number of configured providers tested or evaluated.
++        passed:
++          type: integer
++          format: int32
++          minimum: 0
++          description: Number of providers whose probe succeeded.
++        failed:
++          type: integer
++          format: int32
++          minimum: 0
++          description: Number of providers with configuration, auth, registration, or probe errors.
++
++    ProviderTestStatus:
++      description: Provider test status.
++      type: string
++      enum:
++        - ok
++        - error
++
+     Provider:
+       description: An LLM provider from the catalog with effective config and configured status.
+       type: object
+diff --git a/lib/crates/fabro-server/src/diagnostics.rs b/lib/crates/fabro-server/src/diagnostics.rs
+index 887f8b08a..6a6358a5e 100644
+--- a/lib/crates/fabro-server/src/diagnostics.rs
++++ b/lib/crates/fabro-server/src/diagnostics.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::time::Duration;
+ 
+ use base64::Engine as _;
+@@ -6,6 +7,7 @@ use fabro_auth::auth_issue_message;
+ use fabro_llm::client::Client as LlmClient;
+ use fabro_llm::types::{Message, Request};
+ use fabro_model::{Catalog, ProviderId};
++use fabro_redact::redact_string;
+ use fabro_sandbox::daytona;
+ use fabro_static::EnvVars;
+ use fabro_types::settings::server::GithubIntegrationStrategy;
+@@ -40,6 +42,38 @@ pub struct DiagnosticsReport {
+     pub sections: Vec<CheckSection>,
+ }
+ 
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct ProviderProbeReport {
++    pub data:    Vec<ProviderProbeResult>,
++    pub summary: ProviderProbeSummary,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct ProviderProbeResult {
++    pub provider:      ProviderId,
++    pub model_id:      Option<String>,
++    pub status:        ProviderProbeStatus,
++    pub error_message: Option<String>,
++    #[serde(skip)]
++    diagnostic_detail: Option<String>,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct ProviderProbeSummary {
++    pub status: ProviderProbeStatus,
++    pub total:  u32,
++    pub passed: u32,
++    pub failed: u32,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::Display)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub(crate) enum ProviderProbeStatus {
++    Ok,
++    Error,
++}
++
+ fn decode_pem_value(name: &str, value: &str) -> Result<String, String> {
+     if value.starts_with("-----") {
+         return Ok(value.to_string());
+@@ -79,8 +113,8 @@ pub async fn run_all(state: &AppState) -> DiagnosticsReport {
+ }
+ 
+ async fn check_llm_providers(state: &AppState) -> CheckResult {
+-    let result = match state.resolve_llm_client().await {
+-        Ok(result) => result,
++    let report = match test_llm_providers(state).await {
++        Ok(report) => report,
+         Err(err) => {
+             return CheckResult {
+                 name:        "LLM Providers".to_string(),
+@@ -91,10 +125,7 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {
+             };
+         }
+     };
+-    if result.client.provider_names().is_empty()
+-        && result.auth_issues.is_empty()
+-        && result.registration_issues.is_empty()
+-    {
++    if report.data.is_empty() {
+         return CheckResult {
+             name:        "LLM Providers".to_string(),
+             status:      CheckStatus::Error,
+@@ -106,61 +137,25 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {
+ 
+     let mut details: Vec<CheckDetail> = Vec::new();
+     let mut failures: Vec<ProviderFailure> = Vec::new();
+-    for (provider, issue) in &result.auth_issues {
+-        let message = auth_issue_message(provider, issue);
+-        failures.push(ProviderFailure {
+-            provider:     provider.to_string(),
+-            summary_line: short_error_line(&message),
+-        });
+-        details.push(CheckDetail::new(message));
+-    }
+-    for issue in &result.registration_issues {
+-        let message = issue.error.to_string();
+-        failures.push(ProviderFailure {
+-            provider:     issue.provider.to_string(),
+-            summary_line: short_error_line(&message),
+-        });
+-        details.push(CheckDetail::new(format!("{}: {message}", issue.provider)));
+-    }
+-
+-    let providers: Vec<ProviderId> = result
+-        .client
+-        .provider_names()
+-        .iter()
+-        .map(|name| ProviderId::new(*name))
+-        .collect();
+-    let client = &result.client;
+-    let catalog = state.catalog();
+-    let probe_outcomes = join_all(providers.iter().map(|provider| {
+-        let catalog = catalog.clone();
+-        let provider = provider.clone();
+-        async move {
+-            let outcome = timeout(
+-                Duration::from_secs(30),
+-                probe_llm_provider(client, &provider, catalog.as_ref()),
+-            )
+-            .await;
+-            (provider, outcome)
+-        }
+-    }))
+-    .await;
+-    for (provider, probe_result) in probe_outcomes {
+-        match probe_result {
+-            Ok(Ok(())) => details.push(CheckDetail::new(format!("{provider}: OK"))),
+-            Ok(Err(err)) => {
+-                let rendered = collect_chain(&err).join(": ");
+-                failures.push(ProviderFailure {
+-                    provider:     provider.to_string(),
+-                    summary_line: short_error_line(&rendered),
+-                });
+-                details.push(CheckDetail::new(format!("{provider}: {rendered}")));
++    for result in &report.data {
++        match result.status {
++            ProviderProbeStatus::Ok => {
++                details.push(CheckDetail::new(format!("{}: OK", result.provider)));
+             }
+-            Err(_) => {
++            ProviderProbeStatus::Error => {
++                let message = result
++                    .error_message
++                    .as_deref()
++                    .unwrap_or("provider probe failed");
++                let detail = result
++                    .diagnostic_detail
++                    .clone()
++                    .unwrap_or_else(|| format!("{}: {message}", result.provider));
+                 failures.push(ProviderFailure {
+-                    provider:     provider.to_string(),
+-                    summary_line: "timeout (30s)".to_string(),
++                    provider:     result.provider.to_string(),
++                    summary_line: short_error_line(message),
+                 });
+-                details.push(CheckDetail::new(format!("{provider}: timeout (30s)")));
++                details.push(CheckDetail::new(detail));
+             }
+         }
+     }
+@@ -169,7 +164,7 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {
+         return CheckResult {
+             name: "LLM Providers".to_string(),
+             status: CheckStatus::Pass,
+-            summary: format!("{} configured", result.client.provider_names().len()),
++            summary: format!("{} configured", report.summary.total),
+             details,
+             remediation: None,
+         };
+@@ -200,6 +195,182 @@ struct ProviderFailure {
+     summary_line: String,
+ }
+ 
++pub(crate) async fn test_llm_providers(state: &AppState) -> anyhow::Result<ProviderProbeReport> {
++    let configured_providers = state.configured_llm_provider_ids().await;
++    let result = state.resolve_llm_client().await?;
++    let catalog = state.catalog();
++
++    let mut selected = configured_providers.iter().cloned().collect::<HashSet<_>>();
++    let mut extras = configured_providers;
++    for (provider, _) in &result.auth_issues {
++        if selected.insert(provider.clone()) {
++            extras.push(provider.clone());
++        }
++    }
++    for issue in &result.registration_issues {
++        if selected.insert(issue.provider.clone()) {
++            extras.push(issue.provider.clone());
++        }
++    }
++
++    let mut providers = catalog
++        .providers()
++        .iter()
++        .filter(|provider| selected.contains(&provider.id))
++        .map(|provider| provider.id.clone())
++        .collect::<Vec<_>>();
++    for provider in extras {
++        if !providers.contains(&provider) {
++            providers.push(provider);
++        }
++    }
++
++    let client = &result.client;
++    let probe_results = join_all(providers.into_iter().map(|provider| {
++        let catalog = catalog.clone();
++        let auth_issue = result
++            .auth_issues
++            .iter()
++            .find(|(issue_provider, _)| issue_provider == &provider)
++            .map(|(_, issue)| public_error_message(&auth_issue_message(&provider, issue)));
++        let registration_issue = result
++            .registration_issues
++            .iter()
++            .find(|issue| issue.provider == provider)
++            .map(|issue| public_error_message(&issue.error.to_string()));
++        async move {
++            probe_single_provider(
++                client,
++                catalog.as_ref(),
++                provider,
++                auth_issue,
++                registration_issue,
++            )
++            .await
++        }
++    }))
++    .await;
++
++    Ok(provider_probe_report(probe_results))
++}
++
++async fn probe_single_provider(
++    client: &LlmClient,
++    catalog: &Catalog,
++    provider: ProviderId,
++    auth_issue: Option<String>,
++    registration_issue: Option<String>,
++) -> ProviderProbeResult {
++    if let Some(message) = auth_issue {
++        return provider_probe_error_with_diagnostic_detail(
++            provider,
++            None,
++            message.clone(),
++            message,
++        );
++    }
++    if let Some(message) = registration_issue {
++        return provider_probe_error(provider, None, message);
++    }
++
++    if !client.has_provider(provider.as_str()) {
++        return provider_probe_error(
++            provider,
++            None,
++            "provider is configured but not registered".to_string(),
++        );
++    }
++
++    let Some(model) = catalog.probe_for_provider(&provider) else {
++        return provider_probe_error(
++            provider,
++            None,
++            "no probe model configured for provider".to_string(),
++        );
++    };
++    let model_id = model.id.clone();
++
++    let probe_result = timeout(
++        Duration::from_secs(30),
++        probe_llm_provider(client, &provider, &model_id),
++    )
++    .await;
++    match probe_result {
++        Ok(Ok(())) => ProviderProbeResult {
++            provider,
++            model_id: Some(model_id),
++            status: ProviderProbeStatus::Ok,
++            error_message: None,
++            diagnostic_detail: None,
++        },
++        Ok(Err(err)) => provider_probe_error(
++            provider,
++            Some(model_id),
++            public_error_message(&collect_chain(&err).join(": ")),
++        ),
++        Err(_) => provider_probe_error(provider, Some(model_id), "timeout (30s)".to_string()),
++    }
++}
++
++fn provider_probe_error(
++    provider: ProviderId,
++    model_id: Option<String>,
++    error_message: String,
++) -> ProviderProbeResult {
++    ProviderProbeResult {
++        provider,
++        model_id,
++        status: ProviderProbeStatus::Error,
++        error_message: Some(error_message),
++        diagnostic_detail: None,
++    }
++}
++
++fn provider_probe_error_with_diagnostic_detail(
++    provider: ProviderId,
++    model_id: Option<String>,
++    error_message: String,
++    diagnostic_detail: String,
++) -> ProviderProbeResult {
++    ProviderProbeResult {
++        provider,
++        model_id,
++        status: ProviderProbeStatus::Error,
++        error_message: Some(error_message),
++        diagnostic_detail: Some(diagnostic_detail),
++    }
++}
++
++fn provider_probe_report(data: Vec<ProviderProbeResult>) -> ProviderProbeReport {
++    let total = u32::try_from(data.len()).unwrap_or(u32::MAX);
++    let passed = u32::try_from(
++        data.iter()
++            .filter(|result| result.status == ProviderProbeStatus::Ok)
++            .count(),
++    )
++    .unwrap_or(u32::MAX);
++    let failed = total.saturating_sub(passed);
++    let status = if total > 0 && failed == 0 {
++        ProviderProbeStatus::Ok
++    } else {
++        ProviderProbeStatus::Error
++    };
++
++    ProviderProbeReport {
++        data,
++        summary: ProviderProbeSummary {
++            status,
++            total,
++            passed,
++            failed,
++        },
++    }
++}
++
++fn public_error_message(message: &str) -> String {
++    redact_string(message)
++}
++
+ const MAX_SHORT_LEN: usize = 120;
+ 
+ fn short_error_line(rendered: &str) -> String {
+@@ -216,20 +387,14 @@ fn short_error_line(rendered: &str) -> String {
+     }
+ }
+ 
+-fn probe_model(provider: &ProviderId, catalog: &Catalog) -> String {
+-    catalog
+-        .probe_for_provider(provider)
+-        .map_or_else(|| format!("unknown-{provider}"), |m| m.id.clone())
+-}
+-
+ async fn probe_llm_provider(
+     client: &LlmClient,
+     provider: &ProviderId,
+-    catalog: &Catalog,
++    model_id: &str,
+ ) -> fabro_llm::Result<()> {
+     let request = Request {
+-        model:            probe_model(provider, catalog),
+-        messages:         vec![Message::user("hi")],
++        model:            model_id.to_string(),
++        messages:         vec![Message::user("Say OK")],
+         provider:         Some(provider.to_string()),
+         tools:            None,
+         tool_choice:      None,
+@@ -779,6 +944,78 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn check_llm_providers_reports_none_configured_after_shared_probe() {
++        let state = TestAppStateBuilder::new().build();
++
++        let result = check_llm_providers(&state).await;
++
++        assert_eq!(result.status, CheckStatus::Error);
++        assert_eq!(result.summary, "none configured");
++        assert!(result.details.is_empty());
++        assert_eq!(
++            result.remediation.as_deref(),
++            Some("Set at least one provider API key")
++        );
++    }
++
++    #[tokio::test]
++    async fn check_llm_providers_preserves_pass_summary_after_shared_probe() {
++        let server = MockServer::start_async().await;
++        let _mock = server
++            .mock_async(|when, then| {
++                when.method(POST).path("/v1/responses");
++                then.status(200)
++                    .header("content-type", "application/json")
++                    .json_body(json!({
++                        "id": "resp_1",
++                        "model": "gpt-5.4-mini",
++                        "output": [
++                            {
++                                "type": "message",
++                                "role": "assistant",
++                                "content": [
++                                    {
++                                        "type": "output_text",
++                                        "text": "OK"
++                                    }
++                                ]
++                            }
++                        ],
++                        "status": "completed"
++                    }));
++            })
++            .await;
++        let state = TestAppStateBuilder::new()
++            .provider_base_url("openai", server.url("/v1"))
++            .build();
++        state
++            .vault
++            .write()
++            .await
++            .set(
++                "OPENAI_API_KEY",
++                "vault-openai-key",
++                SecretType::Token,
++                None,
++            )
++            .unwrap();
++
++        let result = check_llm_providers(&state).await;
++
++        assert_eq!(result.status, CheckStatus::Pass);
++        assert_eq!(result.summary, "1 configured");
++        assert_eq!(result.remediation, None);
++        assert!(
++            result
++                .details
++                .iter()
++                .any(|detail| detail.text == "openai: OK"),
++            "expected openai OK detail, got: {:?}",
++            result.details
++        );
++    }
++
+     #[tokio::test]
+     async fn check_sandbox_ignores_env_backed_daytona_api_key() {
+         let state = TestAppStateBuilder::new()
+diff --git a/lib/crates/fabro-server/src/server/handler/models.rs b/lib/crates/fabro-server/src/server/handler/models.rs
+index 4f218dbf6..27c1e1860 100644
+--- a/lib/crates/fabro-server/src/server/handler/models.rs
++++ b/lib/crates/fabro-server/src/server/handler/models.rs
+@@ -5,12 +5,14 @@ use super::super::{
+     ProviderId, ProviderList, Query, RequiredUser, Response, Router, State, StatusCode,
+     auth_issue_message, default_page_limit, error, get, post, run_model_test,
+ };
++use crate::diagnostics;
+ 
+ pub(super) fn routes() -> Router<Arc<AppState>> {
+     Router::new()
+         .route("/models", get(list_models))
+         .route("/models/{id}/test", post(test_model))
+         .route("/providers", get(list_providers))
++        .route("/providers/test", post(test_providers))
+ }
+ 
+ #[derive(serde::Deserialize)]
+@@ -93,6 +95,20 @@ async fn list_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>)
+     (StatusCode::OK, Json(ProviderList { data })).into_response()
+ }
+ 
++async fn test_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
++    match diagnostics::test_llm_providers(&state).await {
++        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
++        Err(err) => {
++            error!(error = ?err, "Failed to resolve LLM providers for provider test");
++            ApiError::new(
++                StatusCode::INTERNAL_SERVER_ERROR,
++                "Failed to resolve LLM providers",
++            )
++            .into_response()
++        }
++    }
++}
++
+ async fn test_model(
+     _auth: RequiredUser,
+     State(state): State<Arc<AppState>>,
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index b8ba80cbd..c7e6a1071 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -5894,6 +5894,398 @@ async fn list_providers_marks_all_unconfigured_without_credentials() {
+     );
+ }
+ 
++#[tokio::test]
++async fn test_providers_no_configured_providers_returns_error_summary() {
++    let state = test_app_state_with_env_lookup(
++        default_test_server_settings(),
++        RunLayer::default(),
++        5,
++        |_| None,
++    );
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++
++    assert_eq!(body["data"].as_array().unwrap().len(), 0);
++    assert_eq!(body["summary"]["status"], "error");
++    assert_eq!(body["summary"]["total"], 0);
++    assert_eq!(body["summary"]["passed"], 0);
++    assert_eq!(body["summary"]["failed"], 0);
++}
++
++#[tokio::test]
++async fn test_providers_successful_probe_returns_probe_model() {
++    let server = MockServer::start_async().await;
++    let response_mock = server
++        .mock_async(|when, then| {
++            when.method(POST)
++                .path("/v1/responses")
++                .header("authorization", "Bearer vault-openai-key");
++            then.status(200)
++                .header("content-type", "application/json")
++                .json_body(openai_responses_payload("OK"));
++        })
++        .await;
++    let state = TestAppStateBuilder::new()
++        .runtime_settings(default_test_server_settings(), RunLayer::default())
++        .max_concurrent_runs(5)
++        .provider_base_url("openai", server.url("/v1"))
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set(
++            EnvVars::OPENAI_API_KEY,
++            "vault-openai-key",
++            SecretType::Token,
++            None,
++        )
++        .unwrap();
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++    let results = body["data"].as_array().unwrap();
++
++    assert_eq!(results.len(), 1);
++    assert_eq!(results[0]["provider"], "openai");
++    assert_eq!(results[0]["model_id"], "gpt-5.4-mini");
++    assert_eq!(results[0]["status"], "ok");
++    assert!(results[0]["error_message"].is_null());
++    assert_eq!(body["summary"]["status"], "ok");
++    assert_eq!(body["summary"]["total"], 1);
++    assert_eq!(body["summary"]["passed"], 1);
++    assert_eq!(body["summary"]["failed"], 0);
++    response_mock.assert_async().await;
++}
++
++#[tokio::test]
++async fn test_providers_auth_issue_returns_error_without_upstream_call() {
++    let server = MockServer::start_async().await;
++    let upstream = server
++        .mock_async(|when, then| {
++            when.method(POST).path("/v1/responses");
++            then.status(200)
++                .header("content-type", "application/json")
++                .json_body(openai_responses_payload("unexpected"));
++        })
++        .await;
++    let state = TestAppStateBuilder::new()
++        .runtime_settings(default_test_server_settings(), RunLayer::default())
++        .max_concurrent_runs(5)
++        .provider_base_url("openai", server.url("/v1"))
++        .build();
++    let mut credential = openai_oauth_credential();
++    credential.tokens.expires_at = Utc::now() - ChronoDuration::hours(1);
++    credential.tokens.refresh_token = None;
++    state
++        .vault
++        .write()
++        .await
++        .set(
++            "OPENAI_CODEX",
++            &serde_json::to_string(&credential).unwrap(),
++            SecretType::Oauth,
++            None,
++        )
++        .unwrap();
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++    let results = body["data"].as_array().unwrap();
++
++    assert_eq!(results.len(), 1);
++    assert_eq!(results[0]["provider"], "openai");
++    assert!(results[0]["model_id"].is_null());
++    assert_eq!(results[0]["status"], "error");
++    assert!(
++        results[0]["error_message"]
++            .as_str()
++            .unwrap()
++            .contains("requires re-authentication")
++    );
++    assert_eq!(body["summary"]["status"], "error");
++    assert_eq!(body["summary"]["total"], 1);
++    assert_eq!(body["summary"]["passed"], 0);
++    assert_eq!(body["summary"]["failed"], 1);
++    upstream.assert_calls_async(0).await;
++}
++
++#[tokio::test]
++async fn test_providers_registration_issue_returns_error_without_probe() {
++    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(
++        r#"
++[providers.acme]
++display_name = "Acme"
++adapter = "openai_compatible"
++
++[providers.acme.auth]
++credentials = ["vault:ACME_API_KEY"]
++
++[models."acme-probe"]
++provider = "acme"
++display_name = "Acme Probe"
++family = "acme"
++default = true
++probe = true
++
++[models."acme-probe".limits]
++context_window = 128000
++
++[models."acme-probe".features]
++tools = true
++vision = false
++reasoning = false
++"#,
++    )
++    .expect("catalog fixture should parse");
++    let state = TestAppStateBuilder::new()
++        .runtime_settings(default_test_server_settings(), RunLayer::default())
++        .max_concurrent_runs(5)
++        .llm_catalog_settings(llm_catalog_settings)
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set("ACME_API_KEY", "acme-key", SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++    let results = body["data"].as_array().unwrap();
++
++    assert_eq!(results.len(), 1);
++    assert_eq!(results[0]["provider"], "acme");
++    assert!(results[0]["model_id"].is_null());
++    assert_eq!(results[0]["status"], "error");
++    assert!(
++        results[0]["error_message"]
++            .as_str()
++            .unwrap()
++            .contains("does not configure base_url")
++    );
++    assert_eq!(body["summary"]["status"], "error");
++    assert_eq!(body["summary"]["total"], 1);
++    assert_eq!(body["summary"]["passed"], 0);
++    assert_eq!(body["summary"]["failed"], 1);
++}
++
++#[tokio::test]
++async fn test_providers_mixed_results_preserve_catalog_order_and_counts() {
++    let server = MockServer::start_async().await;
++    let alpha_mock = server
++        .mock_async(|when, then| {
++            when.method(POST)
++                .path("/v1/responses")
++                .header("authorization", "Bearer alpha-key");
++            then.status(200)
++                .header("content-type", "application/json")
++                .json_body(openai_responses_payload("OK"));
++        })
++        .await;
++    let zeta_mock = server
++        .mock_async(|when, then| {
++            when.method(POST)
++                .path("/v1/responses")
++                .header("authorization", "Bearer zeta-key");
++            then.status(401)
++                .header("content-type", "application/json")
++                .json_body(json!({
++                    "error": {
++                        "message": "invalid api key",
++                        "type": "invalid_request_error"
++                    }
++                }));
++        })
++        .await;
++    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
++        r#"
++[providers.zeta]
++display_name = "Zeta"
++adapter = "openai"
++base_url = "{base_url}"
++
++[providers.zeta.auth]
++credentials = ["vault:ZETA_API_KEY"]
++
++[providers.alpha]
++display_name = "Alpha"
++adapter = "openai"
++base_url = "{base_url}"
++
++[providers.alpha.auth]
++credentials = ["vault:ALPHA_API_KEY"]
++
++[models."zeta-probe"]
++provider = "zeta"
++display_name = "Zeta Probe"
++family = "zeta"
++default = true
++probe = true
++
++[models."zeta-probe".limits]
++context_window = 128000
++
++[models."zeta-probe".features]
++tools = true
++vision = false
++reasoning = false
++
++[models."alpha-probe"]
++provider = "alpha"
++display_name = "Alpha Probe"
++family = "alpha"
++default = true
++probe = true
++
++[models."alpha-probe".limits]
++context_window = 128000
++
++[models."alpha-probe".features]
++tools = true
++vision = false
++reasoning = false
++"#,
++        base_url = server.url("/v1")
++    ))
++    .expect("catalog fixture should parse");
++    let state = TestAppStateBuilder::new()
++        .runtime_settings(default_test_server_settings(), RunLayer::default())
++        .max_concurrent_runs(5)
++        .llm_catalog_settings(llm_catalog_settings)
++        .build();
++    {
++        let mut vault = state.vault.write().await;
++        vault
++            .set("ALPHA_API_KEY", "alpha-key", SecretType::Token, None)
++            .unwrap();
++        vault
++            .set("ZETA_API_KEY", "zeta-key", SecretType::Token, None)
++            .unwrap();
++    }
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++    let results = body["data"].as_array().unwrap();
++
++    assert_eq!(results.len(), 2);
++    assert_eq!(results[0]["provider"], "alpha");
++    assert_eq!(results[0]["model_id"], "alpha-probe");
++    assert_eq!(results[0]["status"], "ok");
++    assert_eq!(results[1]["provider"], "zeta");
++    assert_eq!(results[1]["model_id"], "zeta-probe");
++    assert_eq!(results[1]["status"], "error");
++    assert_eq!(body["summary"]["status"], "error");
++    assert_eq!(body["summary"]["total"], 2);
++    assert_eq!(body["summary"]["passed"], 1);
++    assert_eq!(body["summary"]["failed"], 1);
++    alpha_mock.assert_async().await;
++    zeta_mock.assert_async().await;
++}
++
++#[tokio::test]
++async fn test_providers_response_does_not_leak_api_keys() {
++    let leaked_key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
++    let server = MockServer::start_async().await;
++    let response_mock = server
++        .mock_async(move |when, then| {
++            when.method(POST)
++                .path("/v1/responses")
++                .header("authorization", format!("Bearer {leaked_key}"));
++            then.status(401)
++                .header("content-type", "application/json")
++                .json_body(json!({
++                    "error": {
++                        "message": format!("invalid api key {leaked_key}"),
++                        "type": "invalid_request_error"
++                    }
++                }));
++        })
++        .await;
++    let state = TestAppStateBuilder::new()
++        .runtime_settings(default_test_server_settings(), RunLayer::default())
++        .max_concurrent_runs(5)
++        .provider_base_url("openai", server.url("/v1"))
++        .build();
++    state
++        .vault
++        .write()
++        .await
++        .set(EnvVars::OPENAI_API_KEY, leaked_key, SecretType::Token, None)
++        .unwrap();
++    let app = crate::test_support::build_test_router(state);
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    let body = response_json!(response, StatusCode::OK).await;
++    let serialized = body.to_string();
++
++    assert!(
++        !serialized.contains(leaked_key),
++        "provider test response leaked API key: {serialized}"
++    );
++    assert!(
++        serialized.contains("REDACTED"),
++        "provider test response should include a redacted error: {serialized}"
++    );
++    response_mock.assert_async().await;
++}
++
++#[tokio::test]
++async fn test_providers_requires_user_auth() {
++    let app = build_router(test_app_state(), test_auth_mode());
++
++    let req = Request::builder()
++        .method("POST")
++        .uri(api("/providers/test"))
++        .body(Body::empty())
++        .unwrap();
++
++    let response = app.oneshot(req).await.unwrap();
++    assert_status!(response, StatusCode::UNAUTHORIZED).await;
++}
++
+ #[tokio::test]
+ async fn auth_login_github_redirects_to_github() {
+     let source = r#"
+diff --git a/lib/packages/fabro-api-client/src/.openapi-generator/FILES b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+index 9f907ebba..afa4aa5fd 100644
+--- a/lib/packages/fabro-api-client/src/.openapi-generator/FILES
++++ b/lib/packages/fabro-api-client/src/.openapi-generator/FILES
+@@ -259,6 +259,10 @@ models/principal-worker.ts
+ models/principal.ts
+ models/project-namespace.ts
+ models/provider-list.ts
++models/provider-test-list.ts
++models/provider-test-result.ts
++models/provider-test-status.ts
++models/provider-test-summary.ts
+ models/provider.ts
+ models/prune-run-entry.ts
+ models/prune-runs-request.ts
+diff --git a/lib/packages/fabro-api-client/src/api/models-api.ts b/lib/packages/fabro-api-client/src/api/models-api.ts
+index c4585d51b..6b19c88c3 100644
+--- a/lib/packages/fabro-api-client/src/api/models-api.ts
++++ b/lib/packages/fabro-api-client/src/api/models-api.ts
+@@ -31,6 +31,8 @@ import type { ModelTestResult } from '../models';
+ import type { PaginatedModelList } from '../models';
+ // @ts-ignore
+ import type { ProviderList } from '../models';
++// @ts-ignore
++import type { ProviderTestList } from '../models';
+ /**
+  * ModelsApi - axios parameter creator
+  */
+@@ -168,6 +170,42 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio
+             let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+             localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+ 
++            return {
++                url: toPathString(localVarUrlObj),
++                options: localVarRequestOptions,
++            };
++        },
++        /**
++         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.
++         * @summary Test Providers
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        testProviders: async (options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
++            const localVarPath = `/api/v1/providers/test`;
++            // use dummy base URL string because the URL constructor only accepts absolute URLs.
++            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
++            let baseOptions;
++            if (configuration) {
++                baseOptions = configuration.baseOptions;
++            }
++
++            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
++            const localVarHeaderParameter = {} as any;
++            const localVarQueryParameter = {} as any;
++
++            // authentication SessionCookie required
++
++            // authentication BearerAuth required
++            // http bearer authentication required
++            await setBearerAuthToObject(localVarHeaderParameter, configuration)
++
++            localVarHeaderParameter['Accept'] = 'application/json';
++
++            setSearchParams(localVarUrlObj, localVarQueryParameter);
++            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
++            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
++
+             return {
+                 url: toPathString(localVarUrlObj),
+                 options: localVarRequestOptions,
+@@ -224,6 +262,18 @@ export const ModelsApiFp = function(configuration?: Configuration) {
+             const localVarOperationServerBasePath = operationServerMap['ModelsApi.testModel']?.[localVarOperationServerIndex]?.url;
+             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+         },
++        /**
++         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.
++         * @summary Test Providers
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        async testProviders(options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ProviderTestList>> {
++            const localVarAxiosArgs = await localVarAxiosParamCreator.testProviders(options);
++            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
++            const localVarOperationServerBasePath = operationServerMap['ModelsApi.testProviders']?.[localVarOperationServerIndex]?.url;
++            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
++        },
+     }
+ };
+ 
+@@ -266,6 +316,15 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
+         testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {
+             return localVarFp.testModel(id, mode, options).then((request) => request(axios, basePath));
+         },
++        /**
++         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.
++         * @summary Test Providers
++         * @param {*} [options] Override http request option.
++         * @throws {RequiredError}
++         */
++        testProviders(options?: RawAxiosRequestConfig): AxiosPromise<ProviderTestList> {
++            return localVarFp.testProviders(options).then((request) => request(axios, basePath));
++        },
+     };
+ };
+ 
+@@ -308,4 +367,14 @@ export class ModelsApi extends BaseAPI {
+     public testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {
+         return ModelsApiFp(this.configuration).testModel(id, mode, options).then((request) => request(this.axios, this.basePath));
+     }
++
++    /**
++     * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.
++     * @summary Test Providers
++     * @param {*} [options] Override http request option.
++     * @throws {RequiredError}
++     */
++    public testProviders(options?: RawAxiosRequestConfig) {
++        return ModelsApiFp(this.configuration).testProviders(options).then((request) => request(this.axios, this.basePath));
++    }
+ }
+diff --git a/lib/packages/fabro-api-client/src/models/index.ts b/lib/packages/fabro-api-client/src/models/index.ts
+index b9542d1ab..2ec1e49a4 100644
+--- a/lib/packages/fabro-api-client/src/models/index.ts
++++ b/lib/packages/fabro-api-client/src/models/index.ts
+@@ -236,6 +236,10 @@ export * from './principal-worker';
+ export * from './project-namespace';
+ export * from './provider';
+ export * from './provider-list';
++export * from './provider-test-list';
++export * from './provider-test-result';
++export * from './provider-test-status';
++export * from './provider-test-summary';
+ export * from './prune-run-entry';
+ export * from './prune-runs-request';
+ export * from './prune-runs-response';
+diff --git a/lib/packages/fabro-api-client/src/models/provider-test-list.ts b/lib/packages/fabro-api-client/src/models/provider-test-list.ts
+new file mode 100644
+index 000000000..6235bbd5d
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/provider-test-list.ts
+@@ -0,0 +1,29 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { ProviderTestResult } from './provider-test-result';
++// May contain unused imports in some cases
++// @ts-ignore
++import type { ProviderTestSummary } from './provider-test-summary';
++
++/**
++ * Results from testing all configured LLM providers.
++ */
++export interface ProviderTestList {
++    'data': Array<ProviderTestResult>;
++    'summary': ProviderTestSummary;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/provider-test-result.ts b/lib/packages/fabro-api-client/src/models/provider-test-result.ts
+new file mode 100644
+index 000000000..0a34c894b
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/provider-test-result.ts
+@@ -0,0 +1,37 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { ProviderTestStatus } from './provider-test-status';
++
++/**
++ * Result of testing one configured LLM provider.
++ */
++export interface ProviderTestResult {
++    /**
++     * LLM provider identifier.
++     */
++    'provider': string;
++    /**
++     * Catalog probe model ID used for the provider, or null when no probe was sent.
++     */
++    'model_id': string | null;
++    'status': ProviderTestStatus;
++    /**
++     * Error details when status is \"error\".
++     */
++    'error_message': string | null;
++}
+diff --git a/lib/packages/fabro-api-client/src/models/provider-test-status.ts b/lib/packages/fabro-api-client/src/models/provider-test-status.ts
+new file mode 100644
+index 000000000..fce18e021
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/provider-test-status.ts
+@@ -0,0 +1,26 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++
++/**
++ * Provider test status.
++ */
++
++export const ProviderTestStatus = {
++    OK: 'ok',
++    ERROR: 'error'
++} as const;
++
++export type ProviderTestStatus = typeof ProviderTestStatus[keyof typeof ProviderTestStatus];
+diff --git a/lib/packages/fabro-api-client/src/models/provider-test-summary.ts b/lib/packages/fabro-api-client/src/models/provider-test-summary.ts
+new file mode 100644
+index 000000000..0c3622fa5
+--- /dev/null
++++ b/lib/packages/fabro-api-client/src/models/provider-test-summary.ts
+@@ -0,0 +1,37 @@
++/* tslint:disable */
++/* eslint-disable */
++/**
++ * Fabro Run API
++ * HTTP API for managing Fabro workflow run executions.
++ *
++ * The version of the OpenAPI document: 0.1.0
++ *
++ *
++ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).
++ * https://openapi-generator.tech
++ * Do not edit the class manually.
++ */
++
++
++// May contain unused imports in some cases
++// @ts-ignore
++import type { ProviderTestStatus } from './provider-test-status';
++
++/**
++ * Aggregate provider test status and counts.
++ */
++export interface ProviderTestSummary {
++    'status': ProviderTestStatus;
++    /**
++     * Number of configured providers tested or evaluated.
++     */
++    'total': number;
++    /**
++     * Number of providers whose probe succeeded.
++     */
++    'passed': number;
++    /**
++     * Number of providers with configuration, auth, registration, or probe errors.
++     */
++    'failed': number;
++}

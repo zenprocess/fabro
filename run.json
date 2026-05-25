@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-25T21:44:07.291338Z",
-  "last_event_at": "2026-05-25T22:12:46.059622Z",
+  "last_event_at": "2026-05-25T22:25:43.674986Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -753,9 +753,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 558,
       "checkpoint": {
-        "timestamp": "2026-05-25T22:12:46.084106Z",
+        "timestamp": "2026-05-25T22:12:50.110027Z",
         "current_node": "implement",
         "completed_nodes": [
           "start",
@@ -766,31 +766,154 @@
         ],
         "node_retries": {},
         "context_values": {
-          "failure_class": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "current_node": "implement",
+          "internal.fidelity": "compact",
+          "last_response": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestS",
+          "outcome": "succeeded",
           "failure_signature": "",
+          "internal.retry_count.implement": 0,
+          "graph.rankdir": "LR",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "last_stage": "implement",
+          "thread.start.current_node": "toolchain",
+          "internal.retry_count.toolchain": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.preflight_lint": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.thread_id": "preflight_lint",
+          "thread.toolchain.current_node": "preflight_compile",
           "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+          "internal.run_id": "01KSGHG9F2BGEF3J9K8SKA59TQ",
+          "internal.retry_count.preflight_compile": 0,
+          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
+          "failure_class": ""
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+              "last_response": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestS"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 4615566,
+                    "output_tokens": 18811,
+                    "reasoning_tokens": 14666,
+                    "cache_read_tokens": 13300224,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 30732252
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "simplify_opus",
+        "git_commit_sha": "d1753d40bbc281221321613fd9051b908fbd55f3",
+        "node_visits": {
+          "preflight_compile": 1,
+          "preflight_lint": 1,
+          "implement": 1,
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml\nindex dfa032fe0..d71f84d1d 100644\n--- a/docs/public/api-reference/fabro-api.yaml\n+++ b/docs/public/api-reference/fabro-api.yaml\n@@ -4466,6 +4466,22 @@ paths:\n               schema:\n                 $ref: \"#/components/schemas/ProviderList\"\n \n+  /api/v1/providers/test:\n+    post:\n+      operationId: testProviders\n+      tags: [Models]\n+      summary: Test Providers\n+      description: >\n+        Tests every configured LLM provider once using the catalog probe model.\n+        Provider-level failures are returned in the response body with HTTP 200.\n+      responses:\n+        \"200\":\n+          description: Provider test results\n+          content:\n+            application/json:\n+              schema:\n+                $ref: \"#/components/schemas/ProviderTestList\"\n+\n   # ── Completions ───────────────────────────────────────────────────────\n \n   /api/v1/completions:\n@@ -6177,6 +6193,75 @@ components:\n           items:\n             $ref: \"#/components/schemas/Provider\"\n \n+    ProviderTestList:\n+      description: Results from testing all configured LLM providers.\n+      type: object\n+      required:\n+        - data\n+        - summary\n+      properties:\n+        data:\n+          type: array\n+          items:\n+            $ref: \"#/components/schemas/ProviderTestResult\"\n+        summary:\n+          $ref: \"#/components/schemas/ProviderTestSummary\"\n+\n+    ProviderTestResult:\n+      description: Result of testing one configured LLM provider.\n+      type: object\n+      required:\n+        - provider\n+        - model_id\n+        - status\n+        - error_message\n+      properties:\n+        provider:\n+          $ref: \"#/components/schemas/ProviderId\"\n+        model_id:\n+          type: [\"string\", \"null\"]\n+          description: Catalog probe model ID used for the provider, or null when no probe was sent.\n+          example: \"gpt-5.4-mini\"\n+        status:\n+          $ref: \"#/components/schemas/ProviderTestStatus\"\n+        error_message:\n+          type: [\"string\", \"null\"]\n+          description: Error details when status is \"error\".\n+\n+    ProviderTestSummary:\n+      description: Aggregate provider test status and counts.\n+      type: object\n+      required:\n+        - status\n+        - total\n+        - passed\n+        - failed\n+      properties:\n+        status:\n+          $ref: \"#/components/schemas/ProviderTestStatus\"\n+        total:\n+          type: integer\n+          format: int32\n+          minimum: 0\n+          description: Number of configured providers tested or evaluated.\n+        passed:\n+          type: integer\n+          format: int32\n+          minimum: 0\n+          description: Number of providers whose probe succeeded.\n+        failed:\n+          type: integer\n+          format: int32\n+          minimum: 0\n+          description: Number of providers with configuration, auth, registration, or probe errors.\n+\n+    ProviderTestStatus:\n+      description: Provider test status.\n+      type: string\n+      enum:\n+        - ok\n+        - error\n+\n     Provider:\n       description: An LLM provider from the catalog with effective config and configured status.\n       type: object\ndiff --git a/lib/crates/fabro-server/src/diagnostics.rs b/lib/crates/fabro-server/src/diagnostics.rs\nindex 887f8b08a..6a6358a5e 100644\n--- a/lib/crates/fabro-server/src/diagnostics.rs\n+++ b/lib/crates/fabro-server/src/diagnostics.rs\n@@ -1,3 +1,4 @@\n+use std::collections::HashSet;\n use std::time::Duration;\n \n use base64::Engine as _;\n@@ -6,6 +7,7 @@ use fabro_auth::auth_issue_message;\n use fabro_llm::client::Client as LlmClient;\n use fabro_llm::types::{Message, Request};\n use fabro_model::{Catalog, ProviderId};\n+use fabro_redact::redact_string;\n use fabro_sandbox::daytona;\n use fabro_static::EnvVars;\n use fabro_types::settings::server::GithubIntegrationStrategy;\n@@ -40,6 +42,38 @@ pub struct DiagnosticsReport {\n     pub sections: Vec<CheckSection>,\n }\n \n+#[derive(Debug, Clone, Serialize)]\n+pub(crate) struct ProviderProbeReport {\n+    pub data:    Vec<ProviderProbeResult>,\n+    pub summary: ProviderProbeSummary,\n+}\n+\n+#[derive(Debug, Clone, Serialize)]\n+pub(crate) struct ProviderProbeResult {\n+    pub provider:      ProviderId,\n+    pub model_id:      Option<String>,\n+    pub status:        ProviderProbeStatus,\n+    pub error_message: Option<String>,\n+    #[serde(skip)]\n+    diagnostic_detail: Option<String>,\n+}\n+\n+#[derive(Debug, Clone, Serialize)]\n+pub(crate) struct ProviderProbeSummary {\n+    pub status: ProviderProbeStatus,\n+    pub total:  u32,\n+    pub passed: u32,\n+    pub failed: u32,\n+}\n+\n+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::Display)]\n+#[serde(rename_all = \"snake_case\")]\n+#[strum(serialize_all = \"snake_case\")]\n+pub(crate) enum ProviderProbeStatus {\n+    Ok,\n+    Error,\n+}\n+\n fn decode_pem_value(name: &str, value: &str) -> Result<String, String> {\n     if value.starts_with(\"-----\") {\n         return Ok(value.to_string());\n@@ -79,8 +113,8 @@ pub async fn run_all(state: &AppState) -> DiagnosticsReport {\n }\n \n async fn check_llm_providers(state: &AppState) -> CheckResult {\n-    let result = match state.resolve_llm_client().await {\n-        Ok(result) => result,\n+    let report = match test_llm_providers(state).await {\n+        Ok(report) => report,\n         Err(err) => {\n             return CheckResult {\n                 name:        \"LLM Providers\".to_string(),\n@@ -91,10 +125,7 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {\n             };\n         }\n     };\n-    if result.client.provider_names().is_empty()\n-        && result.auth_issues.is_empty()\n-        && result.registration_issues.is_empty()\n-    {\n+    if report.data.is_empty() {\n         return CheckResult {\n             name:        \"LLM Providers\".to_string(),\n             status:      CheckStatus::Error,\n@@ -106,61 +137,25 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {\n \n     let mut details: Vec<CheckDetail> = Vec::new();\n     let mut failures: Vec<ProviderFailure> = Vec::new();\n-    for (provider, issue) in &result.auth_issues {\n-        let message = auth_issue_message(provider, issue);\n-        failures.push(ProviderFailure {\n-            provider:     provider.to_string(),\n-            summary_line: short_error_line(&message),\n-        });\n-        details.push(CheckDetail::new(message));\n-    }\n-    for issue in &result.registration_issues {\n-        let message = issue.error.to_string();\n-        failures.push(ProviderFailure {\n-            provider:     issue.provider.to_string(),\n-            summary_line: short_error_line(&message),\n-        });\n-        details.push(CheckDetail::new(format!(\"{}: {message}\", issue.provider)));\n-    }\n-\n-    let providers: Vec<ProviderId> = result\n-        .client\n-        .provider_names()\n-        .iter()\n-        .map(|name| ProviderId::new(*name))\n-        .collect();\n-    let client = &result.client;\n-    let catalog = state.catalog();\n-    let probe_outcomes = join_all(providers.iter().map(|provider| {\n-        let catalog = catalog.clone();\n-        let provider = provider.clone();\n-        async move {\n-            let outcome = timeout(\n-                Duration::from_secs(30),\n-                probe_llm_provider(client, &provider, catalog.as_ref()),\n-            )\n-            .await;\n-            (provider, outcome)\n-        }\n-    }))\n-    .await;\n-    for (provider, probe_result) in probe_outcomes {\n-        match probe_result {\n-            Ok(Ok(())) => details.push(CheckDetail::new(format!(\"{provider}: OK\"))),\n-            Ok(Err(err)) => {\n-                let rendered = collect_chain(&err).join(\": \");\n-                failures.push(ProviderFailure {\n-                    provider:     provider.to_string(),\n-                    summary_line: short_error_line(&rendered),\n-                });\n-                details.push(CheckDetail::new(format!(\"{provider}: {rendered}\")));\n+    for result in &report.data {\n+        match result.status {\n+            ProviderProbeStatus::Ok => {\n+                details.push(CheckDetail::new(format!(\"{}: OK\", result.provider)));\n             }\n-            Err(_) => {\n+            ProviderProbeStatus::Error => {\n+                let message = result\n+                    .error_message\n+                    .as_deref()\n+                    .unwrap_or(\"provider probe failed\");\n+                let detail = result\n+                    .diagnostic_detail\n+                    .clone()\n+                    .unwrap_or_else(|| format!(\"{}: {message}\", result.provider));\n                 failures.push(ProviderFailure {\n-                    provider:     provider.to_string(),\n-                    summary_line: \"timeout (30s)\".to_string(),\n+                    provider:     result.provider.to_string(),\n+                    summary_line: short_error_line(message),\n                 });\n-                details.push(CheckDetail::new(format!(\"{provider}: timeout (30s)\")));\n+                details.push(CheckDetail::new(detail));\n             }\n         }\n     }\n@@ -169,7 +164,7 @@ async fn check_llm_providers(state: &AppState) -> CheckResult {\n         return CheckResult {\n             name: \"LLM Providers\".to_string(),\n             status: CheckStatus::Pass,\n-            summary: format!(\"{} configured\", result.client.provider_names().len()),\n+            summary: format!(\"{} configured\", report.summary.total),\n             details,\n             remediation: None,\n         };\n@@ -200,6 +195,182 @@ struct ProviderFailure {\n     summary_line: String,\n }\n \n+pub(crate) async fn test_llm_providers(state: &AppState) -> anyhow::Result<ProviderProbeReport> {\n+    let configured_providers = state.configured_llm_provider_ids().await;\n+    let result = state.resolve_llm_client().await?;\n+    let catalog = state.catalog();\n+\n+    let mut selected = configured_providers.iter().cloned().collect::<HashSet<_>>();\n+    let mut extras = configured_providers;\n+    for (provider, _) in &result.auth_issues {\n+        if selected.insert(provider.clone()) {\n+            extras.push(provider.clone());\n+        }\n+    }\n+    for issue in &result.registration_issues {\n+        if selected.insert(issue.provider.clone()) {\n+            extras.push(issue.provider.clone());\n+        }\n+    }\n+\n+    let mut providers = catalog\n+        .providers()\n+        .iter()\n+        .filter(|provider| selected.contains(&provider.id))\n+        .map(|provider| provider.id.clone())\n+        .collect::<Vec<_>>();\n+    for provider in extras {\n+        if !providers.contains(&provider) {\n+            providers.push(provider);\n+        }\n+    }\n+\n+    let client = &result.client;\n+    let probe_results = join_all(providers.into_iter().map(|provider| {\n+        let catalog = catalog.clone();\n+        let auth_issue = result\n+            .auth_issues\n+            .iter()\n+            .find(|(issue_provider, _)| issue_provider == &provider)\n+            .map(|(_, issue)| public_error_message(&auth_issue_message(&provider, issue)));\n+        let registration_issue = result\n+            .registration_issues\n+            .iter()\n+            .find(|issue| issue.provider == provider)\n+            .map(|issue| public_error_message(&issue.error.to_string()));\n+        async move {\n+            probe_single_provider(\n+                client,\n+                catalog.as_ref(),\n+                provider,\n+                auth_issue,\n+                registration_issue,\n+            )\n+            .await\n+        }\n+    }))\n+    .await;\n+\n+    Ok(provider_probe_report(probe_results))\n+}\n+\n+async fn probe_single_provider(\n+    client: &LlmClient,\n+    catalog: &Catalog,\n+    provider: ProviderId,\n+    auth_issue: Option<String>,\n+    registration_issue: Option<String>,\n+) -> ProviderProbeResult {\n+    if let Some(message) = auth_issue {\n+        return provider_probe_error_with_diagnostic_detail(\n+            provider,\n+            None,\n+            message.clone(),\n+            message,\n+        );\n+    }\n+    if let Some(message) = registration_issue {\n+        return provider_probe_error(provider, None, message);\n+    }\n+\n+    if !client.has_provider(provider.as_str()) {\n+        return provider_probe_error(\n+            provider,\n+            None,\n+            \"provider is configured but not registered\".to_string(),\n+        );\n+    }\n+\n+    let Some(model) = catalog.probe_for_provider(&provider) else {\n+        return provider_probe_error(\n+            provider,\n+            None,\n+            \"no probe model configured for provider\".to_string(),\n+        );\n+    };\n+    let model_id = model.id.clone();\n+\n+    let probe_result = timeout(\n+        Duration::from_secs(30),\n+        probe_llm_provider(client, &provider, &model_id),\n+    )\n+    .await;\n+    match probe_result {\n+        Ok(Ok(())) => ProviderProbeResult {\n+            provider,\n+            model_id: Some(model_id),\n+            status: ProviderProbeStatus::Ok,\n+            error_message: None,\n+            diagnostic_detail: None,\n+        },\n+        Ok(Err(err)) => provider_probe_error(\n+            provider,\n+            Some(model_id),\n+            public_error_message(&collect_chain(&err).join(\": \")),\n+        ),\n+        Err(_) => provider_probe_error(provider, Some(model_id), \"timeout (30s)\".to_string()),\n+    }\n+}\n+\n+fn provider_probe_error(\n+    provider: ProviderId,\n+    model_id: Option<String>,\n+    error_message: String,\n+) -> ProviderProbeResult {\n+    ProviderProbeResult {\n+        provider,\n+        model_id,\n+        status: ProviderProbeStatus::Error,\n+        error_message: Some(error_message),\n+        diagnostic_detail: None,\n+    }\n+}\n+\n+fn provider_probe_error_with_diagnostic_detail(\n+    provider: ProviderId,\n+    model_id: Option<String>,\n+    error_message: String,\n+    diagnostic_detail: String,\n+) -> ProviderProbeResult {\n+    ProviderProbeResult {\n+        provider,\n+        model_id,\n+        status: ProviderProbeStatus::Error,\n+        error_message: Some(error_message),\n+        diagnostic_detail: Some(diagnostic_detail),\n+    }\n+}\n+\n+fn provider_probe_report(data: Vec<ProviderProbeResult>) -> ProviderProbeReport {\n+    let total = u32::try_from(data.len()).unwrap_or(u32::MAX);\n+    let passed = u32::try_from(\n+        data.iter()\n+            .filter(|result| result.status == ProviderProbeStatus::Ok)\n+            .count(),\n+    )\n+    .unwrap_or(u32::MAX);\n+    let failed = total.saturating_sub(passed);\n+    let status = if total > 0 && failed == 0 {\n+        ProviderProbeStatus::Ok\n+    } else {\n+        ProviderProbeStatus::Error\n+    };\n+\n+    ProviderProbeReport {\n+        data,\n+        summary: ProviderProbeSummary {\n+            status,\n+            total,\n+            passed,\n+            failed,\n+        },\n+    }\n+}\n+\n+fn public_error_message(message: &str) -> String {\n+    redact_string(message)\n+}\n+\n const MAX_SHORT_LEN: usize = 120;\n \n fn short_error_line(rendered: &str) -> String {\n@@ -216,20 +387,14 @@ fn short_error_line(rendered: &str) -> String {\n     }\n }\n \n-fn probe_model(provider: &ProviderId, catalog: &Catalog) -> String {\n-    catalog\n-        .probe_for_provider(provider)\n-        .map_or_else(|| format!(\"unknown-{provider}\"), |m| m.id.clone())\n-}\n-\n async fn probe_llm_provider(\n     client: &LlmClient,\n     provider: &ProviderId,\n-    catalog: &Catalog,\n+    model_id: &str,\n ) -> fabro_llm::Result<()> {\n     let request = Request {\n-        model:            probe_model(provider, catalog),\n-        messages:         vec![Message::user(\"hi\")],\n+        model:            model_id.to_string(),\n+        messages:         vec![Message::user(\"Say OK\")],\n         provider:         Some(provider.to_string()),\n         tools:            None,\n         tool_choice:      None,\n@@ -779,6 +944,78 @@ mod tests {\n         );\n     }\n \n+    #[tokio::test]\n+    async fn check_llm_providers_reports_none_configured_after_shared_probe() {\n+        let state = TestAppStateBuilder::new().build();\n+\n+        let result = check_llm_providers(&state).await;\n+\n+        assert_eq!(result.status, CheckStatus::Error);\n+        assert_eq!(result.summary, \"none configured\");\n+        assert!(result.details.is_empty());\n+        assert_eq!(\n+            result.remediation.as_deref(),\n+            Some(\"Set at least one provider API key\")\n+        );\n+    }\n+\n+    #[tokio::test]\n+    async fn check_llm_providers_preserves_pass_summary_after_shared_probe() {\n+        let server = MockServer::start_async().await;\n+        let _mock = server\n+            .mock_async(|when, then| {\n+                when.method(POST).path(\"/v1/responses\");\n+                then.status(200)\n+                    .header(\"content-type\", \"application/json\")\n+                    .json_body(json!({\n+                        \"id\": \"resp_1\",\n+                        \"model\": \"gpt-5.4-mini\",\n+                        \"output\": [\n+                            {\n+                                \"type\": \"message\",\n+                                \"role\": \"assistant\",\n+                                \"content\": [\n+                                    {\n+                                        \"type\": \"output_text\",\n+                                        \"text\": \"OK\"\n+                                    }\n+                                ]\n+                            }\n+                        ],\n+                        \"status\": \"completed\"\n+                    }));\n+            })\n+            .await;\n+        let state = TestAppStateBuilder::new()\n+            .provider_base_url(\"openai\", server.url(\"/v1\"))\n+            .build();\n+        state\n+            .vault\n+            .write()\n+            .await\n+            .set(\n+                \"OPENAI_API_KEY\",\n+                \"vault-openai-key\",\n+                SecretType::Token,\n+                None,\n+            )\n+            .unwrap();\n+\n+        let result = check_llm_providers(&state).await;\n+\n+        assert_eq!(result.status, CheckStatus::Pass);\n+        assert_eq!(result.summary, \"1 configured\");\n+        assert_eq!(result.remediation, None);\n+        assert!(\n+            result\n+                .details\n+                .iter()\n+                .any(|detail| detail.text == \"openai: OK\"),\n+            \"expected openai OK detail, got: {:?}\",\n+            result.details\n+        );\n+    }\n+\n     #[tokio::test]\n     async fn check_sandbox_ignores_env_backed_daytona_api_key() {\n         let state = TestAppStateBuilder::new()\ndiff --git a/lib/crates/fabro-server/src/server/handler/models.rs b/lib/crates/fabro-server/src/server/handler/models.rs\nindex 4f218dbf6..27c1e1860 100644\n--- a/lib/crates/fabro-server/src/server/handler/models.rs\n+++ b/lib/crates/fabro-server/src/server/handler/models.rs\n@@ -5,12 +5,14 @@ use super::super::{\n     ProviderId, ProviderList, Query, RequiredUser, Response, Router, State, StatusCode,\n     auth_issue_message, default_page_limit, error, get, post, run_model_test,\n };\n+use crate::diagnostics;\n \n pub(super) fn routes() -> Router<Arc<AppState>> {\n     Router::new()\n         .route(\"/models\", get(list_models))\n         .route(\"/models/{id}/test\", post(test_model))\n         .route(\"/providers\", get(list_providers))\n+        .route(\"/providers/test\", post(test_providers))\n }\n \n #[derive(serde::Deserialize)]\n@@ -93,6 +95,20 @@ async fn list_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>)\n     (StatusCode::OK, Json(ProviderList { data })).into_response()\n }\n \n+async fn test_providers(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {\n+    match diagnostics::test_llm_providers(&state).await {\n+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),\n+        Err(err) => {\n+            error!(error = ?err, \"Failed to resolve LLM providers for provider test\");\n+            ApiError::new(\n+                StatusCode::INTERNAL_SERVER_ERROR,\n+                \"Failed to resolve LLM providers\",\n+            )\n+            .into_response()\n+        }\n+    }\n+}\n+\n async fn test_model(\n     _auth: RequiredUser,\n     State(state): State<Arc<AppState>>,\ndiff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs\nindex b8ba80cbd..c7e6a1071 100644\n--- a/lib/crates/fabro-server/src/server/tests.rs\n+++ b/lib/crates/fabro-server/src/server/tests.rs\n@@ -5894,6 +5894,398 @@ async fn list_providers_marks_all_unconfigured_without_credentials() {\n     );\n }\n \n+#[tokio::test]\n+async fn test_providers_no_configured_providers_returns_error_summary() {\n+    let state = test_app_state_with_env_lookup(\n+        default_test_server_settings(),\n+        RunLayer::default(),\n+        5,\n+        |_| None,\n+    );\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+\n+    assert_eq!(body[\"data\"].as_array().unwrap().len(), 0);\n+    assert_eq!(body[\"summary\"][\"status\"], \"error\");\n+    assert_eq!(body[\"summary\"][\"total\"], 0);\n+    assert_eq!(body[\"summary\"][\"passed\"], 0);\n+    assert_eq!(body[\"summary\"][\"failed\"], 0);\n+}\n+\n+#[tokio::test]\n+async fn test_providers_successful_probe_returns_probe_model() {\n+    let server = MockServer::start_async().await;\n+    let response_mock = server\n+        .mock_async(|when, then| {\n+            when.method(POST)\n+                .path(\"/v1/responses\")\n+                .header(\"authorization\", \"Bearer vault-openai-key\");\n+            then.status(200)\n+                .header(\"content-type\", \"application/json\")\n+                .json_body(openai_responses_payload(\"OK\"));\n+        })\n+        .await;\n+    let state = TestAppStateBuilder::new()\n+        .runtime_settings(default_test_server_settings(), RunLayer::default())\n+        .max_concurrent_runs(5)\n+        .provider_base_url(\"openai\", server.url(\"/v1\"))\n+        .build();\n+    state\n+        .vault\n+        .write()\n+        .await\n+        .set(\n+            EnvVars::OPENAI_API_KEY,\n+            \"vault-openai-key\",\n+            SecretType::Token,\n+            None,\n+        )\n+        .unwrap();\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+    let results = body[\"data\"].as_array().unwrap();\n+\n+    assert_eq!(results.len(), 1);\n+    assert_eq!(results[0][\"provider\"], \"openai\");\n+    assert_eq!(results[0][\"model_id\"], \"gpt-5.4-mini\");\n+    assert_eq!(results[0][\"status\"], \"ok\");\n+    assert!(results[0][\"error_message\"].is_null());\n+    assert_eq!(body[\"summary\"][\"status\"], \"ok\");\n+    assert_eq!(body[\"summary\"][\"total\"], 1);\n+    assert_eq!(body[\"summary\"][\"passed\"], 1);\n+    assert_eq!(body[\"summary\"][\"failed\"], 0);\n+    response_mock.assert_async().await;\n+}\n+\n+#[tokio::test]\n+async fn test_providers_auth_issue_returns_error_without_upstream_call() {\n+    let server = MockServer::start_async().await;\n+    let upstream = server\n+        .mock_async(|when, then| {\n+            when.method(POST).path(\"/v1/responses\");\n+            then.status(200)\n+                .header(\"content-type\", \"application/json\")\n+                .json_body(openai_responses_payload(\"unexpected\"));\n+        })\n+        .await;\n+    let state = TestAppStateBuilder::new()\n+        .runtime_settings(default_test_server_settings(), RunLayer::default())\n+        .max_concurrent_runs(5)\n+        .provider_base_url(\"openai\", server.url(\"/v1\"))\n+        .build();\n+    let mut credential = openai_oauth_credential();\n+    credential.tokens.expires_at = Utc::now() - ChronoDuration::hours(1);\n+    credential.tokens.refresh_token = None;\n+    state\n+        .vault\n+        .write()\n+        .await\n+        .set(\n+            \"OPENAI_CODEX\",\n+            &serde_json::to_string(&credential).unwrap(),\n+            SecretType::Oauth,\n+            None,\n+        )\n+        .unwrap();\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+    let results = body[\"data\"].as_array().unwrap();\n+\n+    assert_eq!(results.len(), 1);\n+    assert_eq!(results[0][\"provider\"], \"openai\");\n+    assert!(results[0][\"model_id\"].is_null());\n+    assert_eq!(results[0][\"status\"], \"error\");\n+    assert!(\n+        results[0][\"error_message\"]\n+            .as_str()\n+            .unwrap()\n+            .contains(\"requires re-authentication\")\n+    );\n+    assert_eq!(body[\"summary\"][\"status\"], \"error\");\n+    assert_eq!(body[\"summary\"][\"total\"], 1);\n+    assert_eq!(body[\"summary\"][\"passed\"], 0);\n+    assert_eq!(body[\"summary\"][\"failed\"], 1);\n+    upstream.assert_calls_async(0).await;\n+}\n+\n+#[tokio::test]\n+async fn test_providers_registration_issue_returns_error_without_probe() {\n+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(\n+        r#\"\n+[providers.acme]\n+display_name = \"Acme\"\n+adapter = \"openai_compatible\"\n+\n+[providers.acme.auth]\n+credentials = [\"vault:ACME_API_KEY\"]\n+\n+[models.\"acme-probe\"]\n+provider = \"acme\"\n+display_name = \"Acme Probe\"\n+family = \"acme\"\n+default = true\n+probe = true\n+\n+[models.\"acme-probe\".limits]\n+context_window = 128000\n+\n+[models.\"acme-probe\".features]\n+tools = true\n+vision = false\n+reasoning = false\n+\"#,\n+    )\n+    .expect(\"catalog fixture should parse\");\n+    let state = TestAppStateBuilder::new()\n+        .runtime_settings(default_test_server_settings(), RunLayer::default())\n+        .max_concurrent_runs(5)\n+        .llm_catalog_settings(llm_catalog_settings)\n+        .build();\n+    state\n+        .vault\n+        .write()\n+        .await\n+        .set(\"ACME_API_KEY\", \"acme-key\", SecretType::Token, None)\n+        .unwrap();\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+    let results = body[\"data\"].as_array().unwrap();\n+\n+    assert_eq!(results.len(), 1);\n+    assert_eq!(results[0][\"provider\"], \"acme\");\n+    assert!(results[0][\"model_id\"].is_null());\n+    assert_eq!(results[0][\"status\"], \"error\");\n+    assert!(\n+        results[0][\"error_message\"]\n+            .as_str()\n+            .unwrap()\n+            .contains(\"does not configure base_url\")\n+    );\n+    assert_eq!(body[\"summary\"][\"status\"], \"error\");\n+    assert_eq!(body[\"summary\"][\"total\"], 1);\n+    assert_eq!(body[\"summary\"][\"passed\"], 0);\n+    assert_eq!(body[\"summary\"][\"failed\"], 1);\n+}\n+\n+#[tokio::test]\n+async fn test_providers_mixed_results_preserve_catalog_order_and_counts() {\n+    let server = MockServer::start_async().await;\n+    let alpha_mock = server\n+        .mock_async(|when, then| {\n+            when.method(POST)\n+                .path(\"/v1/responses\")\n+                .header(\"authorization\", \"Bearer alpha-key\");\n+            then.status(200)\n+                .header(\"content-type\", \"application/json\")\n+                .json_body(openai_responses_payload(\"OK\"));\n+        })\n+        .await;\n+    let zeta_mock = server\n+        .mock_async(|when, then| {\n+            when.method(POST)\n+                .path(\"/v1/responses\")\n+                .header(\"authorization\", \"Bearer zeta-key\");\n+            then.status(401)\n+                .header(\"content-type\", \"application/json\")\n+                .json_body(json!({\n+                    \"error\": {\n+                        \"message\": \"invalid api key\",\n+                        \"type\": \"invalid_request_error\"\n+                    }\n+                }));\n+        })\n+        .await;\n+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(\n+        r#\"\n+[providers.zeta]\n+display_name = \"Zeta\"\n+adapter = \"openai\"\n+base_url = \"{base_url}\"\n+\n+[providers.zeta.auth]\n+credentials = [\"vault:ZETA_API_KEY\"]\n+\n+[providers.alpha]\n+display_name = \"Alpha\"\n+adapter = \"openai\"\n+base_url = \"{base_url}\"\n+\n+[providers.alpha.auth]\n+credentials = [\"vault:ALPHA_API_KEY\"]\n+\n+[models.\"zeta-probe\"]\n+provider = \"zeta\"\n+display_name = \"Zeta Probe\"\n+family = \"zeta\"\n+default = true\n+probe = true\n+\n+[models.\"zeta-probe\".limits]\n+context_window = 128000\n+\n+[models.\"zeta-probe\".features]\n+tools = true\n+vision = false\n+reasoning = false\n+\n+[models.\"alpha-probe\"]\n+provider = \"alpha\"\n+display_name = \"Alpha Probe\"\n+family = \"alpha\"\n+default = true\n+probe = true\n+\n+[models.\"alpha-probe\".limits]\n+context_window = 128000\n+\n+[models.\"alpha-probe\".features]\n+tools = true\n+vision = false\n+reasoning = false\n+\"#,\n+        base_url = server.url(\"/v1\")\n+    ))\n+    .expect(\"catalog fixture should parse\");\n+    let state = TestAppStateBuilder::new()\n+        .runtime_settings(default_test_server_settings(), RunLayer::default())\n+        .max_concurrent_runs(5)\n+        .llm_catalog_settings(llm_catalog_settings)\n+        .build();\n+    {\n+        let mut vault = state.vault.write().await;\n+        vault\n+            .set(\"ALPHA_API_KEY\", \"alpha-key\", SecretType::Token, None)\n+            .unwrap();\n+        vault\n+            .set(\"ZETA_API_KEY\", \"zeta-key\", SecretType::Token, None)\n+            .unwrap();\n+    }\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+    let results = body[\"data\"].as_array().unwrap();\n+\n+    assert_eq!(results.len(), 2);\n+    assert_eq!(results[0][\"provider\"], \"alpha\");\n+    assert_eq!(results[0][\"model_id\"], \"alpha-probe\");\n+    assert_eq!(results[0][\"status\"], \"ok\");\n+    assert_eq!(results[1][\"provider\"], \"zeta\");\n+    assert_eq!(results[1][\"model_id\"], \"zeta-probe\");\n+    assert_eq!(results[1][\"status\"], \"error\");\n+    assert_eq!(body[\"summary\"][\"status\"], \"error\");\n+    assert_eq!(body[\"summary\"][\"total\"], 2);\n+    assert_eq!(body[\"summary\"][\"passed\"], 1);\n+    assert_eq!(body[\"summary\"][\"failed\"], 1);\n+    alpha_mock.assert_async().await;\n+    zeta_mock.assert_async().await;\n+}\n+\n+#[tokio::test]\n+async fn test_providers_response_does_not_leak_api_keys() {\n+    let leaked_key = \"sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\";\n+    let server = MockServer::start_async().await;\n+    let response_mock = server\n+        .mock_async(move |when, then| {\n+            when.method(POST)\n+                .path(\"/v1/responses\")\n+                .header(\"authorization\", format!(\"Bearer {leaked_key}\"));\n+            then.status(401)\n+                .header(\"content-type\", \"application/json\")\n+                .json_body(json!({\n+                    \"error\": {\n+                        \"message\": format!(\"invalid api key {leaked_key}\"),\n+                        \"type\": \"invalid_request_error\"\n+                    }\n+                }));\n+        })\n+        .await;\n+    let state = TestAppStateBuilder::new()\n+        .runtime_settings(default_test_server_settings(), RunLayer::default())\n+        .max_concurrent_runs(5)\n+        .provider_base_url(\"openai\", server.url(\"/v1\"))\n+        .build();\n+    state\n+        .vault\n+        .write()\n+        .await\n+        .set(EnvVars::OPENAI_API_KEY, leaked_key, SecretType::Token, None)\n+        .unwrap();\n+    let app = crate::test_support::build_test_router(state);\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    let body = response_json!(response, StatusCode::OK).await;\n+    let serialized = body.to_string();\n+\n+    assert!(\n+        !serialized.contains(leaked_key),\n+        \"provider test response leaked API key: {serialized}\"\n+    );\n+    assert!(\n+        serialized.contains(\"REDACTED\"),\n+        \"provider test response should include a redacted error: {serialized}\"\n+    );\n+    response_mock.assert_async().await;\n+}\n+\n+#[tokio::test]\n+async fn test_providers_requires_user_auth() {\n+    let app = build_router(test_app_state(), test_auth_mode());\n+\n+    let req = Request::builder()\n+        .method(\"POST\")\n+        .uri(api(\"/providers/test\"))\n+        .body(Body::empty())\n+        .unwrap();\n+\n+    let response = app.oneshot(req).await.unwrap();\n+    assert_status!(response, StatusCode::UNAUTHORIZED).await;\n+}\n+\n #[tokio::test]\n async fn auth_login_github_redirects_to_github() {\n     let source = r#\"\ndiff --git a/lib/packages/fabro-api-client/src/.openapi-generator/FILES b/lib/packages/fabro-api-client/src/.openapi-generator/FILES\nindex 9f907ebba..afa4aa5fd 100644\n--- a/lib/packages/fabro-api-client/src/.openapi-generator/FILES\n+++ b/lib/packages/fabro-api-client/src/.openapi-generator/FILES\n@@ -259,6 +259,10 @@ models/principal-worker.ts\n models/principal.ts\n models/project-namespace.ts\n models/provider-list.ts\n+models/provider-test-list.ts\n+models/provider-test-result.ts\n+models/provider-test-status.ts\n+models/provider-test-summary.ts\n models/provider.ts\n models/prune-run-entry.ts\n models/prune-runs-request.ts\ndiff --git a/lib/packages/fabro-api-client/src/api/models-api.ts b/lib/packages/fabro-api-client/src/api/models-api.ts\nindex c4585d51b..6b19c88c3 100644\n--- a/lib/packages/fabro-api-client/src/api/models-api.ts\n+++ b/lib/packages/fabro-api-client/src/api/models-api.ts\n@@ -31,6 +31,8 @@ import type { ModelTestResult } from '../models';\n import type { PaginatedModelList } from '../models';\n // @ts-ignore\n import type { ProviderList } from '../models';\n+// @ts-ignore\n+import type { ProviderTestList } from '../models';\n /**\n  * ModelsApi - axios parameter creator\n  */\n@@ -168,6 +170,42 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio\n             let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};\n             localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};\n \n+            return {\n+                url: toPathString(localVarUrlObj),\n+                options: localVarRequestOptions,\n+            };\n+        },\n+        /**\n+         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.\n+         * @summary Test Providers\n+         * @param {*} [options] Override http request option.\n+         * @throws {RequiredError}\n+         */\n+        testProviders: async (options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {\n+            const localVarPath = `/api/v1/providers/test`;\n+            // use dummy base URL string because the URL constructor only accepts absolute URLs.\n+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);\n+            let baseOptions;\n+            if (configuration) {\n+                baseOptions = configuration.baseOptions;\n+            }\n+\n+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};\n+            const localVarHeaderParameter = {} as any;\n+            const localVarQueryParameter = {} as any;\n+\n+            // authentication SessionCookie required\n+\n+            // authentication BearerAuth required\n+            // http bearer authentication required\n+            await setBearerAuthToObject(localVarHeaderParameter, configuration)\n+\n+            localVarHeaderParameter['Accept'] = 'application/json';\n+\n+            setSearchParams(localVarUrlObj, localVarQueryParameter);\n+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};\n+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};\n+\n             return {\n                 url: toPathString(localVarUrlObj),\n                 options: localVarRequestOptions,\n@@ -224,6 +262,18 @@ export const ModelsApiFp = function(configuration?: Configuration) {\n             const localVarOperationServerBasePath = operationServerMap['ModelsApi.testModel']?.[localVarOperationServerIndex]?.url;\n             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);\n         },\n+        /**\n+         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.\n+         * @summary Test Providers\n+         * @param {*} [options] Override http request option.\n+         * @throws {RequiredError}\n+         */\n+        async testProviders(options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ProviderTestList>> {\n+            const localVarAxiosArgs = await localVarAxiosParamCreator.testProviders(options);\n+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;\n+            const localVarOperationServerBasePath = operationServerMap['ModelsApi.testProviders']?.[localVarOperationServerIndex]?.url;\n+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);\n+        },\n     }\n };\n \n@@ -266,6 +316,15 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat\n         testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {\n             return localVarFp.testModel(id, mode, options).then((request) => request(axios, basePath));\n         },\n+        /**\n+         * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.\n+         * @summary Test Providers\n+         * @param {*} [options] Override http request option.\n+         * @throws {RequiredError}\n+         */\n+        testProviders(options?: RawAxiosRequestConfig): AxiosPromise<ProviderTestList> {\n+            return localVarFp.testProviders(options).then((request) => request(axios, basePath));\n+        },\n     };\n };\n \n@@ -308,4 +367,14 @@ export class ModelsApi extends BaseAPI {\n     public testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {\n         return ModelsApiFp(this.configuration).testModel(id, mode, options).then((request) => request(this.axios, this.basePath));\n     }\n+\n+    /**\n+     * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.\n+     * @summary Test Providers\n+     * @param {*} [options] Override http request option.\n+     * @throws {RequiredError}\n+     */\n+    public testProviders(options?: RawAxiosRequestConfig) {\n+        return ModelsApiFp(this.configuration).testProviders(options).then((request) => request(this.axios, this.basePath));\n+    }\n }\ndiff --git a/lib/packages/fabro-api-client/src/models/index.ts b/lib/packages/fabro-api-client/src/models/index.ts\nindex b9542d1ab..2ec1e49a4 100644\n--- a/lib/packages/fabro-api-client/src/models/index.ts\n+++ b/lib/packages/fabro-api-client/src/models/index.ts\n@@ -236,6 +236,10 @@ export * from './principal-worker';\n export * from './project-namespace';\n export * from './provider';\n export * from './provider-list';\n+export * from './provider-test-list';\n+export * from './provider-test-result';\n+export * from './provider-test-status';\n+export * from './provider-test-summary';\n export * from './prune-run-entry';\n export * from './prune-runs-request';\n export * from './prune-runs-response';\ndiff --git a/lib/packages/fabro-api-client/src/models/provider-test-list.ts b/lib/packages/fabro-api-client/src/models/provider-test-list.ts\nnew file mode 100644\nindex 000000000..6235bbd5d\n--- /dev/null\n+++ b/lib/packages/fabro-api-client/src/models/provider-test-list.ts\n@@ -0,0 +1,29 @@\n+/* tslint:disable */\n+/* eslint-disable */\n+/**\n+ * Fabro Run API\n+ * HTTP API for managing Fabro workflow run executions.\n+ *\n+ * The version of the OpenAPI document: 0.1.0\n+ *\n+ *\n+ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).\n+ * https://openapi-generator.tech\n+ * Do not edit the class manually.\n+ */\n+\n+\n+// May contain unused imports in some cases\n+// @ts-ignore\n+import type { ProviderTestResult } from './provider-test-result';\n+// May contain unused imports in some cases\n+// @ts-ignore\n+import type { ProviderTestSummary } from './provider-test-summary';\n+\n+/**\n+ * Results from testing all configured LLM providers.\n+ */\n+export interface ProviderTestList {\n+    'data': Array<ProviderTestResult>;\n+    'summary': ProviderTestSummary;\n+}\ndiff --git a/lib/packages/fabro-api-client/src/models/provider-test-result.ts b/lib/packages/fabro-api-client/src/models/provider-test-result.ts\nnew file mode 100644\nindex 000000000..0a34c894b\n--- /dev/null\n+++ b/lib/packages/fabro-api-client/src/models/provider-test-result.ts\n@@ -0,0 +1,37 @@\n+/* tslint:disable */\n+/* eslint-disable */\n+/**\n+ * Fabro Run API\n+ * HTTP API for managing Fabro workflow run executions.\n+ *\n+ * The version of the OpenAPI document: 0.1.0\n+ *\n+ *\n+ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).\n+ * https://openapi-generator.tech\n+ * Do not edit the class manually.\n+ */\n+\n+\n+// May contain unused imports in some cases\n+// @ts-ignore\n+import type { ProviderTestStatus } from './provider-test-status';\n+\n+/**\n+ * Result of testing one configured LLM provider.\n+ */\n+export interface ProviderTestResult {\n+    /**\n+     * LLM provider identifier.\n+     */\n+    'provider': string;\n+    /**\n+     * Catalog probe model ID used for the provider, or null when no probe was sent.\n+     */\n+    'model_id': string | null;\n+    'status': ProviderTestStatus;\n+    /**\n+     * Error details when status is \\\"error\\\".\n+     */\n+    'error_message': string | null;\n+}\ndiff --git a/lib/packages/fabro-api-client/src/models/provider-test-status.ts b/lib/packages/fabro-api-client/src/models/provider-test-status.ts\nnew file mode 100644\nindex 000000000..fce18e021\n--- /dev/null\n+++ b/lib/packages/fabro-api-client/src/models/provider-test-status.ts\n@@ -0,0 +1,26 @@\n+/* tslint:disable */\n+/* eslint-disable */\n+/**\n+ * Fabro Run API\n+ * HTTP API for managing Fabro workflow run executions.\n+ *\n+ * The version of the OpenAPI document: 0.1.0\n+ *\n+ *\n+ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).\n+ * https://openapi-generator.tech\n+ * Do not edit the class manually.\n+ */\n+\n+\n+\n+/**\n+ * Provider test status.\n+ */\n+\n+export const ProviderTestStatus = {\n+    OK: 'ok',\n+    ERROR: 'error'\n+} as const;\n+\n+export type ProviderTestStatus = typeof ProviderTestStatus[keyof typeof ProviderTestStatus];\ndiff --git a/lib/packages/fabro-api-client/src/models/provider-test-summary.ts b/lib/packages/fabro-api-client/src/models/provider-test-summary.ts\nnew file mode 100644\nindex 000000000..0c3622fa5\n--- /dev/null\n+++ b/lib/packages/fabro-api-client/src/models/provider-test-summary.ts\n@@ -0,0 +1,37 @@\n+/* tslint:disable */\n+/* eslint-disable */\n+/**\n+ * Fabro Run API\n+ * HTTP API for managing Fabro workflow run executions.\n+ *\n+ * The version of the OpenAPI document: 0.1.0\n+ *\n+ *\n+ * NOTE: This class is auto generated by OpenAPI Generator (https://openapi-generator.tech).\n+ * https://openapi-generator.tech\n+ * Do not edit the class manually.\n+ */\n+\n+\n+// May contain unused imports in some cases\n+// @ts-ignore\n+import type { ProviderTestStatus } from './provider-test-status';\n+\n+/**\n+ * Aggregate provider test status and counts.\n+ */\n+export interface ProviderTestSummary {\n+    'status': ProviderTestStatus;\n+    /**\n+     * Number of configured providers tested or evaluated.\n+     */\n+    'total': number;\n+    /**\n+     * Number of providers whose probe succeeded.\n+     */\n+    'passed': number;\n+    /**\n+     * Number of providers with configuration, auth, registration, or probe errors.\n+     */\n+    'failed': number;\n+}\n",
+        "summary": {
+          "files_changed": 11,
+          "additions": 1004,
+          "deletions": 68
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-25T22:25:43.772721Z",
+        "current_node": "simplify_opus",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "failure_signature": "",
+          "internal.retry_count.simplify_opus": 0,
           "internal.run_id": "01KSGHG9F2BGEF3J9K8SKA59TQ",
           "thread.preflight_compile.current_node": "preflight_lint",
           "thread.preflight_lint.current_node": "implement",
           "internal.fidelity": "compact",
           "internal.node_visit_count": 1,
-          "internal.retry_count.preflight_compile": 0,
           "internal.retry_count.toolchain": 0,
           "internal.retry_count.preflight_lint": 0,
           "graph.rankdir": "LR",
-          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
-          "current_node": "implement",
-          "outcome": "succeeded",
+          "current_node": "simplify_opus",
           "thread.toolchain.current_node": "preflight_compile",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "internal.thread_id": "preflight_lint",
-          "thread.start.current_node": "toolchain",
-          "last_stage": "implement",
+          "internal.retry_count.implement": 0,
+          "last_stage": "simplify_opus",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "last_response": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestS",
-          "internal.retry_count.implement": 0,
-          "internal.retry_count.start": 0
+          "internal.retry_count.start": 0,
+          "failure_class": "",
+          "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+          "thread.implement.current_node": "simplify_opus",
+          "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean.",
+          "internal.retry_count.preflight_compile": 0,
+          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
+          "outcome": "succeeded",
+          "last_response": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes ",
+          "internal.thread_id": "implement",
+          "thread.start.current_node": "toolchain"
         },
         "node_outcomes": {
           "preflight_lint": {
@@ -820,6 +943,41 @@
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
+          },
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_opus",
+              "last_response": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes ",
+              "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean."
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 90712,
+                    "output_tokens": 26816,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 3609397,
+                    "cache_write_tokens": 459227
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 459227,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 5798826
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/diagnostics.rs"
+            ]
           },
           "implement": {
             "status": "succeeded",
@@ -852,8 +1010,9 @@
             }
           }
         },
-        "next_node_id": "simplify_opus",
+        "next_node_id": "simplify_gpt",
         "node_visits": {
+          "simplify_opus": 1,
           "start": 1,
           "toolchain": 1,
           "preflight_compile": 1,
@@ -932,11 +1091,289 @@
       },
       "state": "succeeded"
     },
+    "simplify_opus@1": {
+      "first_event_seq": 561,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "anthropic",
+        "model": "claude-opus-4-7"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-25T22:12:50.114847Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 90712,
+        "output_tokens": 26816,
+        "total_tokens": 4186152,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 3609397,
+        "cache_write_tokens": 459227,
+        "total_usd_micros": 5798826
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-opus-4-7"
+      },
+      "todos": {
+        "kind": "anthropic_tasks",
+        "list_id": "anthropic_tasks:a96f6294-45cc-48da-85fa-5cb14cdff9fc",
+        "items": [
+          {
+            "id": "1",
+            "status": "completed",
+            "order": 0,
+            "subject": "Review changes for code reuse, quality, efficiency",
+            "description": "Launch three review agents in parallel against the diff vs origin/main, aggregate findings, fix issues.",
+            "active_form": "Reviewing changes for code reuse, quality, and efficiency"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "bad85205",
+          "depth": 1,
+          "task": "You are a Code Reuse Reviewer. The repo is at /home/daytona/workspace/fabro. The diff under review is at /tmp/review_diff.patch (998 lines).\n\nThe diff adds a new endpoint POST /api/v1/providers/test in fabro-server, and shares the provider probe logic between this endpoint and /health/diagnostics (in lib/crates/fabro-server/src/diagnostics.rs).\n\nYour job: find duplicated/redundant code that could reuse existing utilities or types.\n\nSpecifically:\n1. Read /tmp/review_diff.patch to see the changes.\n2. Then explore lib/crates/fabro-server/src/diagnostics.rs (the file containing most new code) and lib/crates/fabro-server/src/server/handler/models.rs.\n3. Look for opportunities:\n   - Could `ProviderProbeReport/Result/Summary/Status` reuse existing types? (search lib/crates for similar)\n   - Is there an existing `provider_failure` / `auth_issue_message` / `collect_chain` helper that the diff isn't using?\n   - Are the test fixtures duplicating something already in `test_support` or other test files?\n   - Is `public_error_message` (which just wraps `redact_string`) a needless one-liner indirection?\n   - Could the `selected/extras` HashSet dance in `test_llm_providers` be simplified with an existing utility?\n   - Check `model_test` flow (existing single-model test handler) for similar patterns.\n\nReturn concrete findings: \"in <file:line>, code X duplicates Y; suggest Z\". Be concise. No fixes — just findings.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 35
+          }
+        },
+        {
+          "agent_id": "1613b9a6",
+          "depth": 1,
+          "task": "You are a Code Quality Reviewer. The repo is at /home/daytona/workspace/fabro. The diff under review is at /tmp/review_diff.patch (998 lines).\n\nThe diff adds a new endpoint POST /api/v1/providers/test in fabro-server and shares LLM provider probe logic between it and /health/diagnostics (in lib/crates/fabro-server/src/diagnostics.rs).\n\nYour job: find hacky / smelly patterns. This is a greenfield app — be aggressive.\n\nSpecifically look for:\n1. Redundant state — e.g., does `diagnostic_detail` in `ProviderProbeResult` duplicate `error_message` for all but one case? Look at how it's actually used and whether it can be derived.\n2. Parameter sprawl — `probe_single_provider` takes `auth_issue: Option<String>, registration_issue: Option<String>` as separate parameters. Could it use a single enum?\n3. Copy-paste with slight variation — two helper functions `provider_probe_error` and `provider_probe_error_with_diagnostic_detail`. Is the second one even needed?\n4. Leaky abstractions — does the new `ProviderProbeReport` type properly hide internals? Is `diagnostic_detail` leaking probe internals to public crate API?\n5. Stringly-typed code — `client.has_provider(provider.as_str())` — is there a typed version?\n6. The `selected`/`extras` HashSet dance in test_llm_providers — convoluted? Could it be a simpler iter pattern?\n7. `unwrap_or(u32::MAX)` for tests when total count is u32::try_from — is `as u32` adequate or do we have a better idiom?\n8. `public_error_message` — a one-line wrapper. Necessary?\n9. The two `provider_probe_error` helpers vs constructor literals — boilerplate?\n\nRead the diff, the actual files (lib/crates/fabro-server/src/diagnostics.rs especially), and report concrete findings: \"<file:line>: <smell>; suggest <fix>\". No fixes — just findings.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 20
+          }
+        },
+        {
+          "agent_id": "7463223c",
+          "depth": 1,
+          "task": "You are an Efficiency Reviewer. The repo is at /home/daytona/workspace/fabro. The diff under review is at /tmp/review_diff.patch (998 lines).\n\nThe diff adds POST /api/v1/providers/test in fabro-server and shares LLM provider probe logic between it and /health/diagnostics (in lib/crates/fabro-server/src/diagnostics.rs).\n\nYour job: find efficiency issues. This is the request-path code, called rarely but should still be sensible.\n\nSpecifically look for:\n1. Unnecessary work — In `test_llm_providers` (diagnostics.rs around line 198): each provider in the `join_all` loop calls `auth_issues.iter().find(...)` and `registration_issues.iter().find(...)` — that's O(N*M). Acceptable, but could a HashMap reduce it?\n2. The `selected` HashSet then `extras` Vec then `catalog.providers().iter().filter(...)` then a second loop appending extras — does this iterate twice? Can it be one pass?\n3. Concurrency — is `join_all` used correctly? Are the per-provider tasks truly independent?\n4. Hot-path bloat — `state.resolve_llm_client().await` is called from both `check_llm_providers` (via `test_llm_providers`) and elsewhere. Does the shared `test_llm_providers` add extra `resolve_llm_client()` calls per diagnostics run? Compare to before — was it called once before, and still once now?\n5. Cloning — `catalog.clone()` inside the per-provider closure. Is it Arc-cloned (cheap) or deep-cloned? Look it up to confirm.\n6. `provider.clone()` for each filter loop — necessary?\n7. Memory / unbounded — `auth_issues` and `registration_issues` are bounded by the number of providers, so fine.\n\nRead /tmp/review_diff.patch and the actual file lib/crates/fabro-server/src/diagnostics.rs. Report concrete findings: \"<file:line>: <issue>; suggest <fix>\". No fixes — just findings.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 18
+          }
+        }
+      ],
+      "permission_level": "full",
+      "agent_tools": [
+        {
+          "name": "AskUserQuestion",
+          "description": "Ask the human one or more questions and wait for their answers before continuing this stage.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "TaskCreate",
+          "description": "Create pending tasks in the current session. Use concise subjects, descriptions, optional activeForm text, and metadata. Check TaskList first to avoid duplicate tasks.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": true
+        },
+        {
+          "name": "TaskGet",
+          "description": "Get one task by taskId, including subject, status, description, owner, blockedBy, and blocks.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "TaskList",
+          "description": "List tasks for the current session, including status, owner, and blocking dependencies. Use TaskGet with a taskId for full description and dependency details.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "TaskUpdate",
+          "description": "Update an existing task's status, text, owner, metadata, or dependencies. Valid statuses are pending, in_progress, completed, and deleted. After completing a task, call TaskList to find newly unblocked work.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": true
+        },
+        {
+          "name": "close_agent",
+          "description": "Close a running subagent that is no longer needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "edit_file",
+          "description": "Edit a file by replacing an exact string. The old_string must be an exact match and unique unless replace_all is true; include surrounding context when needed. Read the file first and preserve existing indentation.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": true
+        },
+        {
+          "name": "glob",
+          "description": "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "grep",
+          "description": "Search file contents with a regex pattern. Use path to choose the search root, glob_filter to limit matching files, case_insensitive for case folding, and max_results to cap output.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "read_file",
+          "description": "Read files before editing them. Returns line-numbered text and supports offset/limit for large files. Use this instead of shell cat, head, tail, or sed when inspecting repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "send_input",
+          "description": "Send a follow-up message to a running subagent when new information or corrected instructions are needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "shell",
+          "description": "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "shell",
+          "invoked": true
+        },
+        {
+          "name": "spawn_agent",
+          "description": "Spawn a subagent for independent work or context isolation. Use it for tasks that can proceed separately, and avoid duplicating the same work in the parent session.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "wait",
+          "description": "Wait for a subagent to complete, then use the result to synthesize the outcome for the user.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "web_fetch",
+          "description": "Fetch content from a URL that starts with http:// or https://. Pass a prompt to extract specific information or summarize the page; omit prompt to return the page content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "web_search",
+          "description": "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "write_file",
+          "description": "Create new files, or overwrite an existing file only when replacement is explicitly intended. Prefer edit_file for targeted changes to existing files because write_file overwrites the full file content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        }
+      ],
+      "context_window": {
+        "provider": "anthropic",
+        "model": "claude-opus-4-7",
+        "context_window_tokens": 1000000,
+        "input_tokens": 103165,
+        "usage_percent": 10.3165,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-25T22:25:43.674704Z",
+        "event_seq": 882,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 2376,
+            "usage_percent": 0.2376
+          },
+          {
+            "category": "tools",
+            "tokens": 2698,
+            "usage_percent": 0.2698
+          },
+          {
+            "category": "memory",
+            "tokens": 5699,
+            "usage_percent": 0.5699
+          },
+          {
+            "category": "conversation",
+            "tokens": 92385,
+            "usage_percent": 9.2385
+          },
+          {
+            "category": "other",
+            "tokens": 7,
+            "usage_percent": 0.0007
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
     "implement@1": {
       "first_event_seq": 52,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: implement",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T22:12:46.083268Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "openai",
@@ -950,6 +1387,12 @@
       "output": null,
       "started_at": "2026-05-25T21:48:49.588107Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 1436486,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 4615566,
         "output_tokens": 18811,
@@ -1179,7 +1622,7 @@
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "start@1": {
       "first_event_seq": 18,
