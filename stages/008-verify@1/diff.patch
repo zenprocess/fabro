@@ -1,0 +1,244 @@
+diff --git a/apps/fabro-web/app/routes/settings-monitoring.test.tsx b/apps/fabro-web/app/routes/settings-monitoring.test.tsx
+index 10227b98a..070276f8d 100644
+--- a/apps/fabro-web/app/routes/settings-monitoring.test.tsx
++++ b/apps/fabro-web/app/routes/settings-monitoring.test.tsx
+@@ -106,7 +106,7 @@ function sampleServerSettings(maxConcurrentRuns = 8): ServerSettings {
+ describe("SettingsMonitoring route", () => {
+   beforeEach(() => {
+     teardownReactTestEnv = setupReactTestEnv();
+-    systemInfo = { runs: { active: 3, total: 12 } };
++    systemInfo = { runs: { active: 3, scheduler_slots_used: 1, total: 12 } };
+     serverSettings = sampleServerSettings();
+   });
+ 
+@@ -133,7 +133,8 @@ describe("SettingsMonitoring route", () => {
+     expect(text).toContain("5s");
+     expect(text).toContain("3 GiB");
+     expect(text).toContain("8 GiB");
+-    expect(text).toContain("3 / 8 active");
++    expect(text).toContain("1 / 8 slots used");
++    expect(text).not.toContain("3 / 8 active");
+   });
+ 
+   test("shows CPU warmup state while usage is null", () => {
+diff --git a/apps/fabro-web/app/routes/settings-monitoring.tsx b/apps/fabro-web/app/routes/settings-monitoring.tsx
+index b058e6d27..cde3d733c 100644
+--- a/apps/fabro-web/app/routes/settings-monitoring.tsx
++++ b/apps/fabro-web/app/routes/settings-monitoring.tsx
+@@ -59,17 +59,14 @@ function RunsPanel() {
+     return <PanelSkeleton />;
+   }
+ 
+-  const active = info.runs?.active ?? 0;
++  const slotsUsed = info.runs?.scheduler_slots_used ?? 0;
+   const max = settings.server.scheduler.max_concurrent_runs;
+-  const percent = max > 0 ? (active / max) * 100 : null;
++  const percent = max > 0 ? (slotsUsed / max) * 100 : null;
+ 
+   return (
+     <Panel title="Runs">
+-      <Row
+-        title="Active"
+-        help="Runs currently pending, runnable, or executing against the scheduler ceiling."
+-      >
+-        <UsageMeter percent={percent} label={`${active} / ${max} active`} />
++      <Row title="Concurrency used" help="Runs currently occupying scheduler slots.">
++        <UsageMeter percent={percent} label={`${slotsUsed} / ${max} slots used`} />
+       </Row>
+     </Panel>
+   );
+diff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml
+index d71f84d1d..fdada6ce5 100644
+--- a/docs/public/api-reference/fabro-api.yaml
++++ b/docs/public/api-reference/fabro-api.yaml
+@@ -12376,6 +12376,10 @@ components:
+           type: integer
+           format: int64
+           description: Runs currently pending, runnable, or executing.
++        scheduler_slots_used:
++          type: integer
++          format: int64
++          description: Runs currently occupying scheduler concurrency slots.
+ 
+     SystemResourcesResponse:
+       description: Server-visible runtime resource usage for the active Fabro process environment.
+diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs
+index 0c6c602d0..d224b9991 100644
+--- a/lib/crates/fabro-server/src/server.rs
++++ b/lib/crates/fabro-server/src/server.rs
+@@ -2467,6 +2467,16 @@ fn compute_queue_positions(runs: &HashMap<RunId, ManagedRun>) -> HashMap<RunId,
+         .collect()
+ }
+ 
++pub(in crate::server) fn counts_toward_scheduler_capacity(status: RunStatus) -> bool {
++    matches!(
++        status,
++        RunStatus::Starting
++            | RunStatus::Running
++            | RunStatus::Blocked { .. }
++            | RunStatus::Paused { .. }
++    )
++}
++
+ #[allow(
+     clippy::result_large_err,
+     reason = "Run ID parsing returns HTTP 400 responses directly."
+@@ -4063,15 +4073,7 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
+                 let runs = state.runs.lock().expect("runs lock poisoned");
+                 let active = runs
+                     .values()
+-                    .filter(|r| {
+-                        matches!(
+-                            r.status,
+-                            RunStatus::Starting
+-                                | RunStatus::Running
+-                                | RunStatus::Blocked { .. }
+-                                | RunStatus::Paused { .. }
+-                        )
+-                    })
++                    .filter(|r| counts_toward_scheduler_capacity(r.status))
+                     .count();
+                 let available = state.max_concurrent_runs.saturating_sub(active);
+                 if available == 0 {
+diff --git a/lib/crates/fabro-server/src/server/handler/system.rs b/lib/crates/fabro-server/src/server/handler/system.rs
+index ce836f39b..667d7d81d 100644
+--- a/lib/crates/fabro-server/src/server/handler/system.rs
++++ b/lib/crates/fabro-server/src/server/handler/system.rs
+@@ -7,9 +7,9 @@ use super::super::{
+     BillingByModel, DfParams, FABRO_VERSION, GithubIntegrationStrategy, IntoResponse, Json, Path,
+     PruneRunsRequest, PruneRunsResponse, Query, RequiredUser, Response, Router, RunStatus, State,
+     StatusCode, SystemInfoResponse, SystemRepairRunIssue, SystemRepairRunsResponse,
+-    SystemRunCounts, build_disk_usage_response, build_prune_plan, delete_run_internal, diagnostics,
+-    get, post, resolve_interp_string, resource_sampler, spawn_blocking, system_sandbox_provider,
+-    to_i64,
++    SystemRunCounts, build_disk_usage_response, build_prune_plan, counts_toward_scheduler_capacity,
++    delete_run_internal, diagnostics, get, post, resolve_interp_string, resource_sampler,
++    spawn_blocking, system_sandbox_provider, to_i64,
+ };
+ 
+ pub(super) fn routes() -> Router<Arc<AppState>> {
+@@ -44,7 +44,7 @@ async fn get_server_settings(_auth: RequiredUser, State(state): State<Arc<AppSta
+ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
+     let manifest_run_settings = state.manifest_run_settings();
+     let server_settings = state.server_settings();
+-    let (total_runs, active_runs) = {
++    let (total_runs, active_runs, scheduler_slots_used) = {
+         let runs = state.runs.lock().expect("runs lock poisoned");
+         let active = runs
+             .values()
+@@ -60,7 +60,11 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
+                 )
+             })
+             .count();
+-        (runs.len(), active)
++        let scheduler_slots_used = runs
++            .values()
++            .filter(|run| counts_toward_scheduler_capacity(run.status))
++            .count();
++        (runs.len(), active, scheduler_slots_used)
+     };
+ 
+     let response = SystemInfoResponse {
+@@ -75,8 +79,9 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
+         storage_dir:      Some(state.server_storage_dir().display().to_string()),
+         uptime_secs:      Some(to_i64(state.started_at.elapsed().as_secs())),
+         runs:             Some(SystemRunCounts {
+-            total:  Some(to_i64(total_runs)),
+-            active: Some(to_i64(active_runs)),
++            total:                Some(to_i64(total_runs)),
++            active:               Some(to_i64(active_runs)),
++            scheduler_slots_used: Some(to_i64(scheduler_slots_used)),
+         }),
+         sandbox_provider: Some(system_sandbox_provider(&manifest_run_settings)),
+     };
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index c7e6a1071..6d7b619f5 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -9905,6 +9905,20 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {
+         Some("pending")
+     );
+ 
++    let response = app
++        .clone()
++        .oneshot(bearer_request(
++            Method::GET,
++            "/system/info",
++            &user_jwt,
++            Body::empty(),
++        ))
++        .await
++        .unwrap();
++    let info_body = response_json!(response, StatusCode::OK).await;
++    assert_eq!(info_body["runs"]["active"], 1);
++    assert_eq!(info_body["runs"]["scheduler_slots_used"], 0);
++
+     {
+         let runs = state.runs.lock().expect("runs lock poisoned");
+         assert_eq!(
+@@ -13444,6 +13458,31 @@ async fn queue_position_reported_for_runnable_runs() {
+     assert_eq!(positions.get(&second_id).copied(), Some(2));
+ }
+ 
++#[test]
++fn scheduler_capacity_counts_only_runs_occupying_slots() {
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Submitted));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Pending {
++        reason: PendingReason::ApprovalRequired,
++    }));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Runnable));
++    assert!(counts_toward_scheduler_capacity(RunStatus::Starting));
++    assert!(counts_toward_scheduler_capacity(RunStatus::Running));
++    assert!(counts_toward_scheduler_capacity(RunStatus::Blocked {
++        blocked_reason: BlockedReason::HumanInputRequired,
++    }));
++    assert!(counts_toward_scheduler_capacity(RunStatus::Paused {
++        prior_block: None,
++    }));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Removing));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Succeeded {
++        reason: SuccessReason::Completed,
++    }));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Failed {
++        reason: FailureReason::WorkflowError,
++    }));
++    assert!(!counts_toward_scheduler_capacity(RunStatus::Dead));
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn concurrency_limit_respected() {
+     let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);
+diff --git a/lib/crates/fabro-server/tests/it/api/system.rs b/lib/crates/fabro-server/tests/it/api/system.rs
+index a798d5c26..e7b2abbe0 100644
+--- a/lib/crates/fabro-server/tests/it/api/system.rs
++++ b/lib/crates/fabro-server/tests/it/api/system.rs
+@@ -266,6 +266,16 @@ async fn test_app_state_with_options_respects_max_concurrent_runs() {
+             .is_some_and(std::vec::Vec::is_empty),
+         "second run should still be waiting for scheduler capacity while the first waits at the human gate: {second_questions}"
+     );
++
++    let request = Request::builder()
++        .method("GET")
++        .uri(api("/system/info"))
++        .body(Body::empty())
++        .unwrap();
++    let response = app.oneshot(request).await.unwrap();
++    let body = response_json(response, StatusCode::OK, "GET /api/v1/system/info").await;
++    assert_eq!(body["runs"]["active"], 2);
++    assert_eq!(body["runs"]["scheduler_slots_used"], 1);
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+diff --git a/lib/packages/fabro-api-client/src/models/system-run-counts.ts b/lib/packages/fabro-api-client/src/models/system-run-counts.ts
+index ad6854320..3fe29ae9b 100644
+--- a/lib/packages/fabro-api-client/src/models/system-run-counts.ts
++++ b/lib/packages/fabro-api-client/src/models/system-run-counts.ts
+@@ -26,4 +26,8 @@ export interface SystemRunCounts {
+      * Runs currently pending, runnable, or executing.
+      */
+     'active'?: number;
++    /**
++     * Runs currently occupying scheduler concurrency slots.
++     */
++    'scheduler_slots_used'?: number;
+ }

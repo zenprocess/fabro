@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-25T21:44:07.291338Z",
-  "last_event_at": "2026-05-25T22:28:31.841760Z",
+  "last_event_at": "2026-05-25T22:37:41.296790Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1224,9 +1224,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1090,
       "checkpoint": {
-        "timestamp": "2026-05-25T22:37:37.567293Z",
+        "timestamp": "2026-05-25T22:37:41.296680Z",
         "current_node": "verify",
         "completed_nodes": [
           "start",
@@ -1240,39 +1240,39 @@
         ],
         "node_retries": {},
         "context_values": {
-          "failure_signature": "",
-          "internal.retry_count.simplify_opus": 0,
-          "response.simplify_gpt": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean.\n\nVerification run:\n\n- `cargo nextest run -p fabro-server test_providers` — passed, 7/7\n- `cargo nextest run -p fabro-server diagnostics` — passed, 14/14\n- `cargo build -p fabro-api` — passed\n- `cd apps/fabro-web && bun run typecheck` — passed\n\n`git status --short` is clean.",
-          "internal.run_id": "01KSGHG9F2BGEF3J9K8SKA59TQ",
           "thread.preflight_compile.current_node": "preflight_lint",
           "thread.preflight_lint.current_node": "implement",
-          "internal.fidelity": "compact",
-          "internal.node_visit_count": 1,
-          "internal.retry_count.verify": 0,
-          "internal.retry_count.toolchain": 0,
-          "internal.retry_count.preflight_lint": 0,
-          "graph.rankdir": "LR",
-          "current_node": "verify",
-          "thread.toolchain.current_node": "preflight_compile",
-          "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9",
-          "internal.retry_count.implement": 0,
-          "last_stage": "simplify_gpt",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "internal.retry_count.start": 0,
-          "failure_class": "",
-          "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
-          "thread.implement.current_node": "simplify_opus",
-          "thread.simplify_gpt.current_node": "verify",
-          "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean.",
-          "internal.retry_count.preflight_compile": 0,
-          "thread.simplify_opus.current_node": "simplify_gpt",
-          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
-          "outcome": "succeeded",
-          "last_response": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.toolchain": 0,
           "internal.thread_id": "simplify_gpt",
+          "thread.implement.current_node": "simplify_opus",
+          "outcome": "succeeded",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.fidelity": "compact",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "internal.run_id": "01KSGHG9F2BGEF3J9K8SKA59TQ",
+          "last_response": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean",
+          "failure_signature": "",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.verify": 0,
+          "internal.retry_count.start": 0,
+          "thread.simplify_gpt.current_node": "verify",
+          "failure_class": "",
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "thread.toolchain.current_node": "preflight_compile",
+          "graph.rankdir": "LR",
+          "response.implement": "Implemented `POST /api/v1/providers/test`.\n\nSummary:\n- Added OpenAPI `testProviders` operation and schemas:\n  - `ProviderTestList`\n  - `ProviderTestResult`\n  - `ProviderTestSummary`\n  - `ProviderTestStatus` (`ok | error`)\n- Added server route:\n  - `.route(\"/providers/test\", post(test_providers))`\n  - protected by `RequiredUser`\n- Extracted shared provider probe logic in diagnostics:\n  - Catalog-order configured provider selection\n  - Auth/registration failures returned as `error` without network calls\n  - Probe model from `Catalog::probe_for_provider`\n  - Probe prompt `Say OK`, `max_tokens=16`, 30s timeout\n  - HTTP 200 for provider-level failures\n  - No-provider case returns empty `data` with `summary.status = \"error\"`\n  - Redacts provider error messages before returning them\n- Mapped shared structured probe results back into existing `/health/diagnostics` `LLM Providers` check format.\n- Regenerated TypeScript API client models and `ModelsApi.testProviders`.\n- Added server tests for no providers, success, auth issue, registration issue, mixed order/counts, secret redaction, and auth requirement.\n- Added diagnostics regression tests for no-provider and pass summaries.\n\nValidation run:\n- `cargo nextest run -p fabro-server test_providers` ✅\n- `cargo nextest run -p fabro-server diagnostics` ✅\n- `cargo nextest run -p fabro-server --features test-support openapi_conformance --no-tests=pass` ✅\n- `cargo build -p fabro-api` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --all-targets -- -D warnings` ✅\n\nRed/green TDD note: the new `test_providers` tests initially failed with 404 before the route/handler implementation, then passed after implementation.",
+          "response.simplify_gpt": "Reviewed the provider probe endpoint changes against `origin/main` for reuse, quality, and efficiency. I didn’t find any cleanup issues that warranted code changes, so the working tree remains clean.\n\nVerification run:\n\n- `cargo nextest run -p fabro-server test_providers` — passed, 7/7\n- `cargo nextest run -p fabro-server diagnostics` — passed, 14/14\n- `cargo build -p fabro-api` — passed\n- `cd apps/fabro-web && bun run typecheck` — passed\n\n`git status --short` is clean.",
+          "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9",
+          "current_node": "verify",
+          "graph.goal": "---\ndate: 2026-05-25\nstatus: active\n---\n\n# Add Provider Probe Endpoint\n\n## Summary\n\nAdd `POST /api/v1/providers/test` as the focused LLM-provider subset of server diagnostics. V1 has no request body: it tests every configured LLM provider once, using the catalog probe model, and returns typed results suitable for API, CLI, or UI callers without parsing `/health/diagnostics`.\n\n## Key Changes\n\n- Add OpenAPI operation `testProviders` under the Models tag:\n  - `POST /api/v1/providers/test`\n  - Response schema `ProviderTestList`\n  - `data[]`: `{ provider, model_id, status, error_message }`\n  - `summary`: `{ status, total, passed, failed }`\n- Use provider status enum `ok | error`; do not include `skip` because v1 only tests configured providers.\n- Make `model_id` nullable for configuration, auth, or registration failures where no probe was sent.\n- Return HTTP `200` for provider-level failures; use `summary.status = \"error\"` when any provider fails or when no providers are configured.\n- Keep auth required via the same `RequiredUser` path as `/models` and `/providers`.\n\n## Implementation Changes\n\n- Add `.route(\"/providers/test\", post(test_providers))` alongside existing model routes in the models handler.\n- Extract the LLM provider probing portion of diagnostics into shared logic used by both `/providers/test` and `/health/diagnostics`.\n- Probe flow:\n  - Determine configured providers from server credentials/config in catalog order.\n  - For each configured provider, report auth or registration issues as `error` without making a network call.\n  - Otherwise choose `Catalog::probe_for_provider(provider)` and send the existing cheap basic probe (`Say OK`, `max_tokens=16`, 30s timeout).\n  - Preserve diagnostics output by mapping the shared structured results back into the existing `LLM Providers` check/details format.\n- Regenerate API clients after editing `docs/public/api-reference/fabro-api.yaml`:\n  - Rust: `cargo build -p fabro-api`\n  - TypeScript: `cd lib/packages/fabro-api-client && bun run generate`\n\n## Test Plan\n\n- Add server handler tests for:\n  - No configured providers returns `200`, empty `data`, and `summary.status = \"error\"`.\n  - One configured provider with a mocked successful probe returns one `ok` row with the selected probe model.\n  - Provider auth or registration issue returns one `error` row and does not call the upstream provider.\n  - Mixed providers preserve catalog order and summary counts.\n  - Response body does not leak API keys or internal credential material.\n- Add or adjust diagnostics test coverage to confirm `/health/diagnostics` still reports the same `LLM Providers` pass/error summaries after sharing the probe logic.\n- Run focused verification:\n  - `cargo nextest run -p fabro-server test_providers`\n  - `cargo nextest run -p fabro-server diagnostics`\n  - `cargo build -p fabro-api`\n  - `cd apps/fabro-web && bun run typecheck` after TypeScript client regeneration if web imports are affected.\n\n## Assumptions\n\n- V1 intentionally has no request body or provider filter.\n- This endpoint is API-only; no CLI command or web UI flow changes are included.\n- Provider probe failures are data results, not HTTP failures, matching `POST /api/v1/models/{id}/test` behavior.\n",
+          "last_stage": "simplify_gpt",
           "thread.start.current_node": "toolchain",
-          "internal.retry_count.simplify_gpt": 0
+          "internal.retry_count.implement": 0,
+          "response.simplify_opus": "Net **−84 lines** in `diagnostics.rs`, all tests still pass, clippy clean.\n\n## Summary\n\nThree review agents ran in parallel against the diff. After aggregating their findings, I applied these fixes to `lib/crates/fabro-server/src/diagnostics.rs`:\n\n1. **Reused `fabro_llm::model_test::run_basic_model_probe`** instead of the duplicated `probe_llm_provider` function. Same `\"Say OK\"` / `max_tokens=16` / 30s timeout flow already lived in `fabro-llm`; ran_manifest.rs already uses it. Deleted the local copy.\n\n2. **Eliminated the `selected`/`extras` HashSet+Vec dance.** `state.configured_llm_provider_ids()` already returns providers in catalog order, and auth/registration-issue providers are by construction a subset (resolve only runs on providers with credential material). The new code is a single `join_all` over `configured_providers`.\n\n3. **Dropped the redundant `has_provider` check** in `probe_single_provider`. With the new structure (iterate configured providers, attach pre-probe issues), a provider with no auth/registration issue is guaranteed to be registered.\n\n4. **Collapsed two `provider_probe_error*` helpers into one** with an optional `diagnostic_detail` parameter. Kept the `diagnostic_detail` field itself because it carries real signal (auth-issue messages already embed the provider's display name, so the diagnostics consumer must not re-prefix).\n\n5. **Deleted `public_error_message`** — it was a 1-line wrapper over `redact_string`. Inlined direct calls.\n\n6. **Kept `u32::try_from(...).unwrap_or(u32::MAX)` with `saturating_sub`** — clippy rejected the simpler `as u32` and this is the codebase idiom (8+ existing call sites).\n\n**Findings I did not act on** (noted but not worth fixing):\n- Reuse `ModelTestStatus`/`ModelTestOutcome` directly as the API DTO: OpenAPI status enums differ (`ok|error|skip` vs `ok|error`) and the current `ProviderTestResult` shape is intentionally different (adds `provider`/`model_id`).\n- Split internal vs API DTO types: `#[serde(skip)]` on `diagnostic_detail` keeps it off the wire; the smell is minor for a single field.\n- Hot-path/concurrency findings: efficiency reviewer confirmed no regressions; `resolve_llm_client` is still called once per diagnostics run.\n- Test fixture deduplication: out of scope for this cleanup.\n\n**Verification**: 21 targeted tests pass (`diagnostics test_providers`), full `fabro-server` suite runs 670 tests with only 3 pre-existing graphviz failures (confirmed by re-running on origin's HEAD). `cargo build -p fabro-api` clean. `cargo clippy --workspace --all-targets` clean."
         },
         "node_outcomes": {
           "preflight_lint": {
@@ -1289,6 +1289,14 @@
               "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
             },
             "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9"
+            },
+            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
             "usage": null
           },
           "simplify_opus": {
@@ -1356,6 +1364,18 @@
               "total_usd_micros": 30732252
             }
           },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
           "simplify_gpt": {
             "status": "succeeded",
             "context_updates": {
@@ -1385,44 +1405,146 @@
               },
               "total_usd_micros": 4302869
             }
-          },
-          "verify": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9"
-            },
-            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
-            "usage": null
-          },
-          "start": {
-            "status": "succeeded",
-            "usage": null
-          },
-          "preflight_compile": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo check -q --workspace 2>&1",
-            "usage": null
           }
         },
         "next_node_id": "exit",
+        "git_commit_sha": "b7c62c6b9b624f4cc2994d8285d8e3328e72431f",
         "node_visits": {
-          "start": 1,
-          "simplify_gpt": 1,
           "toolchain": 1,
           "simplify_opus": 1,
-          "preflight_compile": 1,
-          "verify": 1,
+          "simplify_gpt": 1,
           "implement": 1,
-          "preflight_lint": 1
+          "preflight_lint": 1,
+          "verify": 1,
+          "preflight_compile": 1,
+          "start": 1
         }
       },
-      "diff": {}
+      "diff": {
+        "patch": "diff --git a/apps/fabro-web/app/routes/settings-monitoring.test.tsx b/apps/fabro-web/app/routes/settings-monitoring.test.tsx\nindex 10227b98a..070276f8d 100644\n--- a/apps/fabro-web/app/routes/settings-monitoring.test.tsx\n+++ b/apps/fabro-web/app/routes/settings-monitoring.test.tsx\n@@ -106,7 +106,7 @@ function sampleServerSettings(maxConcurrentRuns = 8): ServerSettings {\n describe(\"SettingsMonitoring route\", () => {\n   beforeEach(() => {\n     teardownReactTestEnv = setupReactTestEnv();\n-    systemInfo = { runs: { active: 3, total: 12 } };\n+    systemInfo = { runs: { active: 3, scheduler_slots_used: 1, total: 12 } };\n     serverSettings = sampleServerSettings();\n   });\n \n@@ -133,7 +133,8 @@ describe(\"SettingsMonitoring route\", () => {\n     expect(text).toContain(\"5s\");\n     expect(text).toContain(\"3 GiB\");\n     expect(text).toContain(\"8 GiB\");\n-    expect(text).toContain(\"3 / 8 active\");\n+    expect(text).toContain(\"1 / 8 slots used\");\n+    expect(text).not.toContain(\"3 / 8 active\");\n   });\n \n   test(\"shows CPU warmup state while usage is null\", () => {\ndiff --git a/apps/fabro-web/app/routes/settings-monitoring.tsx b/apps/fabro-web/app/routes/settings-monitoring.tsx\nindex b058e6d27..cde3d733c 100644\n--- a/apps/fabro-web/app/routes/settings-monitoring.tsx\n+++ b/apps/fabro-web/app/routes/settings-monitoring.tsx\n@@ -59,17 +59,14 @@ function RunsPanel() {\n     return <PanelSkeleton />;\n   }\n \n-  const active = info.runs?.active ?? 0;\n+  const slotsUsed = info.runs?.scheduler_slots_used ?? 0;\n   const max = settings.server.scheduler.max_concurrent_runs;\n-  const percent = max > 0 ? (active / max) * 100 : null;\n+  const percent = max > 0 ? (slotsUsed / max) * 100 : null;\n \n   return (\n     <Panel title=\"Runs\">\n-      <Row\n-        title=\"Active\"\n-        help=\"Runs currently pending, runnable, or executing against the scheduler ceiling.\"\n-      >\n-        <UsageMeter percent={percent} label={`${active} / ${max} active`} />\n+      <Row title=\"Concurrency used\" help=\"Runs currently occupying scheduler slots.\">\n+        <UsageMeter percent={percent} label={`${slotsUsed} / ${max} slots used`} />\n       </Row>\n     </Panel>\n   );\ndiff --git a/docs/public/api-reference/fabro-api.yaml b/docs/public/api-reference/fabro-api.yaml\nindex d71f84d1d..fdada6ce5 100644\n--- a/docs/public/api-reference/fabro-api.yaml\n+++ b/docs/public/api-reference/fabro-api.yaml\n@@ -12376,6 +12376,10 @@ components:\n           type: integer\n           format: int64\n           description: Runs currently pending, runnable, or executing.\n+        scheduler_slots_used:\n+          type: integer\n+          format: int64\n+          description: Runs currently occupying scheduler concurrency slots.\n \n     SystemResourcesResponse:\n       description: Server-visible runtime resource usage for the active Fabro process environment.\ndiff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs\nindex 0c6c602d0..d224b9991 100644\n--- a/lib/crates/fabro-server/src/server.rs\n+++ b/lib/crates/fabro-server/src/server.rs\n@@ -2467,6 +2467,16 @@ fn compute_queue_positions(runs: &HashMap<RunId, ManagedRun>) -> HashMap<RunId,\n         .collect()\n }\n \n+pub(in crate::server) fn counts_toward_scheduler_capacity(status: RunStatus) -> bool {\n+    matches!(\n+        status,\n+        RunStatus::Starting\n+            | RunStatus::Running\n+            | RunStatus::Blocked { .. }\n+            | RunStatus::Paused { .. }\n+    )\n+}\n+\n #[allow(\n     clippy::result_large_err,\n     reason = \"Run ID parsing returns HTTP 400 responses directly.\"\n@@ -4063,15 +4073,7 @@ pub fn spawn_scheduler(state: Arc<AppState>) {\n                 let runs = state.runs.lock().expect(\"runs lock poisoned\");\n                 let active = runs\n                     .values()\n-                    .filter(|r| {\n-                        matches!(\n-                            r.status,\n-                            RunStatus::Starting\n-                                | RunStatus::Running\n-                                | RunStatus::Blocked { .. }\n-                                | RunStatus::Paused { .. }\n-                        )\n-                    })\n+                    .filter(|r| counts_toward_scheduler_capacity(r.status))\n                     .count();\n                 let available = state.max_concurrent_runs.saturating_sub(active);\n                 if available == 0 {\ndiff --git a/lib/crates/fabro-server/src/server/handler/system.rs b/lib/crates/fabro-server/src/server/handler/system.rs\nindex ce836f39b..667d7d81d 100644\n--- a/lib/crates/fabro-server/src/server/handler/system.rs\n+++ b/lib/crates/fabro-server/src/server/handler/system.rs\n@@ -7,9 +7,9 @@ use super::super::{\n     BillingByModel, DfParams, FABRO_VERSION, GithubIntegrationStrategy, IntoResponse, Json, Path,\n     PruneRunsRequest, PruneRunsResponse, Query, RequiredUser, Response, Router, RunStatus, State,\n     StatusCode, SystemInfoResponse, SystemRepairRunIssue, SystemRepairRunsResponse,\n-    SystemRunCounts, build_disk_usage_response, build_prune_plan, delete_run_internal, diagnostics,\n-    get, post, resolve_interp_string, resource_sampler, spawn_blocking, system_sandbox_provider,\n-    to_i64,\n+    SystemRunCounts, build_disk_usage_response, build_prune_plan, counts_toward_scheduler_capacity,\n+    delete_run_internal, diagnostics, get, post, resolve_interp_string, resource_sampler,\n+    spawn_blocking, system_sandbox_provider, to_i64,\n };\n \n pub(super) fn routes() -> Router<Arc<AppState>> {\n@@ -44,7 +44,7 @@ async fn get_server_settings(_auth: RequiredUser, State(state): State<Arc<AppSta\n async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {\n     let manifest_run_settings = state.manifest_run_settings();\n     let server_settings = state.server_settings();\n-    let (total_runs, active_runs) = {\n+    let (total_runs, active_runs, scheduler_slots_used) = {\n         let runs = state.runs.lock().expect(\"runs lock poisoned\");\n         let active = runs\n             .values()\n@@ -60,7 +60,11 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>\n                 )\n             })\n             .count();\n-        (runs.len(), active)\n+        let scheduler_slots_used = runs\n+            .values()\n+            .filter(|run| counts_toward_scheduler_capacity(run.status))\n+            .count();\n+        (runs.len(), active, scheduler_slots_used)\n     };\n \n     let response = SystemInfoResponse {\n@@ -75,8 +79,9 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>\n         storage_dir:      Some(state.server_storage_dir().display().to_string()),\n         uptime_secs:      Some(to_i64(state.started_at.elapsed().as_secs())),\n         runs:             Some(SystemRunCounts {\n-            total:  Some(to_i64(total_runs)),\n-            active: Some(to_i64(active_runs)),\n+            total:                Some(to_i64(total_runs)),\n+            active:               Some(to_i64(active_runs)),\n+            scheduler_slots_used: Some(to_i64(scheduler_slots_used)),\n         }),\n         sandbox_provider: Some(system_sandbox_provider(&manifest_run_settings)),\n     };\ndiff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs\nindex c7e6a1071..6d7b619f5 100644\n--- a/lib/crates/fabro-server/src/server/tests.rs\n+++ b/lib/crates/fabro-server/src/server/tests.rs\n@@ -9905,6 +9905,20 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {\n         Some(\"pending\")\n     );\n \n+    let response = app\n+        .clone()\n+        .oneshot(bearer_request(\n+            Method::GET,\n+            \"/system/info\",\n+            &user_jwt,\n+            Body::empty(),\n+        ))\n+        .await\n+        .unwrap();\n+    let info_body = response_json!(response, StatusCode::OK).await;\n+    assert_eq!(info_body[\"runs\"][\"active\"], 1);\n+    assert_eq!(info_body[\"runs\"][\"scheduler_slots_used\"], 0);\n+\n     {\n         let runs = state.runs.lock().expect(\"runs lock poisoned\");\n         assert_eq!(\n@@ -13444,6 +13458,31 @@ async fn queue_position_reported_for_runnable_runs() {\n     assert_eq!(positions.get(&second_id).copied(), Some(2));\n }\n \n+#[test]\n+fn scheduler_capacity_counts_only_runs_occupying_slots() {\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Submitted));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Pending {\n+        reason: PendingReason::ApprovalRequired,\n+    }));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Runnable));\n+    assert!(counts_toward_scheduler_capacity(RunStatus::Starting));\n+    assert!(counts_toward_scheduler_capacity(RunStatus::Running));\n+    assert!(counts_toward_scheduler_capacity(RunStatus::Blocked {\n+        blocked_reason: BlockedReason::HumanInputRequired,\n+    }));\n+    assert!(counts_toward_scheduler_capacity(RunStatus::Paused {\n+        prior_block: None,\n+    }));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Removing));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Succeeded {\n+        reason: SuccessReason::Completed,\n+    }));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Failed {\n+        reason: FailureReason::WorkflowError,\n+    }));\n+    assert!(!counts_toward_scheduler_capacity(RunStatus::Dead));\n+}\n+\n #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\n async fn concurrency_limit_respected() {\n     let state = test_app_state_with_options(default_test_server_settings(), RunLayer::default(), 1);\ndiff --git a/lib/crates/fabro-server/tests/it/api/system.rs b/lib/crates/fabro-server/tests/it/api/system.rs\nindex a798d5c26..e7b2abbe0 100644\n--- a/lib/crates/fabro-server/tests/it/api/system.rs\n+++ b/lib/crates/fabro-server/tests/it/api/system.rs\n@@ -266,6 +266,16 @@ async fn test_app_state_with_options_respects_max_concurrent_runs() {\n             .is_some_and(std::vec::Vec::is_empty),\n         \"second run should still be waiting for scheduler capacity while the first waits at the human gate: {second_questions}\"\n     );\n+\n+    let request = Request::builder()\n+        .method(\"GET\")\n+        .uri(api(\"/system/info\"))\n+        .body(Body::empty())\n+        .unwrap();\n+    let response = app.oneshot(request).await.unwrap();\n+    let body = response_json(response, StatusCode::OK, \"GET /api/v1/system/info\").await;\n+    assert_eq!(body[\"runs\"][\"active\"], 2);\n+    assert_eq!(body[\"runs\"][\"scheduler_slots_used\"], 1);\n }\n \n #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]\ndiff --git a/lib/packages/fabro-api-client/src/models/system-run-counts.ts b/lib/packages/fabro-api-client/src/models/system-run-counts.ts\nindex ad6854320..3fe29ae9b 100644\n--- a/lib/packages/fabro-api-client/src/models/system-run-counts.ts\n+++ b/lib/packages/fabro-api-client/src/models/system-run-counts.ts\n@@ -26,4 +26,8 @@ export interface SystemRunCounts {\n      * Runs currently pending, runnable, or executing.\n      */\n     'active'?: number;\n+    /**\n+     * Runs currently occupying scheduler concurrency slots.\n+     */\n+    'scheduler_slots_used'?: number;\n }\n",
+        "summary": {
+          "files_changed": 17,
+          "additions": 1030,
+          "deletions": 116
+        }
+      }
     }
   ],
-  "conclusion": null,
+  "conclusion": {
+    "timestamp": "2026-05-25T22:37:41.327684Z",
+    "status": "succeeded",
+    "timing": {
+      "wall_time_ms": 3213989,
+      "inference_time_ms": 0,
+      "tool_time_ms": 0,
+      "active_time_ms": 0
+    },
+    "final_git_commit_sha": "b7c62c6b9b624f4cc2994d8285d8e3328e72431f",
+    "stages": [
+      {
+        "stage_id": "start",
+        "stage_label": "start",
+        "timing": {
+          "wall_time_ms": 0,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "toolchain",
+        "stage_label": "toolchain",
+        "timing": {
+          "wall_time_ms": 1369,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_compile",
+        "stage_label": "preflight_compile",
+        "timing": {
+          "wall_time_ms": 128992,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_lint",
+        "stage_label": "preflight_lint",
+        "timing": {
+          "wall_time_ms": 139145,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "implement",
+        "stage_label": "implement",
+        "timing": {
+          "wall_time_ms": 1436486,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "billing_usd_micros": 30732252,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_opus",
+        "stage_label": "simplify_opus",
+        "timing": {
+          "wall_time_ms": 773652,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "billing_usd_micros": 5798826,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_gpt",
+        "stage_label": "simplify_gpt",
+        "timing": {
+          "wall_time_ms": 160521,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "billing_usd_micros": 4302869,
+        "retries": 0
+      },
+      {
+        "stage_id": "verify",
+        "stage_label": "verify",
+        "timing": {
+          "wall_time_ms": 545721,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      }
+    ],
+    "billing": {
+      "input_tokens": 5497249,
+      "output_tokens": 48004,
+      "total_tokens": 23405711,
+      "reasoning_tokens": 15962,
+      "cache_read_tokens": 17385269,
+      "cache_write_tokens": 459227,
+      "total_usd_micros": 40833947
+    },
+    "total_retries": 0,
+    "diff": {}
+  },
   "sandbox": {
     "provider": "daytona",
     "snapshot": "fabro-v12",
@@ -2431,23 +2553,30 @@
       },
       "state": "succeeded"
     },
-    "verify@1": {
-      "first_event_seq": 1083,
+    "exit@1": {
+      "first_event_seq": 1093,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-25T22:37:41.296790Z"
+      },
       "provider_used": null,
       "diff": null,
-      "script_invocation": {
-        "script": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
-        "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
-        "language": "shell"
-      },
+      "script_invocation": null,
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-25T22:28:31.841484Z",
-      "handler": "command",
+      "started_at": "2026-05-25T22:37:41.296771Z",
+      "handler": "exit",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -2456,7 +2585,55 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
+    },
+    "verify@1": {
+      "first_event_seq": 1083,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T22:37:37.566420Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/a8d8c154e6b7293f0b52a1f740a915ce84c101080bc70255afb005329d1287c9",
+        "exit_code": 0,
+        "duration_ms": 545711,
+        "termination": "exited",
+        "output_bytes": 204515,
+        "live_streaming": true
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 204515,
+      "live_streaming": true,
+      "termination": "exited",
+      "started_at": "2026-05-25T22:28:31.841484Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 545721,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
     }
   }
 }
