@@ -508,7 +508,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-25T16:11:34.125763Z",
-  "last_event_at": "2026-05-25T16:11:41.834702Z",
+  "last_event_at": "2026-05-25T16:13:52.743502Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -606,9 +606,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 38,
       "checkpoint": {
-        "timestamp": "2026-05-25T16:13:48.741768Z",
+        "timestamp": "2026-05-25T16:13:52.740311Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -617,17 +617,89 @@
         ],
         "node_retries": {},
         "context_values": {
+          "graph.rankdir": "LR",
+          "graph.goal": "# Secrets Rationalization Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Make Fabro server secret resolution simple and predictable: bootstrap secrets come only from process env or `server.env`; optional integration secrets come only from the vault.\n\n**Architecture:** Introduce a small shared registry that classifies well-known secret names as bootstrap or optional. Keep `ServerSecrets` focused on bootstrap startup/runtime requirements, add vault-only helpers for optional integrations, and wire install mode so it can write optional secrets before enabling features such as GitHub auth.\n\n**Tech Stack:** Rust workspace crates (`fabro-static`, `fabro-auth`, `fabro-agent`, `fabro-server`, `fabro-cli`), existing vault storage, existing install persistence, existing docs under `docs/internal` and `docs/public`.\n\n---\n\n## Decisions Locked In\n\n- `server.env` is only for bootstrap/runtime secrets that the server may need before the vault can be used.\n- Process env is also bootstrap-only for server runtime. Optional server integrations do not read process env.\n- Vault is the only server/runtime source for optional integration secrets.\n- Optional secrets may be workflow-visible for now.\n- No compatibility shims or fallback aliases are required. Remove server-runtime `GH_TOKEN` fallback and optional `server.env` fallbacks.\n- Non-secret configuration, such as base URLs, org IDs, or catalog settings, remains configuration. This plan only governs secrets.\n- CLI/library code may still use env-backed credential sources where explicitly selected outside server runtime. The server runtime must not use that path for optional integrations.\n\n## Secret Model\n\nBootstrap secrets:\n\n- `SESSION_SECRET`\n- `FABRO_DEV_TOKEN`\n- object-store/storage credentials resolved by current server object-store builders, including manual AWS credentials such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`\n\nOptional vault secrets:\n\n- LLM provider API keys and OAuth credential records\n- `FABRO_SLACK_BOT_TOKEN`\n- `FABRO_SLACK_APP_TOKEN`\n- `DAYTONA_API_KEY`\n- `BRAVE_SEARCH_API_KEY`\n- `GITHUB_TOKEN`\n- `GITHUB_APP_PRIVATE_KEY`\n- `GITHUB_APP_CLIENT_SECRET`\n- `GITHUB_APP_WEBHOOK_SECRET`\n\n## Change Map\n\n- Create `lib/crates/fabro-static/src/secret_registry.rs` for shared classification.\n- Modify `lib/crates/fabro-static/src/lib.rs` to export the registry.\n- Modify `lib/crates/fabro-server/src/server_secrets.rs` to make the bootstrap boundary explicit in tests and naming.\n- Modify `lib/crates/fabro-server/src/server.rs`, `diagnostics.rs`, `run_files.rs`, `run_manifest.rs`, `web_auth.rs`, `github_webhooks.rs`, and server handlers under `server/handler/` to use vault-only optional lookup.\n- Modify `lib/crates/fabro-server/src/startup.rs`, `serve.rs`, and `jwt_auth.rs` so GitHub auth validates `GITHUB_APP_CLIENT_SECRET` from vault while session/dev-token auth still validates bootstrap secrets.\n- Modify `lib/crates/fabro-auth/src/vault_source.rs` to expose an explicit vault-only credential source constructor for server runtime.\n- Modify `lib/crates/fabro-agent/src/config.rs` and `tools.rs` so `web_search` receives `BRAVE_SEARCH_API_KEY` explicitly instead of reading process env inside the tool.\n- Modify install flows in `lib/crates/fabro-server/src/install.rs` and `lib/crates/fabro-cli/src/commands/install.rs` so GitHub App secrets are written to vault, not `server.env`.\n- Modify `lib/crates/fabro-server/src/server/handler/secrets.rs` so bootstrap secrets cannot be written through the vault API.\n- Update public and internal docs after behavior is implemented.\n\n---\n\n## Task 1: Add The Shared Secret Registry\n\n**Files:**\n\n- Create: `lib/crates/fabro-static/src/secret_registry.rs`\n- Modify: `lib/crates/fabro-static/src/lib.rs`\n- Test: unit tests in `secret_registry.rs`\n\n- [ ] **Step 1: Define the registry types and classified names**\n\nCreate `secret_registry.rs` with this shape:\n\n```rust\nuse crate::EnvVars;\n\n#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum SecretScope {\n    Bootstrap,\n    OptionalVault,\n}\n\nconst BOOTSTRAP_SECRETS: &[&str] = &[\n    EnvVars::SESSION_SECRET,\n    EnvVars::FABRO_DEV_TOKEN,\n    EnvVars::AWS_ACCESS_KEY_ID,\n    EnvVars::AWS_SECRET_ACCESS_KEY,\n    EnvVars::AWS_SESSION_TOKEN,\n];\n\nconst OPTIONAL_VAULT_SECRETS: &[&str] = &[\n    EnvVars::ANTHROPIC_API_KEY,\n    EnvVars::BRAVE_SEARCH_API_KEY,\n    EnvVars::FABRO_SLACK_APP_TOKEN,\n    EnvVars::FABRO_SLACK_BOT_TOKEN,\n    EnvVars::GEMINI_API_KEY,\n    EnvVars::GITHUB_APP_CLIENT_SECRET,\n    EnvVars::GITHUB_APP_PRIVATE_KEY,\n    EnvVars::GITHUB_APP_WEBHOOK_SECRET,\n    EnvVars::GITHUB_TOKEN,\n    EnvVars::INCEPTION_API_KEY,\n    EnvVars::KIMI_API_KEY,\n    EnvVars::MINIMAX_API_KEY,\n    EnvVars::OPENAI_API_KEY,\n    EnvVars::ZAI_API_KEY,\n    EnvVars::DAYTONA_API_KEY,\n];\n\npub fn secret_scope(name: &str) -> Option<SecretScope> {\n    if BOOTSTRAP_SECRETS.contains(&name) {\n        Some(SecretScope::Bootstrap)\n    } else if OPTIONAL_VAULT_SECRETS.contains(&name) {\n        Some(SecretScope::OptionalVault)\n    } else {\n        None\n    }\n}\n\npub fn is_bootstrap_secret(name: &str) -> bool {\n    secret_scope(name) == Some(SecretScope::Bootstrap)\n}\n\npub fn is_optional_vault_secret(name: &str) -> bool {\n    secret_scope(name) == Some(SecretScope::OptionalVault)\n}\n```\n\n- [ ] **Step 2: Export the registry**\n\nModify `lib.rs`:\n\n```rust\nmod env_vars;\nmod secret_registry;\n\npub use env_vars::EnvVars;\npub use secret_registry::{\n    SecretScope, is_bootstrap_secret, is_optional_vault_secret, secret_scope,\n};\n```\n\n- [ ] **Step 3: Add registry tests**\n\nAdd tests proving:\n\n- `SESSION_SECRET` and `FABRO_DEV_TOKEN` are bootstrap.\n- `GITHUB_APP_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_TOKEN`, Slack tokens, Daytona, Brave, and common LLM API keys are optional vault secrets.\n- `GH_TOKEN` is not classified.\n- non-secret config names such as `GITHUB_BASE_URL`, `SLACK_BASE_URL`, and `DAYTONA_API_URL` are not classified.\n\n- [ ] **Step 4: Run the focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-static\n```\n\nExpected: all `fabro-static` tests pass.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add lib/crates/fabro-static/src/lib.rs lib/crates/fabro-static/src/secret_registry.rs\ngit commit -m \"refactor: classify server secret scopes\"\n```\n\n---\n\n## Task 2: Enforce Bootstrap Boundaries In The Secret API\n\n**Files:**\n\n- Modify: `lib/crates/fabro-server/src/server/handler/secrets.rs`\n- Test: existing server handler tests or new focused tests near secret handler coverage\n\n- [ ] **Step 1: Reject bootstrap secrets in `create_secret`**\n\nBefore OAuth parsing or Daytona validation, reject `SecretScope::Bootstrap`:\n\n```rust\nif fabro_static::is_bootstrap_secret(&name) {\n    return ApiError::bad_request(format!(\n        \"{name} is a bootstrap secret; configure it with process env or server.env\"\n    ))\n    .into_response();\n}\n```\n\n- [ ] **Step 2: Keep optional and unknown secret writes allowed**\n\nDo not reject unknown names. Workflows may define arbitrary vault-visible secrets.\n\n- [ ] **Step 3: Add API tests**\n\nAdd tests proving:\n\n- `POST /secrets` with `SESSION_SECRET` returns `400`.\n- `POST /secrets` with `FABRO_DEV_TOKEN` returns `400`.\n- `POST /secrets` with `GITHUB_APP_CLIENT_SECRET` succeeds.\n- `POST /secrets` with a custom name such as `CUSTOM_WORKFLOW_TOKEN` succeeds.\n\n- [ ] **Step 4: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server secret\n```\n\nExpected: secret handler tests pass.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add lib/crates/fabro-server/src/server/handler/secrets.rs lib/crates/fabro-server\ngit commit -m \"fix: reject bootstrap secrets in vault API\"\n```\n\n---\n\n## Task 3: Replace Server Optional Lookups With Vault-Only Lookups\n\n**Files:**\n\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/diagnostics.rs`\n- Modify: `lib/crates/fabro-server/src/run_files.rs`\n- Modify: `lib/crates/fabro-server/src/run_manifest.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/sandbox.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/sessions.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs` and existing handler tests\n\n- [ ] **Step 1: Add explicit helpers on `AppState`**\n\nReplace `vault_or_env` and `vault_or_env_pub` with:\n\n```rust\npub(crate) fn vault_secret(&self, name: &str) -> Option<String> {\n    self.vault\n        .try_read()\n        .ok()\n        .and_then(|vault| vault.get(name).map(str::to_string))\n}\n\nfn config_env_lookup(&self, name: &str) -> Option<String> {\n    (self.env_lookup)(name)\n}\n```\n\nKeep `server_secret` for bootstrap secrets only.\n\n- [ ] **Step 2: Change Daytona secret reads**\n\nUse `state.vault_secret(EnvVars::DAYTONA_API_KEY)` wherever a Daytona API key is required. Keep non-secret Daytona URL and organization settings on `env_lookup` or settings-derived configuration, not vault lookup.\n\n- [ ] **Step 3: Change GitHub token reads**\n\nIn `github_credentials`, resolve token strategy only through:\n\n```rust\nlet token = self\n    .vault_secret(EnvVars::GITHUB_TOKEN)\n    .as_deref()\n    .map(str::trim)\n    .filter(|token| !token.is_empty())\n    .map(str::to_string);\n```\n\nRemove the `GH_TOKEN` fallback and update the error message to say:\n\n```text\nGITHUB_TOKEN not configured -- run fabro install or run fabro secret set GITHUB_TOKEN\n```\n\n- [ ] **Step 4: Change diagnostics and handlers**\n\nReplace `state.vault_or_env(...)` and `state.vault_or_env_pub(...)` with `state.vault_secret(...)` for optional secret checks. Update diagnostics remediation text to use `fabro secret set`.\n\n- [ ] **Step 5: Add regression tests**\n\nAdd tests proving:\n\n- `DAYTONA_API_KEY` in process env but absent from vault is treated as missing by server diagnostics.\n- `GITHUB_TOKEN` in process env but absent from vault is treated as missing by token strategy.\n- `GH_TOKEN` in vault or process env is ignored by server runtime.\n- `DAYTONA_API_KEY` in vault is accepted.\n\n- [ ] **Step 6: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server daytona\ncargo nextest run -p fabro-server github\n```\n\nExpected: relevant server tests pass.\n\n- [ ] **Step 7: Commit**\n\n```bash\ngit add lib/crates/fabro-server\ngit commit -m \"refactor: resolve optional server secrets from vault only\"\n```\n\n---\n\n## Task 4: Make Server LLM Credentials Vault-Only\n\n**Files:**\n\n- Modify: `lib/crates/fabro-auth/src/vault_source.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-auth/src/vault_source.rs`, `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] **Step 1: Add an explicit vault-only constructor**\n\nAdd this constructor to `VaultCredentialSource`:\n\n```rust\n#[must_use]\npub fn vault_only(vault: Arc<AsyncRwLock<Vault>>) -> Self {\n    Self::with_env_lookup(vault, |_| None)\n}\n```\n\n- [ ] **Step 2: Use vault-only source in server app state**\n\nIn `build_app_state`, change the LLM source construction from `with_env_lookup(... env_lookup ...)` to:\n\n```rust\nlet llm_source: Arc<dyn CredentialSource> =\n    Arc::new(VaultCredentialSource::vault_only(Arc::clone(&vault)));\n```\n\n- [ ] **Step 3: Keep CLI/library env sources explicit**\n\nDo not remove `EnvCredentialSource`. Do not change direct CLI/library flows that intentionally choose env-backed credentials outside server runtime.\n\n- [ ] **Step 4: Add tests**\n\nAdd tests proving:\n\n- `VaultCredentialSource::vault_only` does not resolve process env values.\n- Server readiness sees a provider configured only when the matching vault secret exists.\n\n- [ ] **Step 5: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-auth\ncargo nextest run -p fabro-server llm\n```\n\nExpected: auth and server LLM tests pass.\n\n- [ ] **Step 6: Commit**\n\n```bash\ngit add lib/crates/fabro-auth/src/vault_source.rs lib/crates/fabro-server/src/server.rs lib/crates/fabro-server/src/server/tests.rs\ngit commit -m \"fix: use vault-only llm credentials in server runtime\"\n```\n\n---\n\n## Task 5: Move GitHub App Runtime Secrets To Vault\n\n**Files:**\n\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/web_auth.rs`\n- Modify: `lib/crates/fabro-server/src/github_webhooks.rs`\n- Modify: `lib/crates/fabro-server/src/diagnostics.rs`\n- Modify: `lib/crates/fabro-server/src/startup.rs`\n- Modify: `lib/crates/fabro-server/src/serve.rs`\n- Modify: `lib/crates/fabro-server/src/jwt_auth.rs`\n- Test: server startup, auth, webhook, diagnostics, worker command tests\n\n- [ ] **Step 1: Read GitHub App private key from vault**\n\nIn `AppState::github_credentials`, replace:\n\n```rust\nlet raw = self.server_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);\n```\n\nwith:\n\n```rust\nlet raw = self.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);\n```\n\n- [ ] **Step 2: Read OAuth client secret from vault**\n\nIn the GitHub OAuth callback handler, replace `state.server_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)` with `state.vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)`.\n\n- [ ] **Step 3: Read webhook secret from vault**\n\nReplace webhook secret resolution from `server_secret(WEBHOOK_SECRET_ENV)` to `vault_secret(WEBHOOK_SECRET_ENV)`. Startup logging should report webhook presence based on the vault value after the vault is loaded.\n\n- [ ] **Step 4: Validate GitHub auth after vault load**\n\nChange startup validation so `SESSION_SECRET` and `FABRO_DEV_TOKEN` are read from `ServerSecrets`, while `GITHUB_APP_CLIENT_SECRET` is read from the vault.\n\nUse a composite lookup for auth validation:\n\n```rust\nlet auth_secret_lookup = |name: &str| match name {\n    EnvVars::GITHUB_APP_CLIENT_SECRET => vault.get(name).map(str::to_string),\n    _ => server_secrets.get(name),\n};\n```\n\nLoad the vault before calling GitHub-auth validation. Pass the loaded vault into `build_app_state` or factor vault loading so the server does not perform inconsistent duplicate loads.\n\n- [ ] **Step 5: Update worker GitHub App key injection**\n\nWhere the worker command currently forwards `GITHUB_APP_PRIVATE_KEY` from `server_secret`, forward it from `vault_secret`. Keep the explicit worker injection because worker environments remain scrubbed by default.\n\n- [ ] **Step 6: Update tests**\n\nAdd or change tests proving:\n\n- GitHub auth enabled with `GITHUB_APP_CLIENT_SECRET` only in `server.env` fails startup.\n- GitHub auth enabled with `GITHUB_APP_CLIENT_SECRET` in vault passes startup.\n- OAuth callback reads the vault client secret.\n- Webhook verification reads the vault webhook secret.\n- Worker command forwards the GitHub App private key from vault.\n- Diagnostics reports missing GitHub App secrets based on vault, not `server.env`.\n\n- [ ] **Step 7: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server github\ncargo nextest run -p fabro-server worker_auth\ncargo nextest run -p fabro-cli server_start\n```\n\nExpected: GitHub auth, webhook, worker, and startup tests pass.\n\n- [ ] **Step 8: Commit**\n\n```bash\ngit add lib/crates/fabro-server lib/crates/fabro-cli/tests\ngit commit -m \"fix: store github app runtime secrets in vault\"\n```\n\n---\n\n## Task 6: Move Slack To Vault-Only Credentials\n\n**Files:**\n\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-slack/src/config.rs` only if names or status messages need adjustment\n- Test: Slack credential resolution and server app-state tests\n\n- [ ] **Step 1: Resolve Slack tokens from vault**\n\nIn `build_app_state`, replace:\n\n```rust\nresolve_slack_credentials_status_with_lookup(|name| server_secrets.get(name))\n```\n\nwith:\n\n```rust\nresolve_slack_credentials_status_with_lookup(|name| {\n    vault.try_read().ok().and_then(|vault| vault.get(name).map(str::to_string))\n})\n```\n\nIf the implementation already holds a synchronous vault read guard in this block, reuse that guard rather than calling `try_read` repeatedly.\n\n- [ ] **Step 2: Keep Slack base URL out of the secret model**\n\nLeave `SLACK_BASE_URL` as a non-secret test/development override. Do not add it to the secret registry.\n\n- [ ] **Step 3: Update Slack tests**\n\nAdd tests proving:\n\n- Slack tokens in vault enable Slack service.\n- Slack tokens in `server.env` but absent from vault do not enable Slack service.\n- Missing vault tokens produce the existing disabled status with missing token names.\n\n- [ ] **Step 4: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-slack\ncargo nextest run -p fabro-server slack\n```\n\nExpected: Slack tests pass.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add lib/crates/fabro-server/src/server.rs lib/crates/fabro-slack/src/config.rs\ngit commit -m \"fix: resolve slack credentials from vault\"\n```\n\n---\n\n## Task 7: Make Brave Search Tool Use Server-Provided Secrets\n\n**Files:**\n\n- Modify: `lib/crates/fabro-agent/src/config.rs`\n- Modify: `lib/crates/fabro-agent/src/tools.rs`\n- Modify: server session/profile construction where `SessionOptions` are built\n- Test: `lib/crates/fabro-agent/src/tools.rs`, server diagnostics/tool integration tests\n\n- [ ] **Step 1: Add tool secret configuration**\n\nAdd to `config.rs`:\n\n```rust\n#[derive(Clone, Debug, Default, PartialEq, Eq)]\npub struct ToolSecrets {\n    pub brave_search_api_key: Option<String>,\n}\n```\n\nAdd this field to `SessionOptions`:\n\n```rust\npub tool_secrets: ToolSecrets,\n```\n\nDefault it to `ToolSecrets::default()` and include it in the debug impl without printing secret values. Use a boolean:\n\n```rust\n.field(\n    \"brave_search_configured\",\n    &self.tool_secrets.brave_search_api_key.is_some(),\n)\n```\n\n- [ ] **Step 2: Pass the Brave key into tool registration**\n\nChange `register_core_tools`:\n\n```rust\nregistry.register(make_web_search_tool_with_api_key(\n    config.tool_secrets.brave_search_api_key.clone(),\n));\n```\n\nRemove the process-env-reading `make_web_search_tool` wrapper.\n\n- [ ] **Step 3: Improve the missing-key message**\n\nChange the error text from “environment variable is not set” to:\n\n```text\nBRAVE_SEARCH_API_KEY is not configured\n```\n\n- [ ] **Step 4: Populate `SessionOptions.tool_secrets` in server runtime**\n\nWhere the server constructs agent sessions, set:\n\n```rust\ntool_secrets: ToolSecrets {\n    brave_search_api_key: state.vault_secret(EnvVars::BRAVE_SEARCH_API_KEY),\n},\n```\n\nKeep direct CLI agent behavior explicit: if the CLI should support local env-backed Brave Search, set this field at the CLI boundary from `std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).ok()`. Do not let the tool read process env internally.\n\n- [ ] **Step 5: Update tests**\n\nAdd tests proving:\n\n- `make_web_search_tool_with_api_key(None)` returns `BRAVE_SEARCH_API_KEY is not configured`.\n- `register_core_tools` wires `SessionOptions.tool_secrets.brave_search_api_key` into the web search tool.\n- Server diagnostics and server-created sessions both use the same vault-backed key.\n\n- [ ] **Step 6: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-agent web_search\ncargo nextest run -p fabro-server brave\n```\n\nExpected: Brave tests pass.\n\n- [ ] **Step 7: Commit**\n\n```bash\ngit add lib/crates/fabro-agent lib/crates/fabro-server\ngit commit -m \"fix: pass brave search credentials through server configuration\"\n```\n\n---\n\n## Task 8: Update Install Mode Persistence\n\n**Files:**\n\n- Modify: `lib/crates/fabro-server/src/install.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/install.rs`\n- Modify: install tests in `lib/crates/fabro-server/tests/it/api/install.rs` and `lib/crates/fabro-cli/tests/it/cmd/install.rs`\n\n- [ ] **Step 1: Server install writes GitHub App secrets to vault**\n\nIn `post_install_finish`, replace GitHub App `server_env_writes.push(...)` calls with `vault_secrets.push(...)` calls:\n\n```rust\nvault_secrets.push(VaultSecretWrite {\n    name: EnvVars::GITHUB_APP_PRIVATE_KEY.to_string(),\n    value: BASE64_STANDARD.encode(github.pem.as_bytes()),\n    secret_type: VaultSecretType::File,\n    description: None,\n});\n\nvault_secrets.push(VaultSecretWrite {\n    name: EnvVars::GITHUB_APP_CLIENT_SECRET.to_string(),\n    value: github.client_secret,\n    secret_type: VaultSecretType::Token,\n    description: None,\n});\n\nif let Some(secret) = github.webhook_secret {\n    vault_secrets.push(VaultSecretWrite {\n        name: EnvVars::GITHUB_APP_WEBHOOK_SECRET.to_string(),\n        value: secret,\n        secret_type: VaultSecretType::Token,\n        description: None,\n    });\n}\n```\n\n- [ ] **Step 2: Remove stale GitHub App keys from `server.env` during install persistence**\n\nAdd removals for:\n\n- `GITHUB_APP_PRIVATE_KEY`\n- `GITHUB_APP_CLIENT_SECRET`\n- `GITHUB_APP_WEBHOOK_SECRET`\n\nThis keeps greenfield installs clean and removes stale optional secrets if a developer has run earlier local install attempts.\n\n- [ ] **Step 3: Align CLI GitHub install helper**\n\nUpdate CLI install persistence so switching to GitHub App writes app secrets to vault and removes the app keys from `server.env`. Switching to token continues to write `GITHUB_TOKEN` to vault and remove app vault secrets.\n\n- [ ] **Step 4: Update install tests**\n\nAdd or change tests proving:\n\n- Browser install with GitHub App writes private key, client secret, and webhook secret to vault.\n- Browser install with GitHub App does not write those keys to `server.env`.\n- CLI GitHub App install writes app secrets to vault.\n- Switching strategies removes stale secrets from the other strategy.\n- `SESSION_SECRET`, `FABRO_DEV_TOKEN`, and object-store credentials remain in `server.env`.\n\n- [ ] **Step 5: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server install\ncargo nextest run -p fabro-cli install\n```\n\nExpected: install tests pass.\n\n- [ ] **Step 6: Commit**\n\n```bash\ngit add lib/crates/fabro-server/src/install.rs lib/crates/fabro-server/tests/it/api/install.rs lib/crates/fabro-cli/src/commands/install.rs lib/crates/fabro-cli/tests/it/cmd/install.rs\ngit commit -m \"fix: persist optional install secrets in vault\"\n```\n\n---\n\n## Task 9: Update Strategy And Public Docs\n\n**Files:**\n\n- Modify: `docs/internal/server-secrets-strategy.md`\n- Modify: `docs/public/administration/server-configuration.mdx`\n- Modify: `docs/public/administration/self-host-docker.mdx`\n- Modify: `docs/public/administration/deploy-railway.mdx`\n- Modify: `docs/public/integrations/github.mdx`\n- Modify: `docs/public/integrations/slack.mdx`\n- Modify: `docs/public/integrations/brave-search.mdx`\n- Modify: `docs/public/integrations/daytona.mdx`\n- Modify: LLM provider docs that still say server runtime reads provider keys from process env\n\n- [ ] **Step 1: Rewrite internal strategy**\n\nUpdate `server-secrets-strategy.md` to state:\n\n- `ServerSecrets` means bootstrap secrets only.\n- Bootstrap source precedence is process env then `server.env`.\n- Optional integration secrets are vault-only.\n- Requiredness is independent from source: GitHub auth may require a vault secret at startup.\n- Server worker env remains scrubbed and receives only explicit injected values.\n\n- [ ] **Step 2: Update administration docs**\n\nState that `server.env` is for:\n\n- `SESSION_SECRET`\n- `FABRO_DEV_TOKEN`\n- storage/object-store bootstrap credentials\n\nState that `server.env` is not used for:\n\n- Slack\n- Daytona\n- Brave Search\n- LLM provider keys\n- GitHub token\n- GitHub App private key/client secret/webhook secret\n\n- [ ] **Step 3: Update integration docs**\n\nFor each optional integration, show `fabro secret set` as the server-runtime configuration path:\n\n```bash\nfabro secret set BRAVE_SEARCH_API_KEY <key>\nfabro secret set DAYTONA_API_KEY <key>\nfabro secret set FABRO_SLACK_BOT_TOKEN <xoxb-token>\nfabro secret set FABRO_SLACK_APP_TOKEN <xapp-token>\nfabro secret set GITHUB_TOKEN <token>\n```\n\nFor GitHub App, document that install mode stores app secrets in vault.\n\n- [ ] **Step 4: Remove stale `server.env` guidance**\n\nSearch:\n\n```bash\nrg -n \"server.env|process env -> server.env|GITHUB_APP_CLIENT_SECRET|FABRO_SLACK\" docs/public docs/internal\n```\n\nEach result should either describe bootstrap secrets or explicitly say the secret is vault-only.\n\n- [ ] **Step 5: Commit**\n\n```bash\ngit add docs/internal docs/public\ngit commit -m \"docs: document vault-only optional secrets\"\n```\n\n---\n\n## Task 10: Final Verification And Cleanup\n\n**Files:**\n\n- Modify any touched tests or docs needed by final verification.\n\n- [ ] **Step 1: Search for removed server-runtime patterns**\n\nRun:\n\n```bash\nrg -n \"vault_or_env|vault_or_env_pub|GH_TOKEN|GITHUB_APP_CLIENT_SECRET.*server_secret|FABRO_SLACK_.*server_secret|BRAVE_SEARCH_API_KEY.*std::env|DAYTONA_API_KEY.*process_env\" lib/crates docs\n```\n\nExpected:\n\n- no server-runtime `vault_or_env` helper remains;\n- no server-runtime `GH_TOKEN` fallback remains;\n- no optional secret docs claim `server.env` is a valid server-runtime source;\n- live-test annotations and explicit CLI/library env usage may remain.\n\n- [ ] **Step 2: Run focused crate tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-static\ncargo nextest run -p fabro-auth\ncargo nextest run -p fabro-agent web_search\ncargo nextest run -p fabro-slack\ncargo nextest run -p fabro-server\ncargo nextest run -p fabro-cli install\n```\n\nExpected: all listed tests pass.\n\n- [ ] **Step 3: Run workspace quality checks**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nExpected: formatting and clippy pass.\n\n- [ ] **Step 4: Run one end-to-end install smoke if credentials are available**\n\nRun a non-live smoke that exercises install persistence and restart validation through existing install tests. If local live credentials are available, run the relevant ignored/live tests for GitHub App, Daytona, and Brave Search.\n\n- [ ] **Step 5: Final commit**\n\nIf Task 10 required cleanup changes, commit them:\n\n```bash\ngit add .\ngit commit -m \"test: verify rationalized server secrets\"\n```\n\nIf Task 10 produced no file changes, do not create an empty commit.\n\n## Acceptance Criteria\n\n- `server.env` is no longer a provider for Slack, Daytona, Brave Search, LLM provider credentials, GitHub token, or GitHub App secrets.\n- Process env is no longer a server-runtime provider for optional integration secrets.\n- Install mode can enable GitHub auth in one pass by writing GitHub App secrets to vault before normal startup.\n- Startup fails clearly when GitHub auth is enabled and `GITHUB_APP_CLIENT_SECRET` is missing from vault.\n- `fabro secret set` rejects bootstrap secrets and accepts optional integration secrets.\n- Brave Search diagnostics and the actual `web_search` tool agree on whether the key is configured.\n- Worker subprocess env remains scrubbed, with only explicit internal injections preserved.\n",
+          "thread.start.current_node": "toolchain",
+          "failure_class": "",
+          "current_node": "preflight_compile",
+          "internal.retry_count.start": 0,
+          "internal.fidelity": "compact",
+          "internal.thread_id": "toolchain",
+          "outcome": "succeeded",
+          "thread.toolchain.current_node": "preflight_compile",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.node_visit_count": 1,
           "internal.run_id": "01KSFYFBY7GJRA7F2DAH0G3XEB",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "failure_signature": "",
+          "internal.retry_count.preflight_compile": 0,
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "internal.retry_count.toolchain": 0
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "039399da25e19e13fc3995db1f502e50e440c41a",
+        "node_visits": {
+          "preflight_compile": 1,
+          "toolchain": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-25T16:17:18.051436Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.run_id": "01KSFYFBY7GJRA7F2DAH0G3XEB",
+          "thread.preflight_compile.current_node": "preflight_lint",
           "thread.start.current_node": "toolchain",
           "graph.rankdir": "LR",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "internal.retry_count.start": 0,
-          "internal.thread_id": "toolchain",
+          "internal.thread_id": "preflight_compile",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "internal.fidelity": "compact",
-          "current_node": "preflight_compile",
+          "current_node": "preflight_lint",
           "internal.node_visit_count": 1,
           "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.preflight_lint": 0,
           "internal.retry_count.toolchain": 0,
           "thread.toolchain.current_node": "preflight_compile",
           "failure_signature": "",
@@ -656,11 +728,20 @@
             },
             "notes": "Script completed: cargo check -q --workspace 2>&1",
             "usage": null
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
           "start": 1,
+          "preflight_lint": 1,
           "toolchain": 1,
           "preflight_compile": 1
         }
@@ -688,6 +769,33 @@
   "superseded_by": null,
   "pending_interviews": {},
   "stages": {
+    "preflight_lint@1": {
+      "first_event_seq": 41,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-25T16:13:52.743077Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
     "start@1": {
       "first_event_seq": 17,
       "prompt": null,
@@ -774,7 +882,12 @@
       "first_event_seq": 31,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-25T16:13:48.740452Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -782,11 +895,27 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 126895,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
       "started_at": "2026-05-25T16:11:41.833665Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 126906,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -795,7 +924,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     }
   }
 }
