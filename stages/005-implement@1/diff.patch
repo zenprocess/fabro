@@ -1,0 +1,1767 @@
+diff --git a/docs/public/agents/mcp.mdx b/docs/public/agents/mcp.mdx
+index baaf9d64d..c2a6bdcd4 100644
+--- a/docs/public/agents/mcp.mdx
++++ b/docs/public/agents/mcp.mdx
+@@ -33,7 +33,7 @@ Pass `--server` when the MCP client should connect to a specific Fabro server, o
+ | `fabro_run_create` | Create one or more workflow runs, optionally under a parent run, starting them by default. |
+ | `fabro_run_search` | Search runs by ID, parent, workflow, labels, status, archive state, and creation time. |
+ | `fabro_run_get` | Read-only inspection of a run: returns its summary, projection, and pending questions without mutating state. |
+-| `fabro_run_interact` | Control a run: start, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. |
++| `fabro_run_interact` | Control a run: start, approve, deny, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. |
+ | `fabro_run_gather` | Wait for runs to reach terminal states, returning current state on timeout. |
+ | `fabro_run_pair` | Inspect, start, message, end, or read transcript for a live run pairing session. |
+ | `fabro_run_events` | List, inspect, or search stored events for a run. |
+@@ -65,6 +65,20 @@ Use `goal` for inline goal text or `goal_file` to read the run goal from a file.
+ 
+ Run summaries returned by the MCP server include parent metadata. Use `parent_id` on `fabro_run_create` to create a child run, `parent_id` on `fabro_run_search` to list direct children, and the `link_parent` or `unlink_parent` actions on `fabro_run_interact` to change an existing run's parent.
+ 
++Pending runs can be approved or denied through `fabro_run_interact`:
++
++```json
++{ "run_id": "nightly", "action": "approve" }
++```
++
++```json
++{
++  "run_id": "nightly",
++  "action": "deny",
++  "reason": "Not approved for execution"
++}
++```
++
+ Use `fabro_run_pair` when an MCP client needs to pair with an active API-mode agent stage. The tool can inspect current pair status, start a pair session for a selected stage, send messages, end the session, and read transcript entries.
+ 
+ ```json
+diff --git a/docs/public/reference/cli.mdx b/docs/public/reference/cli.mdx
+index 857a9365a..67e390987 100644
+--- a/docs/public/reference/cli.mdx
++++ b/docs/public/reference/cli.mdx
+@@ -63,6 +63,7 @@ fabro [OPTIONS] [COMMAND]
+ 
+ | Command | Description |
+ | --- | --- |
++| `fabro approve` | Approve pending workflow runs |
+ | `fabro archive` | Mark terminal runs as archived (reviewed, no further action needed). Archived runs are hidden from default listings |
+ | `fabro artifact` | Inspect and copy run artifacts (screenshots, reports, traces) |
+ | `fabro ask` | Ask Fabro a read-only question about a run |
+@@ -70,6 +71,7 @@ fabro [OPTIONS] [COMMAND]
+ | `fabro auth` | Manage CLI authentication state |
+ | `fabro completion` | Generate shell completions |
+ | `fabro create` | Create a workflow run (allocate run dir, persist spec) |
++| `fabro deny` | Deny pending workflow runs |
+ | `fabro discord` | Open the Discord community in the browser |
+ | `fabro docs` | Open the docs website in the browser |
+ | `fabro doctor` | Check environment and integration health |
+@@ -106,6 +108,26 @@ fabro [OPTIONS] [COMMAND]
+ | `fabro wait` | Block until a workflow run completes |
+ | `fabro workflow` | Workflow operations |
+ 
++### `fabro approve`
++
++Approve pending workflow runs
++
++```bash
++fabro approve [OPTIONS] <RUNS>...
++```
++
++#### Arguments
++
++| Name | Description |
++| --- | --- |
++| `RUNS` | Run IDs or workflow names to approve |
++
++#### Options
++
++| Option | Description |
++| --- | --- |
++| `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
++
+ ### `fabro archive`
+ 
+ Mark terminal runs as archived (reviewed, no further action needed). Archived runs are hidden from default listings
+@@ -338,6 +360,27 @@ fabro create [OPTIONS] <WORKFLOW>
+ | `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
+ | `-v, --verbose` | Enable verbose output |
+ 
++### `fabro deny`
++
++Deny pending workflow runs
++
++```bash
++fabro deny [OPTIONS] <RUNS>...
++```
++
++#### Arguments
++
++| Name | Description |
++| --- | --- |
++| `RUNS` | Run IDs or workflow names to deny |
++
++#### Options
++
++| Option | Description |
++| --- | --- |
++| `--reason <reason>` | Reason for denying execution |
++| `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
++
+ ### `fabro discord`
+ 
+ Open the Discord community in the browser
+diff --git a/lib/crates/fabro-cli/src/args.rs b/lib/crates/fabro-cli/src/args.rs
+index e926dced6..72aa82b52 100644
+--- a/lib/crates/fabro-cli/src/args.rs
++++ b/lib/crates/fabro-cli/src/args.rs
+@@ -393,6 +393,30 @@ pub(crate) struct RunsUnarchiveArgs {
+     pub(crate) runs: Vec<String>,
+ }
+ 
++#[derive(Args)]
++pub(crate) struct RunsApproveArgs {
++    #[command(flatten)]
++    pub(crate) server: ServerTargetArgs,
++
++    /// Run IDs or workflow names to approve
++    #[arg(required = true)]
++    pub(crate) runs: Vec<String>,
++}
++
++#[derive(Args)]
++pub(crate) struct RunsDenyArgs {
++    #[command(flatten)]
++    pub(crate) server: ServerTargetArgs,
++
++    /// Reason for denying execution
++    #[arg(long)]
++    pub(crate) reason: Option<String>,
++
++    /// Run IDs or workflow names to deny
++    #[arg(required = true)]
++    pub(crate) runs: Vec<String>,
++}
++
+ #[derive(Args)]
+ pub(crate) struct EventsArgs {
+     #[command(flatten)]
+@@ -1151,6 +1175,10 @@ pub(crate) enum RunsCommands {
+     Rm(RunsRemoveArgs),
+     /// Show detailed information about a workflow run
+     Inspect(InspectArgs),
++    /// Approve pending workflow runs.
++    Approve(RunsApproveArgs),
++    /// Deny pending workflow runs.
++    Deny(RunsDenyArgs),
+     /// Mark terminal runs as archived (reviewed, no further action needed).
+     /// Archived runs are hidden from default listings.
+     Archive(RunsArchiveArgs),
+@@ -1164,6 +1192,8 @@ impl RunsCommands {
+             Self::Ps(_) => "ps",
+             Self::Rm(_) => "rm",
+             Self::Inspect(_) => "inspect",
++            Self::Approve(_) => "approve",
++            Self::Deny(_) => "deny",
+             Self::Archive(_) => "archive",
+             Self::Unarchive(_) => "unarchive",
+         }
+diff --git a/lib/crates/fabro-cli/src/commands/runs/approval.rs b/lib/crates/fabro-cli/src/commands/runs/approval.rs
+new file mode 100644
+index 000000000..29e0c1dc2
+--- /dev/null
++++ b/lib/crates/fabro-cli/src/commands/runs/approval.rs
+@@ -0,0 +1,114 @@
++use anyhow::{Result, bail};
++
++use super::short_run_id;
++use crate::args::{RunsApproveArgs, RunsDenyArgs};
++use crate::command_context::CommandContext;
++use crate::shared::print_json_pretty;
++
++pub(crate) async fn approve_command(
++    args: &RunsApproveArgs,
++    base_ctx: &CommandContext,
++) -> Result<()> {
++    let ctx = base_ctx.with_target(&args.server)?;
++    run_bulk(Action::Approve, &args.runs, None, &ctx).await
++}
++
++pub(crate) async fn deny_command(args: &RunsDenyArgs, base_ctx: &CommandContext) -> Result<()> {
++    let ctx = base_ctx.with_target(&args.server)?;
++    run_bulk(Action::Deny, &args.runs, args.reason.clone(), &ctx).await
++}
++
++#[derive(Clone, Copy)]
++enum Action {
++    Approve,
++    Deny,
++}
++
++impl Action {
++    fn verb(self) -> &'static str {
++        match self {
++            Self::Approve => "approved",
++            Self::Deny => "denied",
++        }
++    }
++
++    fn failure_message(self) -> &'static str {
++        match self {
++            Self::Approve => "some runs could not be approved",
++            Self::Deny => "some runs could not be denied",
++        }
++    }
++
++    fn json_key(self) -> &'static str {
++        self.verb()
++    }
++}
++
++async fn run_bulk(
++    action: Action,
++    identifiers: &[String],
++    reason: Option<String>,
++    ctx: &CommandContext,
++) -> Result<()> {
++    let client = ctx.server().await?;
++    let client = client.as_ref();
++    let json = ctx.json_output();
++    let printer = ctx.printer();
++    let mut had_errors = false;
++    let mut changed = Vec::new();
++    let mut errors = Vec::new();
++
++    for identifier in identifiers {
++        let run = match client.resolve_run(identifier).await {
++            Ok(run) => run,
++            Err(err) => {
++                if !json {
++                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
++                }
++                errors.push(serde_json::json!({
++                    "identifier": identifier,
++                    "error": err.to_string(),
++                }));
++                had_errors = true;
++                continue;
++            }
++        };
++
++        let run_id = run.id;
++        let result = match action {
++            Action::Approve => client.approve_run(&run_id).await,
++            Action::Deny => client.deny_run(&run_id, reason.clone()).await,
++        };
++        match result {
++            Ok(_) => {
++                let run_id_string = run_id.to_string();
++                changed.push(run_id_string.clone());
++                if !json {
++                    fabro_util::printerr!(printer, "{}", short_run_id(&run_id_string));
++                }
++            }
++            Err(err) => {
++                if !json {
++                    fabro_util::printerr!(printer, "error: {identifier}: {err}");
++                }
++                errors.push(serde_json::json!({
++                    "identifier": identifier,
++                    "error": err.to_string(),
++                }));
++                had_errors = true;
++            }
++        }
++    }
++
++    if json {
++        let mut body = serde_json::Map::new();
++        body.insert(action.json_key().to_string(), serde_json::json!(changed));
++        body.insert("errors".to_string(), serde_json::json!(errors));
++        print_json_pretty(&serde_json::Value::Object(body))?;
++    }
++
++    if had_errors {
++        bail!(action.failure_message());
++    }
++    Ok(())
++}
+diff --git a/lib/crates/fabro-cli/src/commands/runs/mod.rs b/lib/crates/fabro-cli/src/commands/runs/mod.rs
+index 9e116dab0..eaa6d250c 100644
+--- a/lib/crates/fabro-cli/src/commands/runs/mod.rs
++++ b/lib/crates/fabro-cli/src/commands/runs/mod.rs
+@@ -4,6 +4,7 @@ use fabro_util::terminal::Styles;
+ use crate::args::RunsCommands;
+ use crate::command_context::CommandContext;
+ 
++pub(crate) mod approval;
+ pub(crate) mod archive;
+ pub(crate) mod inspect;
+ pub(crate) mod list;
+@@ -17,6 +18,8 @@ pub(crate) async fn dispatch(cmd: RunsCommands, base_ctx: &CommandContext) -> Re
+         }
+         RunsCommands::Rm(args) => rm::remove_command(&args, base_ctx).await,
+         RunsCommands::Inspect(args) => inspect::run(&args, base_ctx).await,
++        RunsCommands::Approve(args) => approval::approve_command(&args, base_ctx).await,
++        RunsCommands::Deny(args) => approval::deny_command(&args, base_ctx).await,
+         RunsCommands::Archive(args) => archive::archive_command(&args, base_ctx).await,
+         RunsCommands::Unarchive(args) => archive::unarchive_command(&args, base_ctx).await,
+     }
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/approve.rs b/lib/crates/fabro-cli/tests/it/cmd/approve.rs
+new file mode 100644
+index 000000000..a47e0754e
+--- /dev/null
++++ b/lib/crates/fabro-cli/tests/it/cmd/approve.rs
+@@ -0,0 +1,259 @@
++use fabro_test::{fabro_snapshot, test_context};
++use httpmock::MockServer;
++use serde_json::Value;
++
++use super::support::remote_run_summary_json;
++use crate::support::unique_run_id;
++
++fn ulid_filter() -> (String, String) {
++    (
++        r"\b[0-9A-HJKMNP-TV-Z]{12}\b".to_string(),
++        "[ULID]".to_string(),
++    )
++}
++
++fn error_body(detail: &str) -> serde_json::Value {
++    serde_json::json!({
++        "errors": [{
++            "status": "409",
++            "title": "Conflict",
++            "detail": detail,
++        }]
++    })
++}
++
++#[test]
++fn help() {
++    let context = test_context!();
++    let mut cmd = context.command();
++    cmd.args(["approve", "--help"]);
++    fabro_snapshot!(context.filters(), cmd, @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    Approve pending workflow runs
++
++    Usage: fabro approve [OPTIONS] <RUNS>...
++
++    Arguments:
++      <RUNS>...  Run IDs or workflow names to approve
++
++    Options:
++          --json              Output as JSON [env: FABRO_JSON=]
++          --server <SERVER>   Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
++          --debug             Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
++          --no-upgrade-check  Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
++          --quiet             Suppress non-essential output [env: FABRO_QUIET=]
++          --verbose           Enable verbose output [env: FABRO_VERBOSE=]
++      -h, --help              Print help
++    ----- stderr -----
++    ");
++}
++
++#[test]
++fn approve_requires_at_least_one_run() {
++    let context = test_context!();
++    let mut cmd = context.command();
++    cmd.args(["approve"]);
++    fabro_snapshot!(context.filters(), cmd, @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++    ----- stderr -----
++    error: the following required arguments were not provided:
++      <RUNS>...
++
++    Usage: fabro approve --no-upgrade-check <RUNS>...
++
++    For more information, try '--help'.
++    ");
++}
++
++#[test]
++fn approve_resolves_selector_posts_endpoint_and_prints_short_run_id() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let run_id = unique_run_id();
++    let resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly-build");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let approve = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{run_id}/approve"));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "runnable" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let mut filters = context.filters();
++    filters.push(ulid_filter());
++    let mut cmd = context.command();
++    cmd.args(["approve", "nightly-build"]);
++    fabro_snapshot!(filters, cmd, @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    ----- stderr -----
++    [ULID]
++    ");
++
++    resolve.assert();
++    approve.assert();
++}
++
++#[test]
++fn approve_json_success_shape() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let run_id = unique_run_id();
++    let resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly-build");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let approve = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{run_id}/approve"));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "runnable" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let output = context
++        .command()
++        .args(["--json", "approve", "nightly-build"])
++        .output()
++        .expect("approve --json should execute");
++
++    assert!(output.status.success());
++    let value: Value = serde_json::from_slice(&output.stdout).expect("approve JSON should parse");
++    assert_eq!(
++        value["approved"],
++        Value::Array(vec![Value::String(run_id.clone())])
++    );
++    assert_eq!(value["errors"], Value::Array(vec![]));
++    resolve.assert();
++    approve.assert();
++}
++
++#[test]
++fn approve_partial_error_attempts_remaining_runs_and_reports_json() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let stale_run = unique_run_id();
++    let good_run = unique_run_id();
++    let stale_resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "stale");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &stale_run,
++                "Stale",
++                "stale",
++                "Stale run",
++                &serde_json::json!({ "kind": "succeeded", "reason": "completed" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let good_resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &good_run,
++                "Nightly",
++                "nightly",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let stale_approve = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{stale_run}/approve"));
++        then.status(409)
++            .header("Content-Type", "application/json")
++            .json_body(error_body("Run is not pending approval."));
++    });
++    let good_approve = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{good_run}/approve"));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &good_run,
++                "Nightly",
++                "nightly",
++                "Nightly run",
++                &serde_json::json!({ "kind": "runnable" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let output = context
++        .command()
++        .args(["--json", "approve", "stale", "nightly"])
++        .output()
++        .expect("approve should execute");
++
++    assert!(!output.status.success(), "mixed batch should exit non-zero");
++    let value: Value = serde_json::from_slice(&output.stdout).expect("approve JSON should parse");
++    assert_eq!(
++        value["approved"],
++        Value::Array(vec![Value::String(good_run.clone())])
++    );
++    assert_eq!(value["errors"][0]["identifier"], "stale");
++    assert!(
++        value["errors"][0]["error"]
++            .as_str()
++            .is_some_and(|error| error.contains("Run is not pending approval")),
++        "{value}"
++    );
++    stale_resolve.assert();
++    good_resolve.assert();
++    stale_approve.assert();
++    good_approve.assert();
++}
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/deny.rs b/lib/crates/fabro-cli/tests/it/cmd/deny.rs
+new file mode 100644
+index 000000000..c9358c57d
+--- /dev/null
++++ b/lib/crates/fabro-cli/tests/it/cmd/deny.rs
+@@ -0,0 +1,324 @@
++use fabro_test::{fabro_snapshot, test_context};
++use httpmock::MockServer;
++use serde_json::Value;
++
++use super::support::remote_run_summary_json;
++use crate::support::unique_run_id;
++
++fn ulid_filter() -> (String, String) {
++    (
++        r"\b[0-9A-HJKMNP-TV-Z]{12}\b".to_string(),
++        "[ULID]".to_string(),
++    )
++}
++
++fn error_body(detail: &str) -> serde_json::Value {
++    serde_json::json!({
++        "errors": [{
++            "status": "409",
++            "title": "Conflict",
++            "detail": detail,
++        }]
++    })
++}
++
++#[test]
++fn help() {
++    let context = test_context!();
++    let mut cmd = context.command();
++    cmd.args(["deny", "--help"]);
++    fabro_snapshot!(context.filters(), cmd, @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    Deny pending workflow runs
++
++    Usage: fabro deny [OPTIONS] <RUNS>...
++
++    Arguments:
++      <RUNS>...  Run IDs or workflow names to deny
++
++    Options:
++          --json              Output as JSON [env: FABRO_JSON=]
++          --server <SERVER>   Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
++          --debug             Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
++          --reason <REASON>   Reason for denying execution
++          --no-upgrade-check  Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
++          --quiet             Suppress non-essential output [env: FABRO_QUIET=]
++          --verbose           Enable verbose output [env: FABRO_VERBOSE=]
++      -h, --help              Print help
++    ----- stderr -----
++    ");
++}
++
++#[test]
++fn deny_requires_at_least_one_run() {
++    let context = test_context!();
++    let mut cmd = context.command();
++    cmd.args(["deny"]);
++    fabro_snapshot!(context.filters(), cmd, @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++    ----- stderr -----
++    error: the following required arguments were not provided:
++      <RUNS>...
++
++    Usage: fabro deny --no-upgrade-check <RUNS>...
++
++    For more information, try '--help'.
++    ");
++}
++
++#[test]
++fn deny_resolves_selector_posts_endpoint_and_prints_short_run_id() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let run_id = unique_run_id();
++    let resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly-build");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let deny = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{run_id}/deny"))
++            .json_body(serde_json::json!({}));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "failed", "reason": "approval_denied" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let mut filters = context.filters();
++    filters.push(ulid_filter());
++    let mut cmd = context.command();
++    cmd.args(["deny", "nightly-build"]);
++    fabro_snapshot!(filters, cmd, @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    ----- stderr -----
++    [ULID]
++    ");
++
++    resolve.assert();
++    deny.assert();
++}
++
++#[test]
++fn deny_reason_sends_request_body() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let run_id = unique_run_id();
++    let resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly-build");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let deny = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{run_id}/deny"))
++            .json_body(serde_json::json!({ "reason": "Needs review" }));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "failed", "reason": "approval_denied" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let mut filters = context.filters();
++    filters.push(ulid_filter());
++    let mut cmd = context.command();
++    cmd.args(["deny", "--reason", "Needs review", "nightly-build"]);
++    fabro_snapshot!(filters, cmd, @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    ----- stderr -----
++    [ULID]
++    ");
++
++    resolve.assert();
++    deny.assert();
++}
++
++#[test]
++fn deny_json_success_shape() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let run_id = unique_run_id();
++    let resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly-build");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let deny = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{run_id}/deny"))
++            .json_body(serde_json::json!({}));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Nightly Build",
++                "nightly-build",
++                "Nightly run",
++                &serde_json::json!({ "kind": "failed", "reason": "approval_denied" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let output = context
++        .command()
++        .args(["--json", "deny", "nightly-build"])
++        .output()
++        .expect("deny --json should execute");
++
++    assert!(output.status.success());
++    let value: Value = serde_json::from_slice(&output.stdout).expect("deny JSON should parse");
++    assert_eq!(
++        value["denied"],
++        Value::Array(vec![Value::String(run_id.clone())])
++    );
++    assert_eq!(value["errors"], Value::Array(vec![]));
++    resolve.assert();
++    deny.assert();
++}
++
++#[test]
++fn deny_partial_error_attempts_remaining_runs_and_reports_json() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let stale_run = unique_run_id();
++    let good_run = unique_run_id();
++    let stale_resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "stale");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &stale_run,
++                "Stale",
++                "stale",
++                "Stale run",
++                &serde_json::json!({ "kind": "succeeded", "reason": "completed" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let good_resolve = server.mock(|when, then| {
++        when.method("GET")
++            .path("/api/v1/runs/resolve")
++            .query_param("selector", "nightly");
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &good_run,
++                "Nightly",
++                "nightly",
++                "Nightly run",
++                &serde_json::json!({ "kind": "pending", "reason": "approval_required" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let stale_deny = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{stale_run}/deny"))
++            .json_body(serde_json::json!({ "reason": "Needs review" }));
++        then.status(409)
++            .header("Content-Type", "application/json")
++            .json_body(error_body("Run is not pending approval."));
++    });
++    let good_deny = server.mock(|when, then| {
++        when.method("POST")
++            .path(format!("/api/v1/runs/{good_run}/deny"))
++            .json_body(serde_json::json!({ "reason": "Needs review" }));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &good_run,
++                "Nightly",
++                "nightly",
++                "Nightly run",
++                &serde_json::json!({ "kind": "failed", "reason": "approval_denied" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    context.set_http_target(&server.base_url());
++
++    let output = context
++        .command()
++        .args([
++            "--json",
++            "deny",
++            "--reason",
++            "Needs review",
++            "stale",
++            "nightly",
++        ])
++        .output()
++        .expect("deny should execute");
++
++    assert!(!output.status.success(), "mixed batch should exit non-zero");
++    let value: Value = serde_json::from_slice(&output.stdout).expect("deny JSON should parse");
++    assert_eq!(
++        value["denied"],
++        Value::Array(vec![Value::String(good_run.clone())])
++    );
++    assert_eq!(value["errors"][0]["identifier"], "stale");
++    assert!(
++        value["errors"][0]["error"]
++            .as_str()
++            .is_some_and(|error| error.contains("Run is not pending approval")),
++        "{value}"
++    );
++    stale_resolve.assert();
++    good_resolve.assert();
++    stale_deny.assert();
++    good_deny.assert();
++}
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/fabro.rs b/lib/crates/fabro-cli/tests/it/cmd/fabro.rs
+index e38f3cfb0..3fe9c2bf7 100644
+--- a/lib/crates/fabro-cli/tests/it/cmd/fabro.rs
++++ b/lib/crates/fabro-cli/tests/it/cmd/fabro.rs
+@@ -31,6 +31,8 @@ fn help() {
+       dump        Export a run's durable state to a directory
+       rm          Remove one or more workflow runs
+       inspect     Show detailed information about a workflow run
++      approve     Approve pending workflow runs
++      deny        Deny pending workflow runs
+       archive     Mark terminal runs as archived (reviewed, no further action needed). Archived runs are hidden from default listings
+       unarchive   Restore archived runs to their prior terminal status
+       model       List and test LLM models
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/mcp.rs b/lib/crates/fabro-cli/tests/it/cmd/mcp.rs
+index 7f75f94bc..dc1052ac0 100644
+--- a/lib/crates/fabro-cli/tests/it/cmd/mcp.rs
++++ b/lib/crates/fabro-cli/tests/it/cmd/mcp.rs
+@@ -468,6 +468,19 @@ async fn stdio_server_initializes_and_lists_run_tools() {
+             .is_some_and(serde_json::Value::is_object),
+         "fabro_run_interact.answer should have an object JSON Schema: {interact_schema}"
+     );
++    assert!(
++        interact_schema
++            .pointer("/properties/reason")
++            .is_some_and(serde_json::Value::is_object),
++        "fabro_run_interact.reason should have an object JSON Schema: {interact_schema}"
++    );
++    let interact_schema_text = interact_schema.to_string();
++    for action in ["approve", "deny"] {
++        assert!(
++            interact_schema_text.contains(&format!("\"{action}\"")),
++            "fabro_run_interact schema should expose action {action}: {interact_schema}"
++        );
++    }
+     let get_schema = tools
+         .iter()
+         .find(|(name, _, _)| name == "fabro_run_get")
+@@ -1490,6 +1503,79 @@ async fn mcp_interact_actions_resolve_selector_and_call_expected_endpoints() {
+         .expect("MCP client should shut down");
+ }
+ 
++#[tokio::test(flavor = "multi_thread")]
++async fn mcp_interact_approval_actions_resolve_selector_and_call_expected_endpoints() {
++    let context = test_context!();
++    let server = MockServer::start();
++    let target_url = format!("{}/api/v1", server.base_url());
++    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
++    seed_dev_token_auth(&context.home_dir, &target, TEST_DEV_TOKEN);
++    let run_id = unique_run_id();
++    let selector = "nightly";
++    let resolve = mock_resolved_run(&server, selector, &run_id);
++    let approve = server.mock(|when, then| {
++        when.method(POST)
++            .path(format!("/api/v1/runs/{run_id}/approve"));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Simple",
++                "simple",
++                "Run tests",
++                &serde_json::json!({ "kind": "runnable" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++    let deny = server.mock(|when, then| {
++        when.method(POST)
++            .path(format!("/api/v1/runs/{run_id}/deny"))
++            .json_body(serde_json::json!({
++                "reason": "Not approved for execution"
++            }));
++        then.status(200)
++            .header("Content-Type", "application/json")
++            .json_body(remote_run_summary_json(
++                &run_id,
++                "Simple",
++                "simple",
++                "Run tests",
++                &serde_json::json!({ "kind": "failed", "reason": "approval_denied" }),
++                "2026-04-05T12:00:00Z",
++            ));
++    });
++
++    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
++    let approved = call_tool_json(
++        &client,
++        "fabro_run_interact",
++        serde_json::json!({ "run_id": selector, "action": "approve" }),
++    )
++    .await;
++    let denied = call_tool_json(
++        &client,
++        "fabro_run_interact",
++        serde_json::json!({
++            "run_id": selector,
++            "action": "deny",
++            "reason": "Not approved for execution"
++        }),
++    )
++    .await;
++
++    assert_eq!(approved["result"]["summary"]["run_id"], run_id);
++    assert_eq!(approved["result"]["summary"]["status"], "runnable");
++    assert_eq!(denied["result"]["summary"]["run_id"], run_id);
++    assert_eq!(denied["result"]["summary"]["status"], "failed");
++    resolve.assert_calls(2);
++    approve.assert();
++    deny.assert();
++    client
++        .shutdown()
++        .await
++        .expect("MCP client should shut down");
++}
++
+ #[tokio::test(flavor = "multi_thread")]
+ async fn mcp_get_resolves_selector_and_returns_summary_projection_and_questions() {
+     let context = test_context!();
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/mod.rs b/lib/crates/fabro-cli/tests/it/cmd/mod.rs
+index 79adb52e8..fbd02b92d 100644
+--- a/lib/crates/fabro-cli/tests/it/cmd/mod.rs
++++ b/lib/crates/fabro-cli/tests/it/cmd/mod.rs
+@@ -1,3 +1,4 @@
++mod approve;
+ mod archive;
+ mod artifact_cp;
+ mod artifact_list;
+@@ -6,6 +7,7 @@ mod auth;
+ mod cli_reference;
+ mod config;
+ mod create;
++mod deny;
+ mod diff;
+ mod discord;
+ mod docs;
+diff --git a/lib/crates/fabro-client/src/client.rs b/lib/crates/fabro-client/src/client.rs
+index cb741c731..74b11244f 100644
+--- a/lib/crates/fabro-client/src/client.rs
++++ b/lib/crates/fabro-client/src/client.rs
+@@ -924,6 +924,35 @@ impl Client {
+         convert_type(response.into_inner())
+     }
+ 
++    pub async fn approve_run(&self, run_id: &RunId) -> Result<Run> {
++        let response = self
++            .send_api(
++                |client| async move { client.approve_run().id(run_id.to_string()).send().await },
++            )
++            .await?;
++        convert_type(response.into_inner())
++    }
++
++    pub async fn deny_run(&self, run_id: &RunId, reason: Option<String>) -> Result<Run> {
++        let body = types::DenyRunRequest {
++            reason: normalize_optional_text(reason.as_deref()),
++        };
++        let response = self
++            .send_api(|client| {
++                let body = body.clone();
++                async move {
++                    client
++                        .deny_run()
++                        .id(run_id.to_string())
++                        .body(body)
++                        .send()
++                        .await
++                }
++            })
++            .await?;
++        convert_type(response.into_inner())
++    }
++
+     pub async fn interrupt_run(&self, run_id: &RunId) -> Result<()> {
+         self.send_api(|client| async move {
+             client.interrupt_run().id(run_id.to_string()).send().await
+@@ -1978,6 +2007,13 @@ fn non_zero_u64_from_u32(value: u32) -> Option<NonZeroU64> {
+     NonZeroU64::new(u64::from(value))
+ }
+ 
++fn normalize_optional_text(value: Option<&str>) -> Option<String> {
++    value
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .map(ToString::to_string)
++}
++
+ fn non_zero_u64_from_usize(value: usize) -> Option<NonZeroU64> {
+     u64::try_from(value).ok().and_then(NonZeroU64::new)
+ }
+diff --git a/lib/crates/fabro-mcp-server/src/server.rs b/lib/crates/fabro-mcp-server/src/server.rs
+index 2cdd15bc4..c1b932308 100644
+--- a/lib/crates/fabro-mcp-server/src/server.rs
++++ b/lib/crates/fabro-mcp-server/src/server.rs
+@@ -118,7 +118,7 @@ impl FabroMcpServer {
+ 
+     #[tool(
+         name = "fabro_run_interact",
+-        description = "Control a Fabro run: start, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. Use fabro_run_get for read-only inspection."
++        description = "Control a Fabro run: start, approve, deny, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. Use fabro_run_get for read-only inspection."
+     )]
+     async fn fabro_run_interact(
+         &self,
+diff --git a/lib/crates/fabro-server/src/server/tests.rs b/lib/crates/fabro-server/src/server/tests.rs
+index f343b0fb4..5914bd2c7 100644
+--- a/lib/crates/fabro-server/src/server/tests.rs
++++ b/lib/crates/fabro-server/src/server/tests.rs
+@@ -8730,6 +8730,7 @@ async fn run_tools_worker_cannot_call_user_only_non_mcp_routes() {
+ 
+     for (method, path) in [
+         (Method::POST, format!("/runs/{target_run_id}/approve")),
++        (Method::POST, format!("/runs/{target_run_id}/deny")),
+         (Method::GET, format!("/runs/{target_run_id}/timeline")),
+     ] {
+         let response = app
+diff --git a/lib/crates/fabro-tool/src/common.rs b/lib/crates/fabro-tool/src/common.rs
+index 8650a4e8f..9dd64599a 100644
+--- a/lib/crates/fabro-tool/src/common.rs
++++ b/lib/crates/fabro-tool/src/common.rs
+@@ -59,6 +59,8 @@ pub trait FabroToolBackend: Send + Sync {
+     async fn resolve_run(&self, selector: &str) -> anyhow::Result<Run>;
+     async fn retrieve_run(&self, run_id: &RunId) -> anyhow::Result<Run>;
+     async fn start_run(&self, run_id: &RunId, resume: bool) -> anyhow::Result<Run>;
++    async fn approve_run(&self, run_id: &RunId) -> anyhow::Result<Run>;
++    async fn deny_run(&self, run_id: &RunId, reason: Option<String>) -> anyhow::Result<Run>;
+     async fn cancel_run(&self, run_id: &RunId) -> anyhow::Result<Run>;
+     async fn interrupt_run(&self, run_id: &RunId) -> anyhow::Result<()>;
+     async fn steer_run(&self, run_id: &RunId, text: String, interrupt: bool) -> anyhow::Result<()>;
+@@ -192,7 +194,7 @@ static TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
+         ),
+         tool_definition::<crate::FabroRunInteractParams>(
+             FABRO_RUN_INTERACT_TOOL_NAME,
+-            "Control a Fabro run: start, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. Use fabro_run_get for read-only inspection.",
++            "Control a Fabro run: start, approve, deny, message, interrupt, cancel, archive, unarchive, link or unlink a parent, inspect or answer questions. Use fabro_run_get for read-only inspection.",
+         ),
+         tool_definition::<crate::FabroRunGatherParams>(
+             FABRO_RUN_GATHER_TOOL_NAME,
+@@ -365,6 +367,34 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn interact_tool_definition_exposes_approval_schema() {
++        let definition = tool_definitions()
++            .iter()
++            .find(|definition| definition.name == FABRO_RUN_INTERACT_TOOL_NAME)
++            .expect("interact tool should be in the shared catalog");
++        let schema = &definition.parameters;
++        let schema_text = schema.to_string();
++
++        assert!(
++            definition.description.contains("approve") && definition.description.contains("deny"),
++            "interact description should include approval actions: {}",
++            definition.description
++        );
++        for field in ["action", "run_id", "reason"] {
++            assert!(
++                schema.pointer(&format!("/properties/{field}")).is_some(),
++                "interact schema should expose {field}: {schema}"
++            );
++        }
++        for action in ["approve", "deny"] {
++            assert!(
++                schema_text.contains(&format!("\"{action}\"")),
++                "interact schema should expose action {action}: {schema}"
++            );
++        }
++    }
++
+     #[test]
+     fn run_summary_result_includes_parent_metadata() {
+         let parent_id = run_id("01KRBZW4DW0000000000000002");
+diff --git a/lib/crates/fabro-tool/src/create.rs b/lib/crates/fabro-tool/src/create.rs
+index 4d0b57762..8488f8f0b 100644
+--- a/lib/crates/fabro-tool/src/create.rs
++++ b/lib/crates/fabro-tool/src/create.rs
+@@ -985,6 +985,14 @@ mod tests {
+             ))
+         }
+ 
++        async fn approve_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn deny_run(&self, _run_id: &RunId, _reason: Option<String>) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
+         async fn cancel_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
+             unreachable!()
+         }
+diff --git a/lib/crates/fabro-tool/src/fabro_client.rs b/lib/crates/fabro-tool/src/fabro_client.rs
+index 4f994c5ef..59b935a85 100644
+--- a/lib/crates/fabro-tool/src/fabro_client.rs
++++ b/lib/crates/fabro-tool/src/fabro_client.rs
+@@ -102,6 +102,16 @@ impl FabroToolBackend for ClientBackend {
+         self.client.start_run(run_id, resume).await
+     }
+ 
++    async fn approve_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
++        self.client.approve_run(run_id).await
++    }
++
++    async fn deny_run(&self, run_id: &RunId, reason: Option<String>) -> anyhow::Result<Run> {
++        self.ensure_run_scope(run_id)?;
++        self.client.deny_run(run_id, reason).await
++    }
++
+     async fn cancel_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
+         self.ensure_run_scope(run_id)?;
+         self.client.cancel_run(run_id).await
+diff --git a/lib/crates/fabro-tool/src/interact.rs b/lib/crates/fabro-tool/src/interact.rs
+index 79606ac8d..713721063 100644
+--- a/lib/crates/fabro-tool/src/interact.rs
++++ b/lib/crates/fabro-tool/src/interact.rs
+@@ -15,6 +15,8 @@ use super::common::{FabroToolBackend, ToolError, ToolResult};
+ pub enum RunInteractAction {
+     Get,
+     Start,
++    Approve,
++    Deny,
+     Message,
+     /// Cancel the active steerable agent's current round and park it
+     /// waiting for a later `message`. The run sits idle until you follow up
+@@ -35,6 +37,7 @@ pub struct FabroRunInteractParams {
+     pub action:      RunInteractAction,
+     pub run_id:      String,
+     pub parent_id:   Option<String>,
++    pub reason:      Option<String>,
+     pub message:     Option<String>,
+     pub interrupt:   Option<bool>,
+     pub question_id: Option<String>,
+@@ -114,6 +117,10 @@ pub struct ValidatedInteractRun {
+ pub enum ValidatedInteractAction {
+     Get,
+     Start,
++    Approve,
++    Deny {
++        reason: Option<String>,
++    },
+     Message {
+         message:   String,
+         interrupt: bool,
+@@ -138,6 +145,8 @@ impl ValidatedInteractAction {
+         match self {
+             Self::Get => RunInteractAction::Get,
+             Self::Start => RunInteractAction::Start,
++            Self::Approve => RunInteractAction::Approve,
++            Self::Deny { .. } => RunInteractAction::Deny,
+             Self::Message { .. } => RunInteractAction::Message,
+             Self::Interrupt => RunInteractAction::Interrupt,
+             Self::Cancel => RunInteractAction::Cancel,
+@@ -158,9 +167,15 @@ impl TryFrom<FabroRunInteractParams> for ValidatedInteractRun {
+         if params.run_id.trim().is_empty() {
+             return Err(ToolError::message("run_id is required"));
+         }
++        let reason = normalize_optional_text(params.reason.as_deref());
++        if !matches!(params.action, RunInteractAction::Deny) && reason.is_some() {
++            return Err(ToolError::message("reason is only valid for action deny"));
++        }
+         let action = match params.action {
+             RunInteractAction::Get => ValidatedInteractAction::Get,
+             RunInteractAction::Start => ValidatedInteractAction::Start,
++            RunInteractAction::Approve => ValidatedInteractAction::Approve,
++            RunInteractAction::Deny => ValidatedInteractAction::Deny { reason },
+             RunInteractAction::Message => {
+                 let Some(message) = params
+                     .message
+@@ -249,6 +264,20 @@ pub async fn interact_run(
+                 .map_err(|err| ToolError::from_anyhow(&err))?;
+             json!({ "summary": common::run_summary_result(&summary) })
+         }
++        ValidatedInteractAction::Approve => {
++            let summary = backend
++                .approve_run(&run_id)
++                .await
++                .map_err(|err| ToolError::from_anyhow(&err))?;
++            json!({ "summary": common::run_summary_result(&summary) })
++        }
++        ValidatedInteractAction::Deny { reason } => {
++            let summary = backend
++                .deny_run(&run_id, reason)
++                .await
++                .map_err(|err| ToolError::from_anyhow(&err))?;
++            json!({ "summary": common::run_summary_result(&summary) })
++        }
+         ValidatedInteractAction::Message { message, interrupt } => {
+             backend
+                 .steer_run(&run_id, message.clone(), interrupt)
+@@ -401,12 +430,42 @@ fn text_answer_request(text: String) -> types::SubmitAnswerRequest {
+     .into()
+ }
+ 
++fn normalize_optional_text(value: Option<&str>) -> Option<String> {
++    value
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .map(ToString::to_string)
++}
++
+ #[cfg(test)]
+ mod tests {
++    use std::collections::HashMap;
++    use std::path::Path;
++    use std::sync::{Arc, Mutex};
++
++    use async_trait::async_trait;
++    use chrono::{TimeZone, Utc};
++    use fabro_types::{
++        EventEnvelope, FailureReason, Run, RunId, RunLifecycle, RunLinks, RunOrigin, RunProjection,
++        RunStatus, RunTimestamps, WorkflowRef,
++    };
+     use serde_json::json;
+ 
+     use super::*;
+ 
++    fn interact_params(action: RunInteractAction) -> FabroRunInteractParams {
++        FabroRunInteractParams {
++            action,
++            run_id: "run_123".to_string(),
++            parent_id: None,
++            message: None,
++            interrupt: None,
++            question_id: None,
++            answer: None,
++            reason: None,
++        }
++    }
++
+     #[test]
+     fn answer_payloads_map_to_submit_answer_wire_json() {
+         let cases = [
+@@ -450,6 +509,7 @@ mod tests {
+             interrupt:   None,
+             question_id: Some("question-1".to_string()),
+             answer:      Some(json!({ "value": "yes" }).into()),
++            reason:      None,
+         })
+         .unwrap_err();
+ 
+@@ -467,6 +527,7 @@ mod tests {
+                 interrupt: None,
+                 question_id: None,
+                 answer: None,
++                reason: None,
+             })
+             .unwrap_err();
+ 
+@@ -489,6 +550,7 @@ mod tests {
+             interrupt:   None,
+             question_id: None,
+             answer:      None,
++            reason:      None,
+         })
+         .expect("unlink_parent should not require parent_id");
+ 
+@@ -509,6 +571,7 @@ mod tests {
+             interrupt:   None,
+             question_id: None,
+             answer:      None,
++            reason:      None,
+         })
+         .expect("interrupt should validate with only run_id");
+ 
+@@ -518,4 +581,279 @@ mod tests {
+             ValidatedInteractAction::Interrupt
+         ));
+     }
++
++    #[test]
++    fn approve_action_requires_only_run_id() {
++        let validated = ValidatedInteractRun::try_from(interact_params(RunInteractAction::Approve))
++            .expect("approve should validate with only run_id");
++
++        assert_eq!(validated.run_id, "run_123");
++        assert!(matches!(validated.action, ValidatedInteractAction::Approve));
++    }
++
++    #[test]
++    fn deny_action_normalizes_optional_reason() {
++        for (raw_reason, expected) in [
++            (None, None),
++            (
++                Some("  Needs review  ".to_string()),
++                Some("Needs review".to_string()),
++            ),
++            (Some("   ".to_string()), None),
++        ] {
++            let mut params = interact_params(RunInteractAction::Deny);
++            params.reason = raw_reason;
++
++            let validated =
++                ValidatedInteractRun::try_from(params).expect("deny should validate reason");
++
++            match validated.action {
++                ValidatedInteractAction::Deny { reason } => assert_eq!(reason, expected),
++                other => panic!("expected deny action, got {other:?}"),
++            }
++        }
++    }
++
++    #[test]
++    fn nonblank_reason_is_rejected_for_non_deny_actions() {
++        let mut params = interact_params(RunInteractAction::Approve);
++        params.reason = Some("because".to_string());
++
++        let err = ValidatedInteractRun::try_from(params).unwrap_err();
++
++        assert!(err.as_str().contains("reason"));
++        assert!(err.as_str().contains("deny"));
++    }
++
++    #[tokio::test]
++    async fn approve_dispatches_to_backend_and_returns_summary() {
++        let run_id = run_id("01KRBZW5C00000000000000001");
++        let backend = Arc::new(MockInteractBackend::new(run_id));
++
++        let result = interact_run(backend.clone(), ValidatedInteractRun {
++            run_id: "nightly".to_string(),
++            action: ValidatedInteractAction::Approve,
++        })
++        .await
++        .expect("approve should dispatch");
++
++        assert!(matches!(result.action, RunInteractAction::Approve));
++        assert_eq!(result.result["summary"]["run_id"], run_id.to_string());
++        assert_eq!(backend.approved.lock().unwrap().as_slice(), &[run_id]);
++    }
++
++    #[tokio::test]
++    async fn deny_dispatches_to_backend_with_reason_and_returns_summary() {
++        let run_id = run_id("01KRBZW5C00000000000000001");
++        let backend = Arc::new(MockInteractBackend::new(run_id));
++
++        let result = interact_run(backend.clone(), ValidatedInteractRun {
++            run_id: "nightly".to_string(),
++            action: ValidatedInteractAction::Deny {
++                reason: Some("Needs review".to_string()),
++            },
++        })
++        .await
++        .expect("deny should dispatch");
++
++        assert!(matches!(result.action, RunInteractAction::Deny));
++        assert_eq!(result.result["summary"]["run_id"], run_id.to_string());
++        assert_eq!(backend.denied.lock().unwrap().as_slice(), &[(
++            run_id,
++            Some("Needs review".to_string())
++        )]);
++    }
++
++    fn run_id(raw: &str) -> RunId {
++        raw.parse().expect("test run id should parse")
++    }
++
++    fn run_with_status(run_id: RunId, status: RunStatus) -> Run {
++        Run {
++            id:               run_id,
++            parent_id:        None,
++            children_count:   0,
++            title:            "Test run".to_string(),
++            goal:             "Test run".to_string(),
++            workflow:         WorkflowRef {
++                slug:       Some("simple".to_string()),
++                name:       Some("Simple".to_string()),
++                graph_name: None,
++                node_count: 0,
++                edge_count: 0,
++            },
++            automation:       None,
++            repository:       None,
++            created_by:       None,
++            origin:           RunOrigin::default(),
++            labels:           HashMap::new(),
++            lifecycle:        RunLifecycle {
++                status,
++                approval: None,
++                pending_control: None,
++                queue_position: None,
++                error: None,
++                archived: false,
++                archived_at: None,
++            },
++            sandbox:          None,
++            models:           Vec::new(),
++            source_directory: None,
++            timestamps:       RunTimestamps {
++                created_at:    Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap(),
++                started_at:    None,
++                last_event_at: None,
++                completed_at:  None,
++            },
++            timing:           None,
++            billing:          None,
++            size:             fabro_types::RunSize::default(),
++            ask_fabro:        fabro_types::AskFabro::default(),
++            diff:             None,
++            pull_request:     None,
++            current_question: None,
++            superseded_by:    None,
++            retried_from:     None,
++            links:            RunLinks { web: None },
++        }
++    }
++
++    struct MockInteractBackend {
++        run_id:   RunId,
++        approved: Mutex<Vec<RunId>>,
++        denied:   Mutex<Vec<(RunId, Option<String>)>>,
++    }
++
++    impl MockInteractBackend {
++        fn new(run_id: RunId) -> Self {
++            Self {
++                run_id,
++                approved: Mutex::new(Vec::new()),
++                denied: Mutex::new(Vec::new()),
++            }
++        }
++    }
++
++    #[async_trait]
++    impl FabroToolBackend for MockInteractBackend {
++        async fn create_run_from_spec(
++            &self,
++            _spec: &crate::ValidatedCreateRunSpec,
++            _cwd: &Path,
++            _user_settings_path: &Path,
++            _parent_id: Option<RunId>,
++        ) -> anyhow::Result<RunId> {
++            unreachable!()
++        }
++
++        async fn resolve_run(&self, selector: &str) -> anyhow::Result<Run> {
++            assert_eq!(selector, "nightly");
++            Ok(run_with_status(self.run_id, RunStatus::Pending {
++                reason: fabro_types::PendingReason::ApprovalRequired,
++            }))
++        }
++
++        async fn retrieve_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn start_run(&self, _run_id: &RunId, _resume: bool) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn approve_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++            self.approved.lock().unwrap().push(*run_id);
++            Ok(run_with_status(*run_id, RunStatus::Runnable))
++        }
++
++        async fn deny_run(&self, run_id: &RunId, reason: Option<String>) -> anyhow::Result<Run> {
++            self.denied.lock().unwrap().push((*run_id, reason));
++            Ok(run_with_status(*run_id, RunStatus::Failed {
++                reason: FailureReason::ApprovalDenied,
++            }))
++        }
++
++        async fn cancel_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn interrupt_run(&self, _run_id: &RunId) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        async fn steer_run(
++            &self,
++            _run_id: &RunId,
++            _text: String,
++            _interrupt: bool,
++        ) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        async fn archive_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn unarchive_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn list_store_runs(&self) -> anyhow::Result<Vec<Run>> {
++            unreachable!()
++        }
++
++        async fn list_store_runs_by_parent(&self, _parent_id: RunId) -> anyhow::Result<Vec<Run>> {
++            unreachable!()
++        }
++
++        async fn link_run_parent(
++            &self,
++            _child_id: &RunId,
++            _parent_id: &RunId,
++        ) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn unlink_run_parent(&self, _child_id: &RunId) -> anyhow::Result<Run> {
++            unreachable!()
++        }
++
++        async fn get_run_state(&self, _run_id: &RunId) -> anyhow::Result<RunProjection> {
++            unreachable!()
++        }
++
++        async fn list_run_events(
++            &self,
++            _run_id: &RunId,
++            _after: Option<u32>,
++            _limit: Option<usize>,
++        ) -> anyhow::Result<Vec<EventEnvelope>> {
++            unreachable!()
++        }
++
++        async fn list_run_events_until(
++            &self,
++            _run_id: &RunId,
++            _after: Option<u32>,
++            _limit: usize,
++        ) -> anyhow::Result<Vec<EventEnvelope>> {
++            unreachable!()
++        }
++
++        async fn list_run_questions(
++            &self,
++            _run_id: &RunId,
++        ) -> anyhow::Result<Vec<types::ApiQuestion>> {
++            unreachable!()
++        }
++
++        async fn submit_run_answer(
++            &self,
++            _run_id: &RunId,
++            _question_id: &str,
++            _body: types::SubmitAnswerRequest,
++        ) -> anyhow::Result<()> {
++            unreachable!()
++        }
++    }
+ }
+diff --git a/lib/crates/fabro-workflow/src/handler/llm/api.rs b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+index f0267ec86..92e8e8092 100644
+--- a/lib/crates/fabro-workflow/src/handler/llm/api.rs
++++ b/lib/crates/fabro-workflow/src/handler/llm/api.rs
+@@ -287,11 +287,17 @@ async fn execute_fabro_run_tool(
+         }
+         fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME => {
+             let params = parse_fabro_tool_args::<fabro_tool::FabroRunInteractParams>(name, args)?;
+-            let result = fabro_tool::interact_run(
+-                Arc::clone(&services.backend),
+-                fabro_tool::ValidatedInteractRun::try_from(params)?,
+-            )
+-            .await?;
++            let validated = fabro_tool::ValidatedInteractRun::try_from(params)?;
++            if matches!(
++                validated.action,
++                fabro_tool::ValidatedInteractAction::Approve
++                    | fabro_tool::ValidatedInteractAction::Deny { .. }
++            ) {
++                return Err(fabro_tool::ToolError::message(
++                    "Run approval must be performed by a user through the API, CLI, web UI, or human MCP server.",
++                ));
++            }
++            let result = fabro_tool::interact_run(Arc::clone(&services.backend), validated).await?;
+             let summary = fabro_tool::interact_run_text(&result);
+             render_fabro_tool_result(&summary, &result)
+         }
+@@ -1539,8 +1545,8 @@ mod tests {
+     use fabro_llm::{Error as LlmError, ProviderErrorDetail, ProviderErrorKind};
+     use fabro_tool::FabroToolBackend;
+     use fabro_types::{
+-        EventEnvelope, Run, RunId, RunLifecycle, RunLinks, RunOrigin, RunPairStatusResponse,
+-        RunProjection, RunStatus, RunTimestamps, SuccessReason, WorkflowRef,
++        EventEnvelope, FailureReason, Run, RunId, RunLifecycle, RunLinks, RunOrigin,
++        RunPairStatusResponse, RunProjection, RunStatus, RunTimestamps, SuccessReason, WorkflowRef,
+     };
+     use fabro_vault::{SecretType, Vault};
+     use futures::stream;
+@@ -1947,6 +1953,38 @@ reasoning = false
+         ]);
+     }
+ 
++    #[tokio::test]
++    async fn agent_run_interact_rejects_approval_actions_before_backend_dispatch() {
++        for action in ["approve", "deny"] {
++            let (services, backend) = fabro_run_tool_services();
++            let mut registry = ToolRegistry::new();
++            register_fabro_run_tools(&mut registry, &services);
++            let tool = registry
++                .get(fabro_tool::FABRO_RUN_INTERACT_TOOL_NAME)
++                .expect("interact tool should be registered");
++
++            let err = (tool.executor)(
++                serde_json::json!({
++                    "run_id": child_run_id().to_string(),
++                    "action": action
++                }),
++                tool_context(),
++            )
++            .await
++            .expect_err("workflow agents must not approve or deny runs");
++
++            assert!(err.contains("must be performed by a user"), "{err}");
++            assert!(
++                backend.approved_run_ids.lock().unwrap().is_empty(),
++                "approve backend should not be called for {action}"
++            );
++            assert!(
++                backend.denied_run_ids.lock().unwrap().is_empty(),
++                "deny backend should not be called for {action}"
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn agent_run_pair_dispatches_to_shared_backend() {
+         let (services, backend) = fabro_run_tool_services();
+@@ -1978,6 +2016,8 @@ reasoning = false
+             child_id:            child_run_id(),
+             created_parent_ids:  Mutex::new(Vec::new()),
+             started_run_ids:     Mutex::new(Vec::new()),
++            approved_run_ids:    Mutex::new(Vec::new()),
++            denied_run_ids:      Mutex::new(Vec::new()),
+             pair_status_run_ids: Mutex::new(Vec::new()),
+         });
+         let services = FabroRunToolServices {
+@@ -2078,6 +2118,8 @@ reasoning = false
+         child_id:            RunId,
+         created_parent_ids:  Mutex<Vec<Option<RunId>>>,
+         started_run_ids:     Mutex<Vec<RunId>>,
++        approved_run_ids:    Mutex<Vec<RunId>>,
++        denied_run_ids:      Mutex<Vec<RunId>>,
+         pair_status_run_ids: Mutex<Vec<RunId>>,
+     }
+ 
+@@ -2118,6 +2160,28 @@ reasoning = false
+             ))
+         }
+ 
++        async fn approve_run(&self, run_id: &RunId) -> anyhow::Result<Run> {
++            self.approved_run_ids.lock().unwrap().push(*run_id);
++            Ok(run_with_status(
++                *run_id,
++                Some(current_run_id()),
++                0,
++                RunStatus::Runnable,
++            ))
++        }
++
++        async fn deny_run(&self, run_id: &RunId, _reason: Option<String>) -> anyhow::Result<Run> {
++            self.denied_run_ids.lock().unwrap().push(*run_id);
++            Ok(run_with_status(
++                *run_id,
++                Some(current_run_id()),
++                0,
++                RunStatus::Failed {
++                    reason: FailureReason::ApprovalDenied,
++                },
++            ))
++        }
++
+         async fn cancel_run(&self, _run_id: &RunId) -> anyhow::Result<Run> {
+             unreachable!()
+         }
