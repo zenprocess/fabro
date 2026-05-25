@@ -1,0 +1,1 @@
+Fixed. The failure was unrelated snapshot drift from the upstream commit "Use Codex-safe OpenAI context windows" — the displayed context window for `gpt-5.3-codex` changed from `1m` to `272k`. I updated the inline snapshot in `lib/crates/fabro-cli/tests/it/cmd/model.rs:118` accordingly. All 23 `cmd::model*` tests now pass.
