@@ -1,0 +1,773 @@
+diff --git a/lib/crates/fabro-agent/src/subagent.rs b/lib/crates/fabro-agent/src/subagent.rs
+index 0c68694c4..52cec77c6 100644
+--- a/lib/crates/fabro-agent/src/subagent.rs
++++ b/lib/crates/fabro-agent/src/subagent.rs
+@@ -234,7 +234,7 @@ impl SubAgentManager {
+ 
+         match &agent.status {
+             SubAgentStatus::Finished(result) => result.clone(),
+-            _ => unreachable!(),
++            _ => unreachable!("agent status was just assigned to Finished on the line above"),
+         }
+     }
+ 
+diff --git a/lib/crates/fabro-cli/src/commands/run/wait.rs b/lib/crates/fabro-cli/src/commands/run/wait.rs
+index 6ef61c4ee..69931d337 100644
+--- a/lib/crates/fabro-cli/src/commands/run/wait.rs
++++ b/lib/crates/fabro-cli/src/commands/run/wait.rs
+@@ -107,7 +107,7 @@ fn print_human_output(
+         RunStatus::Failed { .. } => (&styles.bold_red, "Failed"),
+         RunStatus::Dead => (&styles.bold_red, "Dead"),
+         // Poll loop only breaks on is_terminal() which is the three arms above.
+-        _ => unreachable!(),
++        _ => unreachable!("print_human_output is only called after is_terminal(), which returns true only for Succeeded, Failed, and Dead"),
+     };
+     let status_display = style.apply_to(label);
+ 
+diff --git a/lib/crates/fabro-core/src/context.rs b/lib/crates/fabro-core/src/context.rs
+index 01761c2d9..99c9bd269 100644
+--- a/lib/crates/fabro-core/src/context.rs
++++ b/lib/crates/fabro-core/src/context.rs
+@@ -20,11 +20,18 @@ impl Context {
+     }
+ 
+     pub fn set(&self, key: impl Into<String>, value: Value) {
+-        self.values.write().unwrap().insert(key.into(), value);
++        self.values
++            .write()
++            .expect("context RwLock should not be poisoned: no code panics while holding this lock")
++            .insert(key.into(), value);
+     }
+ 
+     pub fn get(&self, key: &str) -> Option<Value> {
+-        self.values.read().unwrap().get(key).cloned()
++        self.values
++            .read()
++            .expect("context RwLock should not be poisoned: no code panics while holding this lock")
++            .get(key)
++            .cloned()
+     }
+ 
+     pub fn get_string(&self, key: &str, default: &str) -> String {
+@@ -34,14 +41,20 @@ impl Context {
+     }
+ 
+     pub fn apply_updates(&self, updates: &HashMap<String, Value>) {
+-        let mut values = self.values.write().unwrap();
++        let mut values = self
++            .values
++            .write()
++            .expect("context RwLock should not be poisoned: no code panics while holding this lock");
+         for (k, v) in updates {
+             values.insert(k.clone(), v.clone());
+         }
+     }
+ 
+     pub fn snapshot(&self) -> HashMap<String, Value> {
+-        self.values.read().unwrap().clone()
++        self.values
++            .read()
++            .expect("context RwLock should not be poisoned: no code panics while holding this lock")
++            .clone()
+     }
+ 
+     /// Deep copy for parallel branch isolation.
+diff --git a/lib/crates/fabro-llm/src/providers/openai_compatible.rs b/lib/crates/fabro-llm/src/providers/openai_compatible.rs
+index 4aeb94768..ba66d3e70 100644
+--- a/lib/crates/fabro-llm/src/providers/openai_compatible.rs
++++ b/lib/crates/fabro-llm/src/providers/openai_compatible.rs
+@@ -301,7 +301,7 @@ fn translate_messages(messages: &[Message]) -> Vec<ChatMessage> {
+                 Role::System | Role::Developer => "system",
+                 Role::User => "user",
+                 Role::Assistant => "assistant",
+-                Role::Tool => unreachable!(),
++                Role::Tool => unreachable!("Role::Tool is handled in the early-return branch above this match"),
+             };
+ 
+             let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+diff --git a/lib/crates/fabro-llm/src/tools.rs b/lib/crates/fabro-llm/src/tools.rs
+index 6f64faed9..30bf382c4 100644
+--- a/lib/crates/fabro-llm/src/tools.rs
++++ b/lib/crates/fabro-llm/src/tools.rs
+@@ -39,10 +39,12 @@ impl Tool {
+     /// # Panics
+     ///
+     /// Panics if the tool name is invalid (see [`validate_tool_name`]).
++    /// Tool names are always hardcoded string literals in this codebase; this
++    /// guards against programming errors where a constant would fail validation.
+     #[must_use]
+     pub fn passive(name: &str, description: &str, parameters: serde_json::Value) -> Self {
+         if let Err(e) = validate_tool_name(name) {
+-            panic!("Invalid tool name: {e}");
++            panic!("tool name `{name}` must be a valid identifier ([a-zA-Z][a-zA-Z0-9_]*, ≤64 chars): {e}");
+         }
+         Self {
+             definition: ToolDefinition {
+@@ -59,6 +61,8 @@ impl Tool {
+     /// # Panics
+     ///
+     /// Panics if the tool name is invalid (see [`validate_tool_name`]).
++    /// Tool names are always hardcoded string literals in this codebase; this
++    /// guards against programming errors where a constant would fail validation.
+     pub fn active<F, Fut>(
+         name: &str,
+         description: &str,
+@@ -70,7 +74,7 @@ impl Tool {
+         Fut: Future<Output = Result<serde_json::Value, String>> + Send + 'static,
+     {
+         if let Err(e) = validate_tool_name(name) {
+-            panic!("Invalid tool name: {e}");
++            panic!("tool name `{name}` must be a valid identifier ([a-zA-Z][a-zA-Z0-9_]*, ≤64 chars): {e}");
+         }
+         Self {
+             definition: ToolDefinition {
+@@ -319,7 +323,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[should_panic(expected = "Invalid tool name")]
++    #[should_panic(expected = "must be a valid identifier")]
+     fn passive_tool_panics_on_invalid_name() {
+         let _ = Tool::passive(
+             "1invalid",
+@@ -329,7 +333,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    #[should_panic(expected = "Invalid tool name")]
++    #[should_panic(expected = "must be a valid identifier")]
+     fn active_tool_panics_on_invalid_name() {
+         Tool::active(
+             "my-tool",
+diff --git a/lib/crates/fabro-oauth/src/lib.rs b/lib/crates/fabro-oauth/src/lib.rs
+index 9d65f0c1b..3c453d049 100644
+--- a/lib/crates/fabro-oauth/src/lib.rs
++++ b/lib/crates/fabro-oauth/src/lib.rs
+@@ -293,7 +293,10 @@ impl CallbackHandle {
+     }
+ 
+     pub fn shutdown(&self) {
+-        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
++        if let Some(tx) = self.shutdown_tx.lock()
++            .expect("oauth shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++            .take()
++        {
+             let _ = tx.send(());
+         }
+     }
+@@ -486,10 +489,16 @@ pub async fn start_callback_server(
+                     let desc = params
+                         .error_description
+                         .unwrap_or_else(|| error.clone());
+-                    if let Some(tx) = code_tx.lock().unwrap().take() {
++                    if let Some(tx) = code_tx.lock()
++                        .expect("oauth code_tx mutex should not be poisoned: no code panics while holding this lock")
++                        .take()
++                    {
+                         let _ = tx.send(Err(desc.clone()));
+                     }
+-                    if let Some(tx) = shutdown_tx.lock().unwrap().take() {
++                    if let Some(tx) = shutdown_tx.lock()
++                        .expect("oauth shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                        .take()
++                    {
+                         let _ = tx.send(());
+                     }
+                     return (
+@@ -499,10 +508,16 @@ pub async fn start_callback_server(
+                 }
+ 
+                 let Some(code) = params.code else {
+-                    if let Some(tx) = code_tx.lock().unwrap().take() {
++                    if let Some(tx) = code_tx.lock()
++                        .expect("oauth code_tx mutex should not be poisoned: no code panics while holding this lock")
++                        .take()
++                    {
+                         let _ = tx.send(Err("No authorization code received".to_string()));
+                     }
+-                    if let Some(tx) = shutdown_tx.lock().unwrap().take() {
++                    if let Some(tx) = shutdown_tx.lock()
++                        .expect("oauth shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                        .take()
++                    {
+                         let _ = tx.send(());
+                     }
+                     return (
+@@ -513,10 +528,16 @@ pub async fn start_callback_server(
+                     );
+                 };
+ 
+-                if let Some(tx) = code_tx.lock().unwrap().take() {
++                if let Some(tx) = code_tx.lock()
++                    .expect("oauth code_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(Ok(code));
+                 }
+-                if let Some(tx) = shutdown_tx.lock().unwrap().take() {
++                if let Some(tx) = shutdown_tx.lock()
++                    .expect("oauth shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(());
+                 }
+                 (StatusCode::OK, Html(callback_success_page()))
+@@ -576,13 +597,19 @@ pub async fn start_callback_server_with_errors(
+                 let error_description = params
+                     .error_description
+                     .unwrap_or_else(|| error_code.clone());
+-                if let Some(tx) = callback_tx.lock().unwrap().take() {
++                if let Some(tx) = callback_tx.lock()
++                    .expect("oauth callback_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(Err(CallbackFailure {
+                         error_code:        error_code.clone(),
+                         error_description: error_description.clone(),
+                     }));
+                 }
+-                if let Some(tx) = route_shutdown_tx.lock().unwrap().take() {
++                if let Some(tx) = route_shutdown_tx.lock()
++                    .expect("oauth route_shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(());
+                 }
+                 return (
+@@ -592,13 +619,19 @@ pub async fn start_callback_server_with_errors(
+             }
+ 
+             let Some(code) = params.code else {
+-                if let Some(tx) = callback_tx.lock().unwrap().take() {
++                if let Some(tx) = callback_tx.lock()
++                    .expect("oauth callback_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(Err(CallbackFailure {
+                         error_code:        "invalid_request".to_string(),
+                         error_description: "No authorization code received".to_string(),
+                     }));
+                 }
+-                if let Some(tx) = route_shutdown_tx.lock().unwrap().take() {
++                if let Some(tx) = route_shutdown_tx.lock()
++                    .expect("oauth route_shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                    .take()
++                {
+                     let _ = tx.send(());
+                 }
+                 return (
+@@ -609,10 +642,16 @@ pub async fn start_callback_server_with_errors(
+                 );
+             };
+ 
+-            if let Some(tx) = callback_tx.lock().unwrap().take() {
++            if let Some(tx) = callback_tx.lock()
++                .expect("oauth callback_tx mutex should not be poisoned: no code panics while holding this lock")
++                .take()
++            {
+                 let _ = tx.send(Ok(CallbackSuccess { code }));
+             }
+-            if let Some(tx) = route_shutdown_tx.lock().unwrap().take() {
++            if let Some(tx) = route_shutdown_tx.lock()
++                .expect("oauth route_shutdown_tx mutex should not be poisoned: no code panics while holding this lock")
++                .take()
++            {
+                 let _ = tx.send(());
+             }
+             (StatusCode::OK, Html(callback_success_page()))
+diff --git a/lib/crates/fabro-server/src/demo/mod.rs b/lib/crates/fabro-server/src/demo/mod.rs
+index e2c9b1885..80aff39fc 100644
+--- a/lib/crates/fabro-server/src/demo/mod.rs
++++ b/lib/crates/fabro-server/src/demo/mod.rs
+@@ -243,7 +243,8 @@ where
+     T: TryFrom<String>,
+     <T as TryFrom<String>>::Error: std::fmt::Display,
+ {
+-    T::try_from(sha.to_string()).unwrap_or_else(|err| panic!("invalid demo SHA `{sha}`: {err}"))
++    T::try_from(sha.to_string())
++        .unwrap_or_else(|err| panic!("demo SHA `{sha}` is a hardcoded constant and must match the hex pattern: {err}"))
+ }
+ 
+ fn short_sha_newtype<T>(sha: &str) -> T
+@@ -253,7 +254,7 @@ where
+ {
+     let short = sha.chars().take(7).collect::<String>();
+     T::try_from(short.clone())
+-        .unwrap_or_else(|err| panic!("invalid demo short SHA `{short}`: {err}"))
++        .unwrap_or_else(|err| panic!("demo short SHA `{short}` is a hardcoded constant and must match the hex pattern: {err}"))
+ }
+ 
+ fn demo_run_files() -> PaginatedRunFileList {
+@@ -1128,7 +1129,7 @@ mod runs {
+             labels: labels(entries),
+             lifecycle: RunLifecycle {
+                 status: parse_run_status(status, status_reason)
+-                    .unwrap_or_else(|| panic!("invalid demo run status: {status}")),
++                    .unwrap_or_else(|| panic!("demo run status `{status}` is a hardcoded constant and must be a valid RunStatus variant")),
+                 approval: None,
+                 pending_control,
+                 queue_position: None,
+diff --git a/lib/crates/fabro-server/src/run_files.rs b/lib/crates/fabro-server/src/run_files.rs
+index 8ef410972..a68d30ce6 100644
+--- a/lib/crates/fabro-server/src/run_files.rs
++++ b/lib/crates/fabro-server/src/run_files.rs
+@@ -344,10 +344,10 @@ async fn materialize_run_commits(
+     Ok(PaginatedRunCommitList {
+         data: commits,
+         meta: RunCommitsMeta {
+-            source: RunCommitsMetaSource::Sandbox,
+-            base_sha: sha_newtype::<RunCommitsMetaBaseSha>(&base_sha),
+-            head_sha: sha_newtype::<RunCommitsMetaHeadSha>(&head_sha),
+-            limit: NonZeroU64::new(limit).expect("commit limit is non-zero"),
++            source:          RunCommitsMetaSource::Sandbox,
++            base_sha:        sha_newtype::<RunCommitsMetaBaseSha>(&base_sha)?,
++            head_sha:        sha_newtype::<RunCommitsMetaHeadSha>(&head_sha)?,
++            limit:           NonZeroU64::new(limit).expect("commit limit is non-zero"),
+             total_returned,
+             truncated,
+         },
+@@ -410,15 +410,17 @@ fn parse_git_log_commit(record: &str) -> std::result::Result<RunCommit, ApiError
+     let (subject, body) = split_commit_message(&message);
+     let parents = parents
+         .split_whitespace()
+-        .map(|parent| RunCommitParent {
+-            sha:       sha_newtype::<RunCommitParentSha>(parent),
+-            short_sha: short_sha_newtype::<RunCommitParentShortSha>(parent),
++        .map(|parent| {
++            Ok(RunCommitParent {
++                sha:       sha_newtype::<RunCommitParentSha>(parent)?,
++                short_sha: short_sha_newtype::<RunCommitParentShortSha>(parent)?,
++            })
+         })
+-        .collect();
++        .collect::<std::result::Result<Vec<_>, ApiError>>()?;
+ 
+     Ok(RunCommit {
+-        sha: sha_newtype::<RunCommitSha>(sha),
+-        short_sha: short_sha_newtype::<RunCommitShortSha>(sha),
++        sha:       sha_newtype::<RunCommitSha>(sha)?,
++        short_sha: short_sha_newtype::<RunCommitShortSha>(sha)?,
+         parents,
+         author: RunCommitPerson {
+             name:  author_name.to_string(),
+@@ -434,7 +436,11 @@ fn parse_git_log_commit(record: &str) -> std::result::Result<RunCommit, ApiError
+         body,
+         message: message.clone(),
+         trailers: parse_commit_trailers(&message),
+-        tree_sha: (!tree_sha.is_empty()).then(|| sha_newtype::<RunCommitTreeSha>(tree_sha)),
++        tree_sha: if tree_sha.is_empty() {
++            None
++        } else {
++            Some(sha_newtype::<RunCommitTreeSha>(tree_sha)?)
++        },
+     })
+ }
+ 
+@@ -472,23 +478,25 @@ fn parse_git_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+         .map(|d| d.with_timezone(&chrono::Utc))
+ }
+ 
+-fn sha_newtype<T>(sha: &str) -> T
++fn sha_newtype<T>(sha: &str) -> std::result::Result<T, ApiError>
+ where
+     T: TryFrom<String>,
+     <T as TryFrom<String>>::Error: std::fmt::Display,
+ {
+-    T::try_from(sha.to_string())
+-        .unwrap_or_else(|err| panic!("invalid generated SHA `{sha}`: {err}"))
++    T::try_from(sha.to_string()).map_err(|err| {
++        ApiError::bad_request(format!("git returned a SHA that did not match expected hex pattern: `{sha}`: {err}"))
++    })
+ }
+ 
+-fn short_sha_newtype<T>(sha: &str) -> T
++fn short_sha_newtype<T>(sha: &str) -> std::result::Result<T, ApiError>
+ where
+     T: TryFrom<String>,
+     <T as TryFrom<String>>::Error: std::fmt::Display,
+ {
+     let short = sha.chars().take(7).collect::<String>();
+-    T::try_from(short.clone())
+-        .unwrap_or_else(|err| panic!("invalid generated short SHA `{short}`: {err}"))
++    T::try_from(short.clone()).map_err(|err| {
++        ApiError::bad_request(format!("git returned a short SHA that did not match expected hex pattern: `{short}`: {err}"))
++    })
+ }
+ 
+ /// Materialize the response for `GET /runs/{id}/files`. Prefers the live
+diff --git a/lib/crates/fabro-util/src/warnings.rs b/lib/crates/fabro-util/src/warnings.rs
+index 72ff7a0c4..9b44ee216 100644
+--- a/lib/crates/fabro-util/src/warnings.rs
++++ b/lib/crates/fabro-util/src/warnings.rs
+@@ -20,7 +20,8 @@ macro_rules! warn_user {
+ macro_rules! warn_user_once {
+     ($($arg:tt)*) => {{
+         let message = format!($($arg)*);
+-        let mut set = $crate::WARNINGS.lock().unwrap();
++        let mut set = $crate::WARNINGS.lock()
++            .expect("WARNINGS mutex should not be poisoned: no code panics while holding this lock");
+         if set.insert(message.clone()) {
+             drop(set);
+             $crate::warn_user!("{message}");
+diff --git a/lib/crates/fabro-workflow/src/condition.rs b/lib/crates/fabro-workflow/src/condition.rs
+index 060d40891..8ef707229 100644
+--- a/lib/crates/fabro-workflow/src/condition.rs
++++ b/lib/crates/fabro-workflow/src/condition.rs
+@@ -114,7 +114,7 @@ fn eval_clause(clause: &Clause, outcome: &Outcome, context: &Context) -> bool {
+                 Op::Lt => lhs < rhs,
+                 Op::Gte => lhs >= rhs,
+                 Op::Lte => lhs <= rhs,
+-                _ => unreachable!(),
++                _ => unreachable!("outer match arm already restricts to Gt, Lt, Gte, and Lte"),
+             }
+         }
+         Op::Contains => {
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index 86a0fef41..684af5164 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -834,8 +834,9 @@ fn event_body_from_event(event: &Event) -> EventBody {
+             | AgentEvent::ReasoningDelta { .. }
+             | AgentEvent::ToolCallOutputDelta { .. }
+             | AgentEvent::SessionStarted { .. }
+-            | AgentEvent::SessionEnded => panic!(
+-                "agent event should not be converted through the stage-scoped Event::Agent wrapper"
++            | AgentEvent::SessionEnded => unreachable!(
++                "streaming noise and session lifecycle events are filtered out before wrapping in \
++                 Event::Agent; if this is reached, the emitter has a routing bug"
+             ),
+         },
+         Event::SubgraphStarted { start_node, .. } => {
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/artifact.rs b/lib/crates/fabro-workflow/src/lifecycle/artifact.rs
+index 072a0f76c..fc72af71d 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/artifact.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/artifact.rs
+@@ -73,7 +73,8 @@ impl ArtifactLifecycle {
+ #[async_trait]
+ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
+     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
+-        *self.attempt_start_epoch.lock().unwrap() = None;
++        *self.attempt_start_epoch.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock") = None;
+         let ledger = self
+             .rebuild_captured_artifact_ledger()
+             .await
+@@ -83,7 +84,8 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
+                     "failed to rebuild captured artifact ledger: {rendered}"
+                 ))
+             })?;
+-        *self.captured_artifacts.lock().unwrap() = ledger;
++        *self.captured_artifacts.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock") = ledger;
+         Ok(())
+     }
+ 
+@@ -96,7 +98,8 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
+         let epoch = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+             .map_or(0.0, |d| d.as_secs() as f64);
+-        *self.attempt_start_epoch.lock().unwrap() = Some(epoch);
++        *self.attempt_start_epoch.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock") = Some(epoch);
+         Ok(NodeDecision::Continue)
+     }
+ 
+@@ -108,7 +111,9 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
+         if self.artifact_globs.is_empty() {
+             return Ok(());
+         }
+-        let epoch = self.attempt_start_epoch.lock().unwrap().unwrap_or(0.0);
++        let epoch = self.attempt_start_epoch.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock")
++            .unwrap_or(0.0);
+         let node_id = ctx.node.id();
+         let visit = stage_visit(state, node_id);
+         let node_slug = if visit <= 1 {
+@@ -256,7 +261,8 @@ impl ArtifactLifecycle {
+     }
+ 
+     fn new_captured_assets(&self, artifacts: &[ArtifactUpload]) -> Vec<ArtifactUpload> {
+-        let ledger = self.captured_artifacts.lock().unwrap();
++        let ledger = self.captured_artifacts.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock");
+         artifacts
+             .iter()
+             .filter(|artifact| !ledger.contains(&artifact_identity(artifact)))
+@@ -265,7 +271,8 @@ impl ArtifactLifecycle {
+     }
+ 
+     fn record_captured_assets(&self, artifacts: &[ArtifactUpload]) {
+-        let mut ledger = self.captured_artifacts.lock().unwrap();
++        let mut ledger = self.captured_artifacts.lock()
++            .expect("artifact mutex should not be poisoned: no code panics while holding this lock");
+         for artifact in artifacts {
+             ledger.insert(artifact_identity(artifact));
+         }
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/circuit_breaker.rs b/lib/crates/fabro-workflow/src/lifecycle/circuit_breaker.rs
+index da94d9d10..26215622e 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/circuit_breaker.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/circuit_breaker.rs
+@@ -37,8 +37,10 @@ impl CircuitBreakerLifecycle {
+         loop_sigs: HashMap<FailureSignature, usize>,
+         restart_sigs: HashMap<FailureSignature, usize>,
+     ) {
+-        *self.loop_failure_signatures.lock().unwrap() = loop_sigs;
+-        *self.restart_failure_signatures.lock().unwrap() = restart_sigs;
++        *self.loop_failure_signatures.lock()
++            .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock") = loop_sigs;
++        *self.restart_failure_signatures.lock()
++            .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock") = restart_sigs;
+     }
+ 
+     /// Snapshot current state for checkpoint building.
+@@ -48,8 +50,12 @@ impl CircuitBreakerLifecycle {
+         HashMap<FailureSignature, usize>,
+         HashMap<FailureSignature, usize>,
+     ) {
+-        let loop_sigs = self.loop_failure_signatures.lock().unwrap().clone();
+-        let restart_sigs = self.restart_failure_signatures.lock().unwrap().clone();
++        let loop_sigs = self.loop_failure_signatures.lock()
++            .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock")
++            .clone();
++        let restart_sigs = self.restart_failure_signatures.lock()
++            .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock")
++            .clone();
+         (loop_sigs, restart_sigs)
+     }
+ }
+@@ -83,7 +89,8 @@ impl RunLifecycle<WorkflowGraph> for CircuitBreakerLifecycle {
+                 outcome.failure.as_ref().map(|f| f.message.as_str()),
+             );
+             if fc.is_signature_tracked() {
+-                let mut sigs = self.loop_failure_signatures.lock().unwrap();
++                let mut sigs = self.loop_failure_signatures.lock()
++                    .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock");
+                 let count = sigs.entry(sig.clone()).or_insert(0);
+                 *count += 1;
+                 let limit = self.loop_restart_signature_limit;
+@@ -133,7 +140,8 @@ impl RunLifecycle<WorkflowGraph> for CircuitBreakerLifecycle {
+                 Some(failure.message.as_str()),
+             );
+             if failure.category.is_signature_tracked() {
+-                let mut sigs = self.restart_failure_signatures.lock().unwrap();
++                let mut sigs = self.restart_failure_signatures.lock()
++                    .expect("circuit breaker mutex should not be poisoned: no code panics while holding this lock");
+                 let count = sigs.entry(sig.clone()).or_insert(0);
+                 *count += 1;
+                 let limit = self.loop_restart_signature_limit;
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/event.rs b/lib/crates/fabro-workflow/src/lifecycle/event.rs
+index 3226abac1..54332f9ba 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/event.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/event.rs
+@@ -111,7 +111,8 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
+     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
+         // If restarted_from is Some, emit LoopRestart and clear it
+         {
+-            let mut restarted = self.restarted_from.lock().unwrap();
++            let mut restarted = self.restarted_from.lock()
++                .expect("event lifecycle mutex should not be poisoned: no code panics while holding this lock");
+             if let Some((from_node, to_node)) = restarted.take() {
+                 self.emitter
+                     .emit(&Event::LoopRestart { from_node, to_node });
+@@ -119,7 +120,8 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
+         }
+ 
+         // Reset run_start for duration measurement
+-        *self.run_start.lock().unwrap() = Instant::now();
++        *self.run_start.lock()
++            .expect("event lifecycle mutex should not be poisoned: no code panics while holding this lock") = Instant::now();
+ 
+         // Emit RunStarted
+         self.emitter.emit(&Event::WorkflowRunStarted {
+@@ -377,7 +379,9 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
+         let status = result.outcome.status.to_string();
+ 
+         // Read git checkpoint result (set by GitLifecycle)
+-        let git_result = self.checkpoint_git_result.lock().unwrap().clone();
++        let git_result = self.checkpoint_git_result.lock()
++            .expect("event lifecycle mutex should not be poisoned: no code panics while holding this lock")
++            .clone();
+ 
+         let git_sha = git_result.as_ref().and_then(|r| r.commit_sha.clone());
+         let diff = git_result.as_ref().and_then(|r| r.diff.clone());
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/fidelity.rs b/lib/crates/fabro-workflow/src/lifecycle/fidelity.rs
+index 32b170ad2..e468b47df 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/fidelity.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/fidelity.rs
+@@ -57,7 +57,8 @@ impl FidelityLifecycle {
+     }
+ 
+     pub(crate) fn set_degrade_fidelity_on_resume(&self, flag: bool) {
+-        *self.degrade_fidelity_on_resume.lock().unwrap() = flag;
++        *self.degrade_fidelity_on_resume.lock()
++            .expect("fidelity mutex should not be poisoned: no code panics while holding this lock") = flag;
+     }
+ }
+ 
+@@ -65,7 +66,8 @@ impl FidelityLifecycle {
+ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
+     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
+         // Clear incoming edge data (restart target must not inherit pre-restart edge)
+-        *self.incoming_edge_data.lock().unwrap() = None;
++        *self.incoming_edge_data.lock()
++            .expect("fidelity mutex should not be poisoned: no code panics while holding this lock") = None;
+         Ok(())
+     }
+ 
+@@ -74,7 +76,9 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
+         node: &WorkflowNode,
+         state: &WfRunState,
+     ) -> CoreResult<WfNodeDecision> {
+-        let incoming = self.incoming_edge_data.lock().unwrap().take();
++        let incoming = self.incoming_edge_data.lock()
++            .expect("fidelity mutex should not be poisoned: no code panics while holding this lock")
++            .take();
+         let gv_node = node.inner();
+ 
+         // 1. Fidelity resolution via resolve_fidelity: edge → node → graph default →
+@@ -84,7 +88,8 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
+ 
+         // 2. Fidelity degradation on resume (full → summary:high)
+         let fidelity = {
+-            let mut degrade = self.degrade_fidelity_on_resume.lock().unwrap();
++            let mut degrade = self.degrade_fidelity_on_resume.lock()
++                .expect("fidelity mutex should not be poisoned: no code panics while holding this lock");
+             if *degrade {
+                 *degrade = false;
+                 fidelity.degraded()
+@@ -180,7 +185,8 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
+             let edge_data = IncomingEdgeData {
+                 edge: Arc::new(gv_edge.clone()),
+             };
+-            *self.incoming_edge_data.lock().unwrap() = Some(edge_data);
++            *self.incoming_edge_data.lock()
++                .expect("fidelity mutex should not be poisoned: no code panics while holding this lock") = Some(edge_data);
+         }
+         Ok(EdgeDecision::Continue)
+     }
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/git.rs b/lib/crates/fabro-workflow/src/lifecycle/git.rs
+index bc34009d9..a304313ae 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/git.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/git.rs
+@@ -94,8 +94,10 @@ pub(crate) struct GitLifecycle {
+ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
+     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
+         // Reset last_git_sha (diff base parity)
+-        *self.last_git_sha.lock().unwrap() = None;
+-        *self.checkpoint_git_result.lock().unwrap() = None;
++        *self.last_git_sha.lock()
++            .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock") = None;
++        *self.checkpoint_git_result.lock()
++            .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock") = None;
+         if let Some(meta_branch) = self.metadata_branch().map(str::to_string) {
+             if self.metadata_writer.is_none() || self.metadata_runtime.metadata_degraded() {
+                 return Ok(());
+@@ -173,7 +175,8 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
+ 
+         // Skip git checkpoint for the start node (always empty) or if git disabled
+         if self.start_node_id.as_deref() == Some(node_id) || self.run_options.git.is_none() {
+-            *self.checkpoint_git_result.lock().unwrap() = None;
++            *self.checkpoint_git_result.lock()
++                .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock") = None;
+             return Ok(());
+         }
+ 
+@@ -330,7 +333,9 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
+                 }
+ 
+                 // Save diff.patch
+-                let prev = self.last_git_sha.lock().unwrap().clone().or_else(|| {
++                let prev = self.last_git_sha.lock()
++                    .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock")
++                    .clone().or_else(|| {
+                     self.run_options
+                         .git
+                         .as_ref()
+@@ -386,8 +391,10 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
+                 }
+ 
+                 // Update shared state
+-                *self.last_git_sha.lock().unwrap() = Some(sha);
+-                *self.checkpoint_git_result.lock().unwrap() = Some(git_result);
++                *self.last_git_sha.lock()
++                    .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock") = Some(sha);
++                *self.checkpoint_git_result.lock()
++                    .expect("git lifecycle mutex should not be poisoned: no code panics while holding this lock") = Some(git_result);
+             }
+             Err(e) => {
+                 let exec_output_tail = fabro_sandbox::default_redacted_output_tail(&e);
+diff --git a/lib/crates/fabro-workflow/src/lifecycle/mod.rs b/lib/crates/fabro-workflow/src/lifecycle/mod.rs
+index d6c70c200..ae2042c00 100644
+--- a/lib/crates/fabro-workflow/src/lifecycle/mod.rs
++++ b/lib/crates/fabro-workflow/src/lifecycle/mod.rs
+@@ -391,7 +391,8 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
+                 if matches!(decision, EdgeDecision::Continue) {
+                     if let Some(ref edge) = ctx.edge {
+                         if edge.inner().loop_restart() {
+-                            *self.restarted_from.lock().unwrap() =
++                            *self.restarted_from.lock()
++                                .expect("lifecycle mutex should not be poisoned: no code panics while holding this lock") =
+                                 Some((ctx.from.to_string(), ctx.to.to_string()));
+                         }
+                     }
+@@ -419,7 +420,8 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
+             .on_checkpoint(node, result, next_node_id, state)
+             .await?;
+         // Clear checkpoint result for next checkpoint
+-        *self.checkpoint_git_result.lock().unwrap() = None;
++        *self.checkpoint_git_result.lock()
++            .expect("lifecycle mutex should not be poisoned: no code panics while holding this lock") = None;
+         Ok(())
+     }
+ 
+diff --git a/lib/crates/fabro-workflow/src/operations/start.rs b/lib/crates/fabro-workflow/src/operations/start.rs
+index a5551ff72..a962cd0e5 100644
+--- a/lib/crates/fabro-workflow/src/operations/start.rs
++++ b/lib/crates/fabro-workflow/src/operations/start.rs
+@@ -804,27 +804,31 @@ impl RunSession {
+                 event if matches!(&event.body, EventBody::CheckpointCompleted(_)) => {
+                     if let EventBody::CheckpointCompleted(props) = &event.body {
+                         if let Some(sha) = props.git_commit_sha.as_ref() {
+-                            *sha_clone.lock().unwrap() = Some(sha.clone());
++                            *sha_clone.lock()
++                                .expect("sha_clone mutex should not be poisoned: no code panics while holding this lock") = Some(sha.clone());
+                         }
+                     }
+                 }
+                 event if matches!(&event.body, EventBody::RunCompleted(_)) => {
+                     if let EventBody::RunCompleted(props) = &event.body {
+                         if let Some(sha) = props.final_git_commit_sha.as_ref() {
+-                            *sha_clone.lock().unwrap() = Some(sha.clone());
++                            *sha_clone.lock()
++                                .expect("sha_clone mutex should not be poisoned: no code panics while holding this lock") = Some(sha.clone());
+                         }
+                     }
+                 }
+                 event if matches!(&event.body, EventBody::RunFailed(_)) => {
+                     if let EventBody::RunFailed(props) = &event.body {
+                         if let Some(sha) = props.final_git_commit_sha.as_ref() {
+-                            *sha_clone.lock().unwrap() = Some(sha.clone());
++                            *sha_clone.lock()
++                                .expect("sha_clone mutex should not be poisoned: no code panics while holding this lock") = Some(sha.clone());
+                         }
+                     }
+                 }
+                 event if matches!(&event.body, EventBody::GitCommit(_)) => {
+                     if let EventBody::GitCommit(props) = &event.body {
+-                        *sha_clone.lock().unwrap() = Some(props.sha.clone());
++                        *sha_clone.lock()
++                            .expect("sha_clone mutex should not be poisoned: no code panics while holding this lock") = Some(props.sha.clone());
+                     }
+                 }
+                 _ => {}
+@@ -894,7 +898,9 @@ impl RunSession {
+             workflow_name:    executed.graph.name.clone(),
+             preserve_sandbox: self.preserve_sandbox,
+             stop_on_terminal: self.stop_on_terminal,
+-            last_git_sha:     last_git_sha.lock().unwrap().clone(),
++            last_git_sha:     last_git_sha.lock()
++                .expect("last_git_sha mutex should not be poisoned: no code panics while holding this lock")
++                .clone(),
+         };
+         let pr_opts = PullRequestOptions {
+             pr_config:  self.pr_config,
