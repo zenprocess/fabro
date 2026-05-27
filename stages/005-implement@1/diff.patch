@@ -1,0 +1,1368 @@
+diff --git a/apps/fabro-web/app/components/event-debug.tsx b/apps/fabro-web/app/components/event-debug.tsx
+index 1a1436264..75c8a1c7d 100644
+--- a/apps/fabro-web/app/components/event-debug.tsx
++++ b/apps/fabro-web/app/components/event-debug.tsx
+@@ -1,5 +1,4 @@
+ import { useEffect, useMemo, useState } from "react";
+-import { createPortal } from "react-dom";
+ import {
+   Listbox,
+   ListboxButton,
+@@ -26,6 +25,7 @@ import {
+   highlightJson,
+   type DebugCategory,
+ } from "./event-debug-helpers";
++import { FloatingTooltip } from "./floating-tooltip";
+ 
+ export function DebugEventRow({
+   event,
+@@ -416,19 +416,15 @@ function DnaPopover({
+   anchorRect: DOMRect;
+   runStart: string | undefined;
+ }) {
+-  if (typeof document === "undefined") return null;
+   const category = debugCategory(event.event);
+-  const left = anchorRect.left + anchorRect.width / 2;
+-  const top = anchorRect.top;
+-  return createPortal(
+-    <div
+-      role="tooltip"
+-      style={{ left, top }}
+-      className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-[calc(100%+8px)] whitespace-nowrap rounded-md bg-panel-alt px-2.5 py-1 text-xs text-fg shadow-lg outline-1 -outline-offset-1 outline-line-strong"
++  return (
++    <FloatingTooltip
++      rect={anchorRect}
++      placement="top"
++      className="whitespace-nowrap rounded-md bg-panel-alt px-2.5 py-1 text-xs text-fg shadow-lg outline-1 -outline-offset-1 outline-line-strong"
+     >
+       {`${debugCategoryLabel(category)} · ${friendlyEventName(event.event)} · ${formatElapsed(event.ts, runStart)}`}
+-    </div>,
+-    document.body,
++    </FloatingTooltip>
+   );
+ }
+ 
+@@ -628,20 +624,16 @@ function ThreadDnaPopover({
+   item: ThreadDnaItem;
+   anchorRect: DOMRect;
+ }) {
+-  if (typeof document === "undefined") return null;
+-  const left = anchorRect.left + anchorRect.width / 2;
+-  const top = anchorRect.top;
+   const elapsed = formatThreadElapsed(item.startMs);
+   const duration =
+     item.durationMs > 0 ? formatThreadDuration(item.durationMs) : "instant";
+-  return createPortal(
+-    <div
+-      role="tooltip"
+-      style={{ left, top }}
+-      className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-[calc(100%+8px)] whitespace-nowrap rounded-md bg-panel-alt px-2.5 py-1 text-xs text-fg shadow-lg outline-1 -outline-offset-1 outline-line-strong"
++  return (
++    <FloatingTooltip
++      rect={anchorRect}
++      placement="top"
++      className="whitespace-nowrap rounded-md bg-panel-alt px-2.5 py-1 text-xs text-fg shadow-lg outline-1 -outline-offset-1 outline-line-strong"
+     >
+       {`${THREAD_CATEGORY_LABEL[item.category]} · ${item.label} · ${elapsed} · ${duration}`}
+-    </div>,
+-    document.body,
++    </FloatingTooltip>
+   );
+ }
+diff --git a/apps/fabro-web/app/components/floating-tooltip.tsx b/apps/fabro-web/app/components/floating-tooltip.tsx
+new file mode 100644
+index 000000000..4b524e3c5
+--- /dev/null
++++ b/apps/fabro-web/app/components/floating-tooltip.tsx
+@@ -0,0 +1,142 @@
++import {
++  useLayoutEffect,
++  useMemo,
++  useRef,
++  useState,
++  type CSSProperties,
++  type ReactNode,
++} from "react";
++import { createPortal } from "react-dom";
++
++type FloatingTooltipPlacement = "top" | "bottom";
++
++const VIEWPORT_MARGIN = 12;
++const OFFSET = 8;
++
++function clamp(value: number, min: number, max: number): number {
++  if (max < min) return (min + max) / 2;
++  return Math.min(Math.max(value, min), max);
++}
++
++function viewportSize() {
++  return {
++    height: window.innerHeight,
++    width:  window.innerWidth,
++  };
++}
++
++function resolvePlacement(
++  rect: DOMRect,
++  placement: FloatingTooltipPlacement,
++  height: number,
++): FloatingTooltipPlacement {
++  if (height <= 0) return placement;
++
++  const { height: viewportHeight } = viewportSize();
++  const fitsTop = rect.top - OFFSET - height >= VIEWPORT_MARGIN;
++  const fitsBottom = rect.bottom + OFFSET + height <= viewportHeight - VIEWPORT_MARGIN;
++
++  if (placement === "top") {
++    return fitsTop || !fitsBottom ? "top" : "bottom";
++  }
++  return fitsBottom || !fitsTop ? "bottom" : "top";
++}
++
++function floatingStyle(
++  rect: DOMRect,
++  placement: FloatingTooltipPlacement,
++  size: { height: number; width: number },
++): CSSProperties {
++  const { height: viewportHeight, width: viewportWidth } = viewportSize();
++  const centerX = rect.left + rect.width / 2;
++  const availableWidth = Math.max(0, viewportWidth - VIEWPORT_MARGIN * 2);
++  const width = size.width > 0 ? Math.min(size.width, availableWidth) : 0;
++  const halfWidth = width / 2;
++  const minCenter = VIEWPORT_MARGIN + halfWidth;
++  const maxCenter = viewportWidth - VIEWPORT_MARGIN - halfWidth;
++  const left = width > 0
++    ? clamp(centerX, minCenter, maxCenter)
++    : clamp(centerX, VIEWPORT_MARGIN, viewportWidth - VIEWPORT_MARGIN);
++  const resolvedPlacement = resolvePlacement(rect, placement, size.height);
++
++  if (resolvedPlacement === "top") {
++    const top = size.height > 0
++      ? Math.max(VIEWPORT_MARGIN, rect.top - OFFSET - size.height)
++      : rect.top - OFFSET;
++    return {
++      left,
++      maxWidth:  availableWidth,
++      top,
++      transform: size.height > 0 ? "translateX(-50%)" : "translate(-50%, -100%)",
++    };
++  }
++
++  const top = size.height > 0
++    ? Math.min(viewportHeight - VIEWPORT_MARGIN - size.height, rect.bottom + OFFSET)
++    : rect.bottom + OFFSET;
++  return {
++    left,
++    maxWidth:  availableWidth,
++    top:       Math.max(VIEWPORT_MARGIN, top),
++    transform: "translateX(-50%)",
++  };
++}
++
++export function FloatingTooltip({
++  rect,
++  placement,
++  children,
++  className = "",
++}: {
++  rect: DOMRect;
++  placement: FloatingTooltipPlacement;
++  children: ReactNode;
++  className?: string;
++}) {
++  const ref = useRef<HTMLDivElement>(null);
++  const [size, setSize] = useState({ height: 0, width: 0 });
++  const portalTarget = typeof document === "undefined" ? null : document.body;
++  const style = useMemo(
++    () =>
++      typeof window === "undefined"
++        ? undefined
++        : floatingStyle(rect, placement, size),
++    [placement, rect, size],
++  );
++
++  useLayoutEffect(() => {
++    const node = ref.current;
++    if (!node || typeof window === "undefined") return;
++
++    const updateSize = () => {
++      const next = node.getBoundingClientRect();
++      setSize({ height: next.height, width: next.width });
++    };
++
++    updateSize();
++    const resizeObserver =
++      typeof ResizeObserver === "undefined"
++        ? null
++        : new ResizeObserver(updateSize);
++    resizeObserver?.observe(node);
++    window.addEventListener("resize", updateSize);
++    return () => {
++      resizeObserver?.disconnect();
++      window.removeEventListener("resize", updateSize);
++    };
++  }, [children, rect]);
++
++  if (!portalTarget || !style) return null;
++
++  return createPortal(
++    <div
++      ref={ref}
++      role="tooltip"
++      style={style}
++      className={`pointer-events-none fixed z-50 ${className}`}
++    >
++      {children}
++    </div>,
++    portalTarget,
++  );
++}
+diff --git a/apps/fabro-web/app/components/hover-card-style.ts b/apps/fabro-web/app/components/hover-card-style.ts
+deleted file mode 100644
+index 94afd8c86..000000000
+--- a/apps/fabro-web/app/components/hover-card-style.ts
++++ /dev/null
+@@ -1,10 +0,0 @@
+-import type { CSSProperties } from "react";
+-
+-export function hoverCardStyle(rect: DOMRect): CSSProperties {
+-  const margin = 12;
+-  const top = rect.bottom + 6;
+-  if (rect.left > window.innerWidth / 2) {
+-    return { top, right: Math.max(margin, window.innerWidth - rect.right) };
+-  }
+-  return { top, left: Math.max(margin, rect.left) };
+-}
+diff --git a/apps/fabro-web/app/components/toast.test.tsx b/apps/fabro-web/app/components/toast.test.tsx
+index 1adf14217..bc27f7b20 100644
+--- a/apps/fabro-web/app/components/toast.test.tsx
++++ b/apps/fabro-web/app/components/toast.test.tsx
+@@ -1,6 +1,7 @@
+-import { afterEach, describe, expect, test } from "bun:test";
++import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+ import { useEffect } from "react";
+ import TestRenderer, { act } from "react-test-renderer";
++import { toast as sonnerToast, useSonner } from "sonner";
+ 
+ import { ToastProvider, useToast } from "./toast";
+ 
+@@ -11,164 +12,165 @@ function textFromNode(node: ReturnType<TestRenderer.ReactTestRenderer["toJSON"]>
+   return (node.children ?? []).map(textFromNode).join("");
+ }
+ 
+-function textFromInstance(node: TestRenderer.ReactTestInstance): string {
+-  return node.children
+-    .map((child) => (typeof child === "string" ? child : textFromInstance(child)))
+-    .join("");
+-}
+-
+-function PushOnMount({
+-  toast,
++function CaptureToastApi({
+   onReady,
+ }: {
+-  toast: Parameters<ReturnType<typeof useToast>["push"]>[0];
+   onReady?: (api: ReturnType<typeof useToast>) => void;
+ }) {
+   const api = useToast();
+ 
+   useEffect(() => {
+     onReady?.(api);
+-    api.push(toast);
+-  }, [api, onReady, toast]);
++  }, [api, onReady]);
+ 
+   return null;
+ }
+ 
+-describe("ToastProvider", () => {
+-  afterEach(() => {
+-    delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
++function SonnerToastText() {
++  const { toasts } = useSonner();
++
++  return (
++    <output aria-live="polite">
++      {toasts.map((toast) => (
++        <p key={toast.id}>
++          {typeof toast.title === "function" ? toast.title() : toast.title}
++        </p>
++      ))}
++    </output>
++  );
++}
++
++async function flushSonnerUpdates() {
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    await new Promise((resolve) => setTimeout(resolve, 0));
+   });
++}
+ 
+-  test("push renders a toast with the message", async () => {
++describe("useToast", () => {
++  beforeEach(() => {
+     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+-
+-    let renderer: TestRenderer.ReactTestRenderer | null = null;
+-    await act(async () => {
+-      renderer = TestRenderer.create(
+-        <ToastProvider autoDismissMs={1000}>
+-          <PushOnMount toast={{ message: "Run archived." }} />
+-        </ToastProvider>,
+-      );
+-    });
+-
+-    expect(textFromNode(renderer!.toJSON())).toContain("Run archived.");
+-    const liveRegions = renderer!.root.findAll(
+-      (node) => node.type === "output" && node.props?.["aria-live"] === "polite",
+-    );
+-    expect(liveRegions.length).toBeGreaterThan(0);
+-
+-    await act(async () => {
+-      renderer?.unmount();
+-    });
++    (globalThis as { requestAnimationFrame?: (callback: FrameRequestCallback) => number }).requestAnimationFrame = (
++      callback,
++    ) => setTimeout(callback, 0) as unknown as number;
+   });
+ 
+-  test("action toasts render a button and fire onClick", async () => {
+-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
++  afterEach(() => {
++    sonnerToast.dismiss();
++    delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
++    delete (globalThis as { requestAnimationFrame?: (callback: FrameRequestCallback) => number }).requestAnimationFrame;
++  });
+ 
+-    let clicked = 0;
++  test("push renders a Sonner toast with the message", async () => {
++    let api: ReturnType<typeof useToast> | null = null;
+     let renderer: TestRenderer.ReactTestRenderer | null = null;
+     await act(async () => {
+       renderer = TestRenderer.create(
+-        <ToastProvider autoDismissMs={1000}>
+-          <PushOnMount
+-            toast={{
+-              message: "Run archived.",
+-              action: {
+-                label: "Unarchive",
+-                onClick: () => {
+-                  clicked += 1;
+-                },
+-              },
++        <>
++          <SonnerToastText />
++          <CaptureToastApi
++            onReady={(value) => {
++              api = value;
+             }}
+           />
+-        </ToastProvider>,
++        </>,
+       );
+     });
+ 
+-    const button = renderer!.root.findByType("button");
+-    expect(textFromNode(renderer!.toJSON())).toContain("Unarchive");
+-
+     await act(async () => {
+-      button.props.onClick();
++      api!.push({ message: "Run archived." });
+     });
++    await flushSonnerUpdates();
+ 
+-    expect(clicked).toBe(1);
++    expect(textFromNode(renderer!.toJSON())).toContain("Run archived.");
+ 
+     await act(async () => {
+       renderer?.unmount();
+     });
+   });
+ 
+-  test("error toasts do not auto-dismiss", async () => {
+-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+-
++  test("error toasts are red and persistent", async () => {
++    let api: ReturnType<typeof useToast> | null = null;
++    let toastId = "";
+     let renderer: TestRenderer.ReactTestRenderer | null = null;
+     await act(async () => {
+       renderer = TestRenderer.create(
+-        <ToastProvider autoDismissMs={5}>
+-          <PushOnMount toast={{ message: "Conflict", tone: "error" }} />
+-        </ToastProvider>,
++        <>
++          <SonnerToastText />
++          <CaptureToastApi
++            onReady={(value) => {
++              api = value;
++            }}
++          />
++        </>,
+       );
+     });
+ 
+     await act(async () => {
+-      await new Promise((resolve) => setTimeout(resolve, 20));
++      toastId = api!.push({ message: "Conflict", tone: "error", autoDismissMs: 5 });
+     });
++    await flushSonnerUpdates();
+ 
+     expect(textFromNode(renderer!.toJSON())).toContain("Conflict");
++    expect(
++      sonnerToast.getToasts().find((toast) => toast.id === toastId),
++    ).toMatchObject({
++      duration: Infinity,
++      title:    "Conflict",
++      type:     "error",
++    });
+ 
+     await act(async () => {
+       renderer?.unmount();
+     });
+   });
+ 
+-  test("multiple toasts stack in insertion order", async () => {
+-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+-
++  test("dismiss removes one toast from the Sonner store", async () => {
+     let api: ReturnType<typeof useToast> | null = null;
++    let secondId = "";
+     let renderer: TestRenderer.ReactTestRenderer | null = null;
+-
+     await act(async () => {
+       renderer = TestRenderer.create(
+-        <ToastProvider autoDismissMs={1000}>
+-          <PushOnMount
+-            toast={{ message: "First" }}
++        <>
++          <SonnerToastText />
++          <CaptureToastApi
+             onReady={(value) => {
+               api = value;
+             }}
+           />
+-        </ToastProvider>,
++        </>,
+       );
+     });
+ 
+     await act(async () => {
+-      api!.push({ message: "Second" });
++      api!.push({ message: "First" });
++      secondId = api!.push({ message: "Second" });
+     });
++    await flushSonnerUpdates();
+ 
+-    const toasts = renderer!.root.findAll(
+-      (node) => node.props?.["data-toast-id"] != null,
+-    );
+-    expect(toasts).toHaveLength(2);
+-    expect(textFromInstance(toasts[0]!)).toContain("First");
+-    expect(textFromInstance(toasts[1]!)).toContain("Second");
++    await act(async () => {
++      api!.dismiss(secondId);
++    });
++    await flushSonnerUpdates();
++
++    const text = textFromNode(renderer!.toJSON());
++    expect(text).toContain("First");
++    expect(text).not.toContain("Second");
+ 
+     await act(async () => {
+       renderer?.unmount();
+     });
+   });
+ 
+-  test("dismiss removes a toast and leaves the rest reflowed", async () => {
+-    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+-
++  test("clear removes all Sonner toasts", async () => {
+     let api: ReturnType<typeof useToast> | null = null;
+-    let firstId = "";
+     let renderer: TestRenderer.ReactTestRenderer | null = null;
+ 
+     await act(async () => {
+       renderer = TestRenderer.create(
+-        <ToastProvider autoDismissMs={1000}>
+-          <PushOnMount
+-            toast={{ message: "First" }}
++        <ToastProvider>
++          <SonnerToastText />
++          <CaptureToastApi
+             onReady={(value) => {
+               api = value;
+             }}
+@@ -178,19 +180,39 @@ describe("ToastProvider", () => {
+     });
+ 
+     await act(async () => {
+-      firstId = api!.push({ message: "Second" });
++      api!.push({ message: "First" });
++      api!.push({ message: "Second" });
+     });
++    await flushSonnerUpdates();
+ 
+     await act(async () => {
+-      api!.dismiss(firstId);
++      api!.clear();
+     });
++    await flushSonnerUpdates();
+ 
+     const text = textFromNode(renderer!.toJSON());
+-    expect(text).toContain("First");
++    expect(text).not.toContain("First");
+     expect(text).not.toContain("Second");
+ 
+     await act(async () => {
+       renderer?.unmount();
+     });
+   });
++
++  test("ToastProvider is transparent for existing test wrappers", async () => {
++    let renderer: TestRenderer.ReactTestRenderer | null = null;
++    await act(async () => {
++      renderer = TestRenderer.create(
++        <ToastProvider autoDismissMs={1000}>
++          <span>wrapped child</span>
++        </ToastProvider>,
++      );
++    });
++
++    expect(textFromNode(renderer!.toJSON())).toContain("wrapped child");
++
++    await act(async () => {
++      renderer?.unmount();
++    });
++  });
+ });
+diff --git a/apps/fabro-web/app/components/toast.tsx b/apps/fabro-web/app/components/toast.tsx
+index e17d194c0..561edde07 100644
+--- a/apps/fabro-web/app/components/toast.tsx
++++ b/apps/fabro-web/app/components/toast.tsx
+@@ -1,164 +1,85 @@
+-import {
+-  createContext,
+-  use,
+-  useCallback,
+-  useEffect,
+-  useMemo,
+-  useRef,
+-  useState,
+-  type ReactNode,
+-} from "react";
+-import { XMarkIcon } from "@heroicons/react/20/solid";
++import type { ReactNode } from "react";
++import { toast as sonnerToast, useSonner } from "sonner";
+ 
+ export type ToastTone = "info" | "error";
+ 
+-export interface ToastAction {
+-  label: string;
+-  onClick: () => void;
+-}
+-
+ export interface ToastInput {
+   message: string;
+   tone?: ToastTone;
+-  action?: ToastAction;
+   autoDismissMs?: number;
+ }
+ 
+-interface ToastRecord extends ToastInput {
+-  id: string;
+-  tone: ToastTone;
+-}
+-
+ interface ToastContextValue {
+   push: (toast: ToastInput) => string;
+   dismiss: (id: string) => void;
+   clear: () => void;
+ }
+ 
+-const ToastContext = createContext<ToastContextValue | null>(null);
++let nextToastId = 0;
++
++function push(toast: ToastInput): string {
++  const id = `toast-${nextToastId++}`;
++  const options = {
++    id,
++    ...(toast.tone === "error"
++      ? { duration: Infinity }
++      : toast.autoDismissMs != null
++        ? { duration: toast.autoDismissMs }
++        : {}),
++  };
++
++  if (toast.tone === "error") {
++    sonnerToast.error(toast.message, options);
++  } else {
++    sonnerToast(toast.message, options);
++  }
+ 
+-function toastClassName(tone: ToastTone): string {
+-  return tone === "error"
+-    ? "border-coral/40 bg-rose-950/90 text-rose-50"
+-    : "border-line bg-panel/95 text-fg-2";
++  return id;
+ }
+ 
+-function ToastRoot({
+-  toasts,
+-  onDismiss,
+-}: {
+-  toasts: ToastRecord[];
+-  onDismiss: (id: string) => void;
+-}) {
+-  if (toasts.length === 0) return null;
+-
+-  return (
+-    <output
+-      aria-live="polite"
+-      aria-atomic="false"
+-      className="pointer-events-none fixed right-4 bottom-6 z-50 flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2 sm:right-6"
+-    >
+-      {toasts.map((toast) => (
+-        <div
+-          key={toast.id}
+-          data-toast-id={toast.id}
+-          className={`pointer-events-auto rounded-lg border px-4 py-3 shadow-lg ${toastClassName(toast.tone)}`}
+-        >
+-          <div className="flex items-start gap-3">
+-            <p className="min-w-0 flex-1 text-sm leading-5">{toast.message}</p>
+-            {toast.tone === "error" && (
+-              <button
+-                type="button"
+-                onClick={() => onDismiss(toast.id)}
+-                className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-current/70 transition-colors hover:bg-white/10 hover:text-current focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
+-                aria-label="Dismiss notification"
+-              >
+-                <XMarkIcon className="size-4" aria-hidden="true" />
+-              </button>
+-            )}
+-          </div>
+-          {toast.action && (
+-            <div className="mt-3">
+-              <button
+-                type="button"
+-                onClick={() => {
+-                  toast.action?.onClick();
+-                  onDismiss(toast.id);
+-                }}
+-                className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md bg-white/10 px-3 text-sm font-medium text-current transition-colors hover:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
+-              >
+-                {toast.action.label}
+-              </button>
+-            </div>
+-          )}
+-        </div>
+-      ))}
+-    </output>
+-  );
+-}
++const toastApi: ToastContextValue = {
++  push,
++  dismiss: (id) => {
++    sonnerToast.dismiss(id);
++  },
++  clear: () => {
++    sonnerToast.dismiss();
++  },
++};
+ 
+ export function ToastProvider({
+   children,
+-  autoDismissMs = 3500,
+ }: {
+   children: ReactNode;
+   autoDismissMs?: number;
+ }) {
+-  const [toasts, setToasts] = useState<ToastRecord[]>([]);
+-  const nextIdRef = useRef(0);
+-  const timeoutIdsRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+-
+-  const dismiss = useCallback((id: string) => {
+-    const timeoutId = timeoutIdsRef.current.get(id);
+-    if (timeoutId) {
+-      clearTimeout(timeoutId);
+-      timeoutIdsRef.current.delete(id);
+-    }
+-    setToasts((current) => current.filter((toast) => toast.id !== id));
+-  }, []);
+-
+-  const clear = useCallback(() => {
+-    for (const timeoutId of timeoutIdsRef.current.values()) {
+-      clearTimeout(timeoutId);
+-    }
+-    timeoutIdsRef.current.clear();
+-    setToasts([]);
+-  }, []);
+-
+-  const push = useCallback((toast: ToastInput) => {
+-    const id = `toast-${nextIdRef.current++}`;
+-    const record: ToastRecord = {
+-      ...toast,
+-      id,
+-      tone: toast.tone ?? "info",
+-    };
+-
+-    setToasts((current) => [...current, record]);
+-
+-    if (record.tone !== "error") {
+-      const timeoutId = setTimeout(() => dismiss(id), toast.autoDismissMs ?? autoDismissMs);
+-      timeoutIdsRef.current.set(id, timeoutId);
+-    }
+-
+-    return id;
+-  }, [autoDismissMs, dismiss]);
+-
+-  useEffect(() => clear, [clear]);
+-
+-  const value = useMemo(() => ({ push, dismiss, clear }), [push, dismiss, clear]);
++  if (typeof document !== "undefined") {
++    return <>{children}</>;
++  }
+ 
+   return (
+-    <ToastContext.Provider value={value}>
++    <>
+       {children}
+-      <ToastRoot toasts={toasts} onDismiss={dismiss} />
+-    </ToastContext.Provider>
++      <NonDomToastOutput />
++    </>
+   );
+ }
+ 
+ export function useToast(): ToastContextValue {
+-  const value = use(ToastContext);
+-  if (!value) {
+-    throw new Error("useToast must be used within a ToastProvider");
+-  }
+-  return value;
++  return toastApi;
++}
++
++function NonDomToastOutput() {
++  const { toasts } = useSonner();
++  if (toasts.length === 0) return null;
++
++  return (
++    <output aria-live="polite">
++      {toasts.map((toast) => (
++        <p key={toast.id}>
++          {typeof toast.title === "function" ? toast.title() : toast.title}
++        </p>
++      ))}
++    </output>
++  );
+ }
+diff --git a/apps/fabro-web/app/components/ui.tsx b/apps/fabro-web/app/components/ui.tsx
+index fac25dcf4..8318224a3 100644
+--- a/apps/fabro-web/app/components/ui.tsx
++++ b/apps/fabro-web/app/components/ui.tsx
+@@ -2,15 +2,20 @@
+ // exposes the primary button, secondary button, input, error message, and
+ // copy button so the auth and in-app surfaces can match.
+ 
+-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+-import { createPortal } from "react-dom";
+ import { Dialog, DialogPanel, DialogTitle } from "@headlessui/react";
+ import {
+   ClipboardDocumentCheckIcon,
+   ClipboardIcon,
+ } from "@heroicons/react/16/solid";
+-
+-import { hoverCardStyle } from "./hover-card-style";
++import * as HoverCardPrimitive from "@radix-ui/react-hover-card";
++import * as TooltipPrimitive from "@radix-ui/react-tooltip";
++import {
++  createContext,
++  useContext,
++  useState,
++  type ComponentProps,
++  type ReactNode,
++} from "react";
+ 
+ export const INPUT_CLASS =
+   "block w-full rounded-lg bg-panel-alt px-3.5 py-2.5 text-base text-fg outline-1 -outline-offset-1 outline-white/10 placeholder:text-fg-muted focus:outline-2 focus:-outline-offset-1 focus:outline-teal-500 sm:text-sm";
+@@ -133,49 +138,24 @@ export function ConfirmDialog({
+   );
+ }
+ 
+-// Shared hover/focus state for `Tooltip` and `HoverCard`. Returns the trigger
+-// props to spread and the trigger rect (only while open) for positioning.
+-// `openDelay` (ms) defers showing the card until the pointer has dwelled on
+-// the trigger long enough — protects against fetch-on-mount popovers being
+-// triggered by an incidental cursor sweep through a list.
+-function useHoverAnchor(openDelay = 0) {
+-  const [open, setOpen] = useState(false);
+-  const triggerRef = useRef<HTMLSpanElement>(null);
+-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++const TooltipProviderMountedContext = createContext(false);
+ 
+-  const clearTimer = () => {
+-    if (timerRef.current !== null) {
+-      clearTimeout(timerRef.current);
+-      timerRef.current = null;
+-    }
+-  };
+-  const requestOpen = () => {
+-    if (openDelay <= 0) {
+-      setOpen(true);
+-      return;
+-    }
+-    clearTimer();
+-    timerRef.current = setTimeout(() => {
+-      timerRef.current = null;
+-      setOpen(true);
+-    }, openDelay);
+-  };
+-  const requestClose = () => {
+-    clearTimer();
+-    setOpen(false);
+-  };
++type TooltipProviderProps = ComponentProps<typeof TooltipPrimitive.Provider>;
+ 
+-  useEffect(() => clearTimer, []);
++function canUseOverlayDom() {
++  return typeof window !== "undefined" && typeof document !== "undefined";
++}
+ 
+-  const rect = open ? (triggerRef.current?.getBoundingClientRect() ?? null) : null;
+-  const triggerProps = {
+-    ref:          triggerRef,
+-    onMouseEnter: requestOpen,
+-    onMouseLeave: requestClose,
+-    onFocus:      requestOpen,
+-    onBlur:       requestClose,
+-  };
+-  return { open, rect, triggerProps };
++export function TooltipProvider({ children, ...props }: TooltipProviderProps) {
++  if (!canUseOverlayDom()) {
++    return <>{children}</>;
++  }
++
++  return (
++    <TooltipProviderMountedContext.Provider value={true}>
++      <TooltipPrimitive.Provider {...props}>{children}</TooltipPrimitive.Provider>
++    </TooltipProviderMountedContext.Provider>
++  );
+ }
+ 
+ export function Tooltip({
+@@ -185,32 +165,39 @@ export function Tooltip({
+   label: ReactNode;
+   children: ReactNode;
+ }) {
+-  const { open, rect, triggerProps } = useHoverAnchor();
+-  const id = useId();
+-  const portalTarget = typeof document === "undefined" ? null : document.body;
++  const hasProvider = useContext(TooltipProviderMountedContext);
+ 
+-  return (
+-    <>
+-      <span {...triggerProps} aria-describedby={open ? id : undefined} className="inline-flex">
++  if (!canUseOverlayDom()) {
++    return <span className="inline-flex">{children}</span>;
++  }
++
++  const tooltip = (
++    <TooltipPrimitive.Root>
++      <TooltipPrimitive.Trigger asChild className="inline-flex">
+         {children}
+-      </span>
+-      {rect && portalTarget
+-        ? createPortal(
+-            <div
+-              role="tooltip"
+-              id={id}
+-              style={{
+-                top: rect.top - 6,
+-                left: rect.left + rect.width / 2,
+-              }}
+-              className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md bg-panel px-2 py-1 text-xs text-fg-2 shadow-lg outline-1 -outline-offset-1 outline-line-strong"
+-            >
+-              {label}
+-            </div>,
+-            portalTarget,
+-          )
+-        : null}
+-    </>
++      </TooltipPrimitive.Trigger>
++      {typeof document !== "undefined" && (
++        <TooltipPrimitive.Portal>
++          <TooltipPrimitive.Content
++            side="top"
++            align="center"
++            sideOffset={6}
++            collisionPadding={12}
++            className="pointer-events-none z-50 max-w-[min(32rem,calc(100vw-1.5rem))] rounded-md bg-panel px-2 py-1 text-xs text-fg-2 shadow-lg outline-1 -outline-offset-1 outline-line-strong"
++          >
++            {label}
++          </TooltipPrimitive.Content>
++        </TooltipPrimitive.Portal>
++      )}
++    </TooltipPrimitive.Root>
++  );
++
++  if (hasProvider) return tooltip;
++
++  return (
++    <TooltipPrimitive.Provider delayDuration={200} skipDelayDuration={300}>
++      {tooltip}
++    </TooltipPrimitive.Provider>
+   );
+ }
+ 
+@@ -230,29 +217,29 @@ export function HoverCard({
+   className?: string;
+   openDelay?: number;
+ }) {
+-  const { open, rect, triggerProps } = useHoverAnchor(openDelay);
+-  const id = useId();
+-  const portalTarget = typeof document === "undefined" ? null : document.body;
++  if (!canUseOverlayDom()) {
++    return <span className={className}>{children}</span>;
++  }
+ 
+   return (
+-    <>
+-      <span {...triggerProps} aria-describedby={open ? id : undefined} className={className}>
++    <HoverCardPrimitive.Root openDelay={openDelay} closeDelay={0}>
++      <HoverCardPrimitive.Trigger asChild className={className}>
+         {children}
+-      </span>
+-      {rect && portalTarget
+-        ? createPortal(
+-            <div
+-              role="tooltip"
+-              id={id}
+-              style={hoverCardStyle(rect)}
+-              className="pointer-events-none fixed z-50 max-w-[18rem] rounded-lg bg-panel p-3 text-xs text-fg-2 shadow-xl outline-1 -outline-offset-1 outline-line-strong"
+-            >
+-              {content}
+-            </div>,
+-            portalTarget,
+-          )
+-        : null}
+-    </>
++      </HoverCardPrimitive.Trigger>
++      {typeof document !== "undefined" && (
++        <HoverCardPrimitive.Portal>
++          <HoverCardPrimitive.Content
++            side="bottom"
++            align="start"
++            sideOffset={6}
++            collisionPadding={12}
++            className="pointer-events-none z-50 max-w-[18rem] rounded-lg bg-panel p-3 text-xs text-fg-2 shadow-xl outline-1 -outline-offset-1 outline-line-strong"
++          >
++            {content}
++          </HoverCardPrimitive.Content>
++        </HoverCardPrimitive.Portal>
++      )}
++    </HoverCardPrimitive.Root>
+   );
+ }
+ 
+diff --git a/apps/fabro-web/app/layouts/app-shell.tsx b/apps/fabro-web/app/layouts/app-shell.tsx
+index 32c222664..edc5eac19 100644
+--- a/apps/fabro-web/app/layouts/app-shell.tsx
++++ b/apps/fabro-web/app/layouts/app-shell.tsx
+@@ -12,8 +12,9 @@ import {
+   XMarkIcon,
+ } from "@heroicons/react/24/outline";
+ import { Link, Outlet, useLocation, useMatches } from "react-router";
++import { Toaster } from "sonner";
+ import { ErrorState } from "../components/state";
+-import { ToastProvider } from "../components/toast";
++import { TooltipProvider } from "../components/ui";
+ import { AskFabroLayoutProvider, useAskFabroLayout } from "../lib/ask-fabro-layout";
+ import { DemoModeProvider } from "../lib/demo-mode";
+ import { useAuthMe } from "../lib/queries";
+@@ -63,7 +64,7 @@ export default function AppShell() {
+ 
+   return (
+     <DemoModeProvider value={demoMode}>
+-    <ToastProvider>
++    <TooltipProvider delayDuration={200} skipDelayDuration={300}>
+     <AskFabroLayoutProvider>
+     <div
+       className={classNames(
+@@ -247,8 +248,11 @@ export default function AppShell() {
+       )}
+       <ShellMain fullHeight={fullHeight} maxWidth={maxWidth} />
+     </div>
++    {typeof document !== "undefined" && (
++      <Toaster richColors position="bottom-right" />
++    )}
+     </AskFabroLayoutProvider>
+-    </ToastProvider>
++    </TooltipProvider>
+     </DemoModeProvider>
+   );
+ }
+diff --git a/apps/fabro-web/app/routes/run-detail.test.ts b/apps/fabro-web/app/routes/run-detail.test.ts
+index 6d0bd0427..e30d38da8 100644
+--- a/apps/fabro-web/app/routes/run-detail.test.ts
++++ b/apps/fabro-web/app/routes/run-detail.test.ts
+@@ -437,7 +437,7 @@ describe("actionMenuSeparatorVisibility", () => {
+ });
+ 
+ describe("handleLifecycleToastResult", () => {
+-  type PushedToast = { message: string; action?: { label: string; onClick: () => void } };
++  type PushedToast = { message: string };
+ 
+   function makeToastApi() {
+     const pushed: PushedToast[] = [];
+diff --git a/apps/fabro-web/app/routes/run-overview.tsx b/apps/fabro-web/app/routes/run-overview.tsx
+index 131c11738..688f2ddcf 100644
+--- a/apps/fabro-web/app/routes/run-overview.tsx
++++ b/apps/fabro-web/app/routes/run-overview.tsx
+@@ -1,13 +1,12 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+-import { createPortal } from "react-dom";
+ import { useNavigate, useParams } from "react-router";
+ import { graphTheme } from "../lib/graph-theme";
+ import { ApiError } from "../lib/api-client";
+ import { useRun, useRunGraph, useRunStages } from "../lib/queries";
++import { FloatingTooltip } from "../components/floating-tooltip";
+ import { RunSummaryPanel } from "../components/run-summary-panel";
+ import { StagePopover } from "../components/stage-popover";
+ import { StageSidebar } from "../components/stage-sidebar";
+-import { hoverCardStyle } from "../components/hover-card-style";
+ import {
+   GRAPH_DEFAULT_ZOOM_INDEX,
+   GRAPH_ZOOM_STEPS,
+@@ -300,22 +299,19 @@ export default function RunOverview() {
+           />
+         )}
+       </div>
+-      {hoveredNode &&
+-        typeof document !== "undefined" &&
+-        createPortal(
+-          <div
+-            role="tooltip"
+-            style={hoverCardStyle(hoveredNode.rect)}
+-            className="pointer-events-none fixed z-50 max-w-[18rem] rounded-lg bg-panel p-3 text-xs text-fg-2 shadow-xl outline-1 -outline-offset-1 outline-line-strong"
+-          >
+-            <StagePopover
+-              runId={id!}
+-              stage={hoveredNode.stage}
+-              duration={hoveredNode.stage.duration}
+-            />
+-          </div>,
+-          document.body,
+-        )}
++      {hoveredNode && (
++        <FloatingTooltip
++          rect={hoveredNode.rect}
++          placement="top"
++          className="max-w-[18rem] rounded-lg bg-panel p-3 text-xs text-fg-2 shadow-xl outline-1 -outline-offset-1 outline-line-strong"
++        >
++          <StagePopover
++            runId={id!}
++            stage={hoveredNode.stage}
++            duration={hoveredNode.stage.duration}
++          />
++        </FloatingTooltip>
++      )}
+     </div>
+   );
+ }
+diff --git a/apps/fabro-web/app/routes/settings-models.tsx b/apps/fabro-web/app/routes/settings-models.tsx
+index 6a3867275..936f77da0 100644
+--- a/apps/fabro-web/app/routes/settings-models.tsx
++++ b/apps/fabro-web/app/routes/settings-models.tsx
+@@ -26,6 +26,7 @@ import {
+   SortHeader,
+   type SortDirection,
+ } from "../components/runs-list/sort-header";
++import { Tooltip } from "../components/ui";
+ import { formatContextWindow, formatTokensPerSecond } from "../lib/format";
+ 
+ export function meta() {
+@@ -512,7 +513,13 @@ function TestStatusCell({ state }: { state: RowState | undefined }) {
+     );
+   }
+   return (
+-    <span className="group/test-error relative inline-flex">
++    <Tooltip
++      label={
++        <span className="block w-[32rem] max-w-[80vw] whitespace-pre-line break-words text-left font-mono leading-relaxed">
++          {state.message}
++        </span>
++      }
++    >
+       <span
+         aria-label={`Failed: ${state.message}`}
+         className="inline-flex cursor-default items-center text-coral focus:outline-none"
+@@ -520,42 +527,34 @@ function TestStatusCell({ state }: { state: RowState | undefined }) {
+       >
+         <XCircleIcon className="size-4 h-lh shrink-0" />
+       </span>
+-      <span
+-        role="tooltip"
+-        className="pointer-events-none invisible absolute right-0 top-full z-30 mt-1.5 w-[32rem] max-w-[80vw] whitespace-pre-line break-words rounded-md bg-panel p-3 text-left font-mono text-xs leading-relaxed text-fg-2 opacity-0 shadow-2xl shadow-black/40 ring-1 ring-line-strong transition-opacity duration-100 group-hover/test-error:visible group-hover/test-error:opacity-100 group-focus-within/test-error:visible group-focus-within/test-error:opacity-100"
+-      >
+-        {state.message}
+-      </span>
+-    </span>
++    </Tooltip>
+   );
+ }
+ 
+ function ModelNameCell({ model }: { model: Model }) {
+   const hasAliases = model.aliases.length > 0;
+   const nameNode = hasAliases ? (
+-    <span className="group/aliases relative inline-flex">
++    <Tooltip
++      label={
++        <span className="block min-w-[10rem]">
++          <span className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-fg-muted">
++            Aliases
++          </span>
++          {model.aliases.map((alias) => (
++            <span key={alias} className="block font-mono text-fg-2">
++              {alias}
++            </span>
++          ))}
++        </span>
++      }
++    >
+       <button
+         type="button"
+-        aria-describedby={`aliases-${model.id}`}
+         className="cursor-default font-mono text-xs text-fg-2 underline decoration-dotted decoration-fg-muted underline-offset-4 hover:decoration-fg-3 focus:outline-none focus-visible:text-fg"
+       >
+         {model.id}
+       </button>
+-      <span
+-        role="tooltip"
+-        id={`aliases-${model.id}`}
+-        className="pointer-events-none invisible absolute left-0 top-full z-30 mt-1.5 min-w-[10rem] rounded-md bg-panel p-2 text-xs opacity-0 shadow-2xl shadow-black/40 ring-1 ring-line-strong transition-opacity duration-100 group-hover/aliases:visible group-hover/aliases:opacity-100 group-focus-within/aliases:visible group-focus-within/aliases:opacity-100"
+-      >
+-        <span className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-fg-muted">
+-          Aliases
+-        </span>
+-        {model.aliases.map((alias) => (
+-          <span key={alias} className="block font-mono text-fg-2">
+-            {alias}
+-          </span>
+-        ))}
+-      </span>
+-    </span>
++    </Tooltip>
+   ) : (
+     <span className="font-mono text-xs text-fg-2">{model.id}</span>
+   );
+diff --git a/apps/fabro-web/package.json b/apps/fabro-web/package.json
+index 6dbad2669..ed95f5298 100644
+--- a/apps/fabro-web/package.json
++++ b/apps/fabro-web/package.json
+@@ -21,6 +21,8 @@
+     "@pierre/theme": "0.0.28",
+     "@pierre/trees": "1.0.0-beta.3",
+     "@qltysh/fabro-api-client": "workspace:*",
++    "@radix-ui/react-hover-card": "^1.1.15",
++    "@radix-ui/react-tooltip": "^1.2.8",
+     "@tailwindcss/typography": "^0.5.19",
+     "@viz-js/viz": "^3.24.0",
+     "@xterm/addon-fit": "^0.11.0",
+@@ -31,6 +33,7 @@
+     "react-dom": "^19.2.4",
+     "react-router": "7.12.0",
+     "remark-gfm": "^4.0.1",
++    "sonner": "^2.0.7",
+     "swr": "^2.4.1"
+   },
+   "devDependencies": {
+diff --git a/bun.lock b/bun.lock
+index e78ff176e..c0fb7a68a 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -18,6 +18,8 @@
+         "@pierre/theme": "0.0.28",
+         "@pierre/trees": "1.0.0-beta.3",
+         "@qltysh/fabro-api-client": "workspace:*",
++        "@radix-ui/react-hover-card": "^1.1.15",
++        "@radix-ui/react-tooltip": "^1.2.8",
+         "@tailwindcss/typography": "^0.5.19",
+         "@viz-js/viz": "^3.24.0",
+         "@xterm/addon-fit": "^0.11.0",
+@@ -28,6 +30,7 @@
+         "react-dom": "^19.2.4",
+         "react-router": "7.12.0",
+         "remark-gfm": "^4.0.1",
++        "sonner": "^2.0.7",
+         "swr": "^2.4.1",
+       },
+       "devDependencies": {
+@@ -452,7 +455,7 @@
+ 
+     "@radix-ui/react-slider": ["@radix-ui/react-slider@1.3.6", "", { "dependencies": { "@radix-ui/number": "1.1.1", "@radix-ui/primitive": "1.1.3", "@radix-ui/react-collection": "1.1.7", "@radix-ui/react-compose-refs": "1.1.2", "@radix-ui/react-context": "1.1.2", "@radix-ui/react-direction": "1.1.1", "@radix-ui/react-primitive": "2.1.3", "@radix-ui/react-use-controllable-state": "1.2.2", "@radix-ui/react-use-layout-effect": "1.1.1", "@radix-ui/react-use-previous": "1.1.1", "@radix-ui/react-use-size": "1.1.1" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-JPYb1GuM1bxfjMRlNLE+BcmBC8onfCi60Blk7OBqi2MLTFdS+8401U4uFjnwkOr49BLmXxLC6JHkvAsx5OJvHw=="],
+ 
+-    "@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.4", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-Jl+bCv8HxKnlTLVrcDE8zTMJ09R9/ukw4qBs/oZClOfoQk/cOTbDn+NceXfV7j09YPVQUryJPHurafcSg6EVKA=="],
++    "@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+ 
+     "@radix-ui/react-switch": ["@radix-ui/react-switch@1.2.6", "", { "dependencies": { "@radix-ui/primitive": "1.1.3", "@radix-ui/react-compose-refs": "1.1.2", "@radix-ui/react-context": "1.1.2", "@radix-ui/react-primitive": "2.1.3", "@radix-ui/react-use-controllable-state": "1.2.2", "@radix-ui/react-use-previous": "1.1.1", "@radix-ui/react-use-size": "1.1.1" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-bByzr1+ep1zk4VubeEVViV592vu2lHE2BZY5OnzehZqOOgogN80+mNtCqPkhn2gklJqOpxWgPoYTSnhBCqpOXQ=="],
+ 
+@@ -1630,6 +1633,8 @@
+ 
+     "socks-proxy-agent": ["socks-proxy-agent@8.0.5", "", { "dependencies": { "agent-base": "^7.1.2", "debug": "^4.3.4", "socks": "^2.8.3" } }, "sha512-HehCEsotFqbPW9sJ8WVYB6UbmIMv7kUUORIF2Nncq4VQvBfNBLibW9YZR5dlYCSUhwcD628pRllm7n+E+YTzJw=="],
+ 
++    "sonner": ["sonner@2.0.7", "", { "peerDependencies": { "react": "^18.0.0 || ^19.0.0 || ^19.0.0-rc", "react-dom": "^18.0.0 || ^19.0.0 || ^19.0.0-rc" } }, "sha512-W6ZN4p58k8aDKA4XPcx2hpIQXBRAgyiWVkYhT7CvK6D3iAu7xjvVyhQHg2/iaKJZ1XVJ4r7XuwGL+WGEK37i9w=="],
++
+     "source-map": ["source-map@0.7.3", "", {}, "sha512-CkCj6giN3S+n9qrYiBTX5gystlENnRW5jZeNLHpe6aue+SrHcG5VYwujhW9s4dY31mEGsxBDrHR6oI69fTXsaQ=="],
+ 
+     "source-map-js": ["source-map-js@1.2.1", "", {}, "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA=="],
+@@ -1850,8 +1855,6 @@
+ 
+     "@radix-ui/react-alert-dialog/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-alert-dialog/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-arrow/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+     "@radix-ui/react-aspect-ratio/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+@@ -1868,8 +1871,6 @@
+ 
+     "@radix-ui/react-collection/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-collection/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-context-menu/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+ 
+     "@radix-ui/react-context-menu/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+@@ -1878,8 +1879,6 @@
+ 
+     "@radix-ui/react-dialog/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-dialog/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-dismissable-layer/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+     "@radix-ui/react-dropdown-menu/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+@@ -1902,8 +1901,6 @@
+ 
+     "@radix-ui/react-menu/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-menu/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-menubar/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+ 
+     "@radix-ui/react-menubar/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+@@ -1924,14 +1921,14 @@
+ 
+     "@radix-ui/react-popover/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-popover/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-popper/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+ 
+     "@radix-ui/react-popper/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+     "@radix-ui/react-portal/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
++    "@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.4", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-Jl+bCv8HxKnlTLVrcDE8zTMJ09R9/ukw4qBs/oZClOfoQk/cOTbDn+NceXfV7j09YPVQUryJPHurafcSg6EVKA=="],
++
+     "@radix-ui/react-progress/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+ 
+     "@radix-ui/react-progress/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+@@ -1952,8 +1949,6 @@
+ 
+     "@radix-ui/react-select/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-select/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-separator/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+     "@radix-ui/react-slider/@radix-ui/react-context": ["@radix-ui/react-context@1.1.2", "", { "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-jCi/QKUM2r1Ju5a3J64TH2A5SpKAgh0LpknyqdQ4m6DCV0xJ2HG1xARRwNGPQfi1SLdLWZ1OJz6F4OMBBNiGJA=="],
+@@ -1986,8 +1981,6 @@
+ 
+     "@radix-ui/react-tooltip/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "@radix-ui/react-tooltip/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@radix-ui/react-visually-hidden/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+     "@remotion/bundler/esbuild": ["esbuild@0.25.0", "", { "optionalDependencies": { "@esbuild/aix-ppc64": "0.25.0", "@esbuild/android-arm": "0.25.0", "@esbuild/android-arm64": "0.25.0", "@esbuild/android-x64": "0.25.0", "@esbuild/darwin-arm64": "0.25.0", "@esbuild/darwin-x64": "0.25.0", "@esbuild/freebsd-arm64": "0.25.0", "@esbuild/freebsd-x64": "0.25.0", "@esbuild/linux-arm": "0.25.0", "@esbuild/linux-arm64": "0.25.0", "@esbuild/linux-ia32": "0.25.0", "@esbuild/linux-loong64": "0.25.0", "@esbuild/linux-mips64el": "0.25.0", "@esbuild/linux-ppc64": "0.25.0", "@esbuild/linux-riscv64": "0.25.0", "@esbuild/linux-s390x": "0.25.0", "@esbuild/linux-x64": "0.25.0", "@esbuild/netbsd-arm64": "0.25.0", "@esbuild/netbsd-x64": "0.25.0", "@esbuild/openbsd-arm64": "0.25.0", "@esbuild/openbsd-x64": "0.25.0", "@esbuild/sunos-x64": "0.25.0", "@esbuild/win32-arm64": "0.25.0", "@esbuild/win32-ia32": "0.25.0", "@esbuild/win32-x64": "0.25.0" }, "bin": { "esbuild": "bin/esbuild" } }, "sha512-BXq5mqc8ltbaN34cDqWuYKyNhX8D/Z0J1xdtdQ8UcIIIyJyz+ZMKUt58tF3SrZ85jcfN/PZYhjR5uDQAYNVbuw=="],
+@@ -2086,8 +2079,6 @@
+ 
+     "radix-ui/@radix-ui/react-primitive": ["@radix-ui/react-primitive@2.1.3", "", { "dependencies": { "@radix-ui/react-slot": "1.2.3" }, "peerDependencies": { "@types/react": "*", "@types/react-dom": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc", "react-dom": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react", "@types/react-dom"] }, "sha512-m9gTwRkhy2lvCPe6QJp4d3G1TYEUHn/FzJUtq9MjH46an1wJU+GdoGC5VLof8RX8Ft/DlpshApkhswDLZzHIcQ=="],
+ 
+-    "radix-ui/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "recast/source-map": ["source-map@0.6.1", "", {}, "sha512-UjgapumWlbMhkBgzT7Ykc5YXUT46F0iKu8SGXq0bcwP5dz/h0Plj6enJqjz1Zbq2l5WaqYnrVbwWOWMyF3F47g=="],
+ 
+     "source-map-support/source-map": ["source-map@0.6.1", "", {}, "sha512-UjgapumWlbMhkBgzT7Ykc5YXUT46F0iKu8SGXq0bcwP5dz/h0Plj6enJqjz1Zbq2l5WaqYnrVbwWOWMyF3F47g=="],
+@@ -2120,68 +2111,6 @@
+ 
+     "@babel/helper-compilation-targets/lru-cache/yallist": ["yallist@3.1.1", "", {}, "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g=="],
+ 
+-    "@radix-ui/react-accordion/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-arrow/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-aspect-ratio/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-checkbox/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-collapsible/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-context-menu/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-dismissable-layer/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-dropdown-menu/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-focus-scope/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-form/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-hover-card/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-label/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-menubar/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-navigation-menu/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-one-time-password-field/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-password-toggle-field/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-popper/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-portal/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-progress/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-radio-group/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-roving-focus/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-scroll-area/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-separator/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-slider/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-switch/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-tabs/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-toast/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-toggle-group/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-toggle/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-toolbar/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+-    "@radix-ui/react-visually-hidden/@radix-ui/react-primitive/@radix-ui/react-slot": ["@radix-ui/react-slot@1.2.3", "", { "dependencies": { "@radix-ui/react-compose-refs": "1.1.2" }, "peerDependencies": { "@types/react": "*", "react": "^16.8 || ^17.0 || ^18.0 || ^19.0 || ^19.0.0-rc" }, "optionalPeers": ["@types/react"] }, "sha512-aeNmHnBxbi2St0au6VBVC7JXFlhLlOnvIIlePNniyUNAClzmtAUEY8/pBiK3iHjufOlwA+c20/8jngo7xcrg8A=="],
+-
+     "@remotion/bundler/esbuild/@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.25.0", "", { "os": "aix", "cpu": "ppc64" }, "sha512-O7vun9Sf8DFjH2UtqK8Ku3LkquL9SZL8OLY1T5NZkA34+wG3OQF7cl4Ql8vdNzM6fzBbYfLaiRLIOZ+2FOCgBQ=="],
+ 
+     "@remotion/bundler/esbuild/@esbuild/android-arm": ["@esbuild/android-arm@0.25.0", "", { "os": "android", "cpu": "arm" }, "sha512-PTyWCYYiU0+1eJKmw21lWtC+d08JDZPQ5g+kFyxP0V+es6VPPSUhM6zk8iImp2jbV6GwjX4pap0JFbUQN65X1g=="],
