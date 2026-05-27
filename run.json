@@ -329,7 +329,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-27T03:13:05.585238Z",
-  "last_event_at": "2026-05-27T04:38:06.614569Z",
+  "last_event_at": "2026-05-27T04:39:08.048543Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -923,9 +923,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 2493,
       "checkpoint": {
-        "timestamp": "2026-05-27T04:38:06.651477Z",
+        "timestamp": "2026-05-27T04:38:10.798047Z",
         "current_node": "work",
         "completed_nodes": [
           "start",
@@ -937,28 +937,28 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.thread_id": "goal",
+          "internal.retry_count.audit": 0,
           "graph.goal": "# React Effects Policy\n\nThis document defines how `apps/fabro-web` should use React effects.\n\nThe goal is not to hide `useEffect` behind nicer names. The goal is to keep\ncomponent data flow declarative, localize real external integrations, and make\nthe codebase easier for people and agents to reason about.\n\n## Policy\n\nDo not call `useEffect` directly from route or component code.\n\nNew code should treat every direct `useEffect`, `React.useEffect`,\n`useLayoutEffect`, or `useInsertionEffect` call as a policy violation unless it\nlives inside an approved integration hook.\n\nThe only generic effect primitive exposed to component code should be\n`useMountEffect`, and it is only for true mount/unmount integrations. Prefer a\npurpose-named hook over `useMountEffect` whenever the integration has domain\nmeaning, such as `useRunEvents(runId)`, `useDocumentTitle(title)`, or\n`useWindowEvent(...)`.\n\n`useMountEffect` must not become a way to opt out of React dependencies. If an\nintegration depends on a changing identity, that identity belongs in the API of\na purpose-named hook or in a keyed component boundary.\n\nExisting direct effects should be migrated opportunistically when touching the\nsame area. Do not make a behavior-preserving effect harder to understand just to\nremove the word `useEffect`; the replacement must improve or preserve clarity,\ntestability, and lifecycle correctness.\n\n## What Counts As An External Integration\n\nEffects are only for synchronizing React with a system outside React.\n\nAllowed external systems include:\n\n- browser globals: `window`, `document`, history, media queries, clipboard, focus\n- browser resources: timers, animation frames, `ResizeObserver`, `MutationObserver`\n- network streams and sockets: `EventSource`, WebSocket, cross-tab channels\n- imperative third-party widgets that must be constructed, attached, and disposed\n- durable browser storage when the write cannot happen in an event handler\n- external notifications such as analytics or telemetry for a route/view becoming\n  visible, when they are safe under Strict Mode and do not perform user-visible\n  writes\n\nThese are not external systems for this policy:\n\n- props\n- React state\n- SWR data\n- derived values\n- route params\n- search params used only for rendering\n- mutation result objects\n- \"after this state changes, do another state update\"\n\nIf the effect mostly moves data from one React value to another React value, it\nis almost certainly the wrong tool.\n\n## Preferred Alternatives\n\n### Derive during render\n\nIf a value can be computed from props, route params, query data, or state, compute\nit during render. Use `useMemo` only when the computation is expensive or object\nidentity matters to a child API.\n\nAvoid:\n\n```tsx\nconst [filtered, setFiltered] = useState<Item[]>([]);\n\nuseEffect(() => {\n  setFiltered(items.filter(matchesQuery));\n}, [items, matchesQuery]);\n```\n\nPrefer:\n\n```tsx\nconst filtered = useMemo(\n  () => items.filter(matchesQuery),\n  [items, matchesQuery],\n);\n```\n\n### Handle events in event handlers\n\nIf the work is caused by a click, submit, key press, or mutation trigger, do the\nwork from that event path. Do not set a flag and wait for an effect to notice it.\n\nAvoid watching mutation data just to show a toast or navigate. Prefer mutation\ncallbacks, an explicit `try`/`catch` around `trigger(...)`, or a route action\nresult consumed by the same event flow.\n\n### Use SWR for server state\n\nServer reads belong in shared query hooks in `app/lib/queries.ts` or an adjacent\ndomain query module. Do not fetch server data in a component effect.\n\nUse SWR options such as `keepPreviousData`, `refreshInterval`,\n`revalidateOnFocus`, and `shouldRetryOnError` instead of local effect state when\nthey describe the behavior directly.\n\nPolling that is not a normal SWR refresh should live in a purpose-named hook or a\nsmall state machine, not inline in a route component.\n\n### Use mutations for writes\n\nWrites should happen in event handlers, route actions, or shared mutation hooks.\nSuccess and failure handling should stay on the write path.\n\nIf many callers need the same success behavior, put that behavior in the shared\nmutation hook instead of making every component watch `mutation.data`.\n\n### Use `key` to reset local state\n\nWhen state should reset because an identity changed, prefer a keyed component\nboundary.\n\nAvoid:\n\n```tsx\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n\n  useEffect(() => {\n    setTab(\"summary\");\n  }, [selectedId]);\n}\n```\n\nPrefer:\n\n```tsx\nfunction DetailsRoute({ selectedId }: Props) {\n  return <Details key={selectedId} selectedId={selectedId} />;\n}\n\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n}\n```\n\nUse a reducer when only part of the state should reset or when the reset is part\nof an explicit domain transition.\n\n### Use URL and router primitives\n\nRoute and URL state should be the source of truth for route-owned preferences.\nParse search params during render, and update them from event handlers.\n\nPrefer route loader/action redirects when route data or auth determines the\nredirect. Use `navigate(...)` from the event path for user-initiated navigation.\nUse `<Navigate replace />` sparingly for render-known route gates when the\ntemporary null or fallback frame is acceptable.\n\nAvoid `navigate(...)` in an effect unless the navigation follows an asynchronous\nexternal result that cannot be represented by a loader, action, mutation callback,\nor render-time route gate.\n\n### Use `useSyncExternalStore` for external stores\n\nWhen React renders from a mutable external store or browser source, prefer\n`useSyncExternalStore` over an effect that subscribes and mirrors a snapshot into\nlocal state.\n\nGood candidates include cross-tab stores, browser storage-backed state, and\nimperative models where React needs a consistent current snapshot.\n\n### Use refs deliberately\n\nA ref can hold an imperative handle or the latest value for a stable callback\npassed to an external integration. Updating `ref.current` during render is\nacceptable when the ref is not used to render UI.\n\nIn React 19, prefer `useEffectEvent` inside approved hooks when an effect-owned\ntimer, listener, subscription, or third-party callback must see the latest props\nor state without forcing the external resource to resubscribe. Use refs for\nimperative objects and for APIs that cannot call an Effect Event directly.\n\nDo not use refs to avoid dependency arrays while still depending on changing\nReact data. That usually hides temporal coupling instead of removing it.\n\n## Approved Effect Hooks\n\nApproved hooks may call React effects internally. They should expose the\nexternal integration they manage and keep dependency behavior obvious at the call\nsite.\n\nRecommended primitives:\n\n- `useMountEffect(setup)` for mount/unmount-only setup\n- `useInterval(callback, delayMs, active?)`\n- `useTimeout(callback, delayMs, active?)`\n- `useDebouncedValue(value, delayMs)`\n- `useWindowEvent(type, handler, options?)`\n- `useDocumentTitle(title)`\n- `useMediaQuery(query)`\n- `useResizeObserver(ref, callback)`\n- `useSseSubscription(...)`\n- domain hooks such as `useRunEvents(runId)` and `useBoardEvents()`\n\nApproved hooks should separate resource identity from non-reactive callbacks.\nValues that decide what resource exists, such as `runId`, URL, media query, or\ndelay, should be explicit hook inputs that control setup and cleanup. Callback\nbodies that only need the latest committed React values should use\n`useEffectEvent` internally instead of ref mirrors when that API fits.\n\n`useMountEffect` should have no dependency array at the call site. If the setup\ndepends on a changing identity, make that identity explicit by:\n\n- rendering a keyed child so the integration remounts for that identity\n- writing a purpose-named hook whose API says what identity controls the resource\n- using an event handler or router/data primitive instead, if no external\n  resource exists\n\nNew approved hooks should include a short doc comment naming the external system\nthey synchronize with and the cleanup guarantees they provide. For one-shot\nnotification hooks with no cleanup, document why duplicate development calls are\nharmless.\n\n## `useMountEffect` Rules\n\n`useMountEffect` is allowed for resource setup only when all of these are true:\n\n- the code attaches to, creates, starts, or subscribes to an external resource\n- the cleanup detaches, disposes, stops, or unsubscribes from that resource\n- the effect is not deriving React state from React inputs\n- the setup does not read changing props, state, route params, search params, or\n  SWR data unless those values are stable for the mounted lifetime by construction\n- the setup is safe under React Strict Mode mount/unmount/remount behavior\n- the component still renders a correct initial frame before the effect runs\n\nGood examples:\n\n- open an `EventSource` and close it on unmount\n- create an xterm terminal instance for a DOM node and dispose it on unmount\n- add a `window` event listener and remove it on unmount\n- start a timer whose only purpose is to tick a clock display\n\nBad examples:\n\n- copy `props.title` into local state\n- copy SWR data into local state\n- inspect a mutation result and then show a toast\n- repair a URL after the first render\n- reset selection because a prop changed\n- fetch data on mount when a query hook can own the request\n\n### One-shot external notifications\n\nSome effects legitimately notify an external system because a route or view\nbecame visible, such as analytics, telemetry, or impression tracking. Do not use\n`useMountEffect` for these unless there is also a real resource to clean up.\nPrefer a purpose-named hook such as `usePageVisit(url)` or\n`useImpressionEvent(id)`.\n\nOne-shot notification hooks must be harmless under Strict Mode's development\nmount/unmount/remount cycle. They should be disabled, de-duplicated, or directed\naway from production metrics in development and tests. They must not perform\nuser-visible writes, billable actions, purchases, destructive mutations, or any\noperation whose duplicate execution would be observable to the user.\n\n## Migration Workflow\n\nUse this workflow when auditing existing direct effects.\n\n1. List direct effect usage:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   ```\n\n2. For each hit, classify it:\n\n   - `derived-state`: replace with render-time derivation, `useMemo`, reducer, or keyed remount\n   - `event-reaction`: move into the event handler, mutation callback, route action, or submit path\n   - `server-data`: move into SWR query/mutation hooks\n   - `url-router`: move into URL-derived render state, event-time URL updates, loader, or `<Navigate>`\n   - `external-integration`: move into `useMountEffect` or a purpose-named integration hook\n   - `imperative-dom`: move into a narrow DOM hook such as `useDocumentTitle`, `useWindowEvent`, or `useResizeObserver`\n   - `one-shot-notification`: move into a purpose-named analytics/telemetry hook with Strict Mode behavior documented\n\n3. Write down the replacement before editing. If the replacement is less clear,\n   keep researching instead of performing a mechanical rewrite.\n\n4. Preserve the user-visible initial frame. The migration should not introduce a\n   flash that the old code avoided.\n\n5. Add or update focused tests for behavior that previously depended on effect\n   timing, especially redirects, toasts, focus, polling, and state resets.\n\n6. After migration, run:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   cd apps/fabro-web && bun test\n   cd apps/fabro-web && bun run typecheck\n   ```\n\n## Existing Hotspots\n\nBased on the current codebase survey, prioritize these areas first:\n\n- `routes/run-detail.tsx`: mutation-result watcher effects for preview and\n  lifecycle toasts. Prefer moving success handling into the mutation/action path.\n- `routes/run-files.tsx`: several effects are legitimate DOM/timer bridges, but\n  they should be extracted into named hooks. The SWR data/ref bridge needs a\n  careful replacement that preserves failed-revalidation behavior.\n- `install-app.tsx`: session loading and health polling are component-level\n  async effects. Prefer SWR/query hooks or a small install state machine before\n  enforcing the policy there.\n- state reset effects in run stages, child runs, file trees, and filesystem\n  panels. Prefer keyed boundaries or reducers where they keep ownership clearer.\n- repeated timer/media-query/focus/document-title/listener effects. Replace with\n  shared hooks before auditing the harder cases.\n\n## Enforcement\n\nEnforcement should happen after the initial wrapper hooks exist. Until then,\nreviewers should request a replacement plan for any new direct effect and PR\ndescriptions for effect migrations should name the category being removed.\n\nDo not add a lint or CI gate until the approved hook surface exists and the\ninitial migration path is clear.\n\n## Review Checklist\n\nWhen reviewing React code, ask:\n\n- Does the component render correctly before any effect runs?\n- Is this effect synchronizing with a real external system?\n- Could this value be derived during render?\n- Could this happen in the event handler that caused it?\n- Could SWR or a route action own this data flow?\n- Is a `key` boundary a clearer reset than a reset effect?\n- Does cleanup exactly undo setup?\n- Is the Strict Mode double-mount behavior harmless?\n- Is the dependency behavior visible in the API, rather than hidden in refs?\n- Did the migration reduce temporal coupling instead of moving it elsewhere?\n\nIf the answer is unclear, keep the effect local until the correct abstraction is\nobvious. A vague wrapper is worse than an honest direct effect.\n",
-          "internal.node_visit_count": 3,
-          "last_response": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDet",
-          "internal.retry_count.work": 0,
-          "internal.fidelity": "full",
-          "graph.rankdir": "LR",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
-          "current_node": "work",
-          "internal.retry_count.start": 0,
+          "response.audit": "Audit result: incomplete.\n\nWhat current evidence proves:\n- `apps/fabro-web` typecheck passes:\n  - `cd apps/fabro-web && bun run typecheck` ✅\n- Test suite passes:\n  - `cd apps/fabro-web && bun test --isolate` ✅ — 493 pass, 0 fail\n- Direct React effect search outside `app/hooks`, `app/lib`, and tests returns no matches:\n  - This supports that ordinary route/component files no longer directly call `useEffect`, `useLayoutEffect`, or related APIs.\n\nWhat prevents declaring the goal complete:\n- The broad search still has many direct effect hits in hooks/lib files, and completion requires those to be approved integrations, not just wrappers.\n- I found remaining cases that are not clearly compliant with the policy:\n  - `apps/fabro-web/app/lib/ask-fabro-layout.tsx` uses `useEffect` in `usePublishedAskFabroSidebarWidth` to copy a React-rendered width into React context state. That looks like a React-state bridge rather than synchronization with an external system.\n  - `apps/fabro-web/app/hooks/use-install-effects.ts` includes `useInstallSessionLoader`, which performs a normal server read in an effect. The policy prefers SWR/query hooks for server reads, and specifically called install session loading a hotspot needing SWR/query/state-machine treatment before enforcement.\n  - `apps/fabro-web/app/routes/insights-editor.tsx` still calls `useMountEffect`. The call is only unmount cleanup for a timeout created elsewhere, not a mount-time resource setup, so it does not obviously satisfy the documented `useMountEffect` rules.\n\nBecause the policy explicitly says the goal is not to hide `useEffect` behind nicer names, these questionable hooks mean completion is not proven.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"Remaining effect wrappers are not all proven approved external integrations; at least the Ask Fabro layout context bridge, install session loader server fetch, and insights-editor useMountEffect cleanup-only usage need repair or stronger justification.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Audit and fix the remaining questionable effect wrappers: replace the Ask Fabro layout width effect with a declarative/context-owned design or approved external integration, move install session loading to SWR/query/state-machine semantics, and replace the insights-editor cleanup-only useMountEffect with a purpose-named timer cleanup hook or event-owned cleanup.\"\n  }\n}",
           "response.work": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDetailAskFabroShell` now publishes sidebar layout declaratively via a rendered `<style>` tag with CSS variables.\n  - `AppShell` reads those CSS variables for right padding/transition.\n  - `AskFabroSidebar` now receives resize-state callbacks through props instead of writing to context.\n- Moved install session loading out of a manual effect:\n  - Added `app/install-query.ts` with `useInstallSessionQuery(...)` backed by SWR.\n  - Removed `useInstallSessionLoader`.\n  - Changed install root redirect from an effect to render-time `<Navigate replace />`.\n  - Improved initial install token handling so a URL token is read during initial state setup, avoiding a token-entry flash before URL scrubbing runs.\n- Replaced the cleanup-only `useMountEffect` in `insights-editor.tsx`:\n  - Added `app/hooks/use-insights-query-runner.ts`, a purpose-named timer hook that owns mock query timer setup/cleanup.\n  - `InsightsEditor` now consumes that hook and no longer calls `useMountEffect`.\n\nValidation run:\n- Direct effects outside hooks/lib/tests:\n  ```sh\n  rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}' --glob '!apps/fabro-web/app/hooks/**' --glob '!apps/fabro-web/app/lib/**' --glob '!**/*.test.ts' --glob '!**/*.test.tsx'\n  ```\n  Result: no output.\n- `useMountEffect` call-site search:\n  ```sh\n  rg -n \"useMountEffect\\(\" apps/fabro-web/app --glob '*.{ts,tsx}'\n  ```\n  Result: only the primitive export in `app/hooks/effects.ts`.\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd apps/fabro-web && bun test --isolate` ✅ — 493 pass, 0 fail\n\nCurrent modified/untracked files:\n- Modified:\n  - `apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx`\n  - `apps/fabro-web/app/hooks/use-install-effects.ts`\n  - `apps/fabro-web/app/install-app.tsx`\n  - `apps/fabro-web/app/layouts/app-shell.tsx`\n  - `apps/fabro-web/app/routes/ask-fabro.tsx`\n  - `apps/fabro-web/app/routes/insights-editor.tsx`\n  - `apps/fabro-web/app/routes/run-detail/docked-controls.tsx`\n- Deleted:\n  - `apps/fabro-web/app/lib/ask-fabro-layout.tsx`\n- Added:\n  - `apps/fabro-web/app/hooks/use-insights-query-runner.ts`\n  - `apps/fabro-web/app/install-query.ts`\n\nRemaining uncertainty:\n- The immediate audit blockers are addressed. A full completion audit should still review the remaining hook/lib effect usages as approved integrations, since the full search still reports effects inside hook modules, SSE libs, and tests.",
           "goal_remaining_work": "Audit and fix the remaining questionable effect wrappers: replace the Ask Fabro layout width effect with a declarative/context-owned design or approved external integration, move install session loading to SWR/query/state-machine semantics, and replace the insights-editor cleanup-only useMountEffect with a purpose-named timer cleanup hook or event-owned cleanup.",
-          "response.audit": "Audit result: incomplete.\n\nWhat current evidence proves:\n- `apps/fabro-web` typecheck passes:\n  - `cd apps/fabro-web && bun run typecheck` ✅\n- Test suite passes:\n  - `cd apps/fabro-web && bun test --isolate` ✅ — 493 pass, 0 fail\n- Direct React effect search outside `app/hooks`, `app/lib`, and tests returns no matches:\n  - This supports that ordinary route/component files no longer directly call `useEffect`, `useLayoutEffect`, or related APIs.\n\nWhat prevents declaring the goal complete:\n- The broad search still has many direct effect hits in hooks/lib files, and completion requires those to be approved integrations, not just wrappers.\n- I found remaining cases that are not clearly compliant with the policy:\n  - `apps/fabro-web/app/lib/ask-fabro-layout.tsx` uses `useEffect` in `usePublishedAskFabroSidebarWidth` to copy a React-rendered width into React context state. That looks like a React-state bridge rather than synchronization with an external system.\n  - `apps/fabro-web/app/hooks/use-install-effects.ts` includes `useInstallSessionLoader`, which performs a normal server read in an effect. The policy prefers SWR/query hooks for server reads, and specifically called install session loading a hotspot needing SWR/query/state-machine treatment before enforcement.\n  - `apps/fabro-web/app/routes/insights-editor.tsx` still calls `useMountEffect`. The call is only unmount cleanup for a timeout created elsewhere, not a mount-time resource setup, so it does not obviously satisfy the documented `useMountEffect` rules.\n\nBecause the policy explicitly says the goal is not to hide `useEffect` behind nicer names, these questionable hooks mean completion is not proven.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"Remaining effect wrappers are not all proven approved external integrations; at least the Ask Fabro layout context bridge, install session loader server fetch, and insights-editor useMountEffect cleanup-only usage need repair or stronger justification.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Audit and fix the remaining questionable effect wrappers: replace the Ask Fabro layout width effect with a declarative/context-owned design or approved external integration, move install session loading to SWR/query/state-machine semantics, and replace the insights-editor cleanup-only useMountEffect with a purpose-named timer cleanup hook or event-owned cleanup.\"\n  }\n}",
-          "preferred_label": "Continue",
           "graph.max_node_visits": "30",
-          "outcome": "succeeded",
-          "last_stage": "work",
-          "internal.run_id": "01KSKPQC64DVBM6A4W5Q713BAG",
           "failure_signature": "",
-          "goal_status": "incomplete",
+          "internal.run_id": "01KSKPQC64DVBM6A4W5Q713BAG",
           "thread.goal.current_node": "work",
-          "internal.retry_count.audit": 0,
+          "preferred_label": "Continue",
+          "current_node": "work",
+          "internal.fidelity": "full",
+          "last_response": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDet",
+          "goal_status": "incomplete",
+          "graph.rankdir": "LR",
+          "internal.retry_count.start": 0,
+          "internal.retry_count.work": 0,
+          "internal.thread_id": "goal",
+          "outcome": "succeeded",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "last_stage": "work",
+          "internal.node_visit_count": 3,
           "failure_class": ""
         },
         "node_outcomes": {
@@ -1047,8 +1047,154 @@
           }
         },
         "next_node_id": "audit",
+        "git_commit_sha": "a4b5339d1b4f2ef1d5be7c1d2b9ed676528dce60",
+        "loop_failure_signatures": {
+          "audit|deterministic|apps/fabro-web/app/install-app.tsx still contains direct useeffect calls in route/component-level code,which violates the policy and was explicitly listed as a hotspot needing migration.": 1,
+          "audit|deterministic|remaining effect wrappers are not all proven approved external integrations; at least the ask fabro layout context bridge,install session loader server fetch,and insights-editor usemounteffect cleanup-only usage need repair or stronger just": 1
+        },
         "node_visits": {
           "audit": 2,
+          "work": 3,
+          "start": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx b/apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx\nindex 22804aec1..a300e1d6e 100644\n--- a/apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx\n+++ b/apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx\n@@ -8,7 +8,6 @@ import { XMarkIcon } from \"@heroicons/react/24/outline\";\n import remarkGfm from \"remark-gfm\";\n \n import { createAskFabroAdapter } from \"../../lib/ask-fabro-runtime\";\n-import { useAskFabroLayout } from \"../../lib/ask-fabro-layout\";\n import SidebarComposer from \"./sidebar-composer\";\n import SidebarWelcome from \"./sidebar-welcome\";\n import ToolCallSummary from \"./tool-call-summary\";\n@@ -44,6 +43,7 @@ export default function AskFabroSidebar({\n   defaultModel,\n   width,\n   onWidthChange,\n+  onResizeActiveChange,\n }: {\n   isOpen: boolean;\n   onClose: () => void;\n@@ -51,6 +51,7 @@ export default function AskFabroSidebar({\n   defaultModel?: string | null;\n   width: number;\n   onWidthChange: (width: number) => void;\n+  onResizeActiveChange: (active: boolean) => void;\n }) {\n   const adapter = useMemo(\n     () => createAskFabroAdapter({ runId, defaultModel }),\n@@ -58,7 +59,6 @@ export default function AskFabroSidebar({\n   );\n   const runtime = useLocalRuntime(adapter);\n \n-  const { setIsResizing } = useAskFabroLayout();\n   const [isDragging, setIsDragging] = useState(false);\n   // Pointer X and width captured at drag start, so each move resolves to an\n   // absolute width rather than accumulating rounding error.\n@@ -69,7 +69,7 @@ export default function AskFabroSidebar({\n     event.currentTarget.setPointerCapture(event.pointerId);\n     dragOrigin.current = { x: event.clientX, width };\n     setIsDragging(true);\n-    setIsResizing(true);\n+    onResizeActiveChange(true);\n   };\n \n   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {\n@@ -88,7 +88,7 @@ export default function AskFabroSidebar({\n     event.currentTarget.releasePointerCapture(event.pointerId);\n     dragOrigin.current = null;\n     setIsDragging(false);\n-    setIsResizing(false);\n+    onResizeActiveChange(false);\n   };\n \n   return (\ndiff --git a/apps/fabro-web/app/hooks/use-insights-query-runner.ts b/apps/fabro-web/app/hooks/use-insights-query-runner.ts\nnew file mode 100644\nindex 000000000..019350947\n--- /dev/null\n+++ b/apps/fabro-web/app/hooks/use-insights-query-runner.ts\n@@ -0,0 +1,116 @@\n+import { useCallback, useEffect, useRef, useState } from \"react\";\n+\n+export interface QueryResult {\n+  columns: string[];\n+  rows: Array<Record<string, string | number>>;\n+  elapsed: number;\n+  rowsRead: number;\n+  bytesRead: number;\n+  rowsReturned: number;\n+}\n+\n+function generateMockResult(sql: string): QueryResult {\n+  const lowerSql = sql.toLowerCase();\n+\n+  if (lowerSql.includes(\"workflow_name\") && lowerSql.includes(\"avg\")) {\n+    return {\n+      columns: [\"workflow_name\", \"avg_duration\", \"run_count\"],\n+      rows: [\n+        { workflow_name: \"Expand Product\", avg_duration: 342.5, run_count: 48 },\n+        { workflow_name: \"Implement Feature\", avg_duration: 287.3, run_count: 156 },\n+        { workflow_name: \"Security Scan\", avg_duration: 198.1, run_count: 312 },\n+        { workflow_name: \"Fix Build\", avg_duration: 145.7, run_count: 482 },\n+        { workflow_name: \"Sync Drift\", avg_duration: 89.2, run_count: 94 },\n+        { workflow_name: \"Dependency Audit\", avg_duration: 67.4, run_count: 201 },\n+      ],\n+      elapsed: 0.531,\n+      rowsRead: 5182366,\n+      bytesRead: 357780000,\n+      rowsReturned: 6,\n+    };\n+  }\n+\n+  if (lowerSql.includes(\"failure_rate\") || lowerSql.includes(\"failed\")) {\n+    return {\n+      columns: [\"day\", \"failures\", \"total\", \"failure_rate\"],\n+      rows: Array.from({ length: 14 }, (_, i) => {\n+        const d = new Date();\n+        d.setDate(d.getDate() - i);\n+        const total = 80 + Math.floor(Math.random() * 60);\n+        const failures = Math.floor(Math.random() * 15);\n+        return {\n+          day: d.toISOString().slice(0, 10),\n+          failures,\n+          total,\n+          failure_rate: Math.round((1000 * failures) / total) / 10,\n+        };\n+      }),\n+      elapsed: 0.287,\n+      rowsRead: 2841092,\n+      bytesRead: 198400000,\n+      rowsReturned: 14,\n+    };\n+  }\n+\n+  return {\n+    columns: [\"repo\", \"runs\", \"total_additions\", \"total_deletions\"],\n+    rows: [\n+      { repo: \"fabro-engine\", runs: 482, total_additions: 28450, total_deletions: 12300 },\n+      { repo: \"fabro-web\", runs: 356, total_additions: 19200, total_deletions: 8900 },\n+      { repo: \"fabro-cli\", runs: 198, total_additions: 8700, total_deletions: 4200 },\n+      { repo: \"fabro-docs\", runs: 145, total_additions: 12100, total_deletions: 3400 },\n+      { repo: \"fabro-sdk\", runs: 89, total_additions: 5600, total_deletions: 2100 },\n+      { repo: \"fabro-infra\", runs: 67, total_additions: 3200, total_deletions: 1800 },\n+      { repo: \"fabro-actions\", runs: 42, total_additions: 2100, total_deletions: 980 },\n+      { repo: \"fabro-proto\", runs: 28, total_additions: 1400, total_deletions: 650 },\n+    ],\n+    elapsed: 0.148,\n+    rowsRead: 1204588,\n+    bytesRead: 89200000,\n+    rowsReturned: 8,\n+  };\n+}\n+\n+/**\n+ * Synchronizes the mock Insights query runner with the browser timer queue.\n+ * Starting a new run clears any pending timer, and the active timer is cleared\n+ * on unmount so stale completions cannot update React state.\n+ */\n+export function useInsightsQueryRunner(initialSql: string) {\n+  const [result, setResult] = useState<QueryResult | null>(() =>\n+    generateMockResult(initialSql),\n+  );\n+  const [isRunning, setIsRunning] = useState(false);\n+  const runRequestIdRef = useRef(0);\n+  const runTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);\n+\n+  const clearPendingRun = useCallback(() => {\n+    if (runTimeoutRef.current !== null) {\n+      clearTimeout(runTimeoutRef.current);\n+      runTimeoutRef.current = null;\n+    }\n+  }, []);\n+\n+  const runQuery = useCallback((sql: string) => {\n+    const requestId = runRequestIdRef.current + 1;\n+    runRequestIdRef.current = requestId;\n+    clearPendingRun();\n+    setIsRunning(true);\n+    const delay = 200 + Math.random() * 400;\n+    runTimeoutRef.current = setTimeout(() => {\n+      if (runRequestIdRef.current !== requestId) return;\n+      runTimeoutRef.current = null;\n+      setResult(generateMockResult(sql));\n+      setIsRunning(false);\n+    }, delay);\n+  }, [clearPendingRun]);\n+\n+  useEffect(() => {\n+    return () => {\n+      runRequestIdRef.current += 1;\n+      clearPendingRun();\n+    };\n+  }, [clearPendingRun]);\n+\n+  return { result, isRunning, runQuery };\n+}\ndiff --git a/apps/fabro-web/app/hooks/use-install-effects.ts b/apps/fabro-web/app/hooks/use-install-effects.ts\nindex f609726ad..e101323d1 100644\n--- a/apps/fabro-web/app/hooks/use-install-effects.ts\n+++ b/apps/fabro-web/app/hooks/use-install-effects.ts\n@@ -1,10 +1,7 @@\n-import { startTransition, useEffect, type Dispatch, type SetStateAction } from \"react\";\n-import type { NavigateFunction } from \"react-router\";\n+import { useEffect, type Dispatch, type SetStateAction } from \"react\";\n \n import {\n   type InstallFinishResponse,\n-  type InstallSessionResponse,\n-  getInstallSession,\n   persistInstallToken,\n } from \"../install-api\";\n import { shouldRedirectAfterHealthPoll } from \"../install-flow\";\n@@ -14,12 +11,6 @@ import {\n   shouldConsumeInstallGithubErrorForPath,\n } from \"../mode\";\n \n-type InstallSessionAction =\n-  | { type: \"sessionCleared\" }\n-  | { type: \"sessionRequested\" }\n-  | { type: \"sessionReady\"; session: InstallSessionResponse }\n-  | { type: \"sessionFailed\"; message: string };\n-\n type InstallGithubCallbackAction =\n   | { type: \"saveErrorChanged\"; message: string | null };\n \n@@ -71,44 +62,6 @@ export function useInstallGithubCallbackError({\n   }, [dispatchInstall, pathname]);\n }\n \n-/**\n- * Drives the install session state machine from the current install token. The\n- * in-flight session request is ignored after token changes or unmounts.\n- */\n-export function useInstallSessionLoader({\n-  dispatchInstall,\n-  installToken,\n-}: {\n-  dispatchInstall: (action: InstallSessionAction) => void;\n-  installToken: string | null;\n-}) {\n-  useEffect(() => {\n-    if (!installToken) {\n-      dispatchInstall({ type: \"sessionCleared\" });\n-      return;\n-    }\n-\n-    let cancelled = false;\n-    dispatchInstall({ type: \"sessionRequested\" });\n-    getInstallSession(installToken)\n-      .then((nextSession) => {\n-        if (cancelled) return;\n-        dispatchInstall({ type: \"sessionReady\", session: nextSession });\n-      })\n-      .catch((error) => {\n-        if (cancelled) return;\n-        dispatchInstall({\n-          type:    \"sessionFailed\",\n-          message: error instanceof Error ? error.message : \"Install session failed\",\n-        });\n-      });\n-\n-    return () => {\n-      cancelled = true;\n-    };\n-  }, [dispatchInstall, installToken]);\n-}\n-\n /**\n  * Synchronizes install finishing with browser timers, fetch health polling, and\n  * `window.location`. The deadline timer, polling interval, and in-flight fetch\n@@ -166,31 +119,3 @@ export function useInstallRestartHealthPolling({\n     };\n   }, [dispatchInstall, finishState]);\n }\n-\n-/**\n- * Synchronizes the install root route with the loaded install session by\n- * replacing the URL once the async session is ready. Duplicate development calls\n- * are harmless because React Router replaces to the same destination.\n- */\n-export function useInstallRootRedirect({\n-  finishState,\n-  installToken,\n-  navigate,\n-  pathname,\n-  session,\n-}: {\n-  finishState: InstallFinishResponse | null;\n-  installToken: string | null;\n-  navigate: NavigateFunction;\n-  pathname: string;\n-  session: InstallSessionResponse | null;\n-}) {\n-  useEffect(() => {\n-    if (!installToken || !session) return;\n-    if ((pathname === \"/\" || pathname === \"/install\") && !finishState) {\n-      startTransition(() => {\n-        navigate(\"/install/welcome\", { replace: true });\n-      });\n-    }\n-  }, [finishState, installToken, navigate, pathname, session]);\n-}\ndiff --git a/apps/fabro-web/app/install-app.tsx b/apps/fabro-web/app/install-app.tsx\nindex 85971b3e1..8cf9b6ff1 100644\n--- a/apps/fabro-web/app/install-app.tsx\n+++ b/apps/fabro-web/app/install-app.tsx\n@@ -42,6 +42,7 @@ import {\n   testInstallSandbox,\n } from \"./install-api\";\n import { INSTALL_PROVIDERS } from \"./install-config\";\n+import { useInstallSessionQuery } from \"./install-query\";\n import {\n   CopyButton,\n   ErrorMessage,\n@@ -53,10 +54,9 @@ import { LoadingState } from \"./components/state\";\n import {\n   useInstallGithubCallbackError,\n   useInstallRestartHealthPolling,\n-  useInstallRootRedirect,\n-  useInstallSessionLoader,\n   useInstallTokenFromUrl,\n } from \"./hooks/use-install-effects\";\n+import { consumeInstallTokenFromUrl } from \"./mode\";\n \n const INSTALL_STEPS = [\n   { id: \"welcome\", label: \"Welcome\", href: \"/install/welcome\" },\n@@ -77,9 +77,9 @@ type GithubOwnerKind = \"personal\" | \"org\";\n \n type SessionState =\n   | { status: \"idle\" }\n-  | { status: \"loading\" }\n-  | { status: \"error\"; message: string }\n-  | { status: \"ready\"; data: InstallSessionResponse };\n+  | { status: \"loading\"; token: string }\n+  | { status: \"error\"; token: string | null; message: string }\n+  | { status: \"ready\"; token: string; data: InstallSessionResponse };\n \n type TokenForm = { token: string; username: string };\n \n@@ -134,9 +134,8 @@ type InstallState = {\n type InstallAction =\n   | { type: \"manualTokenChanged\"; value: string }\n   | { type: \"sessionCleared\" }\n-  | { type: \"sessionRequested\" }\n-  | { type: \"sessionReady\"; session: InstallSessionResponse }\n-  | { type: \"sessionFailed\"; message: string }\n+  | { type: \"sessionReady\"; token: string; session: InstallSessionResponse }\n+  | { type: \"sessionFailed\"; token: string | null; message: string }\n   | { type: \"saveErrorChanged\"; message: string | null }\n   | { type: \"submittingChanged\"; submitting: boolean }\n   | { type: \"timedOutChanged\"; timedOut: boolean }\n@@ -177,6 +176,7 @@ function initialInstallState(): InstallState {\n \n function hydrateInstallState(\n   state: InstallState,\n+  token: string,\n   session: InstallSessionResponse,\n ): InstallState {\n   let githubStrategy = state.githubStrategy;\n@@ -200,7 +200,7 @@ function hydrateInstallState(\n \n   return {\n     ...state,\n-    sessionState:    { status: \"ready\", data: session },\n+    sessionState:    { status: \"ready\", token, data: session },\n     canonicalUrl:\n       state.canonicalUrl ||\n       session.server?.canonical_url ||\n@@ -220,12 +220,10 @@ function installReducer(state: InstallState, action: InstallAction): InstallStat\n       return { ...state, manualToken: action.value };\n     case \"sessionCleared\":\n       return { ...state, sessionState: { status: \"idle\" } };\n-    case \"sessionRequested\":\n-      return { ...state, sessionState: { status: \"loading\" } };\n     case \"sessionReady\":\n-      return hydrateInstallState(state, action.session);\n+      return hydrateInstallState(state, action.token, action.session);\n     case \"sessionFailed\":\n-      return { ...state, sessionState: { status: \"error\", message: action.message } };\n+      return { ...state, sessionState: { status: \"error\", token: action.token, message: action.message } };\n     case \"saveErrorChanged\":\n       return { ...state, saveError: action.message };\n     case \"submittingChanged\":\n@@ -286,15 +284,55 @@ function installReducer(state: InstallState, action: InstallAction): InstallStat\n   }\n }\n \n+function installSessionErrorMessage(error: unknown): string {\n+  return error instanceof Error ? error.message : \"Install session failed\";\n+}\n+\n+function sessionStateForInstallToken(\n+  installToken: string | null,\n+  sessionState: SessionState,\n+  queryError: unknown,\n+): SessionState {\n+  if (!installToken) {\n+    return sessionState.status === \"error\" && sessionState.token === null\n+      ? sessionState\n+      : { status: \"idle\" };\n+  }\n+\n+  if (\n+    (sessionState.status === \"ready\" || sessionState.status === \"error\") &&\n+    sessionState.token === installToken\n+  ) {\n+    return sessionState;\n+  }\n+\n+  if (queryError) {\n+    return {\n+      status:  \"error\",\n+      token:   installToken,\n+      message: installSessionErrorMessage(queryError),\n+    };\n+  }\n+\n+  return { status: \"loading\", token: installToken };\n+}\n+\n+function readInitialInstallToken(): string | null {\n+  const stored = readStoredInstallToken();\n+  if (stored) return stored;\n+  if (typeof window === \"undefined\") return null;\n+  return consumeInstallTokenFromUrl(window.location.href).token;\n+}\n+\n /**\n  * Coordinates install-mode browser integrations: token/error URL scrubbing,\n- * install-session loading, and restart health polling. Timers, intervals, and\n- * in-flight requests are cancelled when their install identity changes.\n+ * install-session query state, and restart health polling. Timers, intervals,\n+ * and in-flight requests are cancelled when their install identity changes.\n  */\n function useInstallController() {\n   const { pathname } = useLocation();\n   const [installToken, setInstallToken] = useState<string | null>(() =>\n-    readStoredInstallToken(),\n+    readInitialInstallToken(),\n   );\n   const [installState, dispatchInstall] = useReducer(\n     installReducer,\n@@ -302,13 +340,54 @@ function useInstallController() {\n     initialInstallState,\n   );\n   const { finishState } = installState;\n+  const installSessionQuery = useInstallSessionQuery(installToken, {\n+    onSuccess: (session) => {\n+      if (!installToken) return;\n+      dispatchInstall({ type: \"sessionReady\", token: installToken, session });\n+    },\n+    onError: (error) => {\n+      dispatchInstall({\n+        type:    \"sessionFailed\",\n+        token:   installToken,\n+        message: installSessionErrorMessage(error),\n+      });\n+    },\n+  });\n \n   useInstallTokenFromUrl({ setInstallToken });\n   useInstallGithubCallbackError({ dispatchInstall, pathname });\n-  useInstallSessionLoader({ dispatchInstall, installToken });\n   useInstallRestartHealthPolling({ dispatchInstall, finishState });\n+  const sessionState = sessionStateForInstallToken(\n+    installToken,\n+    installState.sessionState,\n+    installSessionQuery.error,\n+  );\n+  const controllerState =\n+    sessionState === installState.sessionState\n+      ? installState\n+      : { ...installState, sessionState };\n+  const refreshInstallSession = async () => {\n+    if (!installToken) {\n+      throw new Error(\"Install token is required to refresh the session.\");\n+    }\n+    const nextSession = await getInstallSession(installToken);\n+    dispatchInstall({\n+      type:    \"sessionReady\",\n+      token:   installToken,\n+      session: nextSession,\n+    });\n+    await installSessionQuery.mutate(nextSession, { revalidate: false });\n+    return nextSession;\n+  };\n \n-  return { pathname, installToken, setInstallToken, installState, dispatchInstall };\n+  return {\n+    pathname,\n+    installToken,\n+    setInstallToken,\n+    installState: controllerState,\n+    dispatchInstall,\n+    refreshInstallSession,\n+  };\n }\n \n export default function InstallApp() {\n@@ -319,6 +398,7 @@ export default function InstallApp() {\n     setInstallToken,\n     installState,\n     dispatchInstall,\n+    refreshInstallSession,\n   } = useInstallController();\n   const {\n     sessionState,\n@@ -337,8 +417,6 @@ export default function InstallApp() {\n   } = installState;\n   const session = sessionState.status === \"ready\" ? sessionState.data : null;\n \n-  useInstallRootRedirect({ installToken, session, finishState, pathname, navigate });\n-\n   const currentStep = useMemo<StepId>(\n     () =>\n       STEPPER_STEPS.find((step) => pathname.startsWith(step.href))?.id ??\n@@ -364,6 +442,7 @@ export default function InstallApp() {\n           if (!nextToken) {\n             dispatchInstall({\n               type:    \"sessionFailed\",\n+              token:   null,\n               message: \"Paste the install token from the server logs.\",\n             });\n             return;\n@@ -387,8 +466,7 @@ export default function InstallApp() {\n     try {\n       await args.action();\n       if (args.next) {\n-        const nextSession = await getInstallSession(installToken);\n-        dispatchInstall({ type: \"sessionReady\", session: nextSession });\n+        await refreshInstallSession();\n         navigate(args.next);\n       }\n     } catch (error) {\n@@ -418,8 +496,8 @@ export default function InstallApp() {\n     );\n   }\n \n-  // Covers both sessionState \"loading\" AND the brief \"idle\" window between\n-  // the initial render and the session-fetch hook. Without this guard,\n+  // Covers both sessionState \"loading\" AND the brief \"idle\" window before the\n+  // install session query reports data. Without this guard,\n   // screens like GithubAppDoneScreen see `session == null` and navigate away\n   // before the first fetch finishes — trapping the user in a redirect loop.\n   if (!session) {\n@@ -430,6 +508,10 @@ export default function InstallApp() {\n     );\n   }\n \n+  if ((pathname === \"/\" || pathname === \"/install\") && !finishState) {\n+    return <Navigate to=\"/install/welcome\" replace />;\n+  }\n+\n   if (finishState && pathname !== \"/install/finishing\") {\n     return <Navigate to=\"/install/finishing\" replace />;\n   }\ndiff --git a/apps/fabro-web/app/install-query.ts b/apps/fabro-web/app/install-query.ts\nnew file mode 100644\nindex 000000000..6cfca946a\n--- /dev/null\n+++ b/apps/fabro-web/app/install-query.ts\n@@ -0,0 +1,31 @@\n+import useSWR, { type SWRConfiguration } from \"swr\";\n+\n+import { getInstallSession, type InstallSessionResponse } from \"./install-api\";\n+\n+type InstallSessionKey = readonly [\"install\", \"session\", string];\n+\n+function installSessionKey(token: string | null): InstallSessionKey | null {\n+  return token ? [\"install\", \"session\", token] : null;\n+}\n+\n+/**\n+ * Reads the install session through SWR so server state is owned by the query\n+ * layer instead of a component effect. Revalidation is explicit because install\n+ * setup writes refresh the session from their submit path.\n+ */\n+export function useInstallSessionQuery(\n+  token: string | null,\n+  options: SWRConfiguration<InstallSessionResponse, Error> = {},\n+) {\n+  return useSWR<InstallSessionResponse, Error, InstallSessionKey | null>(\n+    installSessionKey(token),\n+    ([, , currentToken]) => getInstallSession(currentToken),\n+    {\n+      dedupingInterval:       0,\n+      revalidateOnFocus:      false,\n+      revalidateOnReconnect:  false,\n+      shouldRetryOnError:     false,\n+      ...options,\n+    },\n+  );\n+}\ndiff --git a/apps/fabro-web/app/layouts/app-shell.tsx b/apps/fabro-web/app/layouts/app-shell.tsx\nindex ca0cbe417..d4749d485 100644\n--- a/apps/fabro-web/app/layouts/app-shell.tsx\n+++ b/apps/fabro-web/app/layouts/app-shell.tsx\n@@ -15,7 +15,6 @@ import { Link, Outlet, useLocation, useMatches } from \"react-router\";\n import { Toaster } from \"sonner\";\n import { ErrorState } from \"../components/state\";\n import { TooltipProvider } from \"../components/ui\";\n-import { AskFabroLayoutProvider, useAskFabroLayout } from \"../lib/ask-fabro-layout\";\n import { DemoModeProvider } from \"../lib/demo-mode\";\n import { useAuthMe } from \"../lib/queries\";\n import { allNavigation, getVisibleNavigation } from \"./navigation\";\n@@ -65,7 +64,6 @@ export default function AppShell() {\n   return (\n     <DemoModeProvider value={demoMode}>\n     <TooltipProvider>\n-    <AskFabroLayoutProvider>\n     <div\n       className={classNames(\n         \"isolate\",\n@@ -251,7 +249,6 @@ export default function AppShell() {\n     {typeof document !== \"undefined\" && (\n       <Toaster richColors position=\"bottom-right\" />\n     )}\n-    </AskFabroLayoutProvider>\n     </TooltipProvider>\n     </DemoModeProvider>\n   );\n@@ -269,15 +266,16 @@ function ShellMain({\n   fullHeight: boolean;\n   maxWidth: string;\n }) {\n-  const { sidebarWidth, isResizing } = useAskFabroLayout();\n   return (\n     <main\n       className={classNames(\n-        !isResizing &&\n-          \"transition-[padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]\",\n         fullHeight && \"min-h-0 flex-1\",\n       )}\n-      style={{ paddingRight: sidebarWidth }}\n+      style={{\n+        paddingRight: \"var(--fabro-ask-sidebar-width, 0px)\",\n+        transition:\n+          \"var(--fabro-ask-sidebar-transition, padding 300ms cubic-bezier(0.16, 1, 0.3, 1))\",\n+      }}\n     >\n       <div\n         className={classNames(\ndiff --git a/apps/fabro-web/app/lib/ask-fabro-layout.tsx b/apps/fabro-web/app/lib/ask-fabro-layout.tsx\ndeleted file mode 100644\nindex bca1d7393..000000000\n--- a/apps/fabro-web/app/lib/ask-fabro-layout.tsx\n+++ /dev/null\n@@ -1,66 +0,0 @@\n-import { createContext, use, useEffect, useMemo, useState } from \"react\";\n-\n-/**\n- * Layout coordination for the docked \"Ask Fabro\" sidebar. The run detail page\n- * owns the open/closed state and publishes the sidebar's current width here;\n- * the app shell reads it and insets `<main>` by that amount so the page\n- * content shifts left instead of being covered by the fixed sidebar.\n- */\n-interface AskFabroLayout {\n-  /** Width in px the docked sidebar currently occupies; 0 when closed. */\n-  sidebarWidth: number;\n-  setSidebarWidth: (width: number) => void;\n-  /**\n-   * True while the user is dragging the sidebar's resize handle. Consumers\n-   * that animate off `sidebarWidth` drop their transition while this is set so\n-   * the layout tracks the cursor instead of trailing it by the ease duration.\n-   */\n-  isResizing: boolean;\n-  setIsResizing: (resizing: boolean) => void;\n-}\n-\n-const NOOP_LAYOUT: AskFabroLayout = {\n-  sidebarWidth: 0,\n-  setSidebarWidth: () => {},\n-  isResizing: false,\n-  setIsResizing: () => {},\n-};\n-\n-const AskFabroLayoutContext = createContext<AskFabroLayout>(NOOP_LAYOUT);\n-\n-export function AskFabroLayoutProvider({\n-  children,\n-}: {\n-  children: React.ReactNode;\n-}) {\n-  const [sidebarWidth, setSidebarWidth] = useState(0);\n-  const [isResizing, setIsResizing] = useState(false);\n-  const value = useMemo(\n-    () => ({ sidebarWidth, setSidebarWidth, isResizing, setIsResizing }),\n-    [sidebarWidth, isResizing],\n-  );\n-  return (\n-    <AskFabroLayoutContext.Provider value={value}>\n-      {children}\n-    </AskFabroLayoutContext.Provider>\n-  );\n-}\n-\n-export function useAskFabroLayout(): AskFabroLayout {\n-  return use(AskFabroLayoutContext);\n-}\n-\n-/**\n- * Synchronizes a mounted run-detail sidebar with the layout context consumed by\n- * the app shell. The published width is reset to 0 on unmount.\n- */\n-export function usePublishedAskFabroSidebarWidth(width: number) {\n-  const { setSidebarWidth, isResizing } = useAskFabroLayout();\n-\n-  useEffect(() => {\n-    setSidebarWidth(width);\n-    return () => setSidebarWidth(0);\n-  }, [setSidebarWidth, width]);\n-\n-  return { isResizing };\n-}\ndiff --git a/apps/fabro-web/app/routes/ask-fabro.tsx b/apps/fabro-web/app/routes/ask-fabro.tsx\nindex 81ced132c..aea117bee 100644\n--- a/apps/fabro-web/app/routes/ask-fabro.tsx\n+++ b/apps/fabro-web/app/routes/ask-fabro.tsx\n@@ -36,6 +36,7 @@ export default function AskFabro() {\n         runId=\"demo\"\n         width={width}\n         onWidthChange={setWidth}\n+        onResizeActiveChange={() => {}}\n       />\n     </div>\n   );\ndiff --git a/apps/fabro-web/app/routes/insights-editor.tsx b/apps/fabro-web/app/routes/insights-editor.tsx\nindex 7a53d5f47..543dff517 100644\n--- a/apps/fabro-web/app/routes/insights-editor.tsx\n+++ b/apps/fabro-web/app/routes/insights-editor.tsx\n@@ -16,85 +16,14 @@ import {\n   PencilIcon,\n } from \"@heroicons/react/24/outline\";\n import { formatBytes } from \"../lib/format\";\n-import { useMountEffect, useResizeObserver } from \"../hooks/effects\";\n-\n-// ── Types ──\n-\n-interface QueryResult {\n-  columns: string[];\n-  rows: Array<Record<string, string | number>>;\n-  elapsed: number;\n-  rowsRead: number;\n-  bytesRead: number;\n-  rowsReturned: number;\n-}\n+import { useResizeObserver } from \"../hooks/effects\";\n+import {\n+  type QueryResult,\n+  useInsightsQueryRunner,\n+} from \"../hooks/use-insights-query-runner\";\n \n type ResultView = \"chart\" | \"table\";\n \n-// ── Mock data ──\n-\n-function generateMockResult(sql: string): QueryResult {\n-  const lowerSql = sql.toLowerCase();\n-\n-  if (lowerSql.includes(\"workflow_name\") && lowerSql.includes(\"avg\")) {\n-    return {\n-      columns: [\"workflow_name\", \"avg_duration\", \"run_count\"],\n-      rows: [\n-        { workflow_name: \"Expand Product\", avg_duration: 342.5, run_count: 48 },\n-        { workflow_name: \"Implement Feature\", avg_duration: 287.3, run_count: 156 },\n-        { workflow_name: \"Security Scan\", avg_duration: 198.1, run_count: 312 },\n-        { workflow_name: \"Fix Build\", avg_duration: 145.7, run_count: 482 },\n-        { workflow_name: \"Sync Drift\", avg_duration: 89.2, run_count: 94 },\n-        { workflow_name: \"Dependency Audit\", avg_duration: 67.4, run_count: 201 },\n-      ],\n-      elapsed: 0.531,\n-      rowsRead: 5182366,\n-      bytesRead: 357780000,\n-      rowsReturned: 6,\n-    };\n-  }\n-\n-  if (lowerSql.includes(\"failure_rate\") || lowerSql.includes(\"failed\")) {\n-    return {\n-      columns: [\"day\", \"failures\", \"total\", \"failure_rate\"],\n-      rows: Array.from({ length: 14 }, (_, i) => {\n-        const d = new Date();\n-        d.setDate(d.getDate() - i);\n-        const total = 80 + Math.floor(Math.random() * 60);\n-        const failures = Math.floor(Math.random() * 15);\n-        return {\n-          day: d.toISOString().slice(0, 10),\n-          failures,\n-          total,\n-          failure_rate: Math.round((1000 * failures) / total) / 10,\n-        };\n-      }),\n-      elapsed: 0.287,\n-      rowsRead: 2841092,\n-      bytesRead: 198400000,\n-      rowsReturned: 14,\n-    };\n-  }\n-\n-  return {\n-    columns: [\"repo\", \"runs\", \"total_additions\", \"total_deletions\"],\n-    rows: [\n-      { repo: \"fabro-engine\", runs: 482, total_additions: 28450, total_deletions: 12300 },\n-      { repo: \"fabro-web\", runs: 356, total_additions: 19200, total_deletions: 8900 },\n-      { repo: \"fabro-cli\", runs: 198, total_additions: 8700, total_deletions: 4200 },\n-      { repo: \"fabro-docs\", runs: 145, total_additions: 12100, total_deletions: 3400 },\n-      { repo: \"fabro-sdk\", runs: 89, total_additions: 5600, total_deletions: 2100 },\n-      { repo: \"fabro-infra\", runs: 67, total_additions: 3200, total_deletions: 1800 },\n-      { repo: \"fabro-actions\", runs: 42, total_additions: 2100, total_deletions: 980 },\n-      { repo: \"fabro-proto\", runs: 28, total_additions: 1400, total_deletions: 650 },\n-    ],\n-    elapsed: 0.148,\n-    rowsRead: 1204588,\n-    bytesRead: 89200000,\n-    rowsReturned: 8,\n-  };\n-}\n-\n // ── Formatting helpers ──\n \n function formatNumber(n: number): string {\n@@ -375,46 +304,13 @@ export default function InsightsEditor() {\n   const initialQueryName = navState?.name ?? \"Run duration by workflow\";\n \n   const [sql, setSql] = useState(() => initialSql);\n-  const [result, setResult] = useState<QueryResult | null>(() =>\n-    generateMockResult(initialSql),\n-  );\n+  const { result, isRunning, runQuery } = useInsightsQueryRunner(initialSql);\n   const [resultView, setResultView] = useState<ResultView>(\"chart\");\n-  const [isRunning, setIsRunning] = useState(false);\n   const [queryName, setQueryName] = useState(() => initialQueryName);\n   const [isEditingName, setIsEditingName] = useState(false);\n   const nameInputRef = useRef<HTMLInputElement>(null);\n   const [showAiDialog, setShowAiDialog] = useState(false);\n   const [aiPrompt, setAiPrompt] = useState(\"\");\n-  const runRequestIdRef = useRef(0);\n-  const runTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);\n-\n-  const runQuery = useCallback(() => {\n-    const requestId = runRequestIdRef.current + 1;\n-    runRequestIdRef.current = requestId;\n-    if (runTimeoutRef.current !== null) {\n-      clearTimeout(runTimeoutRef.current);\n-    }\n-    setIsRunning(true);\n-    const delay = 200 + Math.random() * 400;\n-    runTimeoutRef.current = setTimeout(() => {\n-      if (runRequestIdRef.current !== requestId) return;\n-      runTimeoutRef.current = null;\n-      setResult(generateMockResult(sql));\n-      setIsRunning(false);\n-    }, delay);\n-  }, [sql]);\n-\n-  useMountEffect(() => {\n-    const runRequestIds = runRequestIdRef;\n-    const runTimeouts = runTimeoutRef;\n-    return () => {\n-      runRequestIds.current += 1;\n-      if (runTimeouts.current !== null) {\n-        clearTimeout(runTimeouts.current);\n-        runTimeouts.current = null;\n-      }\n-    };\n-  });\n \n   return (\n     <div className=\"space-y-4\">\n@@ -483,7 +379,7 @@ export default function InsightsEditor() {\n           {/* Run */}\n           <button\n             type=\"button\"\n-            onClick={runQuery}\n+            onClick={() => runQuery(sql)}\n             disabled={isRunning || sql.trim().length === 0}\n             className=\"inline-flex items-center gap-1.5 rounded-md border border-mint/20 bg-mint/5 px-3.5 py-1.5 text-sm font-medium text-mint transition-all hover:border-mint/50 hover:bg-mint/10 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-mint/20 disabled:hover:bg-mint/5 disabled:hover:text-mint\"\n           >\n@@ -499,7 +395,7 @@ export default function InsightsEditor() {\n           </button>\n         </div>\n \n-        <SqlEditor value={sql} onChange={setSql} onRun={runQuery} />\n+        <SqlEditor value={sql} onChange={setSql} onRun={() => runQuery(sql)} />\n       </div>\n \n       {/* ── Results bar + content ── */}\ndiff --git a/apps/fabro-web/app/routes/run-detail/docked-controls.tsx b/apps/fabro-web/app/routes/run-detail/docked-controls.tsx\nindex 53be17b49..0a95fe73f 100644\n--- a/apps/fabro-web/app/routes/run-detail/docked-controls.tsx\n+++ b/apps/fabro-web/app/routes/run-detail/docked-controls.tsx\n@@ -19,7 +19,6 @@ import {\n   type ApiQuestion,\n   type AskFabro,\n } from \"@qltysh/fabro-api-client\";\n-import { usePublishedAskFabroSidebarWidth } from \"../../lib/ask-fabro-layout\";\n import { classNames } from \"./model\";\n \n const ASK_FABRO_UNAVAILABLE_TOOLTIPS: Record<\n@@ -50,11 +49,19 @@ export function RunDetailAskFabroShell({\n   const askDefaultModel = askFabro?.default_model ?? null;\n   const [askOpen, setAskOpen] = useState(false);\n   const [askWidth, setAskWidth] = useState(SIDEBAR_WIDTH);\n+  const [resizeActive, setResizeActive] = useState(false);\n   const sidebarWidth = askAvailable && askOpen ? askWidth : 0;\n-  const { isResizing } = usePublishedAskFabroSidebarWidth(sidebarWidth);\n+  const isResizing = askAvailable && resizeActive;\n+  const shellLayoutStyle = `:root {\n+  --fabro-ask-sidebar-width: ${sidebarWidth}px;\n+  --fabro-ask-sidebar-transition: ${\n+    isResizing ? \"none\" : \"padding 300ms cubic-bezier(0.16, 1, 0.3, 1)\"\n+  };\n+}`;\n \n   return (\n     <>\n+      <style>{shellLayoutStyle}</style>\n       {children({\n         askTrigger: (\n           <AskFabroTriggerButton\n@@ -76,6 +83,7 @@ export function RunDetailAskFabroShell({\n             defaultModel={askDefaultModel}\n             width={askWidth}\n             onWidthChange={setAskWidth}\n+            onResizeActiveChange={setResizeActive}\n           />\n         </div>\n       )}\n",
+        "summary": {
+          "files_changed": 58,
+          "additions": 1803,
+          "deletions": 1189
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-27T04:39:29.263527Z",
+        "current_node": "audit",
+        "completed_nodes": [
+          "start",
+          "work",
+          "audit",
+          "work",
+          "audit",
+          "work",
+          "audit"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.thread_id": "goal",
+          "graph.goal": "# React Effects Policy\n\nThis document defines how `apps/fabro-web` should use React effects.\n\nThe goal is not to hide `useEffect` behind nicer names. The goal is to keep\ncomponent data flow declarative, localize real external integrations, and make\nthe codebase easier for people and agents to reason about.\n\n## Policy\n\nDo not call `useEffect` directly from route or component code.\n\nNew code should treat every direct `useEffect`, `React.useEffect`,\n`useLayoutEffect`, or `useInsertionEffect` call as a policy violation unless it\nlives inside an approved integration hook.\n\nThe only generic effect primitive exposed to component code should be\n`useMountEffect`, and it is only for true mount/unmount integrations. Prefer a\npurpose-named hook over `useMountEffect` whenever the integration has domain\nmeaning, such as `useRunEvents(runId)`, `useDocumentTitle(title)`, or\n`useWindowEvent(...)`.\n\n`useMountEffect` must not become a way to opt out of React dependencies. If an\nintegration depends on a changing identity, that identity belongs in the API of\na purpose-named hook or in a keyed component boundary.\n\nExisting direct effects should be migrated opportunistically when touching the\nsame area. Do not make a behavior-preserving effect harder to understand just to\nremove the word `useEffect`; the replacement must improve or preserve clarity,\ntestability, and lifecycle correctness.\n\n## What Counts As An External Integration\n\nEffects are only for synchronizing React with a system outside React.\n\nAllowed external systems include:\n\n- browser globals: `window`, `document`, history, media queries, clipboard, focus\n- browser resources: timers, animation frames, `ResizeObserver`, `MutationObserver`\n- network streams and sockets: `EventSource`, WebSocket, cross-tab channels\n- imperative third-party widgets that must be constructed, attached, and disposed\n- durable browser storage when the write cannot happen in an event handler\n- external notifications such as analytics or telemetry for a route/view becoming\n  visible, when they are safe under Strict Mode and do not perform user-visible\n  writes\n\nThese are not external systems for this policy:\n\n- props\n- React state\n- SWR data\n- derived values\n- route params\n- search params used only for rendering\n- mutation result objects\n- \"after this state changes, do another state update\"\n\nIf the effect mostly moves data from one React value to another React value, it\nis almost certainly the wrong tool.\n\n## Preferred Alternatives\n\n### Derive during render\n\nIf a value can be computed from props, route params, query data, or state, compute\nit during render. Use `useMemo` only when the computation is expensive or object\nidentity matters to a child API.\n\nAvoid:\n\n```tsx\nconst [filtered, setFiltered] = useState<Item[]>([]);\n\nuseEffect(() => {\n  setFiltered(items.filter(matchesQuery));\n}, [items, matchesQuery]);\n```\n\nPrefer:\n\n```tsx\nconst filtered = useMemo(\n  () => items.filter(matchesQuery),\n  [items, matchesQuery],\n);\n```\n\n### Handle events in event handlers\n\nIf the work is caused by a click, submit, key press, or mutation trigger, do the\nwork from that event path. Do not set a flag and wait for an effect to notice it.\n\nAvoid watching mutation data just to show a toast or navigate. Prefer mutation\ncallbacks, an explicit `try`/`catch` around `trigger(...)`, or a route action\nresult consumed by the same event flow.\n\n### Use SWR for server state\n\nServer reads belong in shared query hooks in `app/lib/queries.ts` or an adjacent\ndomain query module. Do not fetch server data in a component effect.\n\nUse SWR options such as `keepPreviousData`, `refreshInterval`,\n`revalidateOnFocus`, and `shouldRetryOnError` instead of local effect state when\nthey describe the behavior directly.\n\nPolling that is not a normal SWR refresh should live in a purpose-named hook or a\nsmall state machine, not inline in a route component.\n\n### Use mutations for writes\n\nWrites should happen in event handlers, route actions, or shared mutation hooks.\nSuccess and failure handling should stay on the write path.\n\nIf many callers need the same success behavior, put that behavior in the shared\nmutation hook instead of making every component watch `mutation.data`.\n\n### Use `key` to reset local state\n\nWhen state should reset because an identity changed, prefer a keyed component\nboundary.\n\nAvoid:\n\n```tsx\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n\n  useEffect(() => {\n    setTab(\"summary\");\n  }, [selectedId]);\n}\n```\n\nPrefer:\n\n```tsx\nfunction DetailsRoute({ selectedId }: Props) {\n  return <Details key={selectedId} selectedId={selectedId} />;\n}\n\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n}\n```\n\nUse a reducer when only part of the state should reset or when the reset is part\nof an explicit domain transition.\n\n### Use URL and router primitives\n\nRoute and URL state should be the source of truth for route-owned preferences.\nParse search params during render, and update them from event handlers.\n\nPrefer route loader/action redirects when route data or auth determines the\nredirect. Use `navigate(...)` from the event path for user-initiated navigation.\nUse `<Navigate replace />` sparingly for render-known route gates when the\ntemporary null or fallback frame is acceptable.\n\nAvoid `navigate(...)` in an effect unless the navigation follows an asynchronous\nexternal result that cannot be represented by a loader, action, mutation callback,\nor render-time route gate.\n\n### Use `useSyncExternalStore` for external stores\n\nWhen React renders from a mutable external store or browser source, prefer\n`useSyncExternalStore` over an effect that subscribes and mirrors a snapshot into\nlocal state.\n\nGood candidates include cross-tab stores, browser storage-backed state, and\nimperative models where React needs a consistent current snapshot.\n\n### Use refs deliberately\n\nA ref can hold an imperative handle or the latest value for a stable callback\npassed to an external integration. Updating `ref.current` during render is\nacceptable when the ref is not used to render UI.\n\nIn React 19, prefer `useEffectEvent` inside approved hooks when an effect-owned\ntimer, listener, subscription, or third-party callback must see the latest props\nor state without forcing the external resource to resubscribe. Use refs for\nimperative objects and for APIs that cannot call an Effect Event directly.\n\nDo not use refs to avoid dependency arrays while still depending on changing\nReact data. That usually hides temporal coupling instead of removing it.\n\n## Approved Effect Hooks\n\nApproved hooks may call React effects internally. They should expose the\nexternal integration they manage and keep dependency behavior obvious at the call\nsite.\n\nRecommended primitives:\n\n- `useMountEffect(setup)` for mount/unmount-only setup\n- `useInterval(callback, delayMs, active?)`\n- `useTimeout(callback, delayMs, active?)`\n- `useDebouncedValue(value, delayMs)`\n- `useWindowEvent(type, handler, options?)`\n- `useDocumentTitle(title)`\n- `useMediaQuery(query)`\n- `useResizeObserver(ref, callback)`\n- `useSseSubscription(...)`\n- domain hooks such as `useRunEvents(runId)` and `useBoardEvents()`\n\nApproved hooks should separate resource identity from non-reactive callbacks.\nValues that decide what resource exists, such as `runId`, URL, media query, or\ndelay, should be explicit hook inputs that control setup and cleanup. Callback\nbodies that only need the latest committed React values should use\n`useEffectEvent` internally instead of ref mirrors when that API fits.\n\n`useMountEffect` should have no dependency array at the call site. If the setup\ndepends on a changing identity, make that identity explicit by:\n\n- rendering a keyed child so the integration remounts for that identity\n- writing a purpose-named hook whose API says what identity controls the resource\n- using an event handler or router/data primitive instead, if no external\n  resource exists\n\nNew approved hooks should include a short doc comment naming the external system\nthey synchronize with and the cleanup guarantees they provide. For one-shot\nnotification hooks with no cleanup, document why duplicate development calls are\nharmless.\n\n## `useMountEffect` Rules\n\n`useMountEffect` is allowed for resource setup only when all of these are true:\n\n- the code attaches to, creates, starts, or subscribes to an external resource\n- the cleanup detaches, disposes, stops, or unsubscribes from that resource\n- the effect is not deriving React state from React inputs\n- the setup does not read changing props, state, route params, search params, or\n  SWR data unless those values are stable for the mounted lifetime by construction\n- the setup is safe under React Strict Mode mount/unmount/remount behavior\n- the component still renders a correct initial frame before the effect runs\n\nGood examples:\n\n- open an `EventSource` and close it on unmount\n- create an xterm terminal instance for a DOM node and dispose it on unmount\n- add a `window` event listener and remove it on unmount\n- start a timer whose only purpose is to tick a clock display\n\nBad examples:\n\n- copy `props.title` into local state\n- copy SWR data into local state\n- inspect a mutation result and then show a toast\n- repair a URL after the first render\n- reset selection because a prop changed\n- fetch data on mount when a query hook can own the request\n\n### One-shot external notifications\n\nSome effects legitimately notify an external system because a route or view\nbecame visible, such as analytics, telemetry, or impression tracking. Do not use\n`useMountEffect` for these unless there is also a real resource to clean up.\nPrefer a purpose-named hook such as `usePageVisit(url)` or\n`useImpressionEvent(id)`.\n\nOne-shot notification hooks must be harmless under Strict Mode's development\nmount/unmount/remount cycle. They should be disabled, de-duplicated, or directed\naway from production metrics in development and tests. They must not perform\nuser-visible writes, billable actions, purchases, destructive mutations, or any\noperation whose duplicate execution would be observable to the user.\n\n## Migration Workflow\n\nUse this workflow when auditing existing direct effects.\n\n1. List direct effect usage:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   ```\n\n2. For each hit, classify it:\n\n   - `derived-state`: replace with render-time derivation, `useMemo`, reducer, or keyed remount\n   - `event-reaction`: move into the event handler, mutation callback, route action, or submit path\n   - `server-data`: move into SWR query/mutation hooks\n   - `url-router`: move into URL-derived render state, event-time URL updates, loader, or `<Navigate>`\n   - `external-integration`: move into `useMountEffect` or a purpose-named integration hook\n   - `imperative-dom`: move into a narrow DOM hook such as `useDocumentTitle`, `useWindowEvent`, or `useResizeObserver`\n   - `one-shot-notification`: move into a purpose-named analytics/telemetry hook with Strict Mode behavior documented\n\n3. Write down the replacement before editing. If the replacement is less clear,\n   keep researching instead of performing a mechanical rewrite.\n\n4. Preserve the user-visible initial frame. The migration should not introduce a\n   flash that the old code avoided.\n\n5. Add or update focused tests for behavior that previously depended on effect\n   timing, especially redirects, toasts, focus, polling, and state resets.\n\n6. After migration, run:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   cd apps/fabro-web && bun test\n   cd apps/fabro-web && bun run typecheck\n   ```\n\n## Existing Hotspots\n\nBased on the current codebase survey, prioritize these areas first:\n\n- `routes/run-detail.tsx`: mutation-result watcher effects for preview and\n  lifecycle toasts. Prefer moving success handling into the mutation/action path.\n- `routes/run-files.tsx`: several effects are legitimate DOM/timer bridges, but\n  they should be extracted into named hooks. The SWR data/ref bridge needs a\n  careful replacement that preserves failed-revalidation behavior.\n- `install-app.tsx`: session loading and health polling are component-level\n  async effects. Prefer SWR/query hooks or a small install state machine before\n  enforcing the policy there.\n- state reset effects in run stages, child runs, file trees, and filesystem\n  panels. Prefer keyed boundaries or reducers where they keep ownership clearer.\n- repeated timer/media-query/focus/document-title/listener effects. Replace with\n  shared hooks before auditing the harder cases.\n\n## Enforcement\n\nEnforcement should happen after the initial wrapper hooks exist. Until then,\nreviewers should request a replacement plan for any new direct effect and PR\ndescriptions for effect migrations should name the category being removed.\n\nDo not add a lint or CI gate until the approved hook surface exists and the\ninitial migration path is clear.\n\n## Review Checklist\n\nWhen reviewing React code, ask:\n\n- Does the component render correctly before any effect runs?\n- Is this effect synchronizing with a real external system?\n- Could this value be derived during render?\n- Could this happen in the event handler that caused it?\n- Could SWR or a route action own this data flow?\n- Is a `key` boundary a clearer reset than a reset effect?\n- Does cleanup exactly undo setup?\n- Is the Strict Mode double-mount behavior harmless?\n- Is the dependency behavior visible in the API, rather than hidden in refs?\n- Did the migration reduce temporal coupling instead of moving it elsewhere?\n\nIf the answer is unclear, keep the effect local until the correct abstraction is\nobvious. A vague wrapper is worse than an honest direct effect.\n",
+          "internal.node_visit_count": 3,
+          "last_response": "Audit result: incomplete.\n\nEvidence checked:\n- `git status --short`: no output.\n- Full direct-effect search still finds effects in hook/lib/test files.\n- Route/component direct-effect search excluding",
+          "internal.retry_count.work": 0,
+          "internal.fidelity": "full",
+          "graph.rankdir": "LR",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "current_node": "audit",
+          "internal.retry_count.start": 0,
+          "response.work": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDetailAskFabroShell` now publishes sidebar layout declaratively via a rendered `<style>` tag with CSS variables.\n  - `AppShell` reads those CSS variables for right padding/transition.\n  - `AskFabroSidebar` now receives resize-state callbacks through props instead of writing to context.\n- Moved install session loading out of a manual effect:\n  - Added `app/install-query.ts` with `useInstallSessionQuery(...)` backed by SWR.\n  - Removed `useInstallSessionLoader`.\n  - Changed install root redirect from an effect to render-time `<Navigate replace />`.\n  - Improved initial install token handling so a URL token is read during initial state setup, avoiding a token-entry flash before URL scrubbing runs.\n- Replaced the cleanup-only `useMountEffect` in `insights-editor.tsx`:\n  - Added `app/hooks/use-insights-query-runner.ts`, a purpose-named timer hook that owns mock query timer setup/cleanup.\n  - `InsightsEditor` now consumes that hook and no longer calls `useMountEffect`.\n\nValidation run:\n- Direct effects outside hooks/lib/tests:\n  ```sh\n  rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}' --glob '!apps/fabro-web/app/hooks/**' --glob '!apps/fabro-web/app/lib/**' --glob '!**/*.test.ts' --glob '!**/*.test.tsx'\n  ```\n  Result: no output.\n- `useMountEffect` call-site search:\n  ```sh\n  rg -n \"useMountEffect\\(\" apps/fabro-web/app --glob '*.{ts,tsx}'\n  ```\n  Result: only the primitive export in `app/hooks/effects.ts`.\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd apps/fabro-web && bun test --isolate` ✅ — 493 pass, 0 fail\n\nCurrent modified/untracked files:\n- Modified:\n  - `apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx`\n  - `apps/fabro-web/app/hooks/use-install-effects.ts`\n  - `apps/fabro-web/app/install-app.tsx`\n  - `apps/fabro-web/app/layouts/app-shell.tsx`\n  - `apps/fabro-web/app/routes/ask-fabro.tsx`\n  - `apps/fabro-web/app/routes/insights-editor.tsx`\n  - `apps/fabro-web/app/routes/run-detail/docked-controls.tsx`\n- Deleted:\n  - `apps/fabro-web/app/lib/ask-fabro-layout.tsx`\n- Added:\n  - `apps/fabro-web/app/hooks/use-insights-query-runner.ts`\n  - `apps/fabro-web/app/install-query.ts`\n\nRemaining uncertainty:\n- The immediate audit blockers are addressed. A full completion audit should still review the remaining hook/lib effect usages as approved integrations, since the full search still reports effects inside hook modules, SSE libs, and tests.",
+          "goal_remaining_work": "Repair or replace useLastSuccessfulRunFilesData so failed-revalidation fallback, previous-to-sha tracking, timestamping, and empty-transition toasts are handled without an effect that mirrors SWR data into refs; then audit/fix useDataUpdatedAt and useStageArtifactDownloadHref.",
+          "response.audit": "Audit result: incomplete.\n\nEvidence checked:\n- `git status --short`: no output.\n- Full direct-effect search still finds effects in hook/lib/test files.\n- Route/component direct-effect search excluding `app/hooks`, `app/lib`, and tests returns no matches. This proves the narrow “no direct effects in route/component files” requirement.\n- `useMountEffect` search only finds the primitive export in `app/hooks/effects.ts`, not component call sites.\n- `cd apps/fabro-web && bun run typecheck` passes.\n- `cd apps/fabro-web && bun test --isolate` passes: 493 pass, 0 fail.\n\nWhy completion is not proven:\n- The policy says the goal is not merely to hide `useEffect` in hooks; remaining hook effects must be approved external integrations.\n- At least one existing hotspot remains unresolved:\n  - `apps/fabro-web/app/hooks/use-last-successful-run-files-data.ts` still uses an effect to react to SWR data, update refs, record timestamps, and emit an empty-transition toast. This is the exact run-files SWR data/ref bridge called out in the policy hotspot list as needing careful replacement. SWR data and React refs/state are not external systems under the policy, so this hook is not proven compliant.\n- Additional remaining hooks also need audit/repair before declaring completion:\n  - `apps/fabro-web/app/hooks/use-data-updated-at.ts` sets React state from async/SWR data changes.\n  - `apps/fabro-web/app/hooks/use-stage-artifact-download-href.ts` resolves a generated URL from React inputs in an effect and stores it in state.\n\nPassing tests and the clean route/component search are good evidence of progress, but they do not prove every remaining hook effect is an approved integration.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"The remaining run-files SWR data/ref bridge in useLastSuccessfulRunFilesData is an explicit policy hotspot and is not proven to be an approved external integration.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Repair or replace useLastSuccessfulRunFilesData so failed-revalidation fallback, previous-to-sha tracking, timestamping, and empty-transition toasts are handled without an effect that mirrors SWR data into refs; then audit/fix useDataUpdatedAt and useStageArtifactDownloadHref.\"\n  }\n}",
+          "preferred_label": "Continue",
+          "graph.max_node_visits": "30",
+          "outcome": "failed",
+          "last_stage": "audit",
+          "internal.run_id": "01KSKPQC64DVBM6A4W5Q713BAG",
+          "failure_signature": "audit|deterministic|the remaining run-files swr data/ref bridge in uselastsuccessfulrunfilesdata is an explicit policy hotspot and is not proven to be an approved external integration.",
+          "goal_status": "incomplete",
+          "thread.goal.current_node": "audit",
+          "internal.retry_count.audit": 0,
+          "failure_class": "deterministic"
+        },
+        "node_outcomes": {
+          "work": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDet",
+              "response.work": "Continued the React Effects Policy migration and repaired the three audit blockers.\n\nWhat changed:\n- Removed the `AskFabroLayout` effect bridge:\n  - Deleted `app/lib/ask-fabro-layout.tsx`.\n  - `RunDetailAskFabroShell` now publishes sidebar layout declaratively via a rendered `<style>` tag with CSS variables.\n  - `AppShell` reads those CSS variables for right padding/transition.\n  - `AskFabroSidebar` now receives resize-state callbacks through props instead of writing to context.\n- Moved install session loading out of a manual effect:\n  - Added `app/install-query.ts` with `useInstallSessionQuery(...)` backed by SWR.\n  - Removed `useInstallSessionLoader`.\n  - Changed install root redirect from an effect to render-time `<Navigate replace />`.\n  - Improved initial install token handling so a URL token is read during initial state setup, avoiding a token-entry flash before URL scrubbing runs.\n- Replaced the cleanup-only `useMountEffect` in `insights-editor.tsx`:\n  - Added `app/hooks/use-insights-query-runner.ts`, a purpose-named timer hook that owns mock query timer setup/cleanup.\n  - `InsightsEditor` now consumes that hook and no longer calls `useMountEffect`.\n\nValidation run:\n- Direct effects outside hooks/lib/tests:\n  ```sh\n  rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}' --glob '!apps/fabro-web/app/hooks/**' --glob '!apps/fabro-web/app/lib/**' --glob '!**/*.test.ts' --glob '!**/*.test.tsx'\n  ```\n  Result: no output.\n- `useMountEffect` call-site search:\n  ```sh\n  rg -n \"useMountEffect\\(\" apps/fabro-web/app --glob '*.{ts,tsx}'\n  ```\n  Result: only the primitive export in `app/hooks/effects.ts`.\n- `cd apps/fabro-web && bun run typecheck` ✅\n- `cd apps/fabro-web && bun test --isolate` ✅ — 493 pass, 0 fail\n\nCurrent modified/untracked files:\n- Modified:\n  - `apps/fabro-web/app/components/chats/ask-fabro-sidebar.tsx`\n  - `apps/fabro-web/app/hooks/use-install-effects.ts`\n  - `apps/fabro-web/app/install-app.tsx`\n  - `apps/fabro-web/app/layouts/app-shell.tsx`\n  - `apps/fabro-web/app/routes/ask-fabro.tsx`\n  - `apps/fabro-web/app/routes/insights-editor.tsx`\n  - `apps/fabro-web/app/routes/run-detail/docked-controls.tsx`\n- Deleted:\n  - `apps/fabro-web/app/lib/ask-fabro-layout.tsx`\n- Added:\n  - `apps/fabro-web/app/hooks/use-insights-query-runner.ts`\n  - `apps/fabro-web/app/install-query.ts`\n\nRemaining uncertainty:\n- The immediate audit blockers are addressed. A full completion audit should still review the remaining hook/lib effect usages as approved integrations, since the full search still reports effects inside hook modules, SSE libs, and tests.",
+              "last_stage": "work"
+            },
+            "notes": "Stage completed: work",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 1891379,
+                    "output_tokens": 13100,
+                    "reasoning_tokens": 14042,
+                    "cache_read_tokens": 5345792,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 12944051
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 671184,
+              "tool_time_ms": 54937,
+              "active_time_ms": 726121
+            }
+          },
+          "audit": {
+            "status": "failed",
+            "preferred_label": "Continue",
+            "context_updates": {
+              "last_response": "Audit result: incomplete.\n\nEvidence checked:\n- `git status --short`: no output.\n- Full direct-effect search still finds effects in hook/lib/test files.\n- Route/component direct-effect search excluding",
+              "goal_status": "incomplete",
+              "goal_remaining_work": "Repair or replace useLastSuccessfulRunFilesData so failed-revalidation fallback, previous-to-sha tracking, timestamping, and empty-transition toasts are handled without an effect that mirrors SWR data into refs; then audit/fix useDataUpdatedAt and useStageArtifactDownloadHref.",
+              "last_stage": "audit",
+              "response.audit": "Audit result: incomplete.\n\nEvidence checked:\n- `git status --short`: no output.\n- Full direct-effect search still finds effects in hook/lib/test files.\n- Route/component direct-effect search excluding `app/hooks`, `app/lib`, and tests returns no matches. This proves the narrow “no direct effects in route/component files” requirement.\n- `useMountEffect` search only finds the primitive export in `app/hooks/effects.ts`, not component call sites.\n- `cd apps/fabro-web && bun run typecheck` passes.\n- `cd apps/fabro-web && bun test --isolate` passes: 493 pass, 0 fail.\n\nWhy completion is not proven:\n- The policy says the goal is not merely to hide `useEffect` in hooks; remaining hook effects must be approved external integrations.\n- At least one existing hotspot remains unresolved:\n  - `apps/fabro-web/app/hooks/use-last-successful-run-files-data.ts` still uses an effect to react to SWR data, update refs, record timestamps, and emit an empty-transition toast. This is the exact run-files SWR data/ref bridge called out in the policy hotspot list as needing careful replacement. SWR data and React refs/state are not external systems under the policy, so this hook is not proven compliant.\n- Additional remaining hooks also need audit/repair before declaring completion:\n  - `apps/fabro-web/app/hooks/use-data-updated-at.ts` sets React state from async/SWR data changes.\n  - `apps/fabro-web/app/hooks/use-stage-artifact-download-href.ts` resolves a generated URL from React inputs in an effect and stores it in state.\n\nPassing tests and the clean route/component search are good evidence of progress, but they do not prove every remaining hook effect is an approved integration.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"The remaining run-files SWR data/ref bridge in useLastSuccessfulRunFilesData is an explicit policy hotspot and is not proven to be an approved external integration.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Repair or replace useLastSuccessfulRunFilesData so failed-revalidation fallback, previous-to-sha tracking, timestamping, and empty-transition toasts are handled without an effect that mirrors SWR data into refs; then audit/fix useDataUpdatedAt and useStageArtifactDownloadHref.\"\n  }\n}"
+            },
+            "notes": "Stage completed: audit",
+            "failure": {
+              "message": "The remaining run-files SWR data/ref bridge in useLastSuccessfulRunFilesData is an explicit policy hotspot and is not proven to be an approved external integration.",
+              "category": "deterministic"
+            },
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 367955,
+                    "output_tokens": 1613,
+                    "reasoning_tokens": 1308,
+                    "cache_read_tokens": 336896,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 2095853
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 68160,
+              "tool_time_ms": 10230,
+              "active_time_ms": 78390
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "work",
+        "node_visits": {
+          "audit": 3,
           "start": 1,
           "work": 3
         }
@@ -1077,8 +1223,8 @@
   "retried_from": "01KSKMZ950Q1ACD41R9NSX3G0C",
   "pending_interviews": {},
   "stages": {
-    "work@3": {
-      "first_event_seq": 1164,
+    "audit@3": {
+      "first_event_seq": 2496,
       "prompt": null,
       "response": null,
       "completion": null,
@@ -1093,15 +1239,99 @@
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-27T04:25:59.849582Z",
+      "started_at": "2026-05-27T04:38:10.798317Z",
       "handler": "agent",
       "usage": {
-        "input_tokens": 1876255,
-        "output_tokens": 12402,
-        "total_tokens": 7119295,
-        "reasoning_tokens": 13870,
-        "cache_read_tokens": 5216768,
+        "input_tokens": 269292,
+        "output_tokens": 1101,
+        "total_tokens": 557393,
+        "reasoning_tokens": 792,
+        "cache_read_tokens": 286208,
         "cache_write_tokens": 0
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 272000,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2717,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
+          },
+          {
+            "category": "tools",
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
+          },
+          {
+            "category": "memory",
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
+          },
+          {
+            "category": "conversation",
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
+          },
+          {
+            "category": "other",
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
+    "work@3": {
+      "first_event_seq": 1164,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: work",
+        "failure_reason": null,
+        "timestamp": "2026-05-27T04:38:06.651366Z"
+      },
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T04:25:59.849582Z",
+      "handler": "agent",
+      "timing": {
+        "wall_time_ms": 726800,
+        "inference_time_ms": 671184,
+        "tool_time_ms": 54937,
+        "active_time_ms": 726121
+      },
+      "usage": {
+        "input_tokens": 2160671,
+        "output_tokens": 14201,
+        "total_tokens": 7821706,
+        "reasoning_tokens": 14834,
+        "cache_read_tokens": 5632000,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 12944051
       },
       "model": {
         "provider": "openai",
@@ -1148,42 +1378,42 @@
         "provider": "openai",
         "model": "gpt-5.5",
         "context_window_tokens": 272000,
-        "input_tokens": 143906,
-        "usage_percent": 52.90661764705882,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T04:37:46.947351Z",
-        "event_seq": 2464,
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2718,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 899,
-            "usage_percent": 0.33051470588235293
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
           },
           {
             "category": "tools",
-            "tokens": 1313,
-            "usage_percent": 0.4827205882352941
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
           },
           {
             "category": "memory",
-            "tokens": 3143,
-            "usage_percent": 1.155514705882353
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
           },
           {
             "category": "conversation",
-            "tokens": 138544,
-            "usage_percent": 50.93529411764706
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
           },
           {
             "category": "other",
-            "tokens": 7,
-            "usage_percent": 0.002573529411764706
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
           }
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "audit@1": {
       "first_event_seq": 589,
@@ -1215,11 +1445,11 @@
         "active_time_ms": 57553
       },
       "usage": {
-        "input_tokens": 4890843,
-        "output_tokens": 21351,
-        "total_tokens": 11385579,
-        "reasoning_tokens": 20137,
-        "cache_read_tokens": 6453248,
+        "input_tokens": 5160135,
+        "output_tokens": 22452,
+        "total_tokens": 11942972,
+        "reasoning_tokens": 20929,
+        "cache_read_tokens": 6739456,
         "cache_write_tokens": 0,
         "total_usd_micros": 2601334
       },
@@ -1268,32 +1498,32 @@
         "provider": "openai",
         "model": "gpt-5.5",
         "context_window_tokens": 272000,
-        "input_tokens": 144148,
-        "usage_percent": 52.995588235294115,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T04:38:06.614299Z",
-        "event_seq": 2483,
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2716,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 897,
-            "usage_percent": 0.3297794117647059
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
           },
           {
             "category": "tools",
-            "tokens": 1310,
-            "usage_percent": 0.48161764705882354
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
           },
           {
             "category": "memory",
-            "tokens": 3135,
-            "usage_percent": 1.1525735294117647
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
           },
           {
             "category": "conversation",
-            "tokens": 138800,
-            "usage_percent": 51.029411764705884
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
           },
           {
             "category": "other",
@@ -1335,11 +1565,11 @@
         "active_time_ms": 3885789
       },
       "usage": {
-        "input_tokens": 8552646,
-        "output_tokens": 56424,
-        "total_tokens": 28823048,
-        "reasoning_tokens": 39642,
-        "cache_read_tokens": 20174336,
+        "input_tokens": 8837062,
+        "output_tokens": 58223,
+        "total_tokens": 29525459,
+        "reasoning_tokens": 40606,
+        "cache_read_tokens": 20589568,
         "cache_write_tokens": 0,
         "total_usd_micros": 26973131
       },
@@ -1528,37 +1758,37 @@
         "provider": "openai",
         "model": "gpt-5.5",
         "context_window_tokens": 272000,
-        "input_tokens": 143906,
-        "usage_percent": 52.90661764705882,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T04:37:46.947351Z",
-        "event_seq": 2463,
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2719,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 899,
-            "usage_percent": 0.33051470588235293
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
           },
           {
             "category": "tools",
-            "tokens": 1313,
-            "usage_percent": 0.4827205882352941
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
           },
           {
             "category": "memory",
-            "tokens": 3143,
-            "usage_percent": 1.155514705882353
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
           },
           {
             "category": "conversation",
-            "tokens": 138544,
-            "usage_percent": 50.93529411764706
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
           },
           {
             "category": "other",
-            "tokens": 7,
-            "usage_percent": 0.002573529411764706
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
           }
         ],
         "warnings": []
@@ -1629,11 +1859,11 @@
         "active_time_ms": 224710
       },
       "usage": {
-        "input_tokens": 4385371,
-        "output_tokens": 20366,
-        "total_tokens": 10850454,
-        "reasoning_tokens": 19117,
-        "cache_read_tokens": 6425600,
+        "input_tokens": 4654663,
+        "output_tokens": 21467,
+        "total_tokens": 11407847,
+        "reasoning_tokens": 19909,
+        "cache_read_tokens": 6711808,
         "cache_write_tokens": 0,
         "total_usd_micros": 11474810
       },
@@ -1682,32 +1912,32 @@
         "provider": "openai",
         "model": "gpt-5.5",
         "context_window_tokens": 272000,
-        "input_tokens": 144148,
-        "usage_percent": 52.995588235294115,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T04:38:06.614299Z",
-        "event_seq": 2482,
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2720,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 897,
-            "usage_percent": 0.3297794117647059
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
           },
           {
             "category": "tools",
-            "tokens": 1310,
-            "usage_percent": 0.48161764705882354
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
           },
           {
             "category": "memory",
-            "tokens": 3135,
-            "usage_percent": 1.1525735294117647
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
           },
           {
             "category": "conversation",
-            "tokens": 138800,
-            "usage_percent": 51.029411764705884
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
           },
           {
             "category": "other",
@@ -1749,11 +1979,11 @@
         "active_time_ms": 125275
       },
       "usage": {
-        "input_tokens": 2182685,
-        "output_tokens": 14829,
-        "total_tokens": 7873158,
-        "reasoning_tokens": 16508,
-        "cache_read_tokens": 5659136,
+        "input_tokens": 2467101,
+        "output_tokens": 16628,
+        "total_tokens": 8575569,
+        "reasoning_tokens": 17472,
+        "cache_read_tokens": 6074368,
         "cache_write_tokens": 0,
         "total_usd_micros": 1905284
       },
@@ -1802,37 +2032,37 @@
         "provider": "openai",
         "model": "gpt-5.5",
         "context_window_tokens": 272000,
-        "input_tokens": 143906,
-        "usage_percent": 52.90661764705882,
+        "input_tokens": 145135,
+        "usage_percent": 53.35845588235294,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T04:37:46.947351Z",
-        "event_seq": 2462,
+        "generated_at": "2026-05-27T04:38:58.014182Z",
+        "event_seq": 2715,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 899,
-            "usage_percent": 0.33051470588235293
+            "tokens": 823,
+            "usage_percent": 0.3025735294117647
           },
           {
             "category": "tools",
-            "tokens": 1313,
-            "usage_percent": 0.4827205882352941
+            "tokens": 1201,
+            "usage_percent": 0.4415441176470588
           },
           {
             "category": "memory",
-            "tokens": 3143,
-            "usage_percent": 1.155514705882353
+            "tokens": 2874,
+            "usage_percent": 1.0566176470588236
           },
           {
             "category": "conversation",
-            "tokens": 138544,
-            "usage_percent": 50.93529411764706
+            "tokens": 140231,
+            "usage_percent": 51.55551470588235
           },
           {
             "category": "other",
-            "tokens": 7,
-            "usage_percent": 0.002573529411764706
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
           }
         ],
         "warnings": []
