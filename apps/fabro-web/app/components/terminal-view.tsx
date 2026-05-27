@@ -6,7 +6,6 @@ import {
   useState,
 } from "react";
 import type { Terminal as XtermTerminal } from "@xterm/xterm";
-import type { FitAddon as XtermFitAddon } from "@xterm/addon-fit";
 import {
   ArrowPathIcon,
   ArrowTopRightOnSquareIcon,
@@ -140,55 +139,22 @@ function StatusPill({
   );
 }
 
-export default function TerminalView({
-  runId,
-  leading,
-  chromeless = false,
-}: {
-  runId: string;
-  leading?: React.ReactNode;
-  chromeless?: boolean;
-}) {
-  const { push } = useToast();
-  const stateQuery = useRunState(runId);
-  const sandbox = stateQuery.data?.sandbox ?? null;
-  const provider = sandbox?.provider ?? null;
-  const sandboxDetail = sandboxStatusDetail(sandbox);
-  const accessCommandLabel = terminalAccessCommandLabel(provider);
-  const [connectionKey, reconnectTerminal] = useReducer((key: number) => key + 1, 0);
-  const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  const [error, setError] = useState<{ message: string; recoverable: boolean } | null>(null);
-  const terminalEl = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<XtermTerminal | null>(null);
-  const fitRef = useRef<XtermFitAddon | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
-  const headingId = `run-terminal-${runId}`;
-
-  const reconnect = useCallback(() => {
-    setError(null);
-    setStatus("connecting");
-    reconnectTerminal();
-  }, []);
-
-  const copyAccessCommand = useCallback(async () => {
-    if (!accessCommandLabel) return;
-    try {
-      const response = await apiData(() =>
-        humanInTheLoopApi.createRunSshAccess(runId, { ttl_minutes: 60 }),
-      );
-      await navigator.clipboard.writeText(response.command);
-      push({ message: terminalAccessCommandCopiedMessage(provider) });
-    } catch (err) {
-      push({
-        tone: "error",
-        message: err instanceof Error
-          ? err.message
-          : terminalAccessCommandErrorMessage(provider),
-      });
-    }
-  }, [accessCommandLabel, runId, provider, push]);
-
-  // react-doctor-disable-next-line react-doctor/effect-needs-cleanup -- listeners, socket, xterm, and ResizeObserver are disposed in the returned cleanup.
+/**
+ * Creates and manages an xterm.js Terminal + WebSocket session for the given
+ * run. A new session is established each time `connectionKey` increments.
+ *
+ * External systems: xterm.js (dynamic ESM import), WebSocket, ResizeObserver,
+ * and the browser `document.fonts.ready` promise.
+ * Cleanup: disconnects ResizeObserver, disposes xterm disposables, closes the
+ * WebSocket gracefully, and disposes the terminal instance.
+ */
+function useTerminalSession(
+  runId: string,
+  connectionKey: number,
+  terminalEl: React.RefObject<HTMLDivElement | null>,
+  setStatus: React.Dispatch<React.SetStateAction<ConnectionStatus>>,
+  setError: React.Dispatch<React.SetStateAction<{ message: string; recoverable: boolean } | null>>,
+): void {
   useEffect(() => {
     if (!terminalEl.current) return undefined;
 
@@ -196,6 +162,8 @@ export default function TerminalView({
     let resizeObserver: ResizeObserver | null = null;
     const textEncoder = new TextEncoder();
     const disposables: Array<{ dispose: () => void }> = [];
+    const terminalRef: { current: XtermTerminal | null } = { current: null };
+    const socketRef: { current: WebSocket | null } = { current: null };
 
     async function connect() {
       setStatus("connecting");
@@ -222,7 +190,6 @@ export default function TerminalView({
       fitAddon.fit();
       terminal.focus();
       terminalRef.current = terminal;
-      fitRef.current = fitAddon;
 
       const socket = new WebSocket(buildTerminalWebSocketUrl(window.location, runId));
       socket.binaryType = "arraybuffer";
@@ -262,7 +229,7 @@ export default function TerminalView({
         terminal.write(bytes);
       };
       const handleClose = () => {
-        setStatus((current) => current === "error" ? current : "closed");
+        setStatus((current: ConnectionStatus) => current === "error" ? current : "closed");
       };
       const handleError = () => {
         setStatus("error");
@@ -310,9 +277,56 @@ export default function TerminalView({
       socketRef.current = null;
       terminalRef.current?.dispose();
       terminalRef.current = null;
-      fitRef.current = null;
     };
-  }, [connectionKey, runId]);
+  }, [connectionKey, runId, terminalEl, setStatus, setError]);
+}
+
+export default function TerminalView({
+  runId,
+  leading,
+  chromeless = false,
+}: {
+  runId: string;
+  leading?: React.ReactNode;
+  chromeless?: boolean;
+}) {
+  const { push } = useToast();
+  const stateQuery = useRunState(runId);
+  const sandbox = stateQuery.data?.sandbox ?? null;
+  const provider = sandbox?.provider ?? null;
+  const sandboxDetail = sandboxStatusDetail(sandbox);
+  const accessCommandLabel = terminalAccessCommandLabel(provider);
+  const [connectionKey, reconnectTerminal] = useReducer((key: number) => key + 1, 0);
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [error, setError] = useState<{ message: string; recoverable: boolean } | null>(null);
+  const terminalEl = useRef<HTMLDivElement | null>(null);
+  const headingId = `run-terminal-${runId}`;
+
+  const reconnect = useCallback(() => {
+    setError(null);
+    setStatus("connecting");
+    reconnectTerminal();
+  }, []);
+
+  const copyAccessCommand = useCallback(async () => {
+    if (!accessCommandLabel) return;
+    try {
+      const response = await apiData(() =>
+        humanInTheLoopApi.createRunSshAccess(runId, { ttl_minutes: 60 }),
+      );
+      await navigator.clipboard.writeText(response.command);
+      push({ message: terminalAccessCommandCopiedMessage(provider) });
+    } catch (err) {
+      push({
+        tone: "error",
+        message: err instanceof Error
+          ? err.message
+          : terminalAccessCommandErrorMessage(provider),
+      });
+    }
+  }, [accessCommandLabel, runId, provider, push]);
+
+  useTerminalSession(runId, connectionKey, terminalEl, setStatus, setError);
 
   return (
     <section

@@ -2,12 +2,12 @@ import {
   createContext,
   use,
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import { XMarkIcon } from "@heroicons/react/20/solid";
 
 export type ToastTone = "info" | "error";
@@ -143,7 +143,9 @@ export function ToastProvider({
     return id;
   }, [autoDismissMs, dismiss]);
 
-  useEffect(() => clear, [clear]);
+  // Clear all pending auto-dismiss timers when the provider unmounts so they
+  // cannot call setToasts on an unmounted component.
+  useMountEffect(() => clear);
 
   const value = useMemo(() => ({ push, dismiss, clear }), [push, dismiss, clear]);
 

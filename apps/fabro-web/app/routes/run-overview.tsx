@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router";
 import { graphTheme } from "../lib/graph-theme";
@@ -24,59 +24,25 @@ import {
 
 const HOVER_OPEN_DELAY_MS = 200;
 
-interface NodeHover {
-  stage: Stage;
-  rect:  DOMRect;
-}
-
-export const handle = { wide: true };
-
-type Direction = "LR" | "TB";
-
-export default function RunOverview() {
-  const { id } = useParams();
-  const [direction, setDirection] = useState<Direction>("LR");
-  const stagesQuery = useRunStages(id);
-  const graphQuery = useRunGraph(id, direction);
-  const runQuery = useRun(id);
-  const stages = useMemo(
-    () => mapRunStagesToSidebarStages(stagesQuery.data),
-    [stagesQuery.data],
-  );
-  const graphSvg = graphQuery.data;
-  const graphErrorDescription =
-    graphQuery.error instanceof ApiError
-      ? graphQuery.error.message
-      : graphQuery.error
-        ? "The graph render request failed."
-        : undefined;
-  const apiStatus = runQuery.data?.lifecycle.status;
-  const terminalOutcome: "succeeded" | "failed" | "dead" | null =
-    apiStatus?.kind === "succeeded" ||
-    apiStatus?.kind === "failed" ||
-    apiStatus?.kind === "dead"
-      ? apiStatus.kind
-      : null;
-  const containerRef = useRef<HTMLDivElement>(null);
-  const innerRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const navigate = useNavigate();
-  const [zoomIndex, setZoomIndex] = useState(GRAPH_DEFAULT_ZOOM_INDEX);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
-  const zoom = GRAPH_ZOOM_STEPS[zoomIndex];
-  const [hoveredNode, setHoveredNode] = useState<NodeHover | null>(null);
-
-  // Per-stage lookup keyed by latest visit's `stageId`, used when the SVG's
-  // imperative hover handlers need to resolve a node to its sidebar Stage.
-  const stageById = useMemo(() => {
-    const map = new Map<string, Stage>();
-    for (const stage of stages) map.set(stage.id, stage);
-    return map;
-  }, [stages]);
-
-  // Render SVG with stage annotations
-  // react-doctor-disable-next-line react-doctor/no-cascading-set-state -- This effect mutates local Set/Map instances and the Graphviz SVG DOM; it does not call React state setters.
+/**
+ * Sets the SVG innerHTML from the Graphviz API response, colors nodes by their
+ * current run status, and attaches click/hover listeners to each SVG node group.
+ *
+ * External systems: raw SVG DOM (innerHTML mutation + createElement), browser
+ * event listeners, and a CSS animation via SVGAnimateElement.
+ * Cleanup: removes all attached listeners and clears the hover popover.
+ */
+function useGraphSvgAnnotations(
+  innerRef: RefObject<HTMLDivElement | null>,
+  svgRef: RefObject<SVGSVGElement | null>,
+  graphSvg: string | undefined,
+  stages: Stage[],
+  stageById: Map<string, Stage>,
+  id: string | undefined,
+  navigate: (to: string) => void,
+  terminalOutcome: "succeeded" | "failed" | "dead" | null,
+  setHoveredNode: (node: NodeHover | null) => void,
+): void {
   useEffect(() => {
     const inner = innerRef.current;
     if (!inner || !graphSvg) return;
@@ -211,7 +177,76 @@ export default function RunOverview() {
       }
       setHoveredNode(null);
     };
+    // setHoveredNode is a stable state setter; omitted from deps intentionally.
+    // navigate is stable from useNavigate.
   }, [stages, stageById, graphSvg, id, navigate, terminalOutcome]);
+}
+
+interface NodeHover {
+  stage: Stage;
+  rect:  DOMRect;
+}
+
+export const handle = { wide: true };
+
+type Direction = "LR" | "TB";
+
+export default function RunOverview() {
+  const { id } = useParams();
+  const [direction, setDirection] = useState<Direction>("LR");
+  const stagesQuery = useRunStages(id);
+  const graphQuery = useRunGraph(id, direction);
+  const runQuery = useRun(id);
+  const stages = useMemo(
+    () => mapRunStagesToSidebarStages(stagesQuery.data),
+    [stagesQuery.data],
+  );
+  const graphSvg = graphQuery.data;
+  const graphErrorDescription =
+    graphQuery.error instanceof ApiError
+      ? graphQuery.error.message
+      : graphQuery.error
+        ? "The graph render request failed."
+        : undefined;
+  const apiStatus = runQuery.data?.lifecycle.status;
+  const terminalOutcome: "succeeded" | "failed" | "dead" | null =
+    apiStatus?.kind === "succeeded" ||
+    apiStatus?.kind === "failed" ||
+    apiStatus?.kind === "dead"
+      ? apiStatus.kind
+      : null;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const navigate = useNavigate();
+  const [zoomIndex, setZoomIndex] = useState(GRAPH_DEFAULT_ZOOM_INDEX);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
+  const zoom = GRAPH_ZOOM_STEPS[zoomIndex];
+  const [hoveredNode, setHoveredNode] = useState<NodeHover | null>(null);
+
+  // Per-stage lookup keyed by latest visit's `stageId`, used when the SVG's
+  // imperative hover handlers need to resolve a node to its sidebar Stage.
+  const stageById = useMemo(() => {
+    const map = new Map<string, Stage>();
+    for (const stage of stages) map.set(stage.id, stage);
+    return map;
+  }, [stages]);
+
+  // Render SVG with stage annotations: sets innerHTML, colors nodes, and
+  // attaches click/hover listeners. Extracted to a named hook to keep this
+  // component body free of direct useEffect calls.
+  useGraphSvgAnnotations(
+    innerRef,
+    svgRef,
+    graphSvg,
+    stages,
+    stageById,
+    id,
+    navigate,
+    terminalOutcome,
+    setHoveredNode,
+  );
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;

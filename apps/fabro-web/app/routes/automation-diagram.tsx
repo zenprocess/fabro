@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { ArrowDownIcon, ArrowRightIcon, MinusIcon, PlusIcon } from "@heroicons/react/20/solid";
 import { graphTheme } from "../lib/graph-theme";
 
@@ -67,17 +67,21 @@ function stripGraphTitle(svg: SVGSVGElement) {
 const ZOOM_STEPS = [25, 50, 75, 100, 150, 200];
 const DEFAULT_ZOOM_INDEX = 2; // 75%
 
-export default function AutomationDiagram() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const innerRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [zoomIndex, setZoomIndex] = useState(DEFAULT_ZOOM_INDEX);
-  const [direction, setDirection] = useState<Direction>("LR");
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
-  const zoom = ZOOM_STEPS[zoomIndex];
-
+/**
+ * Lazily loads @viz-js/viz, renders the DOT source for the given direction
+ * into an SVGElement, and places it in innerRef's DOM node. Cancels the
+ * async render when direction changes or the component unmounts.
+ *
+ * External systems: dynamic ESM import of @viz-js/viz, imperative DOM insertion.
+ * Cleanup: sets cancelled flag so in-flight renders are discarded.
+ */
+function useVizDiagram(
+  direction: Direction,
+  innerRef: RefObject<HTMLDivElement | null>,
+  svgRef: RefObject<SVGSVGElement | null>,
+  setError: (msg: string | null) => void,
+  setPan: (pan: { x: number; y: number }) => void,
+): void {
   useEffect(() => {
     let cancelled = false;
 
@@ -102,7 +106,23 @@ export default function AutomationDiagram() {
     setPan({ x: 0, y: 0 });
     render();
     return () => { cancelled = true; };
-  }, [direction]);
+    // setError and setPan are stable React state setters; svgRef/innerRef are
+    // stable refs. Only direction triggers a new render.
+  }, [direction, innerRef, svgRef]);
+}
+
+export default function AutomationDiagram() {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [zoomIndex, setZoomIndex] = useState(DEFAULT_ZOOM_INDEX);
+  const [direction, setDirection] = useState<Direction>("LR");
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
+  const zoom = ZOOM_STEPS[zoomIndex];
+
+  useVizDiagram(direction, innerRef, svgRef, setError, setPan);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest("button")) return;

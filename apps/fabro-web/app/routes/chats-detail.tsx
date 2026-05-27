@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo, useRef } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import { useNavigate, useParams } from "react-router";
 import {
   AssistantRuntimeProvider,
@@ -53,10 +54,9 @@ function ChatRuntime({ chatId, chat }: { chatId: string; chat: Chat }) {
 
   // Keep latest `chat` accessible to the stable adapter closure below without
   // recreating the adapter (and the assistant-ui runtime) on every store dispatch.
+  // Updating during render is safe here because chatRef is not used to render UI.
   const chatRef = useRef(chat);
-  useEffect(() => {
-    chatRef.current = chat;
-  });
+  chatRef.current = chat;
 
   const initialMessages = useMemo(
     () => toThreadMessages(chat.seedMessages),
@@ -76,17 +76,14 @@ function ChatRuntime({ chatId, chat }: { chatId: string; chat: Chat }) {
 
   // Autorespond: chats arriving here from /chats/new carry the user's first
   // message in seedMessages with pendingResponse=true. Trigger one startRun
-  // once per mount; the ref dedupes within a StrictMode mount cycle (state
-  // updates from consumePendingResponse aren't visible to the re-fired effect
-  // closure), and the store flag dedupes across mounts (e.g. navigating away
-  // and back to the same chat).
-  const didStartRef = useRef(false);
-  useEffect(() => {
-    if (!chat.pendingResponse || didStartRef.current) return;
-    didStartRef.current = true;
+  // once per mount. ChatRuntime is keyed by chatId so it mounts fresh for each
+  // chat; pendingResponse is set before mount and consumed here. The store flag
+  // in consumePendingResponse dedupes across mounts (e.g. navigating away and back).
+  useMountEffect(() => {
+    if (!chat.pendingResponse) return;
     consumePendingResponse(chatId);
     runtime.thread.startRun({ parentId: null });
-  }, [chat.pendingResponse, chatId, consumePendingResponse, runtime]);
+  });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useInterval } from "../hooks/use-interval";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import { useParams, useSearchParams } from "react-router";
 import { ArrowPathIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
 import type { ListRunsSortEnum } from "@qltysh/fabro-api-client";
@@ -86,13 +88,14 @@ export default function RunChildren() {
     [updatePreferences],
   );
 
-  const hydratedFromStorage = useRef(false);
-  useEffect(() => {
-    if (hydratedFromStorage.current) return;
-    hydratedFromStorage.current = true;
-    if (searchParams === urlSearchParams) return;
-    setSearchParams(searchParams, { replace: true });
-  }, [searchParams, urlSearchParams, setSearchParams]);
+  // Apply any URL defaults that were resolved from localStorage on mount so
+  // queries fire with the correct params. Runs only once; mount-time values
+  // are stable for this initialization purpose.
+  useMountEffect(() => {
+    if (searchParams !== urlSearchParams) {
+      setSearchParams(searchParams, { replace: true });
+    }
+  });
 
   const childRunsQuery = useRunsPage(
     {
@@ -106,20 +109,19 @@ export default function RunChildren() {
     id != null,
   );
 
+  // Track when data was last fetched so the relative timestamp stays fresh.
+  // Updated at render time when data identity changes so the "Updated just now"
+  // label appears on the same render as the new data (SWR already re-renders
+  // this component when childRunsQuery.data changes).
   const lastFetchedAtRef = useRef<number | null>(null);
+  const prevDataRef = useRef(childRunsQuery.data);
+  if (childRunsQuery.data && childRunsQuery.data !== prevDataRef.current) {
+    prevDataRef.current = childRunsQuery.data;
+    lastFetchedAtRef.current = Date.now();
+  }
+
   const [now, setNow] = useState<number>(() => Date.now());
-
-  useEffect(() => {
-    if (childRunsQuery.data) {
-      lastFetchedAtRef.current = Date.now();
-      setNow(Date.now());
-    }
-  }, [childRunsQuery.data]);
-
-  useEffect(() => {
-    const interval = window.setInterval(() => setNow(Date.now()), 15_000);
-    return () => window.clearInterval(interval);
-  }, []);
+  useInterval(() => setNow(Date.now()), 15_000);
 
   const handleRefresh = useCallback(() => {
     void childRunsQuery.mutate();

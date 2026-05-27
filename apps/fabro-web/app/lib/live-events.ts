@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { Key } from "swr";
 
 import {
@@ -62,4 +63,22 @@ export function subscribeToLiveEvents(
         },
       }),
   });
+}
+
+
+/**
+ * Subscribes to the live system event stream for the lifetime of the calling
+ * component. Calls `onEvent` for every incoming payload. Unsubscribes on
+ * unmount. Synchronizes React with the cross-tab SSE coordinator.
+ *
+ * The subscription is created once at mount; `onEvent` is kept current via a
+ * ref so the latest closure always fires without restarting the stream.
+ */
+export function useLiveEvents(
+  onEvent: (payload: LiveEventPayload) => void,
+): void {
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+
+  useEffect(() => subscribeToLiveEvents((payload) => onEventRef.current(payload)), []);
 }

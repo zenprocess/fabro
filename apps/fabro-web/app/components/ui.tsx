@@ -2,7 +2,8 @@
 // exposes the primary button, secondary button, input, error message, and
 // copy button so the auth and in-app surfaces can match.
 
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import { createPortal } from "react-dom";
 import { Dialog, DialogPanel, DialogTitle } from "@headlessui/react";
 import {
@@ -165,7 +166,8 @@ function useHoverAnchor(openDelay = 0) {
     setOpen(false);
   };
 
-  useEffect(() => clearTimer, []);
+  // Cancel any pending open-delay timer when the anchor unmounts.
+  useMountEffect(() => clearTimer);
 
   const rect = open ? (triggerRef.current?.getBoundingClientRect() ?? null) : null;
   const triggerProps = {

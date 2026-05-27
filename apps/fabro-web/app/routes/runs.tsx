@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { Link } from "react-router";
 import { CheckIcon, ChevronDownIcon, CommandLineIcon } from "@heroicons/react/24/outline";
 import { EllipsisVerticalIcon } from "@heroicons/react/20/solid";
@@ -781,12 +781,19 @@ export default function Runs() {
   );
   allWorkflows.sort();
   const [columns, setColumns] = useState(initialColumns);
+
+  // Sync columns with incoming SWR data. Calling setColumns during render
+  // (the render-phase state update pattern) avoids an effect and the extra
+  // render round-trip. React re-renders this component immediately with the
+  // updated columns while preserving drag-state between fetches.
+  const prevInitialColumnsRef = useRef(initialColumns);
+  if (prevInitialColumnsRef.current !== initialColumns) {
+    prevInitialColumnsRef.current = initialColumns;
+    setColumns(initialColumns);
+  }
+
   const lowerQuery = query.toLowerCase();
   useBoardEvents();
-
-  useEffect(() => {
-    setColumns(initialColumns);
-  }, [initialColumns]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),

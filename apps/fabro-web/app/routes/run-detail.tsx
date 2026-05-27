@@ -52,8 +52,8 @@ import {
 } from "./run-detail/lifecycle-toasts";
 import {
   buildRunDetailRun,
-  useTickingNow,
 } from "./run-detail/model";
+import { useTickingNow } from "../lib/time";
 import {
   buildRunDetailTabs,
   childRouteLayoutFlags,
@@ -104,7 +104,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
     childrenCount,
   });
   const steerBarRef = useRef<SteerBarHandle | null>(null);
-  const now = useTickingNow(30_000);
+  const now = useTickingNow(true, 30_000);
   const { fullHeight, hideSteerBar } = childRouteLayoutFlags(matches);
 
   useRunEvents(params.id);

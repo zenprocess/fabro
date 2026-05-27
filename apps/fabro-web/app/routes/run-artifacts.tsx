@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import { useParams } from "react-router";
 import { ArrowDownTrayIcon, PaperClipIcon } from "@heroicons/react/24/outline";
 import type { RunArtifactEntry } from "@qltysh/fabro-api-client";
@@ -180,7 +181,10 @@ function StageGroupCard({ runId, group }: { runId: string; group: StageGroup }) 
 function ArtifactRow({ runId, entry }: { runId: string; entry: RunArtifactEntry }) {
   const [href, setHref] = useState<string>("#");
 
-  useEffect(() => {
+  // Each ArtifactRow is keyed by the entry's identity so it mounts once per
+  // unique entry. The download URL is derived from immutable entry props plus
+  // the stable runId; computing it once on mount is correct.
+  useMountEffect(() => {
     let active = true;
     void stageArtifactDownloadUrl(
       runId,
@@ -193,7 +197,7 @@ function ArtifactRow({ runId, entry }: { runId: string; entry: RunArtifactEntry 
     return () => {
       active = false;
     };
-  }, [entry.relative_path, entry.retry, entry.stage_id, runId]);
+  });
 
   return (
     <li className="flex items-center gap-4 px-4 py-2">

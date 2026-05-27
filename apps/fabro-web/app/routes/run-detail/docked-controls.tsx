@@ -4,6 +4,22 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+
+/**
+ * Registers the Ask Fabro sidebar's current pixel width with the shared layout
+ * context so sibling panels can respond to it. Resets to zero on unmount so
+ * the context does not retain a stale width after this component is removed.
+ *
+ * External system: `useAskFabroLayout` shared layout context.
+ * Cleanup: resets width to 0 on unmount.
+ */
+function useAskFabroSidebarWidth(sidebarWidth: number): void {
+  const { setSidebarWidth } = useAskFabroLayout();
+  useEffect(() => {
+    setSidebarWidth(sidebarWidth);
+    return () => setSidebarWidth(0);
+  }, [sidebarWidth, setSidebarWidth]);
+}
 import { SparklesIcon } from "@heroicons/react/20/solid";
 
 import AskFabroSidebar, {
@@ -52,12 +68,8 @@ export function RunDetailAskFabroShell({
   const [askOpen, setAskOpen] = useState(false);
   const [askWidth, setAskWidth] = useState(SIDEBAR_WIDTH);
   const sidebarWidth = askAvailable && askOpen ? askWidth : 0;
-  const { setSidebarWidth, isResizing } = useAskFabroLayout();
-
-  useEffect(() => {
-    setSidebarWidth(sidebarWidth);
-    return () => setSidebarWidth(0);
-  }, [sidebarWidth, setSidebarWidth]);
+  const { isResizing } = useAskFabroLayout();
+  useAskFabroSidebarWidth(sidebarWidth);
 
   return (
     <>

@@ -1,6 +1,5 @@
 import {
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   useState,
@@ -371,9 +370,11 @@ function DirectoryPane({
     },
   });
 
-  useEffect(() => {
-    model.resetPaths(treeInputs.paths);
-  }, [model, treeInputs.paths]);
+  // Render-phase model sync: useFileTree only consumes `paths` at construction
+  // time, so keep the imperative model in sync on every render by calling
+  // resetPaths directly. This is safe because resetPaths only mutates the
+  // external widget model, not React state.
+  model.resetPaths(treeInputs.paths);
 
   const themeStyles = useMemo<TreeThemeStyle>(
     () => ({

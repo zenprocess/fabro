@@ -10,6 +10,10 @@ import {
   type ReactElement,
   type RefObject,
 } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
+import { useMediaQuery } from "../hooks/use-media-query";
+import { useInterval } from "../hooks/use-interval";
+import { useWindowEvent } from "../hooks/use-window-event";
 import { useLocation, useNavigate, useParams } from "react-router";
 import {
   MultiFileDiff,
@@ -78,18 +82,7 @@ export function normalizeRunFileScope(value: string | null): RunFileScope {
 }
 
 function useNarrowViewport(): boolean {
-  const [narrow, setNarrow] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return window.matchMedia(`(max-width: ${MD_BREAKPOINT_PX - 1}px)`).matches;
-  });
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const mql = window.matchMedia(`(max-width: ${MD_BREAKPOINT_PX - 1}px)`);
-    const apply = () => setNarrow(mql.matches);
-    mql.addEventListener("change", apply);
-    return () => mql.removeEventListener("change", apply);
-  }, []);
-  return narrow;
+  return useMediaQuery(`(max-width: ${MD_BREAKPOINT_PX - 1}px)`);
 }
 
 function useFreshness(
@@ -102,11 +95,7 @@ function useFreshness(
   const hasLabel =
     !!meta && (!!meta.to_sha_committed_at || lastFetchedAt !== null);
   const [, setTick] = useState(0);
-  useEffect(() => {
-    if (!hasLabel) return undefined;
-    const id = setInterval(() => setTick((t) => t + 1), 10_000);
-    return () => clearInterval(id);
-  }, [hasLabel]);
+  useInterval(() => setTick((t) => t + 1), 10_000, hasLabel);
 
   if (!meta) return null;
   const now = Date.now();
@@ -338,6 +327,111 @@ const RunFileRow = memo(function RunFileRow({
   );
 });
 
+// ---------------------------------------------------------------------------
+// Route-scoped integration hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Manages the "last good data" fallback for failed SWR revalidations and shows
+ * a toast when files transition from present to empty. Wraps the effect so the
+ * route component body stays free of direct useEffect calls.
+ *
+ * External systems: toast notification service (push) and the SWR cache.
+ * Cleanup: none required (effect only reads + writes refs and calls push).
+ */
+function useRunFileTransition(
+  filesQuery: ReturnType<typeof useRunFiles>,
+  push: ReturnType<typeof useToast>["push"],
+): {
+  data: PaginatedRunFileList | null;
+  lastFetchedAt: number | null;
+  prevToSha: string | null;
+  revalidationError: string | null;
+  initialError: ApiError | null;
+} {
+  const lastGoodDataRef = useRef<PaginatedRunFileList | null>(null);
+  const lastFetchedAtRef = useRef<number | null>(null);
+
+  // prevToSha is captured before the effect so the render that triggered the
+  // new fetch still sees the prior sha (enabling the refresh-disabled check).
+  const prevToSha = lastGoodDataRef.current?.meta?.to_sha ?? null;
+
+  useEffect(() => {
+    if (!filesQuery.data) return;
+    const message = emptyTransitionToastMessage(
+      lastGoodDataRef.current?.data.length ?? null,
+      filesQuery.data.data.length,
+    );
+    if (message) push({ message });
+    lastGoodDataRef.current = filesQuery.data;
+    lastFetchedAtRef.current = Date.now();
+  }, [push, filesQuery.data]);
+
+  const data = filesQuery.data ?? lastGoodDataRef.current;
+  const apiError = filesQuery.error instanceof ApiError ? filesQuery.error : null;
+  const revalidationError =
+    apiError && lastGoodDataRef.current
+      ? `Couldn't refresh (${apiError.status}).`
+      : null;
+  const initialError = apiError && !lastGoodDataRef.current ? apiError : null;
+
+  return { data, lastFetchedAt: lastFetchedAtRef.current, prevToSha, revalidationError, initialError };
+}
+
+/**
+ * Returns keyboard focus to a button after a boolean `active` flag transitions
+ * from true → false (e.g. after an async refresh visibly completes).
+ *
+ * External system: browser focus API.
+ * Cleanup: none required (no resource is acquired).
+ */
+function useFocusAfterActive(
+  active: boolean,
+  ref: RefObject<HTMLButtonElement | null>,
+): void {
+  const prevRef = useRef(false);
+  useEffect(() => {
+    if (prevRef.current && !active) {
+      ref.current?.focus({ preventScroll: true });
+    }
+    prevRef.current = active;
+  }, [active, ref]);
+}
+
+/**
+ * After URL hash and file data have both settled, scrolls to and focuses the
+ * deep-link target row, or shows a "not found" toast when the file is absent.
+ *
+ * External systems: browser DOM scroll/focus APIs, toast notification service.
+ * Cleanup: none required (no resource is acquired).
+ */
+function useDeepLinkFocus(
+  hashFile: string | null,
+  data: PaginatedRunFileList | null,
+  push: ReturnType<typeof useToast>["push"],
+  lastDeepLinkToastRef: RefObject<string | null>,
+): void {
+  useEffect(() => {
+    const toast = resolveDeepLinkToast(hashFile, data);
+    if (toast) {
+      if (lastDeepLinkToastRef.current !== toast.key) {
+        push({ message: toast.message, autoDismissMs: 5000 });
+        lastDeepLinkToastRef.current = toast.key;
+      }
+      return;
+    }
+    lastDeepLinkToastRef.current = null;
+    if (!hashFile || !data) return;
+    const el = document.getElementById(fileRowId(hashFile));
+    if (el) {
+      el.scrollIntoView({ block: "start", behavior: "smooth" });
+      el.focus({ preventScroll: true });
+    }
+  }, [data, hashFile, push, lastDeepLinkToastRef]);
+}
+
+// ---------------------------------------------------------------------------
+
 function RunFilesLoaded({
   containerRef,
   toolbar,
@@ -475,41 +569,18 @@ export default function RunFiles() {
 
   // Preserve the last successful payload so a failed revalidation can keep
   // rendering the previous files while surfacing an inline banner.
-  const lastGoodDataRef = useRef<PaginatedRunFileList | null>(null);
-  const lastFetchedAtRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (!filesQuery.data) return;
-    const message = emptyTransitionToastMessage(
-      lastGoodDataRef.current?.data.length ?? null,
-      filesQuery.data.data.length,
-    );
-    if (message) {
-      push({ message });
-    }
-    lastGoodDataRef.current = filesQuery.data;
-    lastFetchedAtRef.current = Date.now();
-  }, [push, filesQuery.data]);
-
-  const data: PaginatedRunFileList | null =
-    filesQuery.data ?? lastGoodDataRef.current;
+  const {
+    data,
+    lastFetchedAt,
+    prevToSha,
+    revalidationError,
+    initialError,
+  } = useRunFileTransition(filesQuery, push);
 
   const isInitialLoading = (waitingForCommitSelection || filesQuery.isLoading) && !data;
   const isRevalidating = filesQuery.isValidating;
 
-  // Revalidation error is whatever the most recent loader call returned;
-  // the inline banner renders when we still have prior data to show. When
-  // there's no prior data AND this is the initial load, we render a
-  // full-panel error state instead (the Toolbar would have nothing to act
-  // on with no data).
-  const apiError = filesQuery.error instanceof ApiError ? filesQuery.error : null;
-  const revalidationError =
-    apiError && lastGoodDataRef.current
-      ? `Couldn't refresh (${apiError.status}).`
-      : null;
-  const initialError = apiError && !lastGoodDataRef.current ? apiError : null;
-
-  const freshness = useFreshness(data?.meta ?? null, lastFetchedAtRef.current);
+  const freshness = useFreshness(data?.meta ?? null, lastFetchedAt);
 
   // Persisted desktop preference + md-breakpoint forced unified.
   const [persistedStyle, setPersistedStyle] = useState<DiffStyle>(
@@ -565,20 +636,14 @@ export default function RunFiles() {
     },
     [routeLocation.hash, routeLocation.pathname, routeLocation.search, navigate],
   );
-  useEffect(() => clearMinRefreshTimer, [clearMinRefreshTimer]);
+  // Cancel the minimum-refresh timer when the view unmounts.
+  useMountEffect(() => clearMinRefreshTimer);
   // react-doctor-disable-next-line react-doctor/no-event-handler -- The refresh spinner is driven by both SWR revalidation and the click-owned minimum timer.
   const showRefreshing = isRevalidating || minRefreshActive;
 
   // Return focus to the Refresh button after a refresh visibly completes so
   // keyboard-first users stay oriented.
-  const refreshingPrev = useRef(false);
-  useEffect(() => {
-    // react-doctor-disable-next-line react-doctor/no-event-handler -- Returning focus after async refresh completion is an accessibility sync effect.
-    if (refreshingPrev.current && !showRefreshing) {
-      refreshButtonRef.current?.focus({ preventScroll: true });
-    }
-    refreshingPrev.current = showRefreshing;
-  }, [showRefreshing]);
+  useFocusAfterActive(showRefreshing, refreshButtonRef);
 
   const fileCount = data?.data.length ?? 0;
   useFileKeyboardNav(containerRef, fileCount);
@@ -592,33 +657,13 @@ export default function RunFiles() {
     if (typeof window === "undefined") return null;
     return decodeDeepLinkFile(window.location.hash);
   });
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const onHashChange = () =>
-      setHashFile(decodeDeepLinkFile(window.location.hash));
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  useWindowEvent("hashchange", () =>
+    setHashFile(decodeDeepLinkFile(window.location.hash)),
+  );
 
-  // react-doctor-disable-next-line react-doctor/no-event-handler -- Deep-link focus has to run after URL hash and file data have both rendered matching DOM rows.
-  useEffect(() => {
-    // react-doctor-disable-next-line react-doctor/no-event-handler -- Toasting missing deep links also depends on resolved file data.
-    const toast = resolveDeepLinkToast(hashFile, data);
-    if (toast) {
-      if (lastDeepLinkToastRef.current !== toast.key) {
-        push({ message: toast.message, autoDismissMs: 5000 });
-        lastDeepLinkToastRef.current = toast.key;
-      }
-      return;
-    }
-    lastDeepLinkToastRef.current = null;
-    if (!hashFile || !data) return;
-    const el = document.getElementById(fileRowId(hashFile));
-    if (el) {
-      el.scrollIntoView({ block: "start", behavior: "smooth" });
-      el.focus({ preventScroll: true });
-    }
-  }, [data, hashFile, push]);
+  // After URL hash and file data have both settled, scroll to + focus the row
+  // (or show a "not found" toast when the file is absent).
+  useDeepLinkFocus(hashFile, data, push, lastDeepLinkToastRef);
 
   const handleFileSelect = useCallback((path: string) => {
     if (typeof window === "undefined") return;
@@ -666,9 +711,6 @@ export default function RunFiles() {
 
   // Refresh is disabled when the server reports the same `to_sha` it
   // reported on the previous successful fetch — no new checkpoint yet.
-  // `lastGoodDataRef.current` is updated in a useEffect, so during render
-  // it still holds the previous render's data (or null on first load).
-  const prevToSha = lastGoodDataRef.current?.meta?.to_sha ?? null;
   const refreshDisabled =
     !!meta.to_sha && prevToSha !== null && prevToSha === meta.to_sha;
 

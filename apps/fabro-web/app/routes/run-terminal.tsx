@@ -1,16 +1,9 @@
-import { useEffect } from "react";
-
+import { useDocumentTitle } from "../hooks/use-document-title";
 import TerminalView from "../components/terminal-view";
 import { ToastProvider } from "../components/toast";
 
 export default function RunTerminal({ params }: { params: { id: string } }) {
-  useEffect(() => {
-    const previous = document.title;
-    document.title = `Terminal · ${params.id} · Fabro`;
-    return () => {
-      document.title = previous;
-    };
-  }, [params.id]);
+  useDocumentTitle(`Terminal · ${params.id} · Fabro`);
 
   return (
     <ToastProvider>

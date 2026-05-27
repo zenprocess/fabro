@@ -1,9 +1,8 @@
 import {
   useCallback,
-  useEffect,
   useMemo,
-  useRef,
 } from "react";
+import { useMountEffect } from "../../hooks/use-mount-effect";
 import { useSearchParams } from "react-router";
 import type { BoardColumn, ListRunsSortEnum } from "@qltysh/fabro-api-client";
 
@@ -103,13 +102,14 @@ export function useRunsWorkspacePreferences() {
     [updatePreferences],
   );
 
-  const hydratedFromStorage = useRef(false);
-  useEffect(() => {
-    if (hydratedFromStorage.current) return;
-    hydratedFromStorage.current = true;
-    if (searchParams === urlSearchParams) return;
-    setSearchParams(searchParams, { replace: true });
-  }, [searchParams, urlSearchParams, setSearchParams]);
+  // Apply any URL defaults that were resolved from localStorage on mount so
+  // queries fire with the correct params. Runs only once; mount-time values
+  // are stable for this initialization purpose.
+  useMountEffect(() => {
+    if (searchParams !== urlSearchParams) {
+      setSearchParams(searchParams, { replace: true });
+    }
+  });
 
   return {
     query,

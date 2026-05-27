@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef } from "react";
+import { useMountEffect } from "../hooks/use-mount-effect";
 import {
   Listbox,
   ListboxButton,
@@ -50,9 +51,9 @@ export default function Start() {
   const [openCategory, setOpenCategory] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
+  useMountEffect(() => {
     textareaRef.current?.focus();
-  }, []);
+  });
 
   function autoResize() {
     const el = textareaRef.current;

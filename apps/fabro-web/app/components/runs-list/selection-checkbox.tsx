@@ -1,4 +1,6 @@
-import { useEffect, useRef } from "react";
+// `indeterminate` is an HTMLInputElement imperative property that cannot be
+// set via an HTML attribute. We use a ref callback that React 19 calls on
+// every render, ensuring the property stays in sync with the prop.
 
 export function SelectionCheckbox({
   checked,
@@ -13,13 +15,9 @@ export function SelectionCheckbox({
   onChange:       () => void;
   ariaLabel:      string;
 }) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = indeterminate;
-  }, [indeterminate]);
   return (
     <input
-      ref={ref}
+      ref={(el) => { if (el) el.indeterminate = indeterminate; }}
       type="checkbox"
       aria-label={ariaLabel}
       checked={checked}

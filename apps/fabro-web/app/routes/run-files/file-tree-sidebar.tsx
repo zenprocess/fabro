@@ -3,6 +3,7 @@ import {
   useMemo,
   useRef,
   type CSSProperties,
+  type RefObject,
 } from "react";
 import {
   FileTree,
@@ -67,6 +68,71 @@ function syncSelection(
   if (item && !item.isSelected()) item.select();
 }
 
+/**
+ * Keeps the Pierre FileTree imperative model aligned with React props and
+ * with the model's own selection state.
+ *
+ * Two separate concerns are managed here:
+ *
+ * 1. Path / git-status sync (paths/gitStatus/model deps): when the file list
+ *    changes, resetPaths and setGitStatus are called. A didSyncModelRef guard
+ *    skips the initial run because useFileTree already initialises the model
+ *    with the first render's values.
+ *
+ * 2. Selection sync (selection/selectedPath/changedPaths deps): keeps the
+ *    tree's highlighted row consistent with both the URL-controlled
+ *    `selectedPath` prop and any pending selection written by the
+ *    onSelectionChange callback.
+ *
+ * External systems: @pierre/trees imperative FileTreeModel API.
+ * Cleanup: none required (no resource is acquired).
+ */
+function useFileTreeModelSync(
+  model: FileTreeModel,
+  paths: string[],
+  gitStatus: GitStatusEntry[],
+  selectedPath: string | null,
+  changedPaths: ReadonlySet<string>,
+  pendingSelectedPathRef: RefObject<string | null>,
+  selectedPathRef: RefObject<string | null>,
+  changedPathsRef: RefObject<ReadonlySet<string>>,
+): void {
+  const didSyncModelRef = useRef(false);
+  useEffect(() => {
+    if (!didSyncModelRef.current) {
+      didSyncModelRef.current = true;
+      return;
+    }
+    model.resetPaths(paths);
+    model.setGitStatus(gitStatus);
+    pendingSelectedPathRef.current = null;
+    const currentSelectedPath = selectedPathRef.current;
+    syncSelection(
+      model,
+      model.getSelectedPaths(),
+      currentSelectedPath && changedPathsRef.current.has(currentSelectedPath)
+        ? currentSelectedPath
+        : null,
+    );
+  }, [gitStatus, model, paths, pendingSelectedPathRef, selectedPathRef, changedPathsRef]);
+
+  const selection = useFileTreeSelection(model);
+  useEffect(() => {
+    const pendingSelectedPath = pendingSelectedPathRef.current;
+    // Keeps Pierre's imperative tree model aligned after the tree emits a
+    // selection change.
+    if (pendingSelectedPath === selectedPath) {
+      pendingSelectedPathRef.current = null;
+    }
+    const nextSelectedPath = pendingSelectedPath ?? selectedPath;
+    syncSelection(
+      model,
+      selection,
+      nextSelectedPath && changedPaths.has(nextSelectedPath) ? nextSelectedPath : null,
+    );
+  }, [changedPaths, model, pendingSelectedPathRef, selectedPath, selection]);
+}
+
 interface FileTreeSidebarProps {
   files: readonly FileDiff[];
   selectedPath: string | null;
@@ -117,39 +183,16 @@ export function FileTreeSidebar({
     },
   });
 
-  const didSyncModelRef = useRef(false);
-  useEffect(() => {
-    if (!didSyncModelRef.current) {
-      didSyncModelRef.current = true;
-      return;
-    }
-    model.resetPaths(paths);
-    model.setGitStatus(gitStatus);
-    pendingSelectedPathRef.current = null;
-    const currentSelectedPath = selectedPathRef.current;
-    syncSelection(
-      model,
-      model.getSelectedPaths(),
-      currentSelectedPath && changedPathsRef.current.has(currentSelectedPath)
-        ? currentSelectedPath
-        : null,
-    );
-  }, [gitStatus, model, paths]);
-
-  const selection = useFileTreeSelection(model);
-  useEffect(() => {
-    const pendingSelectedPath = pendingSelectedPathRef.current;
-    // react-doctor-disable-next-line react-doctor/no-event-handler -- This keeps Pierre's imperative tree model aligned after the tree emits a selection change.
-    if (pendingSelectedPath === selectedPath) {
-      pendingSelectedPathRef.current = null;
-    }
-    const nextSelectedPath = pendingSelectedPath ?? selectedPath;
-    syncSelection(
-      model,
-      selection,
-      nextSelectedPath && changedPaths.has(nextSelectedPath) ? nextSelectedPath : null,
-    );
-  }, [changedPaths, model, selectedPath, selection]);
+  useFileTreeModelSync(
+    model,
+    paths,
+    gitStatus,
+    selectedPath,
+    changedPaths,
+    pendingSelectedPathRef,
+    selectedPathRef,
+    changedPathsRef,
+  );
 
   const themeStyles = useMemo<TreeThemeStyle>(
     () => ({
