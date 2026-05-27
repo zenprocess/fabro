@@ -496,14 +496,112 @@
     }
   },
   "web_url": "http://127.0.0.1:32276/runs/01KSN4661TG7HFT3ATDKNGMGC0",
-  "start": null,
-  "status": {
-    "kind": "starting"
+  "start": {
+    "start_time": "2026-05-27T16:27:37.247379Z",
+    "run_branch": "fabro/run/01KSN4661TG7HFT3ATDKNGMGC0",
+    "base_sha": "8df6fff94718bbbf2054006d9d14f99048f45d11"
   },
-  "status_updated_at": "2026-05-27T16:27:22.627922Z",
-  "last_event_at": "2026-05-27T16:27:36.780594Z",
+  "status": {
+    "kind": "running"
+  },
+  "status_updated_at": "2026-05-27T16:27:37.247434Z",
+  "last_event_at": "2026-05-27T16:27:39.542469Z",
   "pending_control": null,
-  "checkpoints": [],
+  "checkpoints": [
+    {
+      "seq": 21,
+      "checkpoint": {
+        "timestamp": "2026-05-27T16:27:39.542158Z",
+        "current_node": "start",
+        "completed_nodes": [
+          "start"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "failure_class": "",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.node_visit_count": 1,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.fidelity": "compact",
+          "current_node": "start",
+          "internal.retry_count.start": 0,
+          "internal.run_id": "01KSN4661TG7HFT3ATDKNGMGC0",
+          "outcome": "succeeded",
+          "failure_signature": "",
+          "graph.rankdir": "LR",
+          "internal.thread_id": null,
+          "graph.goal": "---\ntitle: Add CLI Variable Management\ntype: feat\nstatus: active\ndate: 2026-05-27\n---\n\n# Add CLI Variable Management\n\n## Overview\n\nExpose the recently added variables API through the CLI with a singular `fabro variable`\nnamespace. Variables are non-sensitive run-configuration values, so the CLI should expose\nvalues in `list` and `get`, while continuing to direct credentials and tokens to\n`fabro secret`.\n\n## Requirements Trace\n\n- R1. Provide variables management in the CLI, similar to secrets management.\n- R2. Support the full readable-variable CRUD surface: list, get, set/upsert, and remove.\n- R3. Preserve existing server/API behavior: variable names are env-style, values may be\n  empty, and `set` preserves an existing description when `--description` is omitted.\n- R4. Keep generated CLI docs and help snapshots in sync with the new public command.\n\n## Context & Research\n\n- `lib/crates/fabro-cli/src/commands/secret/` is the command pattern to follow for\n  namespace dispatch, JSON output, tabular list output, stdin value input, and status\n  messages.\n- `lib/crates/fabro-server/src/server/handler/variables.rs` already provides\n  `GET /variables`, `POST /variables`, `GET /variables/{name}`,\n  `PUT /variables/{name}`, and `DELETE /variables/{name}`.\n- `lib/crates/fabro-types/src/variable.rs` defines the canonical API/request types and\n  validates env-style names.\n- `lib/crates/fabro-api/tests/variable_round_trip.rs` already proves OpenAPI generated\n  types reuse the canonical variable types.\n- `docs/public/workflows/variables.mdx` currently explains workflow template variables\n  but does not yet document how server-managed `{{ vars.NAME }}` values are configured.\n\n## Key Technical Decisions\n\n- Use `fabro variable`, not `fabro variables`, to match existing singular CLI namespaces\n  such as `fabro secret`, `fabro model`, and `fabro repo`.\n- Add `get` because variables are intentionally readable; secrets remain write-only.\n- Make `set` an upsert using the API's create/upsert endpoint, matching the mental model\n  of `fabro secret set`.\n- Reuse `--value-stdin` from secrets but allow empty stdin values for variables after\n  trimming trailing newlines.\n- Plain `list` should include a `VALUE` column. Do not add truncation or redaction in\n  this first pass; exact retrieval is available through JSON output and `get`.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add fabro-client variable wrappers**\n\n**Goal:** Give CLI code stable methods over the generated OpenAPI client.\n\n**Requirements:** R2, R3\n\n**Dependencies:** Existing variables API and generated `fabro-api` client.\n\n**Files:**\n- Modify: `lib/crates/fabro-client/src/client.rs`\n\n**Approach:**\n- Add wrappers for `list_variables`, `get_variable`, `create_variable`,\n  `update_variable`, and `delete_variable`.\n- Return `Vec<types::Variable>` from `list_variables` by unwrapping the API response's\n  `data`, matching `list_secrets`.\n- Use the generated path-parameter operations for `get`, `update`, and `delete`.\n\n**Patterns to follow:**\n- `list_secrets`, `create_secret`, and `delete_secret_by_name` in the same file.\n\n**Test scenarios:**\n- Happy path: CLI integration tests in later units exercise each wrapper through the\n  shared server client path.\n- Error path: missing and invalid variable operations propagate the server's API errors.\n\n**Verification:**\n- The CLI can compile against these wrapper methods without importing generated client\n  builders directly.\n\n- [ ] **Unit 2: Add CLI args, dispatch, and command module**\n\n**Goal:** Register the new top-level namespace and route subcommands to implementation\nmodules.\n\n**Requirements:** R1, R2, R4\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/args.rs`\n- Modify: `lib/crates/fabro-cli/src/main.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/mod.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/mod.rs`\n\n**Approach:**\n- Add `Commands::Variable(VariableNamespace)` with description\n  `Manage server-owned variables`.\n- Add `VariableNamespace` with `ServerTargetArgs`, matching `SecretNamespace`.\n- Add `VariableCommand::{List, Get, Rm, Set}`; give `list` the `ls` alias.\n- Add command-name mapping for analytics/logging: `variable list`, `variable get`,\n  `variable rm`, and `variable set`.\n- Dispatch through `commands::variable::dispatch`, deriving the target context with\n  `base_ctx.with_target(&ns.target)`.\n\n**Patterns to follow:**\n- `SecretNamespace`, `SecretCommand`, and `commands::secret::dispatch`.\n\n**Test scenarios:**\n- Happy path: `fabro --help` lists `variable`.\n- Happy path: `fabro variable --help` shows `list`, `get`, `rm`, and `set`.\n- Happy path: command-name mapping covers all subcommands.\n\n**Verification:**\n- The new namespace is reachable through clap and main dispatch without affecting\n  existing commands.\n\n- [ ] **Unit 3: Implement variable list/get/set/rm behavior**\n\n**Goal:** Provide the full user-facing variables management workflow.\n\n**Requirements:** R1, R2, R3\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Create: `lib/crates/fabro-cli/src/commands/variable/list.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/get.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/set.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/rm.rs`\n\n**Approach:**\n- `list`: fetch all variables, print JSON array when JSON output is active, otherwise\n  print a table with `NAME`, `VALUE`, and `UPDATED`.\n- `get`: fetch one variable, print the full variable object for JSON output, otherwise\n  print only the raw value to stdout.\n- `set`: accept `<NAME> [VALUE]`, `--value-stdin`, and `--description`; call the upsert\n  API wrapper and print the stored variable for JSON output or `Set NAME` otherwise.\n- `rm`: call the delete API wrapper and print `{ \"name\": NAME }` for JSON output or\n  `Removed NAME` otherwise.\n- For `set`, allow empty explicit values and empty stdin values. Only error when no value\n  is provided and stdin is not being used.\n\n**Patterns to follow:**\n- `commands/secret/list.rs` for table style and age formatting.\n- `commands/secret/set.rs` for argument precedence and stdin handling, adjusted so empty\n  values are valid.\n- `commands/secret/rm.rs` for delete output shape.\n\n**Test scenarios:**\n- Happy path: `set DEPLOY_ENV staging --description \"Deployment target\"` then `list`\n  shows `DEPLOY_ENV`, `staging`, and an updated age.\n- Happy path: `get DEPLOY_ENV` prints exactly `staging\\n` in plain output.\n- Happy path: `set DEPLOY_ENV production` updates the value and preserves the existing\n  description through API behavior.\n- Happy path: `set EMPTY \"\"` stores an empty value.\n- Happy path: `printf '\\n' | fabro variable set EMPTY --value-stdin` stores an empty\n  value instead of failing.\n- Error path: `get MISSING` and `rm MISSING` fail with `variable not found: MISSING`.\n- Error path: `set 1BAD value` fails with the server invalid-name error.\n\n**Verification:**\n- The command works against the default test server and does not write directly to\n  local `variables.json`.\n\n- [ ] **Unit 4: Add test harness support and CLI integration tests**\n\n**Goal:** Lock the public CLI surface and expected behavior with integration coverage.\n\n**Requirements:** R1, R2, R3, R4\n\n**Dependencies:** Units 1-3\n\n**Files:**\n- Modify: `lib/crates/fabro-test/src/lib.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/json_global.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_list.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_get.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_set.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_rm.rs`\n\n**Approach:**\n- Add `TestContext::variable()` helper mirroring `TestContext::secret()`.\n- Add help snapshots for the namespace and each subcommand.\n- Add lifecycle tests for set/list/get/update/rm, `ls` alias, empty value support, JSON\n  output, missing variable errors, and invalid-name errors.\n- Update root help and curated landing snapshots only if the final clap/landing output\n  changes.\n\n**Patterns to follow:**\n- `secret.rs`, `secret_list.rs`, `secret_set.rs`, and `secret_rm.rs`.\n\n**Test scenarios:**\n- Happy path: JSON `list` returns an array of full variable objects including `value`.\n- Happy path: JSON `get` and `set` return full variable objects.\n- Happy path: global JSON config makes `variable list` emit JSON, matching the\n  `secret list` config test.\n- Error path: missing variables and invalid names produce nonzero exits and readable\n  errors.\n\n**Verification:**\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n\n- [ ] **Unit 5: Update generated and conceptual docs**\n\n**Goal:** Keep public documentation aligned with the new command and clarify how variables\nrelate to secrets.\n\n**Requirements:** R1, R4\n\n**Dependencies:** Units 2-4\n\n**Files:**\n- Modify: `docs/public/reference/cli.mdx`\n- Modify: `docs/public/workflows/variables.mdx`\n\n**Approach:**\n- Regenerate the CLI reference with `cargo dev docs refresh`.\n- Add a short section to `docs/public/workflows/variables.mdx` explaining that\n  server-managed run config variables can be set with `fabro variable set NAME VALUE`\n  and referenced as `{{ vars.NAME }}` in run config interpolation.\n- State that variables are non-sensitive and readable; tokens, keys, and credentials\n  should use `fabro secret set`.\n\n**Patterns to follow:**\n- Existing generated docs workflow in `lib/crates/fabro-dev/src/commands/docs.rs`.\n- Existing CLI references to `fabro secret set` in administration docs.\n\n**Test scenarios:**\n- Happy path: generated CLI docs include `fabro variable` and its subcommands.\n- Documentation check: `cargo dev docs check` succeeds after regeneration.\n\n**Verification:**\n- The docs describe the CLI surface without implying variables are secret storage.\n\n## System-Wide Impact\n\n- **API surface parity:** No server or OpenAPI changes are planned; the CLI consumes the\n  existing variables API.\n- **Error propagation:** Invalid names, missing variables, and write failures should flow\n  through the existing `fabro-client` API error classification.\n- **State lifecycle risks:** CLI commands must use the server API rather than editing\n  `variables.json` locally, so behavior remains correct for remote and socket-backed\n  servers.\n- **Security boundary:** Values are intentionally visible for variables. Documentation\n  must clearly distinguish variables from secrets to avoid accidental credential storage.\n- **Unchanged invariants:** `fabro secret` remains write-only and unchanged.\n\n## Risks & Dependencies\n\n| Risk | Mitigation |\n| --- | --- |\n| Users put credentials in variables because the command looks like secrets | Document variables as non-sensitive and keep secret guidance explicit. |\n| Empty values accidentally fail because secret handling rejects empties | Test explicit empty strings and newline-only stdin for `variable set`. |\n| CLI docs drift after adding clap args | Regenerate with `cargo dev docs refresh` and verify with `cargo dev docs check`. |\n| Plain `list` becomes awkward for long values | Accept for v1; `get` and JSON output provide exact machine-readable retrieval. |\n\n## Verification Plan\n\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n- `cargo dev docs check`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The chosen CLI surface is full CRUD with readable values.\n- The namespace is singular: `fabro variable`.\n- No TypeScript client regeneration is required for this CLI-only change.\n- No server API, OpenAPI schema, or storage migration changes are required."
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "toolchain",
+        "node_visits": {
+          "start": 1
+        }
+      },
+      "diff": {}
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-27T16:27:40.997067Z",
+        "current_node": "toolchain",
+        "completed_nodes": [
+          "start",
+          "toolchain"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.retry_count.toolchain": 0,
+          "internal.node_visit_count": 1,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
+          "internal.fidelity": "compact",
+          "current_node": "toolchain",
+          "failure_signature": "",
+          "internal.run_id": "01KSN4661TG7HFT3ATDKNGMGC0",
+          "graph.goal": "---\ntitle: Add CLI Variable Management\ntype: feat\nstatus: active\ndate: 2026-05-27\n---\n\n# Add CLI Variable Management\n\n## Overview\n\nExpose the recently added variables API through the CLI with a singular `fabro variable`\nnamespace. Variables are non-sensitive run-configuration values, so the CLI should expose\nvalues in `list` and `get`, while continuing to direct credentials and tokens to\n`fabro secret`.\n\n## Requirements Trace\n\n- R1. Provide variables management in the CLI, similar to secrets management.\n- R2. Support the full readable-variable CRUD surface: list, get, set/upsert, and remove.\n- R3. Preserve existing server/API behavior: variable names are env-style, values may be\n  empty, and `set` preserves an existing description when `--description` is omitted.\n- R4. Keep generated CLI docs and help snapshots in sync with the new public command.\n\n## Context & Research\n\n- `lib/crates/fabro-cli/src/commands/secret/` is the command pattern to follow for\n  namespace dispatch, JSON output, tabular list output, stdin value input, and status\n  messages.\n- `lib/crates/fabro-server/src/server/handler/variables.rs` already provides\n  `GET /variables`, `POST /variables`, `GET /variables/{name}`,\n  `PUT /variables/{name}`, and `DELETE /variables/{name}`.\n- `lib/crates/fabro-types/src/variable.rs` defines the canonical API/request types and\n  validates env-style names.\n- `lib/crates/fabro-api/tests/variable_round_trip.rs` already proves OpenAPI generated\n  types reuse the canonical variable types.\n- `docs/public/workflows/variables.mdx` currently explains workflow template variables\n  but does not yet document how server-managed `{{ vars.NAME }}` values are configured.\n\n## Key Technical Decisions\n\n- Use `fabro variable`, not `fabro variables`, to match existing singular CLI namespaces\n  such as `fabro secret`, `fabro model`, and `fabro repo`.\n- Add `get` because variables are intentionally readable; secrets remain write-only.\n- Make `set` an upsert using the API's create/upsert endpoint, matching the mental model\n  of `fabro secret set`.\n- Reuse `--value-stdin` from secrets but allow empty stdin values for variables after\n  trimming trailing newlines.\n- Plain `list` should include a `VALUE` column. Do not add truncation or redaction in\n  this first pass; exact retrieval is available through JSON output and `get`.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add fabro-client variable wrappers**\n\n**Goal:** Give CLI code stable methods over the generated OpenAPI client.\n\n**Requirements:** R2, R3\n\n**Dependencies:** Existing variables API and generated `fabro-api` client.\n\n**Files:**\n- Modify: `lib/crates/fabro-client/src/client.rs`\n\n**Approach:**\n- Add wrappers for `list_variables`, `get_variable`, `create_variable`,\n  `update_variable`, and `delete_variable`.\n- Return `Vec<types::Variable>` from `list_variables` by unwrapping the API response's\n  `data`, matching `list_secrets`.\n- Use the generated path-parameter operations for `get`, `update`, and `delete`.\n\n**Patterns to follow:**\n- `list_secrets`, `create_secret`, and `delete_secret_by_name` in the same file.\n\n**Test scenarios:**\n- Happy path: CLI integration tests in later units exercise each wrapper through the\n  shared server client path.\n- Error path: missing and invalid variable operations propagate the server's API errors.\n\n**Verification:**\n- The CLI can compile against these wrapper methods without importing generated client\n  builders directly.\n\n- [ ] **Unit 2: Add CLI args, dispatch, and command module**\n\n**Goal:** Register the new top-level namespace and route subcommands to implementation\nmodules.\n\n**Requirements:** R1, R2, R4\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/args.rs`\n- Modify: `lib/crates/fabro-cli/src/main.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/mod.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/mod.rs`\n\n**Approach:**\n- Add `Commands::Variable(VariableNamespace)` with description\n  `Manage server-owned variables`.\n- Add `VariableNamespace` with `ServerTargetArgs`, matching `SecretNamespace`.\n- Add `VariableCommand::{List, Get, Rm, Set}`; give `list` the `ls` alias.\n- Add command-name mapping for analytics/logging: `variable list`, `variable get`,\n  `variable rm`, and `variable set`.\n- Dispatch through `commands::variable::dispatch`, deriving the target context with\n  `base_ctx.with_target(&ns.target)`.\n\n**Patterns to follow:**\n- `SecretNamespace`, `SecretCommand`, and `commands::secret::dispatch`.\n\n**Test scenarios:**\n- Happy path: `fabro --help` lists `variable`.\n- Happy path: `fabro variable --help` shows `list`, `get`, `rm`, and `set`.\n- Happy path: command-name mapping covers all subcommands.\n\n**Verification:**\n- The new namespace is reachable through clap and main dispatch without affecting\n  existing commands.\n\n- [ ] **Unit 3: Implement variable list/get/set/rm behavior**\n\n**Goal:** Provide the full user-facing variables management workflow.\n\n**Requirements:** R1, R2, R3\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Create: `lib/crates/fabro-cli/src/commands/variable/list.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/get.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/set.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/rm.rs`\n\n**Approach:**\n- `list`: fetch all variables, print JSON array when JSON output is active, otherwise\n  print a table with `NAME`, `VALUE`, and `UPDATED`.\n- `get`: fetch one variable, print the full variable object for JSON output, otherwise\n  print only the raw value to stdout.\n- `set`: accept `<NAME> [VALUE]`, `--value-stdin`, and `--description`; call the upsert\n  API wrapper and print the stored variable for JSON output or `Set NAME` otherwise.\n- `rm`: call the delete API wrapper and print `{ \"name\": NAME }` for JSON output or\n  `Removed NAME` otherwise.\n- For `set`, allow empty explicit values and empty stdin values. Only error when no value\n  is provided and stdin is not being used.\n\n**Patterns to follow:**\n- `commands/secret/list.rs` for table style and age formatting.\n- `commands/secret/set.rs` for argument precedence and stdin handling, adjusted so empty\n  values are valid.\n- `commands/secret/rm.rs` for delete output shape.\n\n**Test scenarios:**\n- Happy path: `set DEPLOY_ENV staging --description \"Deployment target\"` then `list`\n  shows `DEPLOY_ENV`, `staging`, and an updated age.\n- Happy path: `get DEPLOY_ENV` prints exactly `staging\\n` in plain output.\n- Happy path: `set DEPLOY_ENV production` updates the value and preserves the existing\n  description through API behavior.\n- Happy path: `set EMPTY \"\"` stores an empty value.\n- Happy path: `printf '\\n' | fabro variable set EMPTY --value-stdin` stores an empty\n  value instead of failing.\n- Error path: `get MISSING` and `rm MISSING` fail with `variable not found: MISSING`.\n- Error path: `set 1BAD value` fails with the server invalid-name error.\n\n**Verification:**\n- The command works against the default test server and does not write directly to\n  local `variables.json`.\n\n- [ ] **Unit 4: Add test harness support and CLI integration tests**\n\n**Goal:** Lock the public CLI surface and expected behavior with integration coverage.\n\n**Requirements:** R1, R2, R3, R4\n\n**Dependencies:** Units 1-3\n\n**Files:**\n- Modify: `lib/crates/fabro-test/src/lib.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/json_global.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_list.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_get.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_set.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_rm.rs`\n\n**Approach:**\n- Add `TestContext::variable()` helper mirroring `TestContext::secret()`.\n- Add help snapshots for the namespace and each subcommand.\n- Add lifecycle tests for set/list/get/update/rm, `ls` alias, empty value support, JSON\n  output, missing variable errors, and invalid-name errors.\n- Update root help and curated landing snapshots only if the final clap/landing output\n  changes.\n\n**Patterns to follow:**\n- `secret.rs`, `secret_list.rs`, `secret_set.rs`, and `secret_rm.rs`.\n\n**Test scenarios:**\n- Happy path: JSON `list` returns an array of full variable objects including `value`.\n- Happy path: JSON `get` and `set` return full variable objects.\n- Happy path: global JSON config makes `variable list` emit JSON, matching the\n  `secret list` config test.\n- Error path: missing variables and invalid names produce nonzero exits and readable\n  errors.\n\n**Verification:**\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n\n- [ ] **Unit 5: Update generated and conceptual docs**\n\n**Goal:** Keep public documentation aligned with the new command and clarify how variables\nrelate to secrets.\n\n**Requirements:** R1, R4\n\n**Dependencies:** Units 2-4\n\n**Files:**\n- Modify: `docs/public/reference/cli.mdx`\n- Modify: `docs/public/workflows/variables.mdx`\n\n**Approach:**\n- Regenerate the CLI reference with `cargo dev docs refresh`.\n- Add a short section to `docs/public/workflows/variables.mdx` explaining that\n  server-managed run config variables can be set with `fabro variable set NAME VALUE`\n  and referenced as `{{ vars.NAME }}` in run config interpolation.\n- State that variables are non-sensitive and readable; tokens, keys, and credentials\n  should use `fabro secret set`.\n\n**Patterns to follow:**\n- Existing generated docs workflow in `lib/crates/fabro-dev/src/commands/docs.rs`.\n- Existing CLI references to `fabro secret set` in administration docs.\n\n**Test scenarios:**\n- Happy path: generated CLI docs include `fabro variable` and its subcommands.\n- Documentation check: `cargo dev docs check` succeeds after regeneration.\n\n**Verification:**\n- The docs describe the CLI surface without implying variables are secret storage.\n\n## System-Wide Impact\n\n- **API surface parity:** No server or OpenAPI changes are planned; the CLI consumes the\n  existing variables API.\n- **Error propagation:** Invalid names, missing variables, and write failures should flow\n  through the existing `fabro-client` API error classification.\n- **State lifecycle risks:** CLI commands must use the server API rather than editing\n  `variables.json` locally, so behavior remains correct for remote and socket-backed\n  servers.\n- **Security boundary:** Values are intentionally visible for variables. Documentation\n  must clearly distinguish variables from secrets to avoid accidental credential storage.\n- **Unchanged invariants:** `fabro secret` remains write-only and unchanged.\n\n## Risks & Dependencies\n\n| Risk | Mitigation |\n| --- | --- |\n| Users put credentials in variables because the command looks like secrets | Document variables as non-sensitive and keep secret guidance explicit. |\n| Empty values accidentally fail because secret handling rejects empties | Test explicit empty strings and newline-only stdin for `variable set`. |\n| CLI docs drift after adding clap args | Regenerate with `cargo dev docs refresh` and verify with `cargo dev docs check`. |\n| Plain `list` becomes awkward for long values | Accept for v1; `get` and JSON output provide exact machine-readable retrieval. |\n\n## Verification Plan\n\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n- `cargo dev docs check`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The chosen CLI surface is full CRUD with readable values.\n- The namespace is singular: `fabro variable`.\n- No TypeScript client regeneration is required for this CLI-only change.\n- No server API, OpenAPI schema, or storage migration changes are required.",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "graph.rankdir": "LR",
+          "internal.retry_count.start": 0,
+          "outcome": "succeeded",
+          "failure_class": "",
+          "internal.thread_id": "start",
+          "thread.start.current_node": "toolchain"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1445,
+              "active_time_ms": 1445
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_compile",
+        "node_visits": {
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {}
+    }
+  ],
   "conclusion": null,
   "sandbox": {
     "provider": "daytona",
@@ -523,5 +621,67 @@
   "pull_request": null,
   "superseded_by": null,
   "pending_interviews": {},
-  "stages": {}
+  "stages": {
+    "toolchain@1": {
+      "first_event_seq": 22,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T16:27:39.542260Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
+    "start@1": {
+      "first_event_seq": 18,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-27T16:27:39.541953Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T16:27:39.541479Z",
+      "handler": "start",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    }
+  }
 }
