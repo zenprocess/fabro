@@ -507,7 +507,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-27T16:22:18.730041Z",
-  "last_event_at": "2026-05-27T17:51:45.176526Z",
+  "last_event_at": "2026-05-27T17:56:49.860060Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1898,9 +1898,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1127,
       "checkpoint": {
-        "timestamp": "2026-05-27T17:56:43.746665Z",
+        "timestamp": "2026-05-27T17:56:49.859610Z",
         "current_node": "verify",
         "completed_nodes": [
           "start",
@@ -1916,45 +1916,59 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.retry_count.simplify_opus": 0,
-          "thread.start.current_node": "toolchain",
-          "response.simplify_gpt": "Review complete.\n\n- Ran diff review against `origin/main...HEAD`.\n- Launched all three parallel review agents:\n  - Code reuse\n  - Code quality\n  - Efficiency\n- Aggregated findings.\n\nOutcome:\n- No code changes were needed after review.\n- The main findings were caveats:\n  - Reusing `fabro_automation::AutomationTarget` intentionally couples the public API shape to the domain model now that `ref` is required.\n  - Unknown trigger discriminator → 422 is a handler behavior concern; no automation HTTP handlers are implemented in this diff.\n  - Persisted automation TOML shape changed from prior optional/`cron` fields as part of aligning the domain type with the public API contract.\n- No duplicate helper logic, generated client issues, or efficiency problems were found.\n\nVerification run:\n\n```bash\ncargo build -p fabro-api\ncargo nextest run -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ngit diff -- apps/fabro-web lib/crates/fabro-cli\n```\n\nResults:\n- `cargo build -p fabro-api`: passed\n- `cargo nextest run -p fabro-api`: passed, 166/166\n- TypeScript client regeneration completed and produced no additional diff\n- No changes in `apps/fabro-web` or `lib/crates/fabro-cli`\n- Working tree is clean relative to the current branch.",
-          "graph.rankdir": "LR",
-          "thread.preflight_lint.current_node": "implement",
-          "current_node": "verify",
-          "thread.implement.current_node": "simplify_opus",
-          "internal.fidelity": "compact",
-          "internal.retry_count.simplify_gpt": 0,
-          "response.fixup": "No matches for forbidden patterns. All verify steps now succeed:\n\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo dev docs refresh` ✅ (no changes)\n- Forbidden pattern check ✅\n- `cargo clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo nextest run --workspace --profile ci` ✅ — 6372 passed, 179 skipped\n- `cargo dev docs check` ✅\n- `bun install --frozen-lockfile` ✅\n- `apps/fabro-web` typecheck + test ✅ (505 pass)\n- `lib/packages/fabro-api-client` typecheck ✅\n- `cargo dev build -- -p fabro-cli --release` ✅\n\nThe previous failure was a transient infrastructure issue (\"failed to spawn script\") rather than an actual code problem. No code changes were required.",
-          "failure_class": "",
-          "internal.run_id": "01KSN3WC12B7VVZHTVCC4NHNJ2",
-          "graph.goal": "# Define automation API contract and clients\n\n- Number: #396\n- State: OPEN\n- Author: brynary (Bryan Helmkamp)\n- Created: 2026-05-25T15:06:24Z\n- Updated: 2026-05-25T15:06:24Z\n- URL: https://github.com/fabro-sh/fabro/issues/396\n\n## Body\n\n## Goal\n\nDefine the public Automations API contract, reuse compatible Rust domain types, and regenerate generated API clients.\n\n## Scope\n\nUpdate the OpenAPI spec under `/api/v1` with these paths:\n\n```http\nGET    /automations\nPOST   /automations\nGET    /automations/{id}\nPUT    /automations/{id}\nDELETE /automations/{id}\nGET    /automations/{id}/runs\nPOST   /automations/{id}/runs\n```\n\nAdd schemas for:\n\n- `Automation`\n- `AutomationTarget`\n- `AutomationTrigger`\n- `AutomationApiTrigger`\n- `AutomationScheduleTrigger`\n- `CreateAutomationRequest`\n- `ReplaceAutomationRequest`\n- `AutomationListResponse`\n\nUse this response shape for automations:\n\n```ts\ntype Automation = {\n  id: string;\n  revision: string;\n  name: string;\n  description: string | null;\n  enabled: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n\ntype AutomationTarget = {\n  repository: string;\n  ref: string;\n  workflow: string;\n};\n\ntype AutomationTrigger =\n  | { id: string; type: \"api\"; enabled: boolean }\n  | { id: string; type: \"schedule\"; enabled: boolean; expression: string };\n```\n\nRequest shapes:\n\n```ts\ntype CreateAutomationRequest = {\n  id: string;\n  name: string;\n  description?: string | null;\n  enabled?: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n\ntype ReplaceAutomationRequest = {\n  name: string;\n  description?: string | null;\n  enabled: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n```\n\nContract details:\n\n- Use an OpenAPI discriminator with `propertyName: type` for trigger variants.\n- Unknown trigger discriminator values should be reported by handlers as domain validation errors with HTTP 422, not malformed JSON errors with HTTP 400.\n- Reuse existing `Run` and paginated run-list envelope schemas for automation run endpoints.\n- Add `If-Match` header parameters for replace and delete operations.\n- Add `ETag` response headers on automation read and replace responses.\n- Response codes should cover 200, 201, 204, 400, 404, 409, 422, and 428 where applicable.\n- Before generating duplicate Rust types, search for matching `fabro-automation` domain types and add `with_replacement(...)` mappings where the serde wire shape is identical.\n- Add JSON parity tests for every reused automation type.\n\n## Files\n\nModify:\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-api/Cargo.toml`\n- `lib/crates/fabro-api/build.rs`\n- Generated Rust API files under `lib/crates/fabro-api/src`, as produced by build/codegen\n- Generated TypeScript client files under `lib/packages/fabro-api-client`\n\nCreate:\n\n- `lib/crates/fabro-api/tests/automation_round_trip.rs`\n\n## Acceptance Criteria\n\n- The OpenAPI document exposes the full backend Automations API contract.\n- Rust generated API types compile.\n- Compatible automation domain types are reused instead of duplicated.\n- Reused type JSON parity is covered by tests.\n- The TypeScript API client contains generated automation operations and types.\n- No web UI consumer imports are added.\n\n## Verification\n\nRun:\n\n```bash\ncargo build -p fabro-api\ncargo nextest run -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ngit diff -- apps/fabro-web lib/crates/fabro-cli\n```\n\nExpected: generated API files may change; application UI and CLI command modules should not change.\n\n\n## Comments\n\nNo comments.\n",
-          "internal.retry_count.preflight_compile": 0,
-          "internal.retry_count.fixup": 0,
-          "thread.simplify_gpt.current_node": "verify",
-          "thread.verify.current_node": "fixup",
-          "command.output": "blob://sha256/48271fbaacc4388d9b7e61353bfee8142a341c1b48a63a0e3698b7dc6d897df1",
-          "internal.thread_id": "fixup",
-          "internal.retry_count.implement": 0,
-          "internal.retry_count.toolchain": 0,
-          "internal.retry_count.preflight_lint": 0,
-          "thread.simplify_opus.current_node": "simplify_gpt",
-          "thread.fixup.current_node": "verify",
-          "thread.toolchain.current_node": "preflight_compile",
-          "internal.retry_count.verify": 0,
-          "internal.retry_count.start": 0,
           "last_stage": "fixup",
+          "graph.rankdir": "LR",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "response.implement": "Implemented #396.\n\nSummary:\n- Added the public `/api/v1/automations` OpenAPI contract:\n  - CRUD automation endpoints\n  - automation run list/create endpoints\n  - `If-Match` parameters and `ETag` response headers\n  - discriminator-based trigger schemas\n  - requested response/status coverage\n- Reused compatible `fabro-automation` Rust domain types in `fabro-api` via `with_replacement(...)`.\n- Aligned automation domain serde wire shape with the public API (`target.ref`, schedule `expression`, required response fields).\n- Added `lib/crates/fabro-api/tests/automation_round_trip.rs` with type identity and JSON round-trip/parity coverage.\n- Regenerated the TypeScript Axios client, including `AutomationsApi` and automation models.\n- No web UI or CLI consumer imports/changes were added.\n\nVerification run:\n- Red phase confirmed initially: new automation round-trip test failed before schema/replacement work.\n- `cargo build -p fabro-api` ✅\n- `cargo nextest run -p fabro-api` ✅\n- `cargo nextest run -p fabro-api --test automation_round_trip` ✅\n- `cargo nextest run -p fabro-automation` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 clippy -p fabro-api --all-targets -- -D warnings` ✅\n- `git diff -- apps/fabro-web lib/crates/fabro-cli` ✅ empty",
+          "response.fixup": "No matches for forbidden patterns. All verify steps now succeed:\n\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo dev docs refresh` ✅ (no changes)\n- Forbidden pattern check ✅\n- `cargo clippy --workspace --all-targets -- -D warnings` ✅\n- `cargo nextest run --workspace --profile ci` ✅ — 6372 passed, 179 skipped\n- `cargo dev docs check` ✅\n- `bun install --frozen-lockfile` ✅\n- `apps/fabro-web` typecheck + test ✅ (505 pass)\n- `lib/packages/fabro-api-client` typecheck ✅\n- `cargo dev build -- -p fabro-cli --release` ✅\n\nThe previous failure was a transient infrastructure issue (\"failed to spawn script\") rather than an actual code problem. No code changes were required.",
+          "thread.simplify_gpt.current_node": "verify",
+          "failure_class": "",
+          "command.output": "blob://sha256/48271fbaacc4388d9b7e61353bfee8142a341c1b48a63a0e3698b7dc6d897df1",
+          "internal.retry_count.verify": 0,
           "failure_signature": "",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.toolchain": 0,
+          "internal.thread_id": "fixup",
           "thread.preflight_compile.current_node": "preflight_lint",
-          "internal.node_visit_count": 2,
-          "outcome": "succeeded",
+          "thread.simplify_opus.current_node": "simplify_gpt",
           "response.simplify_opus": "## Summary\n\nThree parallel review agents (reuse, quality, efficiency) ran against the automation API contract change. I applied four concrete fixes from their findings:\n\n1. **`AutomationDraft.enabled` serde was asymmetric** — `skip_serializing_if = \"is_true\"` paired with `default = \"default_true\"` made round-trips lossy on a public API DTO (the test had to use `enabled: false` to dodge it). Dropped the skip attribute and removed the now-unused `is_true` helper (plus its `#[expect(clippy::trivially_copy_pass_by_ref)]`). The create-request round-trip test now uses `enabled: true` — the more interesting case. (`lib/crates/fabro-automation/src/model.rs`)\n\n2. **Removed `NO_TYPE_IMPLS` constant** in `build.rs` — it was used only by the 5 new automation entries while all ~100 existing entries use inline `&[]`. Replaced with inline `&[]` for consistency. (`lib/crates/fabro-api/build.rs`)\n\n3. **Genericized `IfMatch` parameter and `ETag` header descriptions** — both live in shared `components.parameters` / `components.headers` but were worded for \"automation revision\" only. Rewrote them to be resource-agnostic so future entities (secrets, variables, workflows) can `$ref` them without misleading prose. (`docs/public/api-reference/fabro-api.yaml`)\n\n4. **Simplified round-trip tests** — replaced the runtime `assert_same_type<Api, Domain>()` TypeId check with compile-time witness `const _: fn(Api) -> Domain = |v| v;` (catches the same regressions without runtime tautology). Dropped the redundant second deserialize and `assert_eq!(api, domain)` from each JSON test — the two types are physically identical via `with_replacement`, so those assertions were `assert_eq!(api, api)`. (`lib/crates/fabro-api/tests/automation_round_trip.rs`)\n\nFindings I explicitly did **not** act on (acknowledged but out of scope):\n\n- **`pub use ... as ...` aliases** for `AutomationDraft → CreateAutomationRequest` / `AutomationReplace → ReplaceAutomationRequest`. The HTTP/domain naming gap is a real semantic boundary and the issue spec dictates the API names; renaming either side creates more churn than the alias does.\n- **Splitting `fabro-automation` into a types-only sub-crate** to keep `croner`/`tokio`/`toml` out of the build graph of every `fabro-api` consumer — a meaningful build-time cost (`darling`, `derive_builder` added via croner), but a substantial refactor and not in scope here.\n- **Hoisting `assert_same_type` into a shared helper** — duplicated across ~40 sibling test files in `fabro-api/tests/`. Pre-existing pattern.\n- **Consolidating repeated 4xx error responses** into `components.responses/*` — pre-existing spec style across the whole file.\n\nVerification:\n\n- `cargo build -p fabro-api -p fabro-automation` ✅\n- `cargo nextest run -p fabro-api -p fabro-automation` ✅ (175 passed, including the 3 automation round-trip tests)\n- `cargo +nightly-2026-04-14 clippy -p fabro-api -p fabro-automation --all-targets -- -D warnings` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅ (only updated the `If-Match` description text in three places of `automations-api.ts` to match the new generic phrasing)\n- `git diff -- apps/fabro-web lib/crates/fabro-cli` is empty ✅ — acceptance criterion satisfied.",
-          "last_response": "No matches for forbidden patterns. All verify steps now succeed:\n\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo dev docs refresh` ✅ (no changes)\n- Forbidden pattern check ✅\n- `cargo"
+          "internal.node_visit_count": 2,
+          "graph.goal": "# Define automation API contract and clients\n\n- Number: #396\n- State: OPEN\n- Author: brynary (Bryan Helmkamp)\n- Created: 2026-05-25T15:06:24Z\n- Updated: 2026-05-25T15:06:24Z\n- URL: https://github.com/fabro-sh/fabro/issues/396\n\n## Body\n\n## Goal\n\nDefine the public Automations API contract, reuse compatible Rust domain types, and regenerate generated API clients.\n\n## Scope\n\nUpdate the OpenAPI spec under `/api/v1` with these paths:\n\n```http\nGET    /automations\nPOST   /automations\nGET    /automations/{id}\nPUT    /automations/{id}\nDELETE /automations/{id}\nGET    /automations/{id}/runs\nPOST   /automations/{id}/runs\n```\n\nAdd schemas for:\n\n- `Automation`\n- `AutomationTarget`\n- `AutomationTrigger`\n- `AutomationApiTrigger`\n- `AutomationScheduleTrigger`\n- `CreateAutomationRequest`\n- `ReplaceAutomationRequest`\n- `AutomationListResponse`\n\nUse this response shape for automations:\n\n```ts\ntype Automation = {\n  id: string;\n  revision: string;\n  name: string;\n  description: string | null;\n  enabled: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n\ntype AutomationTarget = {\n  repository: string;\n  ref: string;\n  workflow: string;\n};\n\ntype AutomationTrigger =\n  | { id: string; type: \"api\"; enabled: boolean }\n  | { id: string; type: \"schedule\"; enabled: boolean; expression: string };\n```\n\nRequest shapes:\n\n```ts\ntype CreateAutomationRequest = {\n  id: string;\n  name: string;\n  description?: string | null;\n  enabled?: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n\ntype ReplaceAutomationRequest = {\n  name: string;\n  description?: string | null;\n  enabled: boolean;\n  target: AutomationTarget;\n  triggers: AutomationTrigger[];\n};\n```\n\nContract details:\n\n- Use an OpenAPI discriminator with `propertyName: type` for trigger variants.\n- Unknown trigger discriminator values should be reported by handlers as domain validation errors with HTTP 422, not malformed JSON errors with HTTP 400.\n- Reuse existing `Run` and paginated run-list envelope schemas for automation run endpoints.\n- Add `If-Match` header parameters for replace and delete operations.\n- Add `ETag` response headers on automation read and replace responses.\n- Response codes should cover 200, 201, 204, 400, 404, 409, 422, and 428 where applicable.\n- Before generating duplicate Rust types, search for matching `fabro-automation` domain types and add `with_replacement(...)` mappings where the serde wire shape is identical.\n- Add JSON parity tests for every reused automation type.\n\n## Files\n\nModify:\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-api/Cargo.toml`\n- `lib/crates/fabro-api/build.rs`\n- Generated Rust API files under `lib/crates/fabro-api/src`, as produced by build/codegen\n- Generated TypeScript client files under `lib/packages/fabro-api-client`\n\nCreate:\n\n- `lib/crates/fabro-api/tests/automation_round_trip.rs`\n\n## Acceptance Criteria\n\n- The OpenAPI document exposes the full backend Automations API contract.\n- Rust generated API types compile.\n- Compatible automation domain types are reused instead of duplicated.\n- Reused type JSON parity is covered by tests.\n- The TypeScript API client contains generated automation operations and types.\n- No web UI consumer imports are added.\n\n## Verification\n\nRun:\n\n```bash\ncargo build -p fabro-api\ncargo nextest run -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ngit diff -- apps/fabro-web lib/crates/fabro-cli\n```\n\nExpected: generated API files may change; application UI and CLI command modules should not change.\n\n\n## Comments\n\nNo comments.\n",
+          "response.implement": "Implemented #396.\n\nSummary:\n- Added the public `/api/v1/automations` OpenAPI contract:\n  - CRUD automation endpoints\n  - automation run list/create endpoints\n  - `If-Match` parameters and `ETag` response headers\n  - discriminator-based trigger schemas\n  - requested response/status coverage\n- Reused compatible `fabro-automation` Rust domain types in `fabro-api` via `with_replacement(...)`.\n- Aligned automation domain serde wire shape with the public API (`target.ref`, schedule `expression`, required response fields).\n- Added `lib/crates/fabro-api/tests/automation_round_trip.rs` with type identity and JSON round-trip/parity coverage.\n- Regenerated the TypeScript Axios client, including `AutomationsApi` and automation models.\n- No web UI or CLI consumer imports/changes were added.\n\nVerification run:\n- Red phase confirmed initially: new automation round-trip test failed before schema/replacement work.\n- `cargo build -p fabro-api` ✅\n- `cargo nextest run -p fabro-api` ✅\n- `cargo nextest run -p fabro-api --test automation_round_trip` ✅\n- `cargo nextest run -p fabro-automation` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅\n- `cd lib/packages/fabro-api-client && bun run typecheck` ✅\n- `cargo +nightly-2026-04-14 clippy -p fabro-api --all-targets -- -D warnings` ✅\n- `git diff -- apps/fabro-web lib/crates/fabro-cli` ✅ empty",
+          "thread.preflight_lint.current_node": "implement",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.retry_count.simplify_gpt": 0,
+          "internal.run_id": "01KSN3WC12B7VVZHTVCC4NHNJ2",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.fidelity": "compact",
+          "outcome": "succeeded",
+          "current_node": "verify",
+          "internal.retry_count.fixup": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "internal.retry_count.start": 0,
+          "thread.fixup.current_node": "verify",
+          "thread.verify.current_node": "fixup",
+          "thread.implement.current_node": "simplify_opus",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.implement": 0,
+          "thread.start.current_node": "toolchain",
+          "last_response": "No matches for forbidden patterns. All verify steps now succeed:\n\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo dev docs refresh` ✅ (no changes)\n- Forbidden pattern check ✅\n- `cargo",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "response.simplify_gpt": "Review complete.\n\n- Ran diff review against `origin/main...HEAD`.\n- Launched all three parallel review agents:\n  - Code reuse\n  - Code quality\n  - Efficiency\n- Aggregated findings.\n\nOutcome:\n- No code changes were needed after review.\n- The main findings were caveats:\n  - Reusing `fabro_automation::AutomationTarget` intentionally couples the public API shape to the domain model now that `ref` is required.\n  - Unknown trigger discriminator → 422 is a handler behavior concern; no automation HTTP handlers are implemented in this diff.\n  - Persisted automation TOML shape changed from prior optional/`cron` fields as part of aligning the domain type with the public API contract.\n- No duplicate helper logic, generated client issues, or efficiency problems were found.\n\nVerification run:\n\n```bash\ncargo build -p fabro-api\ncargo nextest run -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ngit diff -- apps/fabro-web lib/crates/fabro-cli\n```\n\nResults:\n- `cargo build -p fabro-api`: passed\n- `cargo nextest run -p fabro-api`: passed, 166/166\n- TypeScript client regeneration completed and produced no additional diff\n- No changes in `apps/fabro-web` or `lib/crates/fabro-cli`\n- Working tree is clean relative to the current branch."
         },
         "node_outcomes": {
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 142929,
+              "active_time_ms": 142929
+            }
+          },
           "simplify_gpt": {
             "status": "succeeded",
             "context_updates": {
@@ -1991,23 +2005,63 @@
               "active_time_ms": 366954
             }
           },
-          "toolchain": {
+          "simplify_opus": {
             "status": "succeeded",
             "context_updates": {
-              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+              "response.simplify_opus": "## Summary\n\nThree parallel review agents (reuse, quality, efficiency) ran against the automation API contract change. I applied four concrete fixes from their findings:\n\n1. **`AutomationDraft.enabled` serde was asymmetric** — `skip_serializing_if = \"is_true\"` paired with `default = \"default_true\"` made round-trips lossy on a public API DTO (the test had to use `enabled: false` to dodge it). Dropped the skip attribute and removed the now-unused `is_true` helper (plus its `#[expect(clippy::trivially_copy_pass_by_ref)]`). The create-request round-trip test now uses `enabled: true` — the more interesting case. (`lib/crates/fabro-automation/src/model.rs`)\n\n2. **Removed `NO_TYPE_IMPLS` constant** in `build.rs` — it was used only by the 5 new automation entries while all ~100 existing entries use inline `&[]`. Replaced with inline `&[]` for consistency. (`lib/crates/fabro-api/build.rs`)\n\n3. **Genericized `IfMatch` parameter and `ETag` header descriptions** — both live in shared `components.parameters` / `components.headers` but were worded for \"automation revision\" only. Rewrote them to be resource-agnostic so future entities (secrets, variables, workflows) can `$ref` them without misleading prose. (`docs/public/api-reference/fabro-api.yaml`)\n\n4. **Simplified round-trip tests** — replaced the runtime `assert_same_type<Api, Domain>()` TypeId check with compile-time witness `const _: fn(Api) -> Domain = |v| v;` (catches the same regressions without runtime tautology). Dropped the redundant second deserialize and `assert_eq!(api, domain)` from each JSON test — the two types are physically identical via `with_replacement`, so those assertions were `assert_eq!(api, api)`. (`lib/crates/fabro-api/tests/automation_round_trip.rs`)\n\nFindings I explicitly did **not** act on (acknowledged but out of scope):\n\n- **`pub use ... as ...` aliases** for `AutomationDraft → CreateAutomationRequest` / `AutomationReplace → ReplaceAutomationRequest`. The HTTP/domain naming gap is a real semantic boundary and the issue spec dictates the API names; renaming either side creates more churn than the alias does.\n- **Splitting `fabro-automation` into a types-only sub-crate** to keep `croner`/`tokio`/`toml` out of the build graph of every `fabro-api` consumer — a meaningful build-time cost (`darling`, `derive_builder` added via croner), but a substantial refactor and not in scope here.\n- **Hoisting `assert_same_type` into a shared helper** — duplicated across ~40 sibling test files in `fabro-api/tests/`. Pre-existing pattern.\n- **Consolidating repeated 4xx error responses** into `components.responses/*` — pre-existing spec style across the whole file.\n\nVerification:\n\n- `cargo build -p fabro-api -p fabro-automation` ✅\n- `cargo nextest run -p fabro-api -p fabro-automation` ✅ (175 passed, including the 3 automation round-trip tests)\n- `cargo +nightly-2026-04-14 clippy -p fabro-api -p fabro-automation --all-targets -- -D warnings` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅ (only updated the `If-Match` description text in three places of `automations-api.ts` to match the new generic phrasing)\n- `git diff -- apps/fabro-web lib/crates/fabro-cli` is empty ✅ — acceptance criterion satisfied.",
+              "last_stage": "simplify_opus",
+              "last_response": "## Summary\n\nThree parallel review agents (reuse, quality, efficiency) ran against the automation API contract change. I applied four concrete fixes from their findings:\n\n1. **`AutomationDraft.enabled`"
             },
-            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 59436,
+                    "output_tokens": 16034,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 1376670,
+                    "cache_write_tokens": 171760
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 171760,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 2459865
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/docs/public/api-reference/fabro-api.yaml",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-api/build.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-api/tests/automation_round_trip.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-automation/src/model.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 236585,
+              "tool_time_ms": 229442,
+              "active_time_ms": 466027
+            }
+          },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/48271fbaacc4388d9b7e61353bfee8142a341c1b48a63a0e3698b7dc6d897df1"
+            },
+            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
             "usage": null,
             "timing": {
               "wall_time_ms": 0,
               "inference_time_ms": 0,
-              "tool_time_ms": 1408,
-              "active_time_ms": 1408
+              "tool_time_ms": 298552,
+              "active_time_ms": 298552
             }
-          },
-          "start": {
-            "status": "succeeded",
-            "usage": null
           },
           "preflight_lint": {
             "status": "succeeded",
@@ -2023,18 +2077,22 @@
               "active_time_ms": 160774
             }
           },
-          "verify": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
             "status": "succeeded",
             "context_updates": {
-              "command.output": "blob://sha256/48271fbaacc4388d9b7e61353bfee8142a341c1b48a63a0e3698b7dc6d897df1"
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
             },
-            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
             "usage": null,
             "timing": {
               "wall_time_ms": 0,
               "inference_time_ms": 0,
-              "tool_time_ms": 298552,
-              "active_time_ms": 298552
+              "tool_time_ms": 1408,
+              "active_time_ms": 1408
             }
           },
           "fixup": {
@@ -2110,83 +2168,158 @@
               "tool_time_ms": 269723,
               "active_time_ms": 2735168
             }
-          },
-          "preflight_compile": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo check -q --workspace 2>&1",
-            "usage": null,
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 0,
-              "tool_time_ms": 142929,
-              "active_time_ms": 142929
-            }
-          },
-          "simplify_opus": {
-            "status": "succeeded",
-            "context_updates": {
-              "response.simplify_opus": "## Summary\n\nThree parallel review agents (reuse, quality, efficiency) ran against the automation API contract change. I applied four concrete fixes from their findings:\n\n1. **`AutomationDraft.enabled` serde was asymmetric** — `skip_serializing_if = \"is_true\"` paired with `default = \"default_true\"` made round-trips lossy on a public API DTO (the test had to use `enabled: false` to dodge it). Dropped the skip attribute and removed the now-unused `is_true` helper (plus its `#[expect(clippy::trivially_copy_pass_by_ref)]`). The create-request round-trip test now uses `enabled: true` — the more interesting case. (`lib/crates/fabro-automation/src/model.rs`)\n\n2. **Removed `NO_TYPE_IMPLS` constant** in `build.rs` — it was used only by the 5 new automation entries while all ~100 existing entries use inline `&[]`. Replaced with inline `&[]` for consistency. (`lib/crates/fabro-api/build.rs`)\n\n3. **Genericized `IfMatch` parameter and `ETag` header descriptions** — both live in shared `components.parameters` / `components.headers` but were worded for \"automation revision\" only. Rewrote them to be resource-agnostic so future entities (secrets, variables, workflows) can `$ref` them without misleading prose. (`docs/public/api-reference/fabro-api.yaml`)\n\n4. **Simplified round-trip tests** — replaced the runtime `assert_same_type<Api, Domain>()` TypeId check with compile-time witness `const _: fn(Api) -> Domain = |v| v;` (catches the same regressions without runtime tautology). Dropped the redundant second deserialize and `assert_eq!(api, domain)` from each JSON test — the two types are physically identical via `with_replacement`, so those assertions were `assert_eq!(api, api)`. (`lib/crates/fabro-api/tests/automation_round_trip.rs`)\n\nFindings I explicitly did **not** act on (acknowledged but out of scope):\n\n- **`pub use ... as ...` aliases** for `AutomationDraft → CreateAutomationRequest` / `AutomationReplace → ReplaceAutomationRequest`. The HTTP/domain naming gap is a real semantic boundary and the issue spec dictates the API names; renaming either side creates more churn than the alias does.\n- **Splitting `fabro-automation` into a types-only sub-crate** to keep `croner`/`tokio`/`toml` out of the build graph of every `fabro-api` consumer — a meaningful build-time cost (`darling`, `derive_builder` added via croner), but a substantial refactor and not in scope here.\n- **Hoisting `assert_same_type` into a shared helper** — duplicated across ~40 sibling test files in `fabro-api/tests/`. Pre-existing pattern.\n- **Consolidating repeated 4xx error responses** into `components.responses/*` — pre-existing spec style across the whole file.\n\nVerification:\n\n- `cargo build -p fabro-api -p fabro-automation` ✅\n- `cargo nextest run -p fabro-api -p fabro-automation` ✅ (175 passed, including the 3 automation round-trip tests)\n- `cargo +nightly-2026-04-14 clippy -p fabro-api -p fabro-automation --all-targets -- -D warnings` ✅\n- `cd lib/packages/fabro-api-client && bun run generate` ✅ (only updated the `If-Match` description text in three places of `automations-api.ts` to match the new generic phrasing)\n- `git diff -- apps/fabro-web lib/crates/fabro-cli` is empty ✅ — acceptance criterion satisfied.",
-              "last_stage": "simplify_opus",
-              "last_response": "## Summary\n\nThree parallel review agents (reuse, quality, efficiency) ran against the automation API contract change. I applied four concrete fixes from their findings:\n\n1. **`AutomationDraft.enabled`"
-            },
-            "notes": "Stage completed: simplify_opus",
-            "usage": {
-              "input": {
-                "usage": {
-                  "model": {
-                    "provider": "anthropic",
-                    "model_id": "claude-opus-4-7"
-                  },
-                  "tokens": {
-                    "input_tokens": 59436,
-                    "output_tokens": 16034,
-                    "reasoning_tokens": 0,
-                    "cache_read_tokens": 1376670,
-                    "cache_write_tokens": 171760
-                  }
-                },
-                "facts": {
-                  "algorithm": "anthropic",
-                  "cache_write_5m_tokens": 171760,
-                  "cache_write_1h_tokens": 0
-                }
-              },
-              "total_usd_micros": 2459865
-            },
-            "files_touched": [
-              "/home/daytona/workspace/fabro/docs/public/api-reference/fabro-api.yaml",
-              "/home/daytona/workspace/fabro/lib/crates/fabro-api/build.rs",
-              "/home/daytona/workspace/fabro/lib/crates/fabro-api/tests/automation_round_trip.rs",
-              "/home/daytona/workspace/fabro/lib/crates/fabro-automation/src/model.rs"
-            ],
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 236585,
-              "tool_time_ms": 229442,
-              "active_time_ms": 466027
-            }
           }
         },
         "next_node_id": "exit",
+        "git_commit_sha": "8ae5d080343be3d53b4ba434e23ca2cb43bc17e3",
         "node_visits": {
-          "implement": 1,
-          "toolchain": 1,
-          "simplify_opus": 1,
+          "simplify_gpt": 1,
           "preflight_lint": 1,
+          "toolchain": 1,
           "verify": 2,
-          "start": 1,
           "fixup": 1,
           "preflight_compile": 1,
-          "simplify_gpt": 1
+          "start": 1,
+          "simplify_opus": 1,
+          "implement": 1
         }
       },
-      "diff": {}
+      "diff": {
+        "summary": {
+          "files_changed": 154,
+          "additions": 3033,
+          "deletions": 7048
+        }
+      }
     }
   ],
-  "conclusion": null,
+  "conclusion": {
+    "timestamp": "2026-05-27T17:56:49.919177Z",
+    "status": "succeeded",
+    "timing": {
+      "wall_time_ms": 5009742,
+      "inference_time_ms": 3101747,
+      "tool_time_ms": 1418739,
+      "active_time_ms": 4520486
+    },
+    "final_git_commit_sha": "8ae5d080343be3d53b4ba434e23ca2cb43bc17e3",
+    "stages": [
+      {
+        "stage_id": "start",
+        "stage_label": "start",
+        "timing": {
+          "wall_time_ms": 0,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "toolchain",
+        "stage_label": "toolchain",
+        "timing": {
+          "wall_time_ms": 1415,
+          "inference_time_ms": 0,
+          "tool_time_ms": 1408,
+          "active_time_ms": 1408
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_compile",
+        "stage_label": "preflight_compile",
+        "timing": {
+          "wall_time_ms": 142935,
+          "inference_time_ms": 0,
+          "tool_time_ms": 142929,
+          "active_time_ms": 142929
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_lint",
+        "stage_label": "preflight_lint",
+        "timing": {
+          "wall_time_ms": 160780,
+          "inference_time_ms": 0,
+          "tool_time_ms": 160774,
+          "active_time_ms": 160774
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "implement",
+        "stage_label": "implement",
+        "timing": {
+          "wall_time_ms": 2736816,
+          "inference_time_ms": 2465445,
+          "tool_time_ms": 269723,
+          "active_time_ms": 2735168
+        },
+        "billing_usd_micros": 28665693,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_opus",
+        "stage_label": "simplify_opus",
+        "timing": {
+          "wall_time_ms": 466579,
+          "inference_time_ms": 236585,
+          "tool_time_ms": 229442,
+          "active_time_ms": 466027
+        },
+        "billing_usd_micros": 2459865,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_gpt",
+        "stage_label": "simplify_gpt",
+        "timing": {
+          "wall_time_ms": 367483,
+          "inference_time_ms": 349869,
+          "tool_time_ms": 17085,
+          "active_time_ms": 366954
+        },
+        "billing_usd_micros": 3917715,
+        "retries": 0
+      },
+      {
+        "stage_id": "verify",
+        "stage_label": "verify",
+        "timing": {
+          "wall_time_ms": 728061,
+          "inference_time_ms": 0,
+          "tool_time_ms": 298552,
+          "active_time_ms": 298552
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "fixup",
+        "stage_label": "fixup",
+        "timing": {
+          "wall_time_ms": 352231,
+          "inference_time_ms": 49848,
+          "tool_time_ms": 298826,
+          "active_time_ms": 348674
+        },
+        "billing_usd_micros": 431235,
+        "retries": 0
+      }
+    ],
+    "billing": {
+      "input_tokens": 5233639,
+      "output_tokens": 40954,
+      "total_tokens": 18155734,
+      "reasoning_tokens": 18511,
+      "cache_read_tokens": 12656605,
+      "cache_write_tokens": 206025,
+      "total_usd_micros": 35474508
+    },
+    "total_retries": 0,
+    "diff": {}
+  },
   "sandbox": {
     "provider": "daytona",
     "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
@@ -2482,6 +2615,40 @@
       },
       "state": "succeeded"
     },
+    "exit@1": {
+      "first_event_seq": 1130,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-27T17:56:49.860060Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T17:56:49.859991Z",
+      "handler": "exit",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
     "preflight_lint@1": {
       "first_event_seq": 43,
       "prompt": null,
@@ -2616,7 +2783,12 @@
       "first_event_seq": 1120,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-27T17:56:43.745896Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -2624,11 +2796,27 @@
         "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/48271fbaacc4388d9b7e61353bfee8142a341c1b48a63a0e3698b7dc6d897df1",
+        "exit_code": 0,
+        "duration_ms": 298552,
+        "termination": "exited",
+        "output_bytes": 76956,
+        "live_streaming": true
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 76956,
+      "live_streaming": true,
+      "termination": "exited",
       "started_at": "2026-05-27T17:51:45.175865Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 298568,
+        "inference_time_ms": 0,
+        "tool_time_ms": 298552,
+        "active_time_ms": 298552
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -2637,7 +2825,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "simplify_opus@1": {
       "first_event_seq": 516,
