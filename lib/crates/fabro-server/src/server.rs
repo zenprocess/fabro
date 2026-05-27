@@ -1825,7 +1825,8 @@ async fn http_log_middleware(mut req: axum_extract::Request, next: Next) -> Resp
                     team_id = team_id.as_str(),
                     user_id = user_id.as_str(),
                 ),
-                None | Some(Principal::Agent { .. } | Principal::System { .. }) => {
+                None => emit_http_log!($level),
+                Some(Principal::Agent { .. } | Principal::System { .. }) => {
                     emit_http_log!($level)
                 }
             }

@@ -3,17 +3,8 @@ use std::collections::HashMap;
 use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, GitContext, PreRunPushOutcome, RunSpec};
 use fabro_types::settings::{ProjectNamespace, WorkflowNamespace};
+use fabro_types::test_support::engine_run_provenance;
 use fabro_types::{WorkflowSettings, fixtures};
-
-fn test_run_provenance() -> fabro_types::RunProvenance {
-    fabro_types::RunProvenance {
-        server:  None,
-        client:  None,
-        subject: fabro_types::Principal::System {
-            system_kind: fabro_types::SystemActorKind::Engine,
-        },
-    }
-}
 
 fn sample_run_spec() -> RunSpec {
     let settings = WorkflowSettings {
@@ -36,7 +27,7 @@ fn sample_run_spec() -> RunSpec {
         workflow_slug: Some("demo".to_string()),
         source_directory: Some("/Users/client/project".to_string()),
         labels: HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance: test_run_provenance(),
+        provenance: engine_run_provenance(),
         manifest_blob: None,
         definition_blob: None,
         git: Some(GitContext {

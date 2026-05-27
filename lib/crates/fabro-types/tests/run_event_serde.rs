@@ -6,17 +6,8 @@ use fabro_types::run_event::run::{RunCreatedProps, RunParentLinkedProps, RunPare
 use fabro_types::run_event::{RunSessionTurnFailedCode, RunSessionTurnFailedProps};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
+use fabro_types::test_support::engine_run_provenance;
 use fabro_types::{EventBody, TurnId, WorkflowSettings, fixtures};
-
-fn test_run_provenance() -> fabro_types::RunProvenance {
-    fabro_types::RunProvenance {
-        server:  None,
-        client:  None,
-        subject: fabro_types::Principal::System {
-            system_kind: fabro_types::SystemActorKind::Engine,
-        },
-    }
-}
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
@@ -37,7 +28,7 @@ fn run_created_props_round_trip_templated_settings() {
         source_directory: Some("/Users/client/project".to_string()),
         workflow_slug:    Some("demo".to_string()),
         db_prefix:        Some("run_".to_string()),
-        provenance:       test_run_provenance(),
+        provenance:       engine_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
             origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
@@ -99,7 +90,7 @@ fn run_created_props_omits_web_url_when_absent() {
         source_directory: None,
         workflow_slug:    None,
         db_prefix:        None,
-        provenance:       test_run_provenance(),
+        provenance:       engine_run_provenance(),
         manifest_blob:    None,
         git:              None,
         fork_source_ref:  None,
@@ -137,7 +128,7 @@ fn run_created_props_defaults_retried_from_when_absent() {
         "graph": Graph::new("ship"),
         "labels": {},
         "run_dir": "/tmp/run",
-        "provenance": test_run_provenance()
+        "provenance": engine_run_provenance()
     });
 
     let props: RunCreatedProps = serde_json::from_value(json).expect("props should deserialize");

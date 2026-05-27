@@ -642,14 +642,23 @@ async fn create_run(
         .map(LlmClientResult::provider_ids)
         .unwrap_or_default();
     let provenance = run_provenance(&headers, &actor);
-    let mut create_input = run_manifest::create_run_input(
-        prepared.clone(),
-        ready_provider_ids.clone(),
+    let create_input = operations::CreateRunInput {
+        workflow: operations::WorkflowInput::Bundled(prepared.workflow_input.clone()),
+        settings: prepared.settings.clone(),
+        cwd: prepared.cwd.clone(),
+        workflow_slug: None,
+        workflow_path: Some(prepared.target_path.clone()),
+        workflow_bundle: Some(prepared.workflow_bundle.clone()),
+        submitted_manifest_bytes: Some(body.to_vec()),
+        run_id: Some(run_id),
+        title: prepared.title.clone(),
+        git: prepared.git.clone(),
+        fork_source_ref: None,
+        parent_id: prepared.parent_id,
         provenance,
-        web_url.clone(),
-    );
-    create_input.run_id = Some(run_id);
-    create_input.submitted_manifest_bytes = Some(body.to_vec());
+        configured_providers: ready_provider_ids.clone(),
+        web_url: web_url.clone(),
+    };
 
     let storage_root = match resolve_interp_string(&state.server_settings().server.storage.root) {
         Ok(path) => PathBuf::from(path),

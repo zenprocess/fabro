@@ -26,13 +26,11 @@ use fabro_static::EnvVars;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{EnvironmentProvider, RunGoal, RunNamespace};
-use fabro_types::{
-    ManifestPath, RunId, RunProvenance, SandboxProviderKind, ServerSettings, WorkflowSettings,
-};
+use fabro_types::{ManifestPath, RunId, SandboxProviderKind, ServerSettings, WorkflowSettings};
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
-use fabro_workflow::operations::{CreateRunInput, ValidateInput, WorkflowInput, validate};
+use fabro_workflow::operations::{ValidateInput, WorkflowInput, validate};
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run;
 use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig, WorkflowBundle};
@@ -198,31 +196,6 @@ pub(crate) fn validate_prepared_manifest(
         custom_transforms: Vec::new(),
         catalog,
     })
-}
-
-pub(crate) fn create_run_input(
-    prepared: PreparedManifest,
-    configured_providers: Vec<ProviderId>,
-    provenance: RunProvenance,
-    web_url: Option<String>,
-) -> CreateRunInput {
-    CreateRunInput {
-        workflow: WorkflowInput::Bundled(prepared.workflow_input),
-        settings: prepared.settings,
-        cwd: prepared.cwd,
-        workflow_slug: None,
-        workflow_path: Some(prepared.target_path),
-        workflow_bundle: Some(prepared.workflow_bundle),
-        submitted_manifest_bytes: None,
-        run_id: prepared.run_id,
-        title: prepared.title,
-        git: prepared.git,
-        fork_source_ref: None,
-        parent_id: prepared.parent_id,
-        provenance,
-        configured_providers,
-        web_url,
-    }
 }
 
 pub(crate) async fn run_preflight(
