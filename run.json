@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-27T21:40:08.061760Z",
-  "last_event_at": "2026-05-27T23:44:34.167957Z",
+  "last_event_at": "2026-05-27T23:49:27.870109Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1957,9 +1957,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 2277,
       "checkpoint": {
-        "timestamp": "2026-05-27T23:49:24.037512Z",
+        "timestamp": "2026-05-27T23:49:27.869679Z",
         "current_node": "verify",
         "completed_nodes": [
           "start",
@@ -1975,118 +1975,45 @@
         ],
         "node_retries": {},
         "context_values": {
-          "thread.simplify_gpt.current_node": "verify",
-          "internal.retry_count.start": 0,
-          "internal.retry_count.preflight_lint": 0,
-          "thread.preflight_lint.current_node": "implement",
-          "response.simplify_gpt": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has already trimmed messages, rather than silently replaying a truncated stream.\n  - Active `Start` subscribers that joined before first publish also fail if messages were trimmed before they could establish a cursor.\n  - `After(id)` subscriptions for unknown runs no longer create empty run stream entries.\n  - Added tests for these cursor/cleanup cases.\n\n- **Worker-side delivery-id dedupe**\n  - Replaced the single `last_applied_id` duplicate check with a bounded recent-id dedupe set.\n  - Uses FIFO + `HashSet`, capped at `2048` delivery ids.\n  - Still uses the last applied id for reconnect `?after=...`.\n  - Prevents repeated non-adjacent duplicate delivery ids from being applied twice without unbounded memory growth.\n\n- **Formatting**\n  - `worker_control.rs` had rustfmt-only import formatting changes.\n\nAlready clean / previously addressed in current tree:\n- Worker control route already checks invalid cursor before WebSocket upgrade and returns HTTP `410 Gone`.\n- Invalid-cursor close reason and ping/pong constants were already shared through `fabro-interview`.\n- Terminal-run check already uses `is_terminal()`.\n\nValidation run:\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo nextest run -p fabro-server worker_control` ✅\n- `cargo nextest run -p fabro-cli runner` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server -p fabro-cli --all-targets -- -D warnings` ✅",
-          "thread.fixup.current_node": "verify",
-          "current_node": "verify",
-          "response.implement": "Implemented the worker control bus plan end-to-end.\n\n### What changed\n\n- Added shared protocol support:\n  - `run.pause` / `run.unpause`\n  - `WorkerControlDeliveryFrame { id, envelope }`\n\n- Added server-side worker control bus:\n  - `WorkerControlBus` abstraction\n  - opaque `WorkerControlMessageId`\n  - `WorkerControlCursor::{Start, After(...)}`\n  - `LocalWorkerControlBus` with ordered replay, `after` resume, bounded retention, invalid-cursor detection, and cleanup\n\n- Added server WebSocket route:\n  - `GET /api/v1/runs/{id}/worker/control-stream`\n  - worker-JWT-only and run-scoped\n  - rejects missing/terminal/archived runs before upgrade\n  - invalid cursor returns HTTP 410 before upgrade\n  - sends JSON delivery frames\n  - explicit ping/pong liveness\n\n- Removed worker stdin JSONL runtime transport:\n  - server now publishes all controls through the bus\n  - `__run-worker` subprocess stdin is configured as null\n  - no `control_tx` / stdin control pump remains\n\n- Added CLI worker WebSocket control manager:\n  - connects before start/resume for non-terminal runs\n  - supports HTTP → WS, HTTPS → WSS, and Unix socket targets\n  - reconnects with exponential backoff capped at 5s\n  - first connect omits `after`; reconnect uses last fully applied id\n  - applies frames only once by delivery id\n  - updates `last_applied_id` only after successful application\n  - handles pause/unpause/cancel/answer/steer/interrupt/pair controls\n  - explicit ping/pong liveness and timeout\n  - HTTP 410 / `invalid_cursor` close is fatal control-channel loss\n\n- Added/updated tests across protocol, bus, route, CLI, server transport, and lifecycle/cancel flows.\n\n- Fixed a lifecycle regression where cancellation at a human gate could race with the detached completion guard and emit a duplicate terminal failure.\n\n### Verification run\n\nPassed:\n\n- `cargo nextest run -p fabro-interview control_protocol`\n- `cargo nextest run -p fabro-server worker_control`\n- `cargo nextest run -p fabro-cli runner`\n- `cargo nextest run -p fabro-server worker_command`\n- `cargo nextest run -p fabro-cli --test it runner`\n- `cargo nextest run -p fabro-server --features test-support --test it lifecycle`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `git diff --check`\n\nAlso confirmed by grep:\n\n- no worker-control stdin pump / `control_tx` remnants in server or CLI runtime code\n- no `Latest` worker-control cursor\n- no Redis dependency/config/runtime path added, only future-backend comments in the bus contract.",
-          "graph.rankdir": "LR",
-          "outcome": "succeeded",
-          "failure_class": "",
-          "response.simplify_opus": "Net 47 lines deleted. Here's a summary of the cleanup applied based on the three parallel reviews:\n\n## Cleanup Summary\n\n**Correctness fix:**\n- **Lost-wakeup race in `LocalWorkerControlBus`**: `local_subscription_task` could miss a publish that landed between message-read and `notify.notified()` registration. Now registers `notified()` before inspecting the stream and uses the proper enable-before-check pattern.\n\n**Memory / efficiency:**\n- **Removed unbounded `applied_ids: HashSet<String>`** in the CLI worker control task. The server cursor + monotonic IDs already guarantee no replay; kept a simple `last_applied_id == frame.id` check as defense-in-depth.\n- **Dropped `Arc<Mutex<Option<String>>>` for `last_applied_id`**: it's owned by a single task. Now a plain `&mut Option<String>`, removing two lock-held-across-await sites per loop iteration.\n- **Pinned the `Sleep` once outside the WS loop** in both server and worker handlers, calling `Pin::reset` instead of allocating a new `Sleep` per iteration.\n- **Replaced O(N) `iter().filter().cloned()` over the retained deque** with `partition_point` + tail iteration in `collect_messages_from`.\n\n**Reuse / consolidation:**\n- **Moved `WORKER_CONTROL_WS_PING_INTERVAL`, `WORKER_CONTROL_WS_LIVENESS_TIMEOUT`, `WORKER_CONTROL_INVALID_CURSOR_REASON`, `WORKER_CONTROL_PONG_TIMEOUT_REASON`** into `fabro-interview::control_protocol` so server and worker share one source of truth.\n- **Used `axum::extract::ws::close_code::AWAY` / `POLICY` constants** instead of raw `1001` / `1008` literals on the server.\n\n**Dead code removal:**\n- **Removed `WorkerControlBus::backend_name`** trait method (only used by a tautological test) and the associated `#[allow(dead_code)]` and `Hash` derive on `WorkerControlMessageId`.\n- **Removed the single-variant `WorkerCommandStdin` enum** + constant + tautological test; inlined `Stdio::null()`.\n- **Deleted `#[cfg(test)] parse_worker_control_line` and `apply_worker_control_line`** wrappers; rewrote the four tests to call `apply_worker_control_message` directly with typed envelopes.\n\n**Verification:**\n- `cargo nextest run -p fabro-server worker_control` — 15/15 pass\n- `cargo nextest run -p fabro-interview` — 62/62 pass\n- `cargo nextest run -p fabro-cli runner` — 33/33 pass\n- `cargo nextest run -p fabro-server --test it --features test-support lifecycle` — 3/3 pass\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — clean\n- Two pre-existing `pause_run_*` / `unpause_run_sets_pending_control` failures verified to exist before this cleanup (confirmed via `git stash`).\n\n**Findings I deliberately skipped** (not high-impact enough or would require API surface changes outside this cleanup):\n- Splitting `WorkerControlBusError` into publish/subscribe error types\n- Replacing `BoxFuture` with `async_trait` (style consistency)\n- Moving WS-URL construction onto `ServerTarget` (touches `fabro-client`, `fabro-sandbox`)\n- Adopting `fabro_util::backoff::BackoffPolicy` (small benefit; existing hand-rolled is correct)\n- Collapsing `WorkerControlSocket` enum into `Box<dyn AsyncRead + AsyncWrite>` (works but tungstenite's `from_raw_socket` generic constraints make this fiddly)\n- Per-run inner mutex sharding in the bus (premature for local single-node)\n- `cleanup_worker_control_bus_for_run` spawn-per-call (sync-fast-path optimization; correctness fine)",
-          "internal.run_id": "01KSNP2DXVS2TD1HEASQAFBGFK",
-          "thread.verify.current_node": "fixup",
-          "graph.goal": "# Worker Control Bus Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Replace the server-to-worker stdin JSONL control pipe with a backend-agnostic worker control bus, implemented now with a local in-memory bus and delivered to workers over a worker-initiated WebSocket.\n\n**Architecture:** API handlers publish `WorkerControlEnvelope` messages to a `WorkerControlBus`; the worker WebSocket route subscribes to that bus and forwards ordered delivery frames to the worker. Workers track the last fully applied delivery id and reconnect with `?after=<id>` after any unexpected WebSocket close. The first backend is an in-process `LocalWorkerControlBus` for local and single-node deployments. A Redis Streams backend must fit behind the same trait later, but Redis is explicitly out of scope for this implementation plan.\n\n**Tech Stack:** Rust, Axum WebSockets, tokio-tungstenite, UnixStream, async-trait or boxed async traits, tokio channels/Notify, worker JWT auth, existing `WorkerControlEnvelope`.\n\n---\n\n## Key Decisions\n\n- WebSocket fully replaces stdin control. Do not keep stdin JSONL as a compatibility path.\n- The worker protocol stays identical across local, single-node, ECS, and later SaaS deployments.\n- The server-side delivery backend is the only thing that varies by deployment.\n- This plan implements only `LocalWorkerControlBus`.\n- This plan does not add Redis dependencies, Redis configuration, Redis tests, Redis health checks, or Redis runtime behavior.\n- Redis Streams are covered only as a future backend contract so the local design does not paint us into a corner.\n- There is no `Latest` cursor. The first worker connection starts at the beginning of the run's retained control stream; reconnects resume after the worker's last fully applied delivery id.\n- Every WebSocket text frame is a delivery frame with an id and envelope. The worker advances `last_applied_id` only after applying the envelope.\n- Workers reconnect forever while the local run is not terminal, using backoff from 100ms, doubled after each failure, capped at 5s.\n- The worker must complete its first control-stream connection before starting or resuming workflow execution. Temporary first-connect failures wait and retry; they do not start a control-disconnected run.\n- Invalid cursor means the bus can no longer prove replay correctness. The worker treats it as fatal control-channel loss and fails/aborts the run as infrastructure failure, not as user cancellation.\n- WebSocket liveness is handled at the WebSocket layer with explicit ping/pong and timeout logic. The bus does not know about heartbeats.\n- ECS task launch, ECS stop/reconciliation, Redis-backed multi-node delivery, and remote hard-kill behavior are follow-up work.\n\n## Redis Fit Later: Out of Scope Now\n\nRedis should later implement the same `WorkerControlBus` API introduced here.\n\n- `publish(run_id, envelope)` maps to `XADD fabro:run:{run_id}:control ...`.\n- First `subscribe(run_id, Start)` maps to `XREAD BLOCK ... STREAMS fabro:run:{run_id}:control 0-0`.\n- Reconnect `subscribe(run_id, After(id))` maps to `XREAD BLOCK ... STREAMS fabro:run:{run_id}:control {id}`.\n- Local message ids use an opaque string format such as `local:1`; Redis message ids can use Redis stream ids such as `1716810000000-0`.\n- The WebSocket route should not care whether the subscription source is local memory or Redis.\n- The worker should not care whether the frame came from a local bus or Redis.\n- Redis trimming/retention, consumer groups, per-tenant key naming, TLS/auth, reconnect-after-redeploy semantics, and SaaS config validation are not part of this plan.\n\n## Proposed File Structure\n\n- Create `lib/crates/fabro-server/src/worker_control/mod.rs`\n  - Owns the server-side control bus abstraction and re-exports the local backend.\n- Create `lib/crates/fabro-server/src/worker_control/bus.rs`\n  - Defines `WorkerControlBus`, `WorkerControlDelivery`, `WorkerControlMessageId`, `WorkerControlCursor`, and bus errors.\n- Create `lib/crates/fabro-server/src/worker_control/local.rs`\n  - Implements `LocalWorkerControlBus` using process memory.\n- Create `lib/crates/fabro-server/src/server/handler/worker_control.rs`\n  - Adds the worker-only WebSocket route.\n- Modify `lib/crates/fabro-server/src/server.rs`\n  - Adds the bus to `AppState`, replaces subprocess `RunAnswerTransport` sends with bus publishes, removes stdin pumping.\n- Modify `lib/crates/fabro-server/src/server/handler/mod.rs`\n  - Registers the worker control route.\n- Modify `lib/crates/fabro-server/src/server/handler/lifecycle.rs`\n  - Sends pause/unpause/cancel controls through the transport/bus where appropriate.\n- Modify `lib/crates/fabro-cli/src/commands/run/runner.rs`\n  - Replaces stdin reading with worker WebSocket client handling.\n- Modify `lib/crates/fabro-cli/Cargo.toml`\n  - Adds `tokio-tungstenite` as a direct dependency if needed.\n- Modify `lib/crates/fabro-interview/src/control_protocol.rs`\n  - Adds pause/unpause control messages and a transport delivery frame type shared by server and worker.\n\n## Task 1: Define the Control Bus Contract\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/worker_control/mod.rs`\n- Create: `lib/crates/fabro-server/src/worker_control/bus.rs`\n- Modify: `lib/crates/fabro-server/src/lib.rs`\n\n- [ ] Add a private `worker_control` module in `fabro-server`.\n- [ ] Define `WorkerControlMessageId` as an opaque cloneable id rather than a numeric type.\n- [ ] Define `WorkerControlCursor` with `Start` and `After(WorkerControlMessageId)` variants.\n- [ ] Define `WorkerControlDelivery { id: WorkerControlMessageId, envelope: WorkerControlEnvelope }`.\n- [ ] Define `WorkerControlBus` with async `publish(run_id, envelope)` and `subscribe(run_id, cursor)` methods.\n- [ ] Make `subscribe` return a stream-like receiver owned by the caller, so the WebSocket handler can forward messages without knowing the backend.\n- [ ] Define explicit bus errors for closed backend, unavailable backend, invalid cursor, and publish timeout.\n- [ ] Document in code comments that `Start` maps to Redis stream id `0-0` and `After(id)` maps to Redis `XREAD` after that id, but do not add Redis code.\n- [ ] Add unit tests for id equality/debug formatting and cursor parsing from the optional `after` query parameter.\n- [ ] Test that absent `after` parses as `WorkerControlCursor::Start`.\n- [ ] Test that present `after=local:42` parses as `WorkerControlCursor::After(...)`.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 2: Implement the Local In-Memory Bus\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/worker_control/local.rs`\n- Test: `lib/crates/fabro-server/src/worker_control/local.rs`\n\n- [ ] Implement `LocalWorkerControlBus` as `Arc<Mutex<HashMap<RunId, LocalRunControlStream>>>`.\n- [ ] Store messages per run in insertion order with a monotonic local sequence id.\n- [ ] Wake active subscribers when `publish` appends a message.\n- [ ] Support `subscribe(run_id, Start)` for first worker startup; it must replay retained messages from the beginning of the run control stream.\n- [ ] Support `subscribe(run_id, After(id))` so reconnect uses the same API that later maps to Redis `XREAD`.\n- [ ] Allow `publish` before the worker subscribes; retained messages must be visible to the first `Start` subscriber.\n- [ ] Trim retained local messages to a bounded per-run size so a disconnected local worker cannot grow memory without bound. Use a named constant with initial value 1024 messages per run.\n- [ ] Return a clear `invalid cursor` error when a subscriber asks for an id that has been trimmed or belongs to a different local stream.\n- [ ] Add a cleanup method for terminal runs so completed/cancelled runs can release retained control messages.\n- [ ] Test that messages publish in order.\n- [ ] Test that an active subscriber receives a message published after subscription.\n- [ ] Test that messages published before subscription are replayed to a `Start` subscriber.\n- [ ] Test that `After(id)` receives only later messages.\n- [ ] Test that trimming bounds retained messages and reports an invalid old cursor.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 3: Add Control Bus to Server State\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Add `worker_control_bus: Arc<dyn WorkerControlBus>` to `AppState`.\n- [ ] Construct `LocalWorkerControlBus` in normal server state initialization.\n- [ ] Add a test-only way to inject a fake or local bus without exposing test helpers to production builds.\n- [ ] Keep demo/in-process execution behavior unchanged unless it currently depends on subprocess control.\n- [ ] Add a state construction test proving the default bus is local and available.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 4: Extend the Control Protocol\n\n**Files:**\n- Modify: `lib/crates/fabro-interview/src/control_protocol.rs`\n- Test: `lib/crates/fabro-interview/src/control_protocol.rs`\n\n- [ ] Add `WorkerControlEnvelope::pause_run()` and `WorkerControlEnvelope::unpause_run()` constructors.\n- [ ] Add `WorkerControlMessage::RunPause` serialized as `\"run.pause\"`.\n- [ ] Add `WorkerControlMessage::RunUnpause` serialized as `\"run.unpause\"`.\n- [ ] Add `WorkerControlDeliveryFrame { id: String, envelope: WorkerControlEnvelope }` as the WebSocket text-frame payload shared by server and worker.\n- [ ] Add round-trip serde tests for both new messages.\n- [ ] Add round-trip serde tests for `WorkerControlDeliveryFrame`.\n- [ ] Run `cargo nextest run -p fabro-interview control_protocol`.\n\n## Task 5: Share Worker Message Handling\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] Split `apply_worker_control_line(...)` into parsing and `apply_worker_control_message(...)`.\n- [ ] Route WebSocket delivery frames through `apply_worker_control_message(...)`.\n- [ ] Route `run.pause` to `RunControlState::request_pause()`.\n- [ ] Route `run.unpause` to `RunControlState::request_unpause()`.\n- [ ] Add a small in-memory applied-id dedupe set in the worker control task; ignore duplicate delivery ids before applying envelopes.\n- [ ] Update `last_applied_id` only after `apply_worker_control_message(...)` returns.\n- [ ] Treat all current control messages as idempotent under delivery-id dedupe. `run.steer` must not be applied twice for the same delivery id.\n- [ ] Keep control stream close behavior explicit: an unexpected close triggers reconnect; a fatal invalid cursor interrupts pending interviews and fails/aborts the run as control-channel loss.\n- [ ] Update existing stdin-era tests to exercise the shared message handler directly.\n- [ ] Add tests for pause and unpause routing.\n- [ ] Add a test proving duplicate delivery ids are not applied twice.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n\n## Task 6: Add Worker WebSocket Client\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/Cargo.toml`\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] Add `tokio-tungstenite.workspace = true` as a direct `fabro-cli` dependency if the crate does not already have it.\n- [ ] Add a helper that builds the control-stream request for a `ServerTarget` and `RunId`.\n- [ ] For HTTP URLs, convert `http` to `ws` and `https` to `wss`.\n- [ ] For Unix socket paths, connect `tokio::net::UnixStream` and use `ws://fabro/api/v1/runs/{run_id}/worker/control-stream` for the handshake host/path.\n- [ ] Add the worker bearer token as an `Authorization: Bearer ...` request header.\n- [ ] On the first connection, omit the `after` query parameter so the server maps it to `WorkerControlCursor::Start`.\n- [ ] On reconnect, include `?after=<last_applied_id>` when `last_applied_id` is set.\n- [ ] Spawn a WebSocket control manager task in `execute(...)` after `ControlInterviewer`, `RunControlState`, `CancellationToken`, and `SteeringHub` are created, and before `operations::start` or `operations::resume`.\n- [ ] Gate `operations::start` and `operations::resume` on the first successful control-stream connection.\n- [ ] The control manager should keep reconnecting while the run is not locally terminal, with backoff starting at 100ms, doubling after each failure, and capped at 5s.\n- [ ] Deserialize each text frame into `WorkerControlDeliveryFrame`.\n- [ ] Apply each envelope through `apply_worker_control_message(...)`, then record the frame id as `last_applied_id`.\n- [ ] Respond to received WebSocket ping frames with pong frames.\n- [ ] Send worker-initiated ping frames every 15s.\n- [ ] Track pongs for worker-initiated pings and close the WebSocket after 45s without a matching pong or other proof of connection liveness.\n- [ ] Treat normal close/error as reconnectable while the run is not terminal.\n- [ ] Treat HTTP 410 Gone or a WebSocket close reason of `invalid_cursor` as fatal control-channel loss.\n- [ ] On fatal control-channel loss, interrupt pending interviews and fail/abort the run with an infrastructure/control-channel error, not a user cancellation.\n- [ ] Wire fatal control-channel loss back into `execute(...)` so the worker returns an error instead of silently continuing workflow execution.\n- [ ] Add tests for URL/request construction for `http`, `https`, and Unix socket targets.\n- [ ] Add tests proving first connection has no `after` query and reconnect includes `after=<last_applied_id>`.\n- [ ] Add tests for reconnect backoff bounds.\n- [ ] Add tests for ping/pong timeout behavior using paused Tokio time.\n- [ ] Add a local Unix-socket WebSocket test proving the client can complete a handshake against an Axum route.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n\n## Task 7: Add Worker-Only Control Stream Route\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/server/handler/worker_control.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/mod.rs`\n- Modify: `lib/crates/fabro-server/src/principal_middleware.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Add a narrow helper or extractor that accepts only authenticated worker principals whose token run id matches the route run id.\n- [ ] Add `GET /runs/{id}/worker/control-stream` to real API routes only.\n- [ ] Reject missing runs, terminal runs, and archived runs before upgrading.\n- [ ] Reject user JWTs and cross-run worker JWTs.\n- [ ] Parse absent `after` into `WorkerControlCursor::Start`.\n- [ ] Parse present `after` into `WorkerControlCursor::After(id)`.\n- [ ] On upgrade, call `worker_control_bus.subscribe(run_id, cursor)`.\n- [ ] If `subscribe` returns invalid cursor before upgrade, reject with HTTP 410 Gone.\n- [ ] Serialize each `WorkerControlDelivery` to `WorkerControlDeliveryFrame` and send it as a WebSocket text frame.\n- [ ] Send server-initiated ping frames every 15s.\n- [ ] Respond to received WebSocket ping frames with pong frames.\n- [ ] Track pongs for server-initiated pings and close the WebSocket after 45s without a matching pong or other proof of connection liveness.\n- [ ] On timeout or disconnect, drop the bus subscription so local resources are released.\n- [ ] Do not store the live WebSocket sender in `ManagedRun`; the bus is now the delivery boundary.\n- [ ] Add tests for auth rejection, successful `Start` subscription, successful `After(id)` subscription, frame delivery, invalid cursor rejection as 410 Gone, ping/pong timeout cleanup, and cross-run worker rejection.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 8: Replace Server-Side Stdin Transport with Bus Publishing\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/lifecycle.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/pair.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Replace `RunAnswerTransport::Subprocess { control_tx }` with a bus-backed subprocess/worker variant.\n- [ ] Ensure the bus-backed variant has enough context to publish messages for the correct `RunId`.\n- [ ] Delete `pump_worker_control_jsonl(...)`.\n- [ ] Change `worker_command(...)` so `__run-worker` uses `stdin(Stdio::null())` instead of `stdin(Stdio::piped())`.\n- [ ] Remove child-stdin extraction and the control pump task from `execute_run_subprocess(...)`.\n- [ ] Keep stderr capture and worker exit handling unchanged.\n- [ ] Update `RunAnswerTransport` methods so answer, cancel, steer, interrupt, pair start/message/end all publish the existing envelope to `WorkerControlBus`.\n- [ ] Add `pause_run()` and `unpause_run()` methods on `RunAnswerTransport`.\n- [ ] Update pause/unpause lifecycle handlers to send `run.pause` and `run.unpause` over the bus for running workers.\n- [ ] Keep process signals only for hard cleanup paths such as cancel fallback, shutdown, terminal delete, and force removal.\n- [ ] Update existing tests that assert subprocess transport enqueue behavior to assert bus publish behavior instead.\n- [ ] Add a `worker_command` test proving stdin is null/not piped and `FABRO_WORKER_TOKEN` still travels only through env.\n- [ ] Run `cargo nextest run -p fabro-server worker_command`.\n\n## Task 9: End-to-End Local Control Flow Regression\n\n**Files:**\n- Test: `lib/crates/fabro-cli/tests/it/cmd/runner.rs`\n- Test: `lib/crates/fabro-server/tests/it/scenario/lifecycle.rs`\n\n- [ ] Add a test run where the worker connects to the control WebSocket and receives a cancel request through `LocalWorkerControlBus`.\n- [ ] Add a test where the server publishes a control message before the worker connects and the worker receives it on first connection.\n- [ ] Add a reconnect test where the worker applies message A, reconnects with `after=<A>`, and then receives only message B.\n- [ ] Add an invalid-cursor test proving the worker reports control-channel loss as infrastructure failure rather than user cancellation.\n- [ ] Add a human-interview test proving submitted answers reach the worker through the bus and WebSocket.\n- [ ] Add a steer or interrupt test proving live agent controls still reach the worker transport.\n- [ ] Add a local Unix-socket server test proving the default local server target works without stdin.\n- [ ] Run `cargo nextest run -p fabro-cli --test it runner`.\n- [ ] Run `cargo nextest run -p fabro-server --test it lifecycle`.\n\n## Task 10: Final Verification\n\n**Files:**\n- Modify only if failures expose necessary fixes.\n\n- [ ] Run `cargo nextest run -p fabro-interview control_protocol`.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n- [ ] Run `cargo nextest run -p fabro-server worker_command`.\n- [ ] Run `cargo nextest run -p fabro-server --test it lifecycle`.\n- [ ] Run `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- [ ] Confirm no code path still writes `WorkerControlEnvelope` to child stdin.\n- [ ] Confirm no Redis dependency, Redis config key, or Redis runtime path was added.\n- [ ] Confirm there is no `Latest` cursor or wait-for-subscriber behavior in the control bus.\n- [ ] Confirm WebSocket ping/pong handling is explicit on both worker and server.\n- [ ] Confirm `run.steer` and other controls are protected from duplicate delivery-id application.\n- [ ] Confirm `__run-worker` still scrubs `FABRO_WORKER_TOKEN` from process env before launching descendants.\n\n## Acceptance Criteria\n\n- All worker control traffic uses the worker control bus plus WebSocket last-mile transport.\n- Local Unix-socket server targets and remote HTTP(S) server targets both support worker control without Redis.\n- Local and single-node deployments require no external control-channel service.\n- The bus API can later be implemented by Redis Streams without changing API handlers or worker message handling.\n- First worker connection replays retained messages from the beginning of the run control stream; reconnect resumes after the last fully applied id.\n- Invalid cursor is the only fatal control-stream replay failure and is surfaced as infrastructure/control-channel failure, not user cancellation.\n- WebSocket liveness is explicit and backend-agnostic.\n- Existing run event/blob/artifact HTTP paths are unchanged.\n- Existing worker JWT scope rules remain authoritative.\n- Temporary WebSocket disconnects reconnect and replay through the bus; only unrecoverable replay loss reports worker-control-unavailable behavior.\n- Worker stdout/stderr behavior remains unchanged except that stdin is no longer a control channel.\n- Redis is clearly documented as future work and is not required by this plan.\n",
-          "thread.simplify_opus.current_node": "simplify_gpt",
-          "internal.fidelity": "compact",
-          "internal.retry_count.toolchain": 0,
-          "thread.start.current_node": "toolchain",
-          "command.output": "blob://sha256/d7eff0107d632faa544d8591722ccc826bde2e324d5b0d83f8dac34269458bf1",
-          "internal.retry_count.implement": 0,
           "last_stage": "fixup",
-          "internal.retry_count.simplify_gpt": 0,
-          "thread.preflight_compile.current_node": "preflight_lint",
-          "internal.retry_count.fixup": 0,
-          "internal.thread_id": "fixup",
-          "internal.retry_count.preflight_compile": 0,
           "failure_signature": "",
-          "thread.toolchain.current_node": "preflight_compile",
-          "internal.node_visit_count": 2,
-          "response.fixup": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Paused { prior_block: None }` and `worker_pid = Some(u32::MAX)` to simulate an active worker. The previous implementation used SIGUSR1/SIGUSR2 against `worker_pid`, so that was sufficient. After the control-bus refactor, pause/unpause now require a `RunAnswerTransport` on the managed run, so the handler returned 409 \"Run worker is not available.\"\n\n**Fix:** In both tests, attach a worker `RunAnswerTransport` (built via the existing `worker_transport_with_receiver` helper) to the managed run alongside the manual status/pid mutation.\n\nVerified:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo nextest run --workspace --profile ci` (6438 passed, 179 skipped)\n- `cargo dev docs check`\n- `bun install`, `apps/fabro-web` typecheck + test, `lib/packages/fabro-api-client` typecheck\n- `cargo dev build -- -p fabro-cli --release`",
-          "last_response": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Pau",
-          "internal.retry_count.simplify_opus": 0,
-          "internal.retry_count.verify": 0,
-          "thread.implement.current_node": "simplify_opus",
+          "failure_class": "",
+          "internal.fidelity": "compact",
+          "internal.retry_count.preflight_compile": 0,
           "internal.work_dir": "/home/daytona/workspace/fabro",
-          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        "
+          "response.implement": "Implemented the worker control bus plan end-to-end.\n\n### What changed\n\n- Added shared protocol support:\n  - `run.pause` / `run.unpause`\n  - `WorkerControlDeliveryFrame { id, envelope }`\n\n- Added server-side worker control bus:\n  - `WorkerControlBus` abstraction\n  - opaque `WorkerControlMessageId`\n  - `WorkerControlCursor::{Start, After(...)}`\n  - `LocalWorkerControlBus` with ordered replay, `after` resume, bounded retention, invalid-cursor detection, and cleanup\n\n- Added server WebSocket route:\n  - `GET /api/v1/runs/{id}/worker/control-stream`\n  - worker-JWT-only and run-scoped\n  - rejects missing/terminal/archived runs before upgrade\n  - invalid cursor returns HTTP 410 before upgrade\n  - sends JSON delivery frames\n  - explicit ping/pong liveness\n\n- Removed worker stdin JSONL runtime transport:\n  - server now publishes all controls through the bus\n  - `__run-worker` subprocess stdin is configured as null\n  - no `control_tx` / stdin control pump remains\n\n- Added CLI worker WebSocket control manager:\n  - connects before start/resume for non-terminal runs\n  - supports HTTP → WS, HTTPS → WSS, and Unix socket targets\n  - reconnects with exponential backoff capped at 5s\n  - first connect omits `after`; reconnect uses last fully applied id\n  - applies frames only once by delivery id\n  - updates `last_applied_id` only after successful application\n  - handles pause/unpause/cancel/answer/steer/interrupt/pair controls\n  - explicit ping/pong liveness and timeout\n  - HTTP 410 / `invalid_cursor` close is fatal control-channel loss\n\n- Added/updated tests across protocol, bus, route, CLI, server transport, and lifecycle/cancel flows.\n\n- Fixed a lifecycle regression where cancellation at a human gate could race with the detached completion guard and emit a duplicate terminal failure.\n\n### Verification run\n\nPassed:\n\n- `cargo nextest run -p fabro-interview control_protocol`\n- `cargo nextest run -p fabro-server worker_control`\n- `cargo nextest run -p fabro-cli runner`\n- `cargo nextest run -p fabro-server worker_command`\n- `cargo nextest run -p fabro-cli --test it runner`\n- `cargo nextest run -p fabro-server --features test-support --test it lifecycle`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `git diff --check`\n\nAlso confirmed by grep:\n\n- no worker-control stdin pump / `control_tx` remnants in server or CLI runtime code\n- no `Latest` worker-control cursor\n- no Redis dependency/config/runtime path added, only future-backend comments in the bus contract.",
+          "internal.thread_id": "fixup",
+          "thread.implement.current_node": "simplify_opus",
+          "internal.run_id": "01KSNP2DXVS2TD1HEASQAFBGFK",
+          "command.output": "blob://sha256/d7eff0107d632faa544d8591722ccc826bde2e324d5b0d83f8dac34269458bf1",
+          "internal.retry_count.start": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "graph.rankdir": "LR",
+          "thread.fixup.current_node": "verify",
+          "internal.retry_count.verify": 0,
+          "last_response": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Pau",
+          "thread.toolchain.current_node": "preflight_compile",
+          "thread.verify.current_node": "fixup",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.implement": 0,
+          "current_node": "verify",
+          "internal.retry_count.fixup": 0,
+          "internal.retry_count.simplify_opus": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "thread.start.current_node": "toolchain",
+          "internal.retry_count.toolchain": 0,
+          "internal.retry_count.simplify_gpt": 0,
+          "outcome": "succeeded",
+          "graph.goal": "# Worker Control Bus Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Replace the server-to-worker stdin JSONL control pipe with a backend-agnostic worker control bus, implemented now with a local in-memory bus and delivered to workers over a worker-initiated WebSocket.\n\n**Architecture:** API handlers publish `WorkerControlEnvelope` messages to a `WorkerControlBus`; the worker WebSocket route subscribes to that bus and forwards ordered delivery frames to the worker. Workers track the last fully applied delivery id and reconnect with `?after=<id>` after any unexpected WebSocket close. The first backend is an in-process `LocalWorkerControlBus` for local and single-node deployments. A Redis Streams backend must fit behind the same trait later, but Redis is explicitly out of scope for this implementation plan.\n\n**Tech Stack:** Rust, Axum WebSockets, tokio-tungstenite, UnixStream, async-trait or boxed async traits, tokio channels/Notify, worker JWT auth, existing `WorkerControlEnvelope`.\n\n---\n\n## Key Decisions\n\n- WebSocket fully replaces stdin control. Do not keep stdin JSONL as a compatibility path.\n- The worker protocol stays identical across local, single-node, ECS, and later SaaS deployments.\n- The server-side delivery backend is the only thing that varies by deployment.\n- This plan implements only `LocalWorkerControlBus`.\n- This plan does not add Redis dependencies, Redis configuration, Redis tests, Redis health checks, or Redis runtime behavior.\n- Redis Streams are covered only as a future backend contract so the local design does not paint us into a corner.\n- There is no `Latest` cursor. The first worker connection starts at the beginning of the run's retained control stream; reconnects resume after the worker's last fully applied delivery id.\n- Every WebSocket text frame is a delivery frame with an id and envelope. The worker advances `last_applied_id` only after applying the envelope.\n- Workers reconnect forever while the local run is not terminal, using backoff from 100ms, doubled after each failure, capped at 5s.\n- The worker must complete its first control-stream connection before starting or resuming workflow execution. Temporary first-connect failures wait and retry; they do not start a control-disconnected run.\n- Invalid cursor means the bus can no longer prove replay correctness. The worker treats it as fatal control-channel loss and fails/aborts the run as infrastructure failure, not as user cancellation.\n- WebSocket liveness is handled at the WebSocket layer with explicit ping/pong and timeout logic. The bus does not know about heartbeats.\n- ECS task launch, ECS stop/reconciliation, Redis-backed multi-node delivery, and remote hard-kill behavior are follow-up work.\n\n## Redis Fit Later: Out of Scope Now\n\nRedis should later implement the same `WorkerControlBus` API introduced here.\n\n- `publish(run_id, envelope)` maps to `XADD fabro:run:{run_id}:control ...`.\n- First `subscribe(run_id, Start)` maps to `XREAD BLOCK ... STREAMS fabro:run:{run_id}:control 0-0`.\n- Reconnect `subscribe(run_id, After(id))` maps to `XREAD BLOCK ... STREAMS fabro:run:{run_id}:control {id}`.\n- Local message ids use an opaque string format such as `local:1`; Redis message ids can use Redis stream ids such as `1716810000000-0`.\n- The WebSocket route should not care whether the subscription source is local memory or Redis.\n- The worker should not care whether the frame came from a local bus or Redis.\n- Redis trimming/retention, consumer groups, per-tenant key naming, TLS/auth, reconnect-after-redeploy semantics, and SaaS config validation are not part of this plan.\n\n## Proposed File Structure\n\n- Create `lib/crates/fabro-server/src/worker_control/mod.rs`\n  - Owns the server-side control bus abstraction and re-exports the local backend.\n- Create `lib/crates/fabro-server/src/worker_control/bus.rs`\n  - Defines `WorkerControlBus`, `WorkerControlDelivery`, `WorkerControlMessageId`, `WorkerControlCursor`, and bus errors.\n- Create `lib/crates/fabro-server/src/worker_control/local.rs`\n  - Implements `LocalWorkerControlBus` using process memory.\n- Create `lib/crates/fabro-server/src/server/handler/worker_control.rs`\n  - Adds the worker-only WebSocket route.\n- Modify `lib/crates/fabro-server/src/server.rs`\n  - Adds the bus to `AppState`, replaces subprocess `RunAnswerTransport` sends with bus publishes, removes stdin pumping.\n- Modify `lib/crates/fabro-server/src/server/handler/mod.rs`\n  - Registers the worker control route.\n- Modify `lib/crates/fabro-server/src/server/handler/lifecycle.rs`\n  - Sends pause/unpause/cancel controls through the transport/bus where appropriate.\n- Modify `lib/crates/fabro-cli/src/commands/run/runner.rs`\n  - Replaces stdin reading with worker WebSocket client handling.\n- Modify `lib/crates/fabro-cli/Cargo.toml`\n  - Adds `tokio-tungstenite` as a direct dependency if needed.\n- Modify `lib/crates/fabro-interview/src/control_protocol.rs`\n  - Adds pause/unpause control messages and a transport delivery frame type shared by server and worker.\n\n## Task 1: Define the Control Bus Contract\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/worker_control/mod.rs`\n- Create: `lib/crates/fabro-server/src/worker_control/bus.rs`\n- Modify: `lib/crates/fabro-server/src/lib.rs`\n\n- [ ] Add a private `worker_control` module in `fabro-server`.\n- [ ] Define `WorkerControlMessageId` as an opaque cloneable id rather than a numeric type.\n- [ ] Define `WorkerControlCursor` with `Start` and `After(WorkerControlMessageId)` variants.\n- [ ] Define `WorkerControlDelivery { id: WorkerControlMessageId, envelope: WorkerControlEnvelope }`.\n- [ ] Define `WorkerControlBus` with async `publish(run_id, envelope)` and `subscribe(run_id, cursor)` methods.\n- [ ] Make `subscribe` return a stream-like receiver owned by the caller, so the WebSocket handler can forward messages without knowing the backend.\n- [ ] Define explicit bus errors for closed backend, unavailable backend, invalid cursor, and publish timeout.\n- [ ] Document in code comments that `Start` maps to Redis stream id `0-0` and `After(id)` maps to Redis `XREAD` after that id, but do not add Redis code.\n- [ ] Add unit tests for id equality/debug formatting and cursor parsing from the optional `after` query parameter.\n- [ ] Test that absent `after` parses as `WorkerControlCursor::Start`.\n- [ ] Test that present `after=local:42` parses as `WorkerControlCursor::After(...)`.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 2: Implement the Local In-Memory Bus\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/worker_control/local.rs`\n- Test: `lib/crates/fabro-server/src/worker_control/local.rs`\n\n- [ ] Implement `LocalWorkerControlBus` as `Arc<Mutex<HashMap<RunId, LocalRunControlStream>>>`.\n- [ ] Store messages per run in insertion order with a monotonic local sequence id.\n- [ ] Wake active subscribers when `publish` appends a message.\n- [ ] Support `subscribe(run_id, Start)` for first worker startup; it must replay retained messages from the beginning of the run control stream.\n- [ ] Support `subscribe(run_id, After(id))` so reconnect uses the same API that later maps to Redis `XREAD`.\n- [ ] Allow `publish` before the worker subscribes; retained messages must be visible to the first `Start` subscriber.\n- [ ] Trim retained local messages to a bounded per-run size so a disconnected local worker cannot grow memory without bound. Use a named constant with initial value 1024 messages per run.\n- [ ] Return a clear `invalid cursor` error when a subscriber asks for an id that has been trimmed or belongs to a different local stream.\n- [ ] Add a cleanup method for terminal runs so completed/cancelled runs can release retained control messages.\n- [ ] Test that messages publish in order.\n- [ ] Test that an active subscriber receives a message published after subscription.\n- [ ] Test that messages published before subscription are replayed to a `Start` subscriber.\n- [ ] Test that `After(id)` receives only later messages.\n- [ ] Test that trimming bounds retained messages and reports an invalid old cursor.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 3: Add Control Bus to Server State\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Add `worker_control_bus: Arc<dyn WorkerControlBus>` to `AppState`.\n- [ ] Construct `LocalWorkerControlBus` in normal server state initialization.\n- [ ] Add a test-only way to inject a fake or local bus without exposing test helpers to production builds.\n- [ ] Keep demo/in-process execution behavior unchanged unless it currently depends on subprocess control.\n- [ ] Add a state construction test proving the default bus is local and available.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 4: Extend the Control Protocol\n\n**Files:**\n- Modify: `lib/crates/fabro-interview/src/control_protocol.rs`\n- Test: `lib/crates/fabro-interview/src/control_protocol.rs`\n\n- [ ] Add `WorkerControlEnvelope::pause_run()` and `WorkerControlEnvelope::unpause_run()` constructors.\n- [ ] Add `WorkerControlMessage::RunPause` serialized as `\"run.pause\"`.\n- [ ] Add `WorkerControlMessage::RunUnpause` serialized as `\"run.unpause\"`.\n- [ ] Add `WorkerControlDeliveryFrame { id: String, envelope: WorkerControlEnvelope }` as the WebSocket text-frame payload shared by server and worker.\n- [ ] Add round-trip serde tests for both new messages.\n- [ ] Add round-trip serde tests for `WorkerControlDeliveryFrame`.\n- [ ] Run `cargo nextest run -p fabro-interview control_protocol`.\n\n## Task 5: Share Worker Message Handling\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] Split `apply_worker_control_line(...)` into parsing and `apply_worker_control_message(...)`.\n- [ ] Route WebSocket delivery frames through `apply_worker_control_message(...)`.\n- [ ] Route `run.pause` to `RunControlState::request_pause()`.\n- [ ] Route `run.unpause` to `RunControlState::request_unpause()`.\n- [ ] Add a small in-memory applied-id dedupe set in the worker control task; ignore duplicate delivery ids before applying envelopes.\n- [ ] Update `last_applied_id` only after `apply_worker_control_message(...)` returns.\n- [ ] Treat all current control messages as idempotent under delivery-id dedupe. `run.steer` must not be applied twice for the same delivery id.\n- [ ] Keep control stream close behavior explicit: an unexpected close triggers reconnect; a fatal invalid cursor interrupts pending interviews and fails/aborts the run as control-channel loss.\n- [ ] Update existing stdin-era tests to exercise the shared message handler directly.\n- [ ] Add tests for pause and unpause routing.\n- [ ] Add a test proving duplicate delivery ids are not applied twice.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n\n## Task 6: Add Worker WebSocket Client\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/Cargo.toml`\n- Modify: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n- Test: `lib/crates/fabro-cli/src/commands/run/runner.rs`\n\n- [ ] Add `tokio-tungstenite.workspace = true` as a direct `fabro-cli` dependency if the crate does not already have it.\n- [ ] Add a helper that builds the control-stream request for a `ServerTarget` and `RunId`.\n- [ ] For HTTP URLs, convert `http` to `ws` and `https` to `wss`.\n- [ ] For Unix socket paths, connect `tokio::net::UnixStream` and use `ws://fabro/api/v1/runs/{run_id}/worker/control-stream` for the handshake host/path.\n- [ ] Add the worker bearer token as an `Authorization: Bearer ...` request header.\n- [ ] On the first connection, omit the `after` query parameter so the server maps it to `WorkerControlCursor::Start`.\n- [ ] On reconnect, include `?after=<last_applied_id>` when `last_applied_id` is set.\n- [ ] Spawn a WebSocket control manager task in `execute(...)` after `ControlInterviewer`, `RunControlState`, `CancellationToken`, and `SteeringHub` are created, and before `operations::start` or `operations::resume`.\n- [ ] Gate `operations::start` and `operations::resume` on the first successful control-stream connection.\n- [ ] The control manager should keep reconnecting while the run is not locally terminal, with backoff starting at 100ms, doubling after each failure, and capped at 5s.\n- [ ] Deserialize each text frame into `WorkerControlDeliveryFrame`.\n- [ ] Apply each envelope through `apply_worker_control_message(...)`, then record the frame id as `last_applied_id`.\n- [ ] Respond to received WebSocket ping frames with pong frames.\n- [ ] Send worker-initiated ping frames every 15s.\n- [ ] Track pongs for worker-initiated pings and close the WebSocket after 45s without a matching pong or other proof of connection liveness.\n- [ ] Treat normal close/error as reconnectable while the run is not terminal.\n- [ ] Treat HTTP 410 Gone or a WebSocket close reason of `invalid_cursor` as fatal control-channel loss.\n- [ ] On fatal control-channel loss, interrupt pending interviews and fail/abort the run with an infrastructure/control-channel error, not a user cancellation.\n- [ ] Wire fatal control-channel loss back into `execute(...)` so the worker returns an error instead of silently continuing workflow execution.\n- [ ] Add tests for URL/request construction for `http`, `https`, and Unix socket targets.\n- [ ] Add tests proving first connection has no `after` query and reconnect includes `after=<last_applied_id>`.\n- [ ] Add tests for reconnect backoff bounds.\n- [ ] Add tests for ping/pong timeout behavior using paused Tokio time.\n- [ ] Add a local Unix-socket WebSocket test proving the client can complete a handshake against an Axum route.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n\n## Task 7: Add Worker-Only Control Stream Route\n\n**Files:**\n- Create: `lib/crates/fabro-server/src/server/handler/worker_control.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/mod.rs`\n- Modify: `lib/crates/fabro-server/src/principal_middleware.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Add a narrow helper or extractor that accepts only authenticated worker principals whose token run id matches the route run id.\n- [ ] Add `GET /runs/{id}/worker/control-stream` to real API routes only.\n- [ ] Reject missing runs, terminal runs, and archived runs before upgrading.\n- [ ] Reject user JWTs and cross-run worker JWTs.\n- [ ] Parse absent `after` into `WorkerControlCursor::Start`.\n- [ ] Parse present `after` into `WorkerControlCursor::After(id)`.\n- [ ] On upgrade, call `worker_control_bus.subscribe(run_id, cursor)`.\n- [ ] If `subscribe` returns invalid cursor before upgrade, reject with HTTP 410 Gone.\n- [ ] Serialize each `WorkerControlDelivery` to `WorkerControlDeliveryFrame` and send it as a WebSocket text frame.\n- [ ] Send server-initiated ping frames every 15s.\n- [ ] Respond to received WebSocket ping frames with pong frames.\n- [ ] Track pongs for server-initiated pings and close the WebSocket after 45s without a matching pong or other proof of connection liveness.\n- [ ] On timeout or disconnect, drop the bus subscription so local resources are released.\n- [ ] Do not store the live WebSocket sender in `ManagedRun`; the bus is now the delivery boundary.\n- [ ] Add tests for auth rejection, successful `Start` subscription, successful `After(id)` subscription, frame delivery, invalid cursor rejection as 410 Gone, ping/pong timeout cleanup, and cross-run worker rejection.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n\n## Task 8: Replace Server-Side Stdin Transport with Bus Publishing\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/lifecycle.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/pair.rs`\n- Test: `lib/crates/fabro-server/src/server/tests.rs`\n\n- [ ] Replace `RunAnswerTransport::Subprocess { control_tx }` with a bus-backed subprocess/worker variant.\n- [ ] Ensure the bus-backed variant has enough context to publish messages for the correct `RunId`.\n- [ ] Delete `pump_worker_control_jsonl(...)`.\n- [ ] Change `worker_command(...)` so `__run-worker` uses `stdin(Stdio::null())` instead of `stdin(Stdio::piped())`.\n- [ ] Remove child-stdin extraction and the control pump task from `execute_run_subprocess(...)`.\n- [ ] Keep stderr capture and worker exit handling unchanged.\n- [ ] Update `RunAnswerTransport` methods so answer, cancel, steer, interrupt, pair start/message/end all publish the existing envelope to `WorkerControlBus`.\n- [ ] Add `pause_run()` and `unpause_run()` methods on `RunAnswerTransport`.\n- [ ] Update pause/unpause lifecycle handlers to send `run.pause` and `run.unpause` over the bus for running workers.\n- [ ] Keep process signals only for hard cleanup paths such as cancel fallback, shutdown, terminal delete, and force removal.\n- [ ] Update existing tests that assert subprocess transport enqueue behavior to assert bus publish behavior instead.\n- [ ] Add a `worker_command` test proving stdin is null/not piped and `FABRO_WORKER_TOKEN` still travels only through env.\n- [ ] Run `cargo nextest run -p fabro-server worker_command`.\n\n## Task 9: End-to-End Local Control Flow Regression\n\n**Files:**\n- Test: `lib/crates/fabro-cli/tests/it/cmd/runner.rs`\n- Test: `lib/crates/fabro-server/tests/it/scenario/lifecycle.rs`\n\n- [ ] Add a test run where the worker connects to the control WebSocket and receives a cancel request through `LocalWorkerControlBus`.\n- [ ] Add a test where the server publishes a control message before the worker connects and the worker receives it on first connection.\n- [ ] Add a reconnect test where the worker applies message A, reconnects with `after=<A>`, and then receives only message B.\n- [ ] Add an invalid-cursor test proving the worker reports control-channel loss as infrastructure failure rather than user cancellation.\n- [ ] Add a human-interview test proving submitted answers reach the worker through the bus and WebSocket.\n- [ ] Add a steer or interrupt test proving live agent controls still reach the worker transport.\n- [ ] Add a local Unix-socket server test proving the default local server target works without stdin.\n- [ ] Run `cargo nextest run -p fabro-cli --test it runner`.\n- [ ] Run `cargo nextest run -p fabro-server --test it lifecycle`.\n\n## Task 10: Final Verification\n\n**Files:**\n- Modify only if failures expose necessary fixes.\n\n- [ ] Run `cargo nextest run -p fabro-interview control_protocol`.\n- [ ] Run `cargo nextest run -p fabro-server worker_control`.\n- [ ] Run `cargo nextest run -p fabro-cli runner`.\n- [ ] Run `cargo nextest run -p fabro-server worker_command`.\n- [ ] Run `cargo nextest run -p fabro-server --test it lifecycle`.\n- [ ] Run `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`.\n- [ ] Confirm no code path still writes `WorkerControlEnvelope` to child stdin.\n- [ ] Confirm no Redis dependency, Redis config key, or Redis runtime path was added.\n- [ ] Confirm there is no `Latest` cursor or wait-for-subscriber behavior in the control bus.\n- [ ] Confirm WebSocket ping/pong handling is explicit on both worker and server.\n- [ ] Confirm `run.steer` and other controls are protected from duplicate delivery-id application.\n- [ ] Confirm `__run-worker` still scrubs `FABRO_WORKER_TOKEN` from process env before launching descendants.\n\n## Acceptance Criteria\n\n- All worker control traffic uses the worker control bus plus WebSocket last-mile transport.\n- Local Unix-socket server targets and remote HTTP(S) server targets both support worker control without Redis.\n- Local and single-node deployments require no external control-channel service.\n- The bus API can later be implemented by Redis Streams without changing API handlers or worker message handling.\n- First worker connection replays retained messages from the beginning of the run control stream; reconnect resumes after the last fully applied id.\n- Invalid cursor is the only fatal control-stream replay failure and is surfaced as infrastructure/control-channel failure, not user cancellation.\n- WebSocket liveness is explicit and backend-agnostic.\n- Existing run event/blob/artifact HTTP paths are unchanged.\n- Existing worker JWT scope rules remain authoritative.\n- Temporary WebSocket disconnects reconnect and replay through the bus; only unrecoverable replay loss reports worker-control-unavailable behavior.\n- Worker stdout/stderr behavior remains unchanged except that stdin is no longer a control channel.\n- Redis is clearly documented as future work and is not required by this plan.\n",
+          "response.simplify_gpt": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has already trimmed messages, rather than silently replaying a truncated stream.\n  - Active `Start` subscribers that joined before first publish also fail if messages were trimmed before they could establish a cursor.\n  - `After(id)` subscriptions for unknown runs no longer create empty run stream entries.\n  - Added tests for these cursor/cleanup cases.\n\n- **Worker-side delivery-id dedupe**\n  - Replaced the single `last_applied_id` duplicate check with a bounded recent-id dedupe set.\n  - Uses FIFO + `HashSet`, capped at `2048` delivery ids.\n  - Still uses the last applied id for reconnect `?after=...`.\n  - Prevents repeated non-adjacent duplicate delivery ids from being applied twice without unbounded memory growth.\n\n- **Formatting**\n  - `worker_control.rs` had rustfmt-only import formatting changes.\n\nAlready clean / previously addressed in current tree:\n- Worker control route already checks invalid cursor before WebSocket upgrade and returns HTTP `410 Gone`.\n- Invalid-cursor close reason and ping/pong constants were already shared through `fabro-interview`.\n- Terminal-run check already uses `is_terminal()`.\n\nValidation run:\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo nextest run -p fabro-server worker_control` ✅\n- `cargo nextest run -p fabro-cli runner` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server -p fabro-cli --all-targets -- -D warnings` ✅",
+          "response.fixup": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Paused { prior_block: None }` and `worker_pid = Some(u32::MAX)` to simulate an active worker. The previous implementation used SIGUSR1/SIGUSR2 against `worker_pid`, so that was sufficient. After the control-bus refactor, pause/unpause now require a `RunAnswerTransport` on the managed run, so the handler returned 409 \"Run worker is not available.\"\n\n**Fix:** In both tests, attach a worker `RunAnswerTransport` (built via the existing `worker_transport_with_receiver` helper) to the managed run alongside the manual status/pid mutation.\n\nVerified:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo nextest run --workspace --profile ci` (6438 passed, 179 skipped)\n- `cargo dev docs check`\n- `bun install`, `apps/fabro-web` typecheck + test, `lib/packages/fabro-api-client` typecheck\n- `cargo dev build -- -p fabro-cli --release`",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.node_visit_count": 2,
+          "thread.preflight_lint.current_node": "implement",
+          "thread.simplify_gpt.current_node": "verify",
+          "response.simplify_opus": "Net 47 lines deleted. Here's a summary of the cleanup applied based on the three parallel reviews:\n\n## Cleanup Summary\n\n**Correctness fix:**\n- **Lost-wakeup race in `LocalWorkerControlBus`**: `local_subscription_task` could miss a publish that landed between message-read and `notify.notified()` registration. Now registers `notified()` before inspecting the stream and uses the proper enable-before-check pattern.\n\n**Memory / efficiency:**\n- **Removed unbounded `applied_ids: HashSet<String>`** in the CLI worker control task. The server cursor + monotonic IDs already guarantee no replay; kept a simple `last_applied_id == frame.id` check as defense-in-depth.\n- **Dropped `Arc<Mutex<Option<String>>>` for `last_applied_id`**: it's owned by a single task. Now a plain `&mut Option<String>`, removing two lock-held-across-await sites per loop iteration.\n- **Pinned the `Sleep` once outside the WS loop** in both server and worker handlers, calling `Pin::reset` instead of allocating a new `Sleep` per iteration.\n- **Replaced O(N) `iter().filter().cloned()` over the retained deque** with `partition_point` + tail iteration in `collect_messages_from`.\n\n**Reuse / consolidation:**\n- **Moved `WORKER_CONTROL_WS_PING_INTERVAL`, `WORKER_CONTROL_WS_LIVENESS_TIMEOUT`, `WORKER_CONTROL_INVALID_CURSOR_REASON`, `WORKER_CONTROL_PONG_TIMEOUT_REASON`** into `fabro-interview::control_protocol` so server and worker share one source of truth.\n- **Used `axum::extract::ws::close_code::AWAY` / `POLICY` constants** instead of raw `1001` / `1008` literals on the server.\n\n**Dead code removal:**\n- **Removed `WorkerControlBus::backend_name`** trait method (only used by a tautological test) and the associated `#[allow(dead_code)]` and `Hash` derive on `WorkerControlMessageId`.\n- **Removed the single-variant `WorkerCommandStdin` enum** + constant + tautological test; inlined `Stdio::null()`.\n- **Deleted `#[cfg(test)] parse_worker_control_line` and `apply_worker_control_line`** wrappers; rewrote the four tests to call `apply_worker_control_message` directly with typed envelopes.\n\n**Verification:**\n- `cargo nextest run -p fabro-server worker_control` — 15/15 pass\n- `cargo nextest run -p fabro-interview` — 62/62 pass\n- `cargo nextest run -p fabro-cli runner` — 33/33 pass\n- `cargo nextest run -p fabro-server --test it --features test-support lifecycle` — 3/3 pass\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — clean\n- Two pre-existing `pause_run_*` / `unpause_run_sets_pending_control` failures verified to exist before this cleanup (confirmed via `git stash`).\n\n**Findings I deliberately skipped** (not high-impact enough or would require API surface changes outside this cleanup):\n- Splitting `WorkerControlBusError` into publish/subscribe error types\n- Replacing `BoxFuture` with `async_trait` (style consistency)\n- Moving WS-URL construction onto `ServerTarget` (touches `fabro-client`, `fabro-sandbox`)\n- Adopting `fabro_util::backoff::BackoffPolicy` (small benefit; existing hand-rolled is correct)\n- Collapsing `WorkerControlSocket` enum into `Box<dyn AsyncRead + AsyncWrite>` (works but tungstenite's `from_raw_socket` generic constraints make this fiddly)\n- Per-run inner mutex sharding in the bus (premature for local single-node)\n- `cleanup_worker_control_bus_for_run` spawn-per-call (sync-fast-path optimization; correctness fine)"
         },
         "node_outcomes": {
-          "preflight_compile": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo check -q --workspace 2>&1",
-            "usage": null,
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 0,
-              "tool_time_ms": 130559,
-              "active_time_ms": 130559
-            }
-          },
-          "preflight_lint": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-            "usage": null,
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 0,
-              "tool_time_ms": 143452,
-              "active_time_ms": 143452
-            }
-          },
-          "fixup": {
-            "status": "succeeded",
-            "context_updates": {
-              "last_stage": "fixup",
-              "last_response": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Pau",
-              "response.fixup": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Paused { prior_block: None }` and `worker_pid = Some(u32::MAX)` to simulate an active worker. The previous implementation used SIGUSR1/SIGUSR2 against `worker_pid`, so that was sufficient. After the control-bus refactor, pause/unpause now require a `RunAnswerTransport` on the managed run, so the handler returned 409 \"Run worker is not available.\"\n\n**Fix:** In both tests, attach a worker `RunAnswerTransport` (built via the existing `worker_transport_with_receiver` helper) to the managed run alongside the manual status/pid mutation.\n\nVerified:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo nextest run --workspace --profile ci` (6438 passed, 179 skipped)\n- `cargo dev docs check`\n- `bun install`, `apps/fabro-web` typecheck + test, `lib/packages/fabro-api-client` typecheck\n- `cargo dev build -- -p fabro-cli --release`"
-            },
-            "notes": "Stage completed: fixup",
-            "usage": {
-              "input": {
-                "usage": {
-                  "model": {
-                    "provider": "anthropic",
-                    "model_id": "claude-opus-4-7"
-                  },
-                  "tokens": {
-                    "input_tokens": 47401,
-                    "output_tokens": 8522,
-                    "reasoning_tokens": 0,
-                    "cache_read_tokens": 1165952,
-                    "cache_write_tokens": 193869
-                  }
-                },
-                "facts": {
-                  "algorithm": "anthropic",
-                  "cache_write_5m_tokens": 193869,
-                  "cache_write_1h_tokens": 0
-                }
-              },
-              "total_usd_micros": 2244712
-            },
-            "files_touched": [
-              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/server/tests.rs"
-            ],
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 140463,
-              "tool_time_ms": 518224,
-              "active_time_ms": 658687
-            }
-          },
-          "start": {
-            "status": "succeeded",
-            "usage": null
-          },
           "simplify_opus": {
             "status": "succeeded",
             "context_updates": {
@@ -2135,6 +2062,97 @@
               "active_time_ms": 1374568
             }
           },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "simplify_gpt",
+              "response.simplify_gpt": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has already trimmed messages, rather than silently replaying a truncated stream.\n  - Active `Start` subscribers that joined before first publish also fail if messages were trimmed before they could establish a cursor.\n  - `After(id)` subscriptions for unknown runs no longer create empty run stream entries.\n  - Added tests for these cursor/cleanup cases.\n\n- **Worker-side delivery-id dedupe**\n  - Replaced the single `last_applied_id` duplicate check with a bounded recent-id dedupe set.\n  - Uses FIFO + `HashSet`, capped at `2048` delivery ids.\n  - Still uses the last applied id for reconnect `?after=...`.\n  - Prevents repeated non-adjacent duplicate delivery ids from being applied twice without unbounded memory growth.\n\n- **Formatting**\n  - `worker_control.rs` had rustfmt-only import formatting changes.\n\nAlready clean / previously addressed in current tree:\n- Worker control route already checks invalid cursor before WebSocket upgrade and returns HTTP `410 Gone`.\n- Invalid-cursor close reason and ping/pong constants were already shared through `fabro-interview`.\n- Terminal-run check already uses `is_terminal()`.\n\nValidation run:\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo nextest run -p fabro-server worker_control` ✅\n- `cargo nextest run -p fabro-cli runner` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server -p fabro-cli --all-targets -- -D warnings` ✅",
+              "last_response": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has al"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 379150,
+                    "output_tokens": 8564,
+                    "reasoning_tokens": 1094,
+                    "cache_read_tokens": 1107968,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 2739474
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 283105,
+              "tool_time_ms": 155590,
+              "active_time_ms": 438695
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 130559,
+              "active_time_ms": 130559
+            }
+          },
+          "fixup": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "fixup",
+              "last_response": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Pau",
+              "response.fixup": "All verify steps pass. Summary of the fix:\n\n**Root cause:** Two tests (`pause_run_sets_pending_control_on_board_response` and `unpause_run_sets_pending_control`) manually set `RunStatus::Running`/`Paused { prior_block: None }` and `worker_pid = Some(u32::MAX)` to simulate an active worker. The previous implementation used SIGUSR1/SIGUSR2 against `worker_pid`, so that was sufficient. After the control-bus refactor, pause/unpause now require a `RunAnswerTransport` on the managed run, so the handler returned 409 \"Run worker is not available.\"\n\n**Fix:** In both tests, attach a worker `RunAnswerTransport` (built via the existing `worker_transport_with_receiver` helper) to the managed run alongside the manual status/pid mutation.\n\nVerified:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo nextest run --workspace --profile ci` (6438 passed, 179 skipped)\n- `cargo dev docs check`\n- `bun install`, `apps/fabro-web` typecheck + test, `lib/packages/fabro-api-client` typecheck\n- `cargo dev build -- -p fabro-cli --release`"
+            },
+            "notes": "Stage completed: fixup",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 47401,
+                    "output_tokens": 8522,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 1165952,
+                    "cache_write_tokens": 193869
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 193869,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 2244712
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/server/tests.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 140463,
+              "tool_time_ms": 518224,
+              "active_time_ms": 658687
+            }
+          },
           "implement": {
             "status": "succeeded",
             "context_updates": {
@@ -2177,55 +2195,23 @@
               "active_time_ms": 4319397
             }
           },
-          "toolchain": {
+          "preflight_lint": {
             "status": "succeeded",
             "context_updates": {
-              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
             },
-            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
             "usage": null,
             "timing": {
               "wall_time_ms": 0,
               "inference_time_ms": 0,
-              "tool_time_ms": 1331,
-              "active_time_ms": 1331
+              "tool_time_ms": 143452,
+              "active_time_ms": 143452
             }
           },
-          "simplify_gpt": {
+          "start": {
             "status": "succeeded",
-            "context_updates": {
-              "last_stage": "simplify_gpt",
-              "response.simplify_gpt": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has already trimmed messages, rather than silently replaying a truncated stream.\n  - Active `Start` subscribers that joined before first publish also fail if messages were trimmed before they could establish a cursor.\n  - `After(id)` subscriptions for unknown runs no longer create empty run stream entries.\n  - Added tests for these cursor/cleanup cases.\n\n- **Worker-side delivery-id dedupe**\n  - Replaced the single `last_applied_id` duplicate check with a bounded recent-id dedupe set.\n  - Uses FIFO + `HashSet`, capped at `2048` delivery ids.\n  - Still uses the last applied id for reconnect `?after=...`.\n  - Prevents repeated non-adjacent duplicate delivery ids from being applied twice without unbounded memory growth.\n\n- **Formatting**\n  - `worker_control.rs` had rustfmt-only import formatting changes.\n\nAlready clean / previously addressed in current tree:\n- Worker control route already checks invalid cursor before WebSocket upgrade and returns HTTP `410 Gone`.\n- Invalid-cursor close reason and ping/pong constants were already shared through `fabro-interview`.\n- Terminal-run check already uses `is_terminal()`.\n\nValidation run:\n- `cargo +nightly-2026-04-14 fmt --check --all` ✅\n- `cargo nextest run -p fabro-server worker_control` ✅\n- `cargo nextest run -p fabro-cli runner` ✅\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server -p fabro-cli --all-targets -- -D warnings` ✅",
-              "last_response": "Implemented review cleanup after running the three parallel review agents.\n\nFixed:\n- **Local bus replay correctness**\n  - `Start` subscriptions now fail with `InvalidCursor` if the local stream has al"
-            },
-            "notes": "Stage completed: simplify_gpt",
-            "usage": {
-              "input": {
-                "usage": {
-                  "model": {
-                    "provider": "openai",
-                    "model_id": "gpt-5.5"
-                  },
-                  "tokens": {
-                    "input_tokens": 379150,
-                    "output_tokens": 8564,
-                    "reasoning_tokens": 1094,
-                    "cache_read_tokens": 1107968,
-                    "cache_write_tokens": 0
-                  }
-                },
-                "facts": {
-                  "algorithm": "openai"
-                }
-              },
-              "total_usd_micros": 2739474
-            },
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 283105,
-              "tool_time_ms": 155590,
-              "active_time_ms": 438695
-            }
+            "usage": null
           },
           "verify": {
             "status": "succeeded",
@@ -2240,25 +2226,172 @@
               "tool_time_ms": 289838,
               "active_time_ms": 289838
             }
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1331,
+              "active_time_ms": 1331
+            }
           }
         },
         "next_node_id": "exit",
+        "git_commit_sha": "3ca17a62bf14bc3b41a8a58e71ec0f16f1e5ee68",
         "node_visits": {
-          "preflight_lint": 1,
-          "toolchain": 1,
-          "simplify_gpt": 1,
-          "implement": 1,
-          "verify": 2,
           "preflight_compile": 1,
+          "simplify_gpt": 1,
+          "start": 1,
+          "preflight_lint": 1,
+          "implement": 1,
           "simplify_opus": 1,
+          "toolchain": 1,
           "fixup": 1,
-          "start": 1
+          "verify": 2
         }
       },
-      "diff": {}
+      "diff": {
+        "summary": {
+          "files_changed": 38,
+          "additions": 3277,
+          "deletions": 453
+        }
+      }
     }
   ],
-  "conclusion": null,
+  "conclusion": {
+    "timestamp": "2026-05-27T23:49:27.956118Z",
+    "status": "succeeded",
+    "timing": {
+      "wall_time_ms": 7759778,
+      "inference_time_ms": 3826137,
+      "tool_time_ms": 3771906,
+      "active_time_ms": 7598043
+    },
+    "final_git_commit_sha": "3ca17a62bf14bc3b41a8a58e71ec0f16f1e5ee68",
+    "stages": [
+      {
+        "stage_id": "start",
+        "stage_label": "start",
+        "timing": {
+          "wall_time_ms": 0,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "toolchain",
+        "stage_label": "toolchain",
+        "timing": {
+          "wall_time_ms": 1337,
+          "inference_time_ms": 0,
+          "tool_time_ms": 1331,
+          "active_time_ms": 1331
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_compile",
+        "stage_label": "preflight_compile",
+        "timing": {
+          "wall_time_ms": 130565,
+          "inference_time_ms": 0,
+          "tool_time_ms": 130559,
+          "active_time_ms": 130559
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "preflight_lint",
+        "stage_label": "preflight_lint",
+        "timing": {
+          "wall_time_ms": 143461,
+          "inference_time_ms": 0,
+          "tool_time_ms": 143452,
+          "active_time_ms": 143452
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "implement",
+        "stage_label": "implement",
+        "timing": {
+          "wall_time_ms": 4428217,
+          "inference_time_ms": 2814420,
+          "tool_time_ms": 1504977,
+          "active_time_ms": 4319397
+        },
+        "billing_usd_micros": 41534999,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_opus",
+        "stage_label": "simplify_opus",
+        "timing": {
+          "wall_time_ms": 1375946,
+          "inference_time_ms": 588149,
+          "tool_time_ms": 786419,
+          "active_time_ms": 1374568
+        },
+        "billing_usd_micros": 11754153,
+        "retries": 0
+      },
+      {
+        "stage_id": "simplify_gpt",
+        "stage_label": "simplify_gpt",
+        "timing": {
+          "wall_time_ms": 439379,
+          "inference_time_ms": 283105,
+          "tool_time_ms": 155590,
+          "active_time_ms": 438695
+        },
+        "billing_usd_micros": 2739474,
+        "retries": 0
+      },
+      {
+        "stage_id": "verify",
+        "stage_label": "verify",
+        "timing": {
+          "wall_time_ms": 531399,
+          "inference_time_ms": 0,
+          "tool_time_ms": 531354,
+          "active_time_ms": 531354
+        },
+        "retries": 0
+      },
+      {
+        "stage_id": "fixup",
+        "stage_label": "fixup",
+        "timing": {
+          "wall_time_ms": 659434,
+          "inference_time_ms": 140463,
+          "tool_time_ms": 518224,
+          "active_time_ms": 658687
+        },
+        "billing_usd_micros": 2244712,
+        "retries": 0
+      }
+    ],
+    "billing": {
+      "input_tokens": 3934854,
+      "output_tokens": 119952,
+      "total_tokens": 62195161,
+      "reasoning_tokens": 32474,
+      "cache_read_tokens": 57200804,
+      "cache_write_tokens": 907077,
+      "total_usd_micros": 58273338
+    },
+    "total_retries": 0,
+    "diff": {}
+  },
   "sandbox": {
     "kind": "ready",
     "plan": {
@@ -2288,7 +2421,12 @@
       "first_event_seq": 2270,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-27T23:49:24.036331Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -2296,11 +2434,27 @@
         "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/d7eff0107d632faa544d8591722ccc826bde2e324d5b0d83f8dac34269458bf1",
+        "exit_code": 0,
+        "duration_ms": 289838,
+        "termination": "exited",
+        "output_bytes": 153882,
+        "live_streaming": true
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 153882,
+      "live_streaming": true,
+      "termination": "exited",
       "started_at": "2026-05-27T23:44:34.167298Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 289867,
+        "inference_time_ms": 0,
+        "tool_time_ms": 289838,
+        "active_time_ms": 289838
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -2309,7 +2463,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "toolchain@1": {
       "first_event_seq": 21,
@@ -3376,6 +3530,40 @@
           }
         ],
         "warnings": []
+      },
+      "state": "succeeded"
+    },
+    "exit@1": {
+      "first_event_seq": 2280,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-27T23:49:27.870109Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T23:49:27.870030Z",
+      "handler": "exit",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
       },
       "state": "succeeded"
     },
