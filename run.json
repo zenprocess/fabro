@@ -313,7 +313,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-27T02:04:35.579135Z",
-  "last_event_at": "2026-05-27T02:44:53.393859Z",
+  "last_event_at": "2026-05-27T02:49:26.084562Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -604,9 +604,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 995,
       "checkpoint": {
-        "timestamp": "2026-05-27T02:44:53.658382Z",
+        "timestamp": "2026-05-27T02:44:57.459858Z",
         "current_node": "work",
         "completed_nodes": [
           "start",
@@ -616,29 +616,29 @@
         ],
         "node_retries": {},
         "context_values": {
-          "response.audit": "## Audit Analysis\n\n### Requirements mapping\n\nThe goal requires:\n1. No `unwrap()` in production runtime code\n2. `expect()` only with messages explaining why failure is impossible (not merely what failed)\n3. `panic!`, `todo!`, `unimplemented!`, `unreachable!` only with explicit, reviewable justification\n4. All environment-reachable failures use `Result`\n\n### Evidence from scans\n\n**`unwrap()` in production code:** **CLEAN** — 0 hits confirmed by exhaustive AST-aware scan.\n\n**`panic!`, `todo!`, `unimplemented!` in production code:**\n- `fabro-llm/src/tools.rs:48,81` — panics on invalid tool names, with `# Panics` doc block; tool names are hardcoded literals. **Allowed** (hardcoded literal exception).\n- `fabro-server/src/demo/mod.rs:247,258,1178` — hardcoded demo constants with clear messages. **Allowed**.\n\n**`unreachable!`:** All 16 in production code have explicit, reviewable messages explaining the structural invariant. **Compliant**.\n\n**`expect()` quality — critical findings:**\n\n| Location | Message | Assessment |\n|----------|---------|------------|\n| `sanitize.rs:7` | `\"valid regex\"` | **Weak** — \"valid regex\" says what it is, not why failure is impossible. Compare to `error.rs` which uses `\"hardcoded regex should compile\"` for equivalent cases. |\n| `generate.rs:213,232` | `\"just pushed\"` | Borderline — terse but Vec::last() after push() cannot return None; the structural invariant is visible in context. |\n| `strategy.rs:68` | `assert_eq!` (CodexDevice must be OpenAI) | Production `assert!` — not an `expect()`, panics if called with a non-OpenAI provider + CodexDevice method. Could be triggered by configuration mismatch. |\n\n**Fixes applied in this pass:** `upgrade.rs` HTTP client error propagation, `serve.rs` signal handler graceful fallback, `telemetry/lib.rs` thread spawn graceful fallback, `event/convert.rs` improved messages, OS RNG messages in `cli_flow.rs` and `dev_token.rs`. All 6470 tests pass.\n\n### Remaining violations\n\nTwo issues are not fully resolved under the strict policy:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`**: `.expect(\"valid regex\")` — the message names what the regex is, not why the failure is impossible. The accepted pattern in this codebase for hardcoded regexes is `\"hardcoded regex should compile\"` (used in `error.rs`). This message deviates from that and does not explain the invariant.\n\n2. **`fabro-auth/src/strategy.rs:68`**: A production-code `assert_eq!` that fires if `CodexDevice` auth is used with a non-OpenAI provider. While likely an internal invariant, it uses a bare `assert_eq!` rather than an `expect()` with an explanatory message, and the CodexDevice/provider pairing could conceivably be triggered by configuration data.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"Two `expect()`/`assert` violations remain: (1) `fabro-telemetry/src/sanitize.rs:7` uses `.expect(\\\"valid regex\\\")` which describes what the regex is rather than why failure is impossible — the codebase standard for hardcoded regexes is `\\\"hardcoded regex should compile\\\"`; (2) `fabro-auth/src/strategy.rs:68` uses a bare `assert_eq!` in production code for the CodexDevice/OpenAI pairing invariant, rather than an `expect()` with a message explaining the invariant.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Fix two remaining message-quality violations: (1) change `.expect(\\\"valid regex\\\")` in `fabro-telemetry/src/sanitize.rs:7` to `.expect(\\\"hardcoded regex literal is always syntactically valid\\\")` or similar; (2) change `assert_eq!` in `fabro-auth/src/strategy.rs:68` to an `expect()`-based guard with a message explaining why CodexDevice is only valid for OpenAI.\"\n  }\n}",
-          "goal_status": "incomplete",
-          "internal.node_visit_count": 2,
-          "thread.goal.current_node": "work",
-          "last_response": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`**",
-          "graph.max_node_visits": "30",
-          "graph.rankdir": "LR",
-          "current_node": "work",
+          "response.work": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`** — `\"valid regex\"` → `\"hardcoded regex literal is always syntactically valid\"` (matches the pattern used in `error.rs`)\n\n2. **`fabro-auth/src/strategy.rs:68`** — Replaced bare `assert_eq!` with an explicit `if`/`panic!` block plus a comment explaining that all call sites enforce the CodexDevice+OpenAI invariant\n\n### Additional weak messages fixed in this pass\n\nThe same scan surface found several more messages that failed the \"explains why failure is impossible\" test:\n\n| File | Old message | Fix |\n|------|-------------|-----|\n| `generate.rs:213,232` | `\"just pushed\"` | `\"steps is non-empty: element was pushed on the line above\"` |\n| `run_progress/styles.rs:13` | `\"valid template\"` | `\"hardcoded progress template is always syntactically valid\"` |\n| `shared/utilities.rs:27` | `\"valid template\"` | same |\n| `graphviz/parser/semantic.rs:98,118,132` | `\"just ensured\"` | `\"node was just inserted by ensure_node, so get_mut cannot return None\"` |\n| `demo/mod.rs:232` | `\"literal is non-zero\"` | `\"hardcoded literal 100 is non-zero\"` |\n| `slack/connection.rs:62` | `\"ack serialization\"` | explains the struct's derived `Serialize` has no custom logic that can fail |\n| `stylesheet.rs:51` | `\"node must exist\"` | explains node_id was collected from the same map's keys |\n| `event/convert.rs:654,713,745` | `\"serializable agent/sdk error\"` | explains the derives-based serialization has no custom failure path |\n| `run_projection.rs:427` | `\"event seq starts at 1\"` | `\"event sequence numbers are 1-based so seq is always non-zero at this call site\"` |\n\n### Remaining justified `panic!` calls (all verified)\n\n- `tools.rs` — hardcoded tool name validation with `# Panics` doc\n- `demo/mod.rs` — hardcoded demo SHA/status constants\n- `strategy.rs` — programming invariant (CodexDevice+OpenAI pairing), all call sites verified\n\n### Evidence\n\n- `unwrap()` in production: **0**\n- Weak `expect()` messages: **0**\n- All `unreachable!`: documented with explicit structural invariants\n- `cargo nextest run --workspace`: **6470 passed, 0 failed**",
           "internal.retry_count.audit": 0,
+          "graph.goal": "Production runtime code must not panic on any path reachable from CLI input,\n  HTTP requests, workflow definitions, external services, storage, subprocesses,\n  or normal environment failure.\n\n  Use Result for recoverable or reportable failures, preserving the source chain\n  until the boundary. CLI boundaries render errors with miette. HTTP boundaries log\n  the full internal chain and return a curated public API error.\n\n  Panics are allowed only for:\n  - tests, fixtures, and test-only helpers;\n  - build scripts or dev tooling where failure happens before runtime;\n  - hard-coded literals or generated constants whose validity is controlled by the\n    source tree, preferably with `expect` explaining the invariant;\n  - truly impossible internal invariants where continuing would be more dangerous\n    than terminating.\n\n  `unwrap()` is not allowed in production runtime code. `expect()` is allowed only\n  when the message explains why the failure is impossible, not merely what failed.\n  `panic!`, `todo!`, `unimplemented!`, and `unreachable!` require an explicit,\n  reviewable justification.\n\n  The practical review test should be:\n\n  > Could this failure be caused by input, config, environment, I/O, network, time, concurrency, persisted state, or a third-party system?\n\n  If yes, it is not a panic. Return an error.",
+          "internal.node_visit_count": 2,
+          "internal.thread_id": "goal",
           "internal.run_id": "01KSKJSYQ3JRE9E04XZ8VCT2Y9",
+          "graph.max_node_visits": "30",
+          "outcome": "succeeded",
+          "goal_remaining_work": "Fix two remaining message-quality violations: (1) change `.expect(\"valid regex\")` in `fabro-telemetry/src/sanitize.rs:7` to `.expect(\"hardcoded regex literal is always syntactically valid\")` or similar; (2) change `assert_eq!` in `fabro-auth/src/strategy.rs:68` to an `expect()`-based guard with a message explaining why CodexDevice is only valid for OpenAI.",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
           "preferred_label": "Continue",
-          "last_stage": "work",
+          "internal.fidelity": "full",
+          "response.audit": "## Audit Analysis\n\n### Requirements mapping\n\nThe goal requires:\n1. No `unwrap()` in production runtime code\n2. `expect()` only with messages explaining why failure is impossible (not merely what failed)\n3. `panic!`, `todo!`, `unimplemented!`, `unreachable!` only with explicit, reviewable justification\n4. All environment-reachable failures use `Result`\n\n### Evidence from scans\n\n**`unwrap()` in production code:** **CLEAN** — 0 hits confirmed by exhaustive AST-aware scan.\n\n**`panic!`, `todo!`, `unimplemented!` in production code:**\n- `fabro-llm/src/tools.rs:48,81` — panics on invalid tool names, with `# Panics` doc block; tool names are hardcoded literals. **Allowed** (hardcoded literal exception).\n- `fabro-server/src/demo/mod.rs:247,258,1178` — hardcoded demo constants with clear messages. **Allowed**.\n\n**`unreachable!`:** All 16 in production code have explicit, reviewable messages explaining the structural invariant. **Compliant**.\n\n**`expect()` quality — critical findings:**\n\n| Location | Message | Assessment |\n|----------|---------|------------|\n| `sanitize.rs:7` | `\"valid regex\"` | **Weak** — \"valid regex\" says what it is, not why failure is impossible. Compare to `error.rs` which uses `\"hardcoded regex should compile\"` for equivalent cases. |\n| `generate.rs:213,232` | `\"just pushed\"` | Borderline — terse but Vec::last() after push() cannot return None; the structural invariant is visible in context. |\n| `strategy.rs:68` | `assert_eq!` (CodexDevice must be OpenAI) | Production `assert!` — not an `expect()`, panics if called with a non-OpenAI provider + CodexDevice method. Could be triggered by configuration mismatch. |\n\n**Fixes applied in this pass:** `upgrade.rs` HTTP client error propagation, `serve.rs` signal handler graceful fallback, `telemetry/lib.rs` thread spawn graceful fallback, `event/convert.rs` improved messages, OS RNG messages in `cli_flow.rs` and `dev_token.rs`. All 6470 tests pass.\n\n### Remaining violations\n\nTwo issues are not fully resolved under the strict policy:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`**: `.expect(\"valid regex\")` — the message names what the regex is, not why the failure is impossible. The accepted pattern in this codebase for hardcoded regexes is `\"hardcoded regex should compile\"` (used in `error.rs`). This message deviates from that and does not explain the invariant.\n\n2. **`fabro-auth/src/strategy.rs:68`**: A production-code `assert_eq!` that fires if `CodexDevice` auth is used with a non-OpenAI provider. While likely an internal invariant, it uses a bare `assert_eq!` rather than an `expect()` with an explanatory message, and the CodexDevice/provider pairing could conceivably be triggered by configuration data.\n\n{\n  \"outcome\": \"failed\",\n  \"preferred_next_label\": \"Continue\",\n  \"failure_reason\": \"Two `expect()`/`assert` violations remain: (1) `fabro-telemetry/src/sanitize.rs:7` uses `.expect(\\\"valid regex\\\")` which describes what the regex is rather than why failure is impossible — the codebase standard for hardcoded regexes is `\\\"hardcoded regex should compile\\\"`; (2) `fabro-auth/src/strategy.rs:68` uses a bare `assert_eq!` in production code for the CodexDevice/OpenAI pairing invariant, rather than an `expect()` with a message explaining the invariant.\",\n  \"context_updates\": {\n    \"goal_status\": \"incomplete\",\n    \"goal_remaining_work\": \"Fix two remaining message-quality violations: (1) change `.expect(\\\"valid regex\\\")` in `fabro-telemetry/src/sanitize.rs:7` to `.expect(\\\"hardcoded regex literal is always syntactically valid\\\")` or similar; (2) change `assert_eq!` in `fabro-auth/src/strategy.rs:68` to an `expect()`-based guard with a message explaining why CodexDevice is only valid for OpenAI.\"\n  }\n}",
+          "last_response": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`**",
+          "goal_status": "incomplete",
+          "graph.rankdir": "LR",
+          "thread.goal.current_node": "work",
+          "internal.retry_count.work": 0,
+          "current_node": "work",
           "failure_class": "",
           "failure_signature": "",
-          "internal.retry_count.work": 0,
           "internal.retry_count.start": 0,
-          "goal_remaining_work": "Fix two remaining message-quality violations: (1) change `.expect(\"valid regex\")` in `fabro-telemetry/src/sanitize.rs:7` to `.expect(\"hardcoded regex literal is always syntactically valid\")` or similar; (2) change `assert_eq!` in `fabro-auth/src/strategy.rs:68` to an `expect()`-based guard with a message explaining why CodexDevice is only valid for OpenAI.",
-          "outcome": "succeeded",
-          "internal.work_dir": "/home/daytona/workspace/fabro",
-          "graph.goal": "Production runtime code must not panic on any path reachable from CLI input,\n  HTTP requests, workflow definitions, external services, storage, subprocesses,\n  or normal environment failure.\n\n  Use Result for recoverable or reportable failures, preserving the source chain\n  until the boundary. CLI boundaries render errors with miette. HTTP boundaries log\n  the full internal chain and return a curated public API error.\n\n  Panics are allowed only for:\n  - tests, fixtures, and test-only helpers;\n  - build scripts or dev tooling where failure happens before runtime;\n  - hard-coded literals or generated constants whose validity is controlled by the\n    source tree, preferably with `expect` explaining the invariant;\n  - truly impossible internal invariants where continuing would be more dangerous\n    than terminating.\n\n  `unwrap()` is not allowed in production runtime code. `expect()` is allowed only\n  when the message explains why the failure is impossible, not merely what failed.\n  `panic!`, `todo!`, `unimplemented!`, and `unreachable!` require an explicit,\n  reviewable justification.\n\n  The practical review test should be:\n\n  > Could this failure be caused by input, config, environment, I/O, network, time, concurrency, persisted state, or a third-party system?\n\n  If yes, it is not a panic. Return an error.",
-          "response.work": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`** — `\"valid regex\"` → `\"hardcoded regex literal is always syntactically valid\"` (matches the pattern used in `error.rs`)\n\n2. **`fabro-auth/src/strategy.rs:68`** — Replaced bare `assert_eq!` with an explicit `if`/`panic!` block plus a comment explaining that all call sites enforce the CodexDevice+OpenAI invariant\n\n### Additional weak messages fixed in this pass\n\nThe same scan surface found several more messages that failed the \"explains why failure is impossible\" test:\n\n| File | Old message | Fix |\n|------|-------------|-----|\n| `generate.rs:213,232` | `\"just pushed\"` | `\"steps is non-empty: element was pushed on the line above\"` |\n| `run_progress/styles.rs:13` | `\"valid template\"` | `\"hardcoded progress template is always syntactically valid\"` |\n| `shared/utilities.rs:27` | `\"valid template\"` | same |\n| `graphviz/parser/semantic.rs:98,118,132` | `\"just ensured\"` | `\"node was just inserted by ensure_node, so get_mut cannot return None\"` |\n| `demo/mod.rs:232` | `\"literal is non-zero\"` | `\"hardcoded literal 100 is non-zero\"` |\n| `slack/connection.rs:62` | `\"ack serialization\"` | explains the struct's derived `Serialize` has no custom logic that can fail |\n| `stylesheet.rs:51` | `\"node must exist\"` | explains node_id was collected from the same map's keys |\n| `event/convert.rs:654,713,745` | `\"serializable agent/sdk error\"` | explains the derives-based serialization has no custom failure path |\n| `run_projection.rs:427` | `\"event seq starts at 1\"` | `\"event sequence numbers are 1-based so seq is always non-zero at this call site\"` |\n\n### Remaining justified `panic!` calls (all verified)\n\n- `tools.rs` — hardcoded tool name validation with `# Panics` doc\n- `demo/mod.rs` — hardcoded demo SHA/status constants\n- `strategy.rs` — programming invariant (CodexDevice+OpenAI pairing), all call sites verified\n\n### Evidence\n\n- `unwrap()` in production: **0**\n- Weak `expect()` messages: **0**\n- All `unreachable!`: documented with explicit structural invariants\n- `cargo nextest run --workspace`: **6470 passed, 0 failed**",
-          "internal.thread_id": "goal",
-          "internal.fidelity": "full"
+          "last_stage": "work"
         },
         "node_outcomes": {
           "start": {
@@ -742,8 +742,163 @@
           }
         },
         "next_node_id": "audit",
+        "git_commit_sha": "b62a7dbf0ecec72ec50da40accb821ca10a35893",
+        "loop_failure_signatures": {
+          "audit|deterministic|two `expect()`/`assert` violations remain: (<n>) `fabro-telemetry/src/sanitize.rs:<n>` uses `.expect(\"valid regex\")` which describes what the regex is rather than why failure is impossible — the codebase standard for hardcoded regexes is ": 1
+        },
         "node_visits": {
+          "start": 1,
           "audit": 1,
+          "work": 2
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-auth/src/strategy.rs b/lib/crates/fabro-auth/src/strategy.rs\nindex b4e0ab058..db3f0ce22 100644\n--- a/lib/crates/fabro-auth/src/strategy.rs\n+++ b/lib/crates/fabro-auth/src/strategy.rs\n@@ -65,11 +65,19 @@ pub fn strategy_for(\n             Box::new(ApiKeyStrategy::new(provider))\n         }\n         AuthMethod::CodexDevice(config) => {\n-            assert_eq!(\n-                provider_id.as_str(),\n-                ProviderId::OPENAI,\n-                \"Codex device auth is only supported for OpenAI\"\n-            );\n+            // Programming invariant: every call site that constructs\n+            // `AuthMethod::CodexDevice` pairs it with `ProviderId::OPENAI`.\n+            // `pick_auth_method` returns CodexDevice only when provider ==\n+            // openai(), and the install flow hard-codes `ProviderId::openai()`.\n+            // This check catches future regressions where a new call site\n+            // forgets the constraint.\n+            if provider_id.as_str() != ProviderId::OPENAI {\n+                panic!(\n+                    \"CodexDevice auth is only constructed by CLI code for the \\\n+                     OpenAI provider; all existing call sites enforce this pairing: \\\n+                     got provider_id={provider_id}\"\n+                );\n+            }\n             Box::new(CodexDeviceStrategy::new(config))\n         }\n     }\ndiff --git a/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs b/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs\nindex 6faf8bada..bff41c16d 100644\n--- a/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs\n+++ b/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs\n@@ -10,7 +10,7 @@ macro_rules! cached_style {\n         pub(super) fn $name() -> ProgressStyle {\n             static STYLE: OnceLock<ProgressStyle> = OnceLock::new();\n             STYLE\n-                .get_or_init(|| ProgressStyle::with_template($template).expect(\"valid template\"))\n+                .get_or_init(|| ProgressStyle::with_template($template).expect(\"hardcoded progress template is always syntactically valid\"))\n                 .clone()\n         }\n     };\ndiff --git a/lib/crates/fabro-cli/src/shared/utilities.rs b/lib/crates/fabro-cli/src/shared/utilities.rs\nindex 8e3d06448..d7d82f1fe 100644\n--- a/lib/crates/fabro-cli/src/shared/utilities.rs\n+++ b/lib/crates/fabro-cli/src/shared/utilities.rs\n@@ -24,7 +24,7 @@ pub(crate) fn cyan_spinner(message: impl Into<std::borrow::Cow<'static, str>>) -\n     let spinner = ProgressBar::new_spinner();\n     spinner.set_style(\n         ProgressStyle::with_template(\"{spinner:.cyan} {msg}\")\n-            .expect(\"valid template\")\n+            .expect(\"hardcoded progress template is always syntactically valid\")\n             .tick_strings(&[\"⠋\", \"⠙\", \"⠹\", \"⠸\", \"⠼\", \"⠴\", \"⠦\", \"⠧\", \"⠇\", \"⠏\", \"\"]),\n     );\n     spinner.set_message(message);\ndiff --git a/lib/crates/fabro-graphviz/src/parser/semantic.rs b/lib/crates/fabro-graphviz/src/parser/semantic.rs\nindex 90b10e5d0..03b435c0f 100644\n--- a/lib/crates/fabro-graphviz/src/parser/semantic.rs\n+++ b/lib/crates/fabro-graphviz/src/parser/semantic.rs\n@@ -95,7 +95,7 @@ impl SemanticState {\n             .graph\n             .nodes\n             .get_mut(&node_stmt.id)\n-            .expect(\"just ensured\");\n+            .expect(\"node was just inserted by ensure_node, so get_mut cannot return None\");\n         if let Some(attrs) = &node_stmt.attrs {\n             for (k, v) in attrs {\n                 node.attrs.insert(k.clone(), convert_value(v));\n@@ -115,7 +115,7 @@ impl SemanticState {\n                 .graph\n                 .nodes\n                 .get_mut(&node_stmt.id)\n-                .expect(\"just ensured\");\n+                .expect(\"node was just inserted by ensure_node, so get_mut cannot return None\");\n             for cls in class_str.split(',') {\n                 let cls = cls.trim().to_string();\n                 if !cls.is_empty() && !node.classes.contains(&cls) {\n@@ -129,7 +129,7 @@ impl SemanticState {\n         for id in &edge_stmt.nodes {\n             self.ensure_node(id);\n             if let Some(cls) = subgraph_class {\n-                let node = self.graph.nodes.get_mut(id).expect(\"just ensured\");\n+                let node = self.graph.nodes.get_mut(id).expect(\"node was just inserted by ensure_node, so get_mut cannot return None\");\n                 Self::add_class_to_node(node, cls);\n             }\n         }\ndiff --git a/lib/crates/fabro-llm/src/generate.rs b/lib/crates/fabro-llm/src/generate.rs\nindex 6847e3d4b..78d7469c0 100644\n--- a/lib/crates/fabro-llm/src/generate.rs\n+++ b/lib/crates/fabro-llm/src/generate.rs\n@@ -210,7 +210,7 @@ pub async fn generate(params: GenerateParams) -> Result<GenerateResult, Error> {\n                 tool_results,\n             });\n \n-            let last = steps.last().expect(\"just pushed\");\n+            let last = steps.last().expect(\"steps is non-empty: element was pushed on the line above\");\n             let should_continue = !tool_calls.is_empty()\n                 && last.response.finish_reason == FinishReason::ToolCalls\n                 && round < max_tool_rounds\n@@ -229,7 +229,7 @@ pub async fn generate(params: GenerateParams) -> Result<GenerateResult, Error> {\n                 }\n             }\n \n-            let last = steps.last().expect(\"just pushed\");\n+            let last = steps.last().expect(\"steps is non-empty: element was pushed on the line above\");\n             messages.push(last.response.message.clone());\n             for result in &last.tool_results {\n                 messages.push(Message::tool_result(\ndiff --git a/lib/crates/fabro-server/src/demo/mod.rs b/lib/crates/fabro-server/src/demo/mod.rs\nindex 42e19a97c..2e1fab5b3 100644\n--- a/lib/crates/fabro-server/src/demo/mod.rs\n+++ b/lib/crates/fabro-server/src/demo/mod.rs\n@@ -229,7 +229,7 @@ pub(crate) async fn list_run_commits_stub(\n                 source:         RunCommitsMetaSource::Sandbox,\n                 base_sha:       sha_newtype::<RunCommitsMetaBaseSha>(parent),\n                 head_sha:       sha_newtype::<RunCommitsMetaHeadSha>(sha),\n-                limit:          std::num::NonZeroU64::new(100).expect(\"literal is non-zero\"),\n+                limit:          std::num::NonZeroU64::new(100).expect(\"hardcoded literal 100 is non-zero\"),\n                 total_returned: 1,\n                 truncated:      false,\n             },\ndiff --git a/lib/crates/fabro-slack/src/connection.rs b/lib/crates/fabro-slack/src/connection.rs\nindex 413e0cae5..222f0bbe9 100644\n--- a/lib/crates/fabro-slack/src/connection.rs\n+++ b/lib/crates/fabro-slack/src/connection.rs\n@@ -59,7 +59,7 @@ pub fn process_message(\n     let ack_json = envelope\n         .envelope_id\n         .as_deref()\n-        .map(|id| serde_json::to_string(&SocketAck::new(id)).expect(\"ack serialization\"));\n+        .map(|id| serde_json::to_string(&SocketAck::new(id)).expect(\"SocketAck serialization cannot fail: it contains only a String field with no custom serializer\"));\n \n     let action = dispatch(&envelope, thread_registry);\n \ndiff --git a/lib/crates/fabro-telemetry/src/sanitize.rs b/lib/crates/fabro-telemetry/src/sanitize.rs\nindex 3a7489c25..793a97a40 100644\n--- a/lib/crates/fabro-telemetry/src/sanitize.rs\n+++ b/lib/crates/fabro-telemetry/src/sanitize.rs\n@@ -4,7 +4,7 @@ use std::sync::LazyLock;\n use regex::Regex;\n \n static NUMERIC_RE: LazyLock<Regex> =\n-    LazyLock::new(|| Regex::new(r\"^\\d+(\\.\\d+)*$\").expect(\"valid regex\"));\n+    LazyLock::new(|| Regex::new(r\"^\\d+(\\.\\d+)*$\").expect(\"hardcoded regex literal is always syntactically valid\"));\n \n /// Sanitize CLI arguments for telemetry, redacting potentially sensitive\n /// values.\ndiff --git a/lib/crates/fabro-types/src/run_projection.rs b/lib/crates/fabro-types/src/run_projection.rs\nindex 3bba6d43e..eb3479439 100644\n--- a/lib/crates/fabro-types/src/run_projection.rs\n+++ b/lib/crates/fabro-types/src/run_projection.rs\n@@ -424,7 +424,7 @@ pub enum McpServerStatus {\n /// `StageProjection::first_event_seq`. Run event seqs always start at 1.\n #[must_use]\n pub fn first_event_seq(seq: u32) -> NonZeroU32 {\n-    NonZeroU32::new(seq).expect(\"event seq starts at 1\")\n+    NonZeroU32::new(seq).expect(\"event sequence numbers are 1-based so seq is always non-zero at this call site\")\n }\n \n impl StageProjection {\ndiff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs\nindex ee2d46c1e..1db6d3b56 100644\n--- a/lib/crates/fabro-workflow/src/event/convert.rs\n+++ b/lib/crates/fabro-workflow/src/event/convert.rs\n@@ -651,7 +651,7 @@ fn event_body_from_event(event: &Event) -> EventBody {\n                 turn_id:      None,\n             }),\n             AgentEvent::Error { error } => EventBody::AgentError(fabro_types::AgentErrorProps {\n-                error: serde_json::to_value(error).expect(\"serializable agent error\"),\n+                error: serde_json::to_value(error).expect(\"agent Error derives Serialize with no custom logic that can fail\"),\n                 visit: *visit,\n             }),\n             AgentEvent::Warning {\n@@ -710,7 +710,7 @@ fn event_body_from_event(event: &Event) -> EventBody {\n                 model:      model.clone(),\n                 attempt:    *attempt,\n                 delay_secs: *delay_secs,\n-                error:      serde_json::to_value(error).expect(\"serializable sdk error\"),\n+                error:      serde_json::to_value(error).expect(\"LLM SDK error derives Serialize with no custom logic that can fail\"),\n                 visit:      *visit,\n             }),\n             AgentEvent::SubAgentSpawned {\n@@ -742,7 +742,7 @@ fn event_body_from_event(event: &Event) -> EventBody {\n             } => EventBody::AgentSubFailed(fabro_types::AgentSubFailedProps {\n                 agent_id: agent_id.clone(),\n                 depth:    *depth,\n-                error:    serde_json::to_value(error).expect(\"serializable agent error\"),\n+                error:    serde_json::to_value(error).expect(\"agent Error derives Serialize with no custom logic that can fail\"),\n                 visit:    *visit,\n             }),\n             AgentEvent::SubAgentClosed { agent_id, depth } => {\ndiff --git a/lib/crates/fabro-workflow/src/transforms/stylesheet.rs b/lib/crates/fabro-workflow/src/transforms/stylesheet.rs\nindex b6e61f6d7..eac959255 100644\n--- a/lib/crates/fabro-workflow/src/transforms/stylesheet.rs\n+++ b/lib/crates/fabro-workflow/src/transforms/stylesheet.rs\n@@ -48,7 +48,7 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {\n         let node = graph\n             .nodes\n             .get_mut(node_id.as_str())\n-            .expect(\"node must exist\");\n+            .expect(\"node_id was collected from graph.nodes.keys() on the line above, so it must still exist\");\n         for (prop, (val, _)) in &applied {\n             if !node.attrs.contains_key(prop) {\n                 node.attrs\n",
+        "summary": {
+          "files_changed": 16,
+          "additions": 71,
+          "deletions": 44
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-27T02:49:48.038778Z",
+        "current_node": "audit",
+        "completed_nodes": [
+          "start",
+          "work",
+          "audit",
+          "work",
+          "audit"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "response.audit": "## Audit Results\n\n### Evidence Examined\n\n**Production-code `unwrap()` — 0 violations**\n- Scanner found 31 `.unwrap()` hits, all in `#[cfg(test)]`-gated modules:\n  - `fabro-workflow/src/pipeline/execute/tests.rs` — included via `#[cfg(test)] #[path = ...] mod tests;`\n  - `fabro-server/src/server/tests.rs` — same gating pattern\n- No production code contains `unwrap()`\n\n**Production-code `expect()` with weak messages — 0 violations**\n- 57 items found by scanner; all in test support files (`test_support.rs`), integration test directories (`tests/it/`), or `examples/`\n- All production `expect()` messages were fixed in prior passes\n\n**Production-code `panic!`/`unreachable!`/`todo!`/`unimplemented!` — 26 hits, all justified**\n\nEvery production-code occurrence falls into an explicitly allowed category:\n\n| Category | Instances |\n|----------|-----------|\n| Hardcoded demo/tool constants | `demo/mod.rs:247,258,1178`, `tools.rs:48,81` |\n| Structurally-impossible match arms (with explanation) | `condition.rs:117`, `event/convert.rs:837`, `router.rs:52`, `openai_compatible.rs:304`, `catalog.rs:408`, `run_catalog_index.rs:20`, `diagnostics.rs:352`, `server.rs:3153`, `handler/system.rs:487,587`, `subagent.rs:237` |\n| Loop invariants (loop always returns) | `executor.rs:410`, `2026050101_migration:463` |\n| CLI preprocessing (handled before bootstrap) | `main.rs:424,426` |\n| Caller-contract invariant (only called after `is_terminal()`) | `wait.rs:110` |\n| Programming regression guard (full comment) | `strategy.rs:75` |\n| Debug-assertions only; release falls through to `Ok(())` | `safe_url.rs:141` |\n\nAll 26 have explicit, reviewable justification messages.\n\n**Test suite: 6470/6470 passed, 181 skipped**\n\n### Conclusion\n\nEvery concrete requirement in the goal is satisfied by current evidence:\n- `unwrap()`: 0 in production\n- Weak `expect()`: 0 in production  \n- `panic!`/`unreachable!` without justification: 0 in production\n- All tests green\n\n{\n  \"outcome\": \"succeeded\",\n  \"preferred_next_label\": \"Done\",\n  \"context_updates\": {\n    \"goal_status\": \"complete\",\n    \"goal_remaining_work\": \"\"\n  }\n}",
+          "goal_status": "complete",
+          "internal.node_visit_count": 2,
+          "thread.goal.current_node": "audit",
+          "last_response": "## Audit Results\n\n### Evidence Examined\n\n**Production-code `unwrap()` — 0 violations**\n- Scanner found 31 `.unwrap()` hits, all in `#[cfg(test)]`-gated modules:\n  - `fabro-workflow/src/pipeline/exec",
+          "graph.max_node_visits": "30",
+          "graph.rankdir": "LR",
+          "current_node": "audit",
+          "internal.retry_count.audit": 0,
+          "internal.run_id": "01KSKJSYQ3JRE9E04XZ8VCT2Y9",
+          "preferred_label": "Done",
+          "last_stage": "audit",
+          "failure_class": "",
+          "failure_signature": "",
+          "internal.retry_count.work": 0,
+          "internal.retry_count.start": 0,
+          "goal_remaining_work": "",
+          "outcome": "succeeded",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "graph.goal": "Production runtime code must not panic on any path reachable from CLI input,\n  HTTP requests, workflow definitions, external services, storage, subprocesses,\n  or normal environment failure.\n\n  Use Result for recoverable or reportable failures, preserving the source chain\n  until the boundary. CLI boundaries render errors with miette. HTTP boundaries log\n  the full internal chain and return a curated public API error.\n\n  Panics are allowed only for:\n  - tests, fixtures, and test-only helpers;\n  - build scripts or dev tooling where failure happens before runtime;\n  - hard-coded literals or generated constants whose validity is controlled by the\n    source tree, preferably with `expect` explaining the invariant;\n  - truly impossible internal invariants where continuing would be more dangerous\n    than terminating.\n\n  `unwrap()` is not allowed in production runtime code. `expect()` is allowed only\n  when the message explains why the failure is impossible, not merely what failed.\n  `panic!`, `todo!`, `unimplemented!`, and `unreachable!` require an explicit,\n  reviewable justification.\n\n  The practical review test should be:\n\n  > Could this failure be caused by input, config, environment, I/O, network, time, concurrency, persisted state, or a third-party system?\n\n  If yes, it is not a panic. Return an error.",
+          "response.work": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`** — `\"valid regex\"` → `\"hardcoded regex literal is always syntactically valid\"` (matches the pattern used in `error.rs`)\n\n2. **`fabro-auth/src/strategy.rs:68`** — Replaced bare `assert_eq!` with an explicit `if`/`panic!` block plus a comment explaining that all call sites enforce the CodexDevice+OpenAI invariant\n\n### Additional weak messages fixed in this pass\n\nThe same scan surface found several more messages that failed the \"explains why failure is impossible\" test:\n\n| File | Old message | Fix |\n|------|-------------|-----|\n| `generate.rs:213,232` | `\"just pushed\"` | `\"steps is non-empty: element was pushed on the line above\"` |\n| `run_progress/styles.rs:13` | `\"valid template\"` | `\"hardcoded progress template is always syntactically valid\"` |\n| `shared/utilities.rs:27` | `\"valid template\"` | same |\n| `graphviz/parser/semantic.rs:98,118,132` | `\"just ensured\"` | `\"node was just inserted by ensure_node, so get_mut cannot return None\"` |\n| `demo/mod.rs:232` | `\"literal is non-zero\"` | `\"hardcoded literal 100 is non-zero\"` |\n| `slack/connection.rs:62` | `\"ack serialization\"` | explains the struct's derived `Serialize` has no custom logic that can fail |\n| `stylesheet.rs:51` | `\"node must exist\"` | explains node_id was collected from the same map's keys |\n| `event/convert.rs:654,713,745` | `\"serializable agent/sdk error\"` | explains the derives-based serialization has no custom failure path |\n| `run_projection.rs:427` | `\"event seq starts at 1\"` | `\"event sequence numbers are 1-based so seq is always non-zero at this call site\"` |\n\n### Remaining justified `panic!` calls (all verified)\n\n- `tools.rs` — hardcoded tool name validation with `# Panics` doc\n- `demo/mod.rs` — hardcoded demo SHA/status constants\n- `strategy.rs` — programming invariant (CodexDevice+OpenAI pairing), all call sites verified\n\n### Evidence\n\n- `unwrap()` in production: **0**\n- Weak `expect()` messages: **0**\n- All `unreachable!`: documented with explicit structural invariants\n- `cargo nextest run --workspace`: **6470 passed, 0 failed**",
+          "internal.thread_id": "goal",
+          "internal.fidelity": "full"
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "audit": {
+            "status": "succeeded",
+            "preferred_label": "Done",
+            "context_updates": {
+              "last_stage": "audit",
+              "goal_remaining_work": "",
+              "last_response": "## Audit Results\n\n### Evidence Examined\n\n**Production-code `unwrap()` — 0 violations**\n- Scanner found 31 `.unwrap()` hits, all in `#[cfg(test)]`-gated modules:\n  - `fabro-workflow/src/pipeline/exec",
+              "goal_status": "complete",
+              "response.audit": "## Audit Results\n\n### Evidence Examined\n\n**Production-code `unwrap()` — 0 violations**\n- Scanner found 31 `.unwrap()` hits, all in `#[cfg(test)]`-gated modules:\n  - `fabro-workflow/src/pipeline/execute/tests.rs` — included via `#[cfg(test)] #[path = ...] mod tests;`\n  - `fabro-server/src/server/tests.rs` — same gating pattern\n- No production code contains `unwrap()`\n\n**Production-code `expect()` with weak messages — 0 violations**\n- 57 items found by scanner; all in test support files (`test_support.rs`), integration test directories (`tests/it/`), or `examples/`\n- All production `expect()` messages were fixed in prior passes\n\n**Production-code `panic!`/`unreachable!`/`todo!`/`unimplemented!` — 26 hits, all justified**\n\nEvery production-code occurrence falls into an explicitly allowed category:\n\n| Category | Instances |\n|----------|-----------|\n| Hardcoded demo/tool constants | `demo/mod.rs:247,258,1178`, `tools.rs:48,81` |\n| Structurally-impossible match arms (with explanation) | `condition.rs:117`, `event/convert.rs:837`, `router.rs:52`, `openai_compatible.rs:304`, `catalog.rs:408`, `run_catalog_index.rs:20`, `diagnostics.rs:352`, `server.rs:3153`, `handler/system.rs:487,587`, `subagent.rs:237` |\n| Loop invariants (loop always returns) | `executor.rs:410`, `2026050101_migration:463` |\n| CLI preprocessing (handled before bootstrap) | `main.rs:424,426` |\n| Caller-contract invariant (only called after `is_terminal()`) | `wait.rs:110` |\n| Programming regression guard (full comment) | `strategy.rs:75` |\n| Debug-assertions only; release falls through to `Ok(())` | `safe_url.rs:141` |\n\nAll 26 have explicit, reviewable justification messages.\n\n**Test suite: 6470/6470 passed, 181 skipped**\n\n### Conclusion\n\nEvery concrete requirement in the goal is satisfied by current evidence:\n- `unwrap()`: 0 in production\n- Weak `expect()`: 0 in production  \n- `panic!`/`unreachable!` without justification: 0 in production\n- All tests green\n\n{\n  \"outcome\": \"succeeded\",\n  \"preferred_next_label\": \"Done\",\n  \"context_updates\": {\n    \"goal_status\": \"complete\",\n    \"goal_remaining_work\": \"\"\n  }\n}"
+            },
+            "notes": "Stage completed: audit",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-4-6"
+                  },
+                  "tokens": {
+                    "input_tokens": 29929,
+                    "output_tokens": 12119,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 415570,
+                    "cache_write_tokens": 75063
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 75063,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 677729
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 194472,
+              "tool_time_ms": 58102,
+              "active_time_ms": 252574
+            }
+          },
+          "work": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "work",
+              "last_response": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`**",
+              "response.work": "6470/6470 tests pass. Here's a summary of this pass:\n\n## Summary\n\n### Audit-flagged items fixed\n\nTwo items were explicitly called out by the previous audit:\n\n1. **`fabro-telemetry/src/sanitize.rs:7`** — `\"valid regex\"` → `\"hardcoded regex literal is always syntactically valid\"` (matches the pattern used in `error.rs`)\n\n2. **`fabro-auth/src/strategy.rs:68`** — Replaced bare `assert_eq!` with an explicit `if`/`panic!` block plus a comment explaining that all call sites enforce the CodexDevice+OpenAI invariant\n\n### Additional weak messages fixed in this pass\n\nThe same scan surface found several more messages that failed the \"explains why failure is impossible\" test:\n\n| File | Old message | Fix |\n|------|-------------|-----|\n| `generate.rs:213,232` | `\"just pushed\"` | `\"steps is non-empty: element was pushed on the line above\"` |\n| `run_progress/styles.rs:13` | `\"valid template\"` | `\"hardcoded progress template is always syntactically valid\"` |\n| `shared/utilities.rs:27` | `\"valid template\"` | same |\n| `graphviz/parser/semantic.rs:98,118,132` | `\"just ensured\"` | `\"node was just inserted by ensure_node, so get_mut cannot return None\"` |\n| `demo/mod.rs:232` | `\"literal is non-zero\"` | `\"hardcoded literal 100 is non-zero\"` |\n| `slack/connection.rs:62` | `\"ack serialization\"` | explains the struct's derived `Serialize` has no custom logic that can fail |\n| `stylesheet.rs:51` | `\"node must exist\"` | explains node_id was collected from the same map's keys |\n| `event/convert.rs:654,713,745` | `\"serializable agent/sdk error\"` | explains the derives-based serialization has no custom failure path |\n| `run_projection.rs:427` | `\"event seq starts at 1\"` | `\"event sequence numbers are 1-based so seq is always non-zero at this call site\"` |\n\n### Remaining justified `panic!` calls (all verified)\n\n- `tools.rs` — hardcoded tool name validation with `# Panics` doc\n- `demo/mod.rs` — hardcoded demo SHA/status constants\n- `strategy.rs` — programming invariant (CodexDevice+OpenAI pairing), all call sites verified\n\n### Evidence\n\n- `unwrap()` in production: **0**\n- Weak `expect()` messages: **0**\n- All `unreachable!`: documented with explicit structural invariants\n- `cargo nextest run --workspace`: **6470 passed, 0 failed**"
+            },
+            "notes": "Stage completed: work",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-sonnet-4-6"
+                  },
+                  "tokens": {
+                    "input_tokens": 35264,
+                    "output_tokens": 19810,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 6456456,
+                    "cache_write_tokens": 741610
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 741610,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 5120915
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-auth/src/strategy.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-cli/src/shared/utilities.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-llm/src/generate.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/demo/mod.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-slack/src/connection.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-telemetry/src/sanitize.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/run_projection.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/event/convert.rs",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-workflow/src/transforms/stylesheet.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 372149,
+              "tool_time_ms": 377052,
+              "active_time_ms": 749201
+            }
+          }
+        },
+        "next_node_id": "exit",
+        "node_visits": {
+          "audit": 2,
           "work": 2,
           "start": 1
         }
@@ -775,7 +930,12 @@
       "first_event_seq": 491,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: work",
+        "failure_reason": null,
+        "timestamp": "2026-05-27T02:44:53.658237Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "anthropic",
@@ -788,13 +948,19 @@
       "output": null,
       "started_at": "2026-05-27T02:32:23.623290Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 750030,
+        "inference_time_ms": 372149,
+        "tool_time_ms": 377052,
+        "active_time_ms": 749201
+      },
       "usage": {
-        "input_tokens": 35264,
-        "output_tokens": 19810,
-        "total_tokens": 7253140,
+        "input_tokens": 62468,
+        "output_tokens": 30598,
+        "total_tokens": 7738933,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 6456456,
-        "cache_write_tokens": 741610,
+        "cache_read_tokens": 6829441,
+        "cache_write_tokens": 816426,
         "total_usd_micros": 5120915
       },
       "model": {
@@ -806,42 +972,42 @@
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "context_window_tokens": 200000,
-        "input_tokens": 159238,
-        "usage_percent": 79.619,
+        "input_tokens": 42833,
+        "usage_percent": 21.4165,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T02:44:53.393585Z",
-        "event_seq": 989,
+        "generated_at": "2026-05-27T02:48:29.374824Z",
+        "event_seq": 1242,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 1530,
-            "usage_percent": 0.765
+            "tokens": 1800,
+            "usage_percent": 0.9
           },
           {
             "category": "tools",
-            "tokens": 1757,
-            "usage_percent": 0.8785
+            "tokens": 2067,
+            "usage_percent": 1.0335
           },
           {
             "category": "memory",
-            "tokens": 3711,
-            "usage_percent": 1.8555
+            "tokens": 4365,
+            "usage_percent": 2.1825
           },
           {
             "category": "conversation",
-            "tokens": 152235,
-            "usage_percent": 76.1175
+            "tokens": 34595,
+            "usage_percent": 17.2975
           },
           {
             "category": "other",
-            "tokens": 5,
-            "usage_percent": 0.0025
+            "tokens": 6,
+            "usage_percent": 0.003
           }
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "audit@1": {
       "first_event_seq": 309,
@@ -872,12 +1038,12 @@
         "active_time_ms": 344242
       },
       "usage": {
-        "input_tokens": 59742,
-        "output_tokens": 36449,
-        "total_tokens": 9969681,
+        "input_tokens": 86946,
+        "output_tokens": 47237,
+        "total_tokens": 10455474,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 8887296,
-        "cache_write_tokens": 986194,
+        "cache_read_tokens": 9260281,
+        "cache_write_tokens": 1061010,
         "total_usd_micros": 1969461
       },
       "model": {
@@ -889,37 +1055,37 @@
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "context_window_tokens": 200000,
-        "input_tokens": 159238,
-        "usage_percent": 79.619,
+        "input_tokens": 42833,
+        "usage_percent": 21.4165,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T02:44:53.393585Z",
-        "event_seq": 988,
+        "generated_at": "2026-05-27T02:48:29.374824Z",
+        "event_seq": 1241,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 1530,
-            "usage_percent": 0.765
+            "tokens": 1800,
+            "usage_percent": 0.9
           },
           {
             "category": "tools",
-            "tokens": 1757,
-            "usage_percent": 0.8785
+            "tokens": 2067,
+            "usage_percent": 1.0335
           },
           {
             "category": "memory",
-            "tokens": 3711,
-            "usage_percent": 1.8555
+            "tokens": 4365,
+            "usage_percent": 2.1825
           },
           {
             "category": "conversation",
-            "tokens": 152235,
-            "usage_percent": 76.1175
+            "tokens": 34595,
+            "usage_percent": 17.2975
           },
           {
             "category": "other",
-            "tokens": 5,
-            "usage_percent": 0.0025
+            "tokens": 6,
+            "usage_percent": 0.003
           }
         ],
         "warnings": []
@@ -960,6 +1126,77 @@
       },
       "state": "succeeded"
     },
+    "audit@2": {
+      "first_event_seq": 998,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T02:44:57.460003Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 27204,
+        "output_tokens": 10788,
+        "total_tokens": 485793,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 372985,
+        "cache_write_tokens": 74816
+      },
+      "model": {
+        "provider": "anthropic",
+        "model_id": "claude-sonnet-4-6"
+      },
+      "permission_level": "full",
+      "context_window": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "context_window_tokens": 200000,
+        "input_tokens": 42833,
+        "usage_percent": 21.4165,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-27T02:48:29.374824Z",
+        "event_seq": 1244,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 1800,
+            "usage_percent": 0.9
+          },
+          {
+            "category": "tools",
+            "tokens": 2067,
+            "usage_percent": 1.0335
+          },
+          {
+            "category": "memory",
+            "tokens": 4365,
+            "usage_percent": 2.1825
+          },
+          {
+            "category": "conversation",
+            "tokens": 34595,
+            "usage_percent": 17.2975
+          },
+          {
+            "category": "other",
+            "tokens": 6,
+            "usage_percent": 0.003
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    },
     "work@1": {
       "first_event_seq": 22,
       "prompt": null,
@@ -989,12 +1226,12 @@
         "active_time_ms": 1311589
       },
       "usage": {
-        "input_tokens": 150041,
-        "output_tokens": 72238,
-        "total_tokens": 14722155,
+        "input_tokens": 177245,
+        "output_tokens": 83026,
+        "total_tokens": 15207948,
         "reasoning_tokens": 0,
-        "cache_read_tokens": 13026040,
-        "cache_write_tokens": 1473836,
+        "cache_read_tokens": 13399025,
+        "cache_write_tokens": 1548652,
         "total_usd_micros": 3878012
       },
       "model": {
@@ -1174,37 +1411,37 @@
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "context_window_tokens": 200000,
-        "input_tokens": 159238,
-        "usage_percent": 79.619,
+        "input_tokens": 42833,
+        "usage_percent": 21.4165,
         "count_method": "response_usage_scaled_breakdown",
         "staleness": "live",
-        "generated_at": "2026-05-27T02:44:53.393585Z",
-        "event_seq": 987,
+        "generated_at": "2026-05-27T02:48:29.374824Z",
+        "event_seq": 1243,
         "breakdown": [
           {
             "category": "system_prompt",
-            "tokens": 1530,
-            "usage_percent": 0.765
+            "tokens": 1800,
+            "usage_percent": 0.9
           },
           {
             "category": "tools",
-            "tokens": 1757,
-            "usage_percent": 0.8785
+            "tokens": 2067,
+            "usage_percent": 1.0335
           },
           {
             "category": "memory",
-            "tokens": 3711,
-            "usage_percent": 1.8555
+            "tokens": 4365,
+            "usage_percent": 2.1825
           },
           {
             "category": "conversation",
-            "tokens": 152235,
-            "usage_percent": 76.1175
+            "tokens": 34595,
+            "usage_percent": 17.2975
           },
           {
             "category": "other",
-            "tokens": 5,
-            "usage_percent": 0.0025
+            "tokens": 6,
+            "usage_percent": 0.003
           }
         ],
         "warnings": []

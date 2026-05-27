@@ -1,0 +1,204 @@
+diff --git a/lib/crates/fabro-auth/src/strategy.rs b/lib/crates/fabro-auth/src/strategy.rs
+index b4e0ab058..db3f0ce22 100644
+--- a/lib/crates/fabro-auth/src/strategy.rs
++++ b/lib/crates/fabro-auth/src/strategy.rs
+@@ -65,11 +65,19 @@ pub fn strategy_for(
+             Box::new(ApiKeyStrategy::new(provider))
+         }
+         AuthMethod::CodexDevice(config) => {
+-            assert_eq!(
+-                provider_id.as_str(),
+-                ProviderId::OPENAI,
+-                "Codex device auth is only supported for OpenAI"
+-            );
++            // Programming invariant: every call site that constructs
++            // `AuthMethod::CodexDevice` pairs it with `ProviderId::OPENAI`.
++            // `pick_auth_method` returns CodexDevice only when provider ==
++            // openai(), and the install flow hard-codes `ProviderId::openai()`.
++            // This check catches future regressions where a new call site
++            // forgets the constraint.
++            if provider_id.as_str() != ProviderId::OPENAI {
++                panic!(
++                    "CodexDevice auth is only constructed by CLI code for the \
++                     OpenAI provider; all existing call sites enforce this pairing: \
++                     got provider_id={provider_id}"
++                );
++            }
+             Box::new(CodexDeviceStrategy::new(config))
+         }
+     }
+diff --git a/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs b/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs
+index 6faf8bada..bff41c16d 100644
+--- a/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs
++++ b/lib/crates/fabro-cli/src/commands/run/run_progress/styles.rs
+@@ -10,7 +10,7 @@ macro_rules! cached_style {
+         pub(super) fn $name() -> ProgressStyle {
+             static STYLE: OnceLock<ProgressStyle> = OnceLock::new();
+             STYLE
+-                .get_or_init(|| ProgressStyle::with_template($template).expect("valid template"))
++                .get_or_init(|| ProgressStyle::with_template($template).expect("hardcoded progress template is always syntactically valid"))
+                 .clone()
+         }
+     };
+diff --git a/lib/crates/fabro-cli/src/shared/utilities.rs b/lib/crates/fabro-cli/src/shared/utilities.rs
+index 8e3d06448..d7d82f1fe 100644
+--- a/lib/crates/fabro-cli/src/shared/utilities.rs
++++ b/lib/crates/fabro-cli/src/shared/utilities.rs
+@@ -24,7 +24,7 @@ pub(crate) fn cyan_spinner(message: impl Into<std::borrow::Cow<'static, str>>) -
+     let spinner = ProgressBar::new_spinner();
+     spinner.set_style(
+         ProgressStyle::with_template("{spinner:.cyan} {msg}")
+-            .expect("valid template")
++            .expect("hardcoded progress template is always syntactically valid")
+             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", ""]),
+     );
+     spinner.set_message(message);
+diff --git a/lib/crates/fabro-graphviz/src/parser/semantic.rs b/lib/crates/fabro-graphviz/src/parser/semantic.rs
+index 90b10e5d0..03b435c0f 100644
+--- a/lib/crates/fabro-graphviz/src/parser/semantic.rs
++++ b/lib/crates/fabro-graphviz/src/parser/semantic.rs
+@@ -95,7 +95,7 @@ impl SemanticState {
+             .graph
+             .nodes
+             .get_mut(&node_stmt.id)
+-            .expect("just ensured");
++            .expect("node was just inserted by ensure_node, so get_mut cannot return None");
+         if let Some(attrs) = &node_stmt.attrs {
+             for (k, v) in attrs {
+                 node.attrs.insert(k.clone(), convert_value(v));
+@@ -115,7 +115,7 @@ impl SemanticState {
+                 .graph
+                 .nodes
+                 .get_mut(&node_stmt.id)
+-                .expect("just ensured");
++                .expect("node was just inserted by ensure_node, so get_mut cannot return None");
+             for cls in class_str.split(',') {
+                 let cls = cls.trim().to_string();
+                 if !cls.is_empty() && !node.classes.contains(&cls) {
+@@ -129,7 +129,7 @@ impl SemanticState {
+         for id in &edge_stmt.nodes {
+             self.ensure_node(id);
+             if let Some(cls) = subgraph_class {
+-                let node = self.graph.nodes.get_mut(id).expect("just ensured");
++                let node = self.graph.nodes.get_mut(id).expect("node was just inserted by ensure_node, so get_mut cannot return None");
+                 Self::add_class_to_node(node, cls);
+             }
+         }
+diff --git a/lib/crates/fabro-llm/src/generate.rs b/lib/crates/fabro-llm/src/generate.rs
+index 6847e3d4b..78d7469c0 100644
+--- a/lib/crates/fabro-llm/src/generate.rs
++++ b/lib/crates/fabro-llm/src/generate.rs
+@@ -210,7 +210,7 @@ pub async fn generate(params: GenerateParams) -> Result<GenerateResult, Error> {
+                 tool_results,
+             });
+ 
+-            let last = steps.last().expect("just pushed");
++            let last = steps.last().expect("steps is non-empty: element was pushed on the line above");
+             let should_continue = !tool_calls.is_empty()
+                 && last.response.finish_reason == FinishReason::ToolCalls
+                 && round < max_tool_rounds
+@@ -229,7 +229,7 @@ pub async fn generate(params: GenerateParams) -> Result<GenerateResult, Error> {
+                 }
+             }
+ 
+-            let last = steps.last().expect("just pushed");
++            let last = steps.last().expect("steps is non-empty: element was pushed on the line above");
+             messages.push(last.response.message.clone());
+             for result in &last.tool_results {
+                 messages.push(Message::tool_result(
+diff --git a/lib/crates/fabro-server/src/demo/mod.rs b/lib/crates/fabro-server/src/demo/mod.rs
+index 42e19a97c..2e1fab5b3 100644
+--- a/lib/crates/fabro-server/src/demo/mod.rs
++++ b/lib/crates/fabro-server/src/demo/mod.rs
+@@ -229,7 +229,7 @@ pub(crate) async fn list_run_commits_stub(
+                 source:         RunCommitsMetaSource::Sandbox,
+                 base_sha:       sha_newtype::<RunCommitsMetaBaseSha>(parent),
+                 head_sha:       sha_newtype::<RunCommitsMetaHeadSha>(sha),
+-                limit:          std::num::NonZeroU64::new(100).expect("literal is non-zero"),
++                limit:          std::num::NonZeroU64::new(100).expect("hardcoded literal 100 is non-zero"),
+                 total_returned: 1,
+                 truncated:      false,
+             },
+diff --git a/lib/crates/fabro-slack/src/connection.rs b/lib/crates/fabro-slack/src/connection.rs
+index 413e0cae5..222f0bbe9 100644
+--- a/lib/crates/fabro-slack/src/connection.rs
++++ b/lib/crates/fabro-slack/src/connection.rs
+@@ -59,7 +59,7 @@ pub fn process_message(
+     let ack_json = envelope
+         .envelope_id
+         .as_deref()
+-        .map(|id| serde_json::to_string(&SocketAck::new(id)).expect("ack serialization"));
++        .map(|id| serde_json::to_string(&SocketAck::new(id)).expect("SocketAck serialization cannot fail: it contains only a String field with no custom serializer"));
+ 
+     let action = dispatch(&envelope, thread_registry);
+ 
+diff --git a/lib/crates/fabro-telemetry/src/sanitize.rs b/lib/crates/fabro-telemetry/src/sanitize.rs
+index 3a7489c25..793a97a40 100644
+--- a/lib/crates/fabro-telemetry/src/sanitize.rs
++++ b/lib/crates/fabro-telemetry/src/sanitize.rs
+@@ -4,7 +4,7 @@ use std::sync::LazyLock;
+ use regex::Regex;
+ 
+ static NUMERIC_RE: LazyLock<Regex> =
+-    LazyLock::new(|| Regex::new(r"^\d+(\.\d+)*$").expect("valid regex"));
++    LazyLock::new(|| Regex::new(r"^\d+(\.\d+)*$").expect("hardcoded regex literal is always syntactically valid"));
+ 
+ /// Sanitize CLI arguments for telemetry, redacting potentially sensitive
+ /// values.
+diff --git a/lib/crates/fabro-types/src/run_projection.rs b/lib/crates/fabro-types/src/run_projection.rs
+index 3bba6d43e..eb3479439 100644
+--- a/lib/crates/fabro-types/src/run_projection.rs
++++ b/lib/crates/fabro-types/src/run_projection.rs
+@@ -424,7 +424,7 @@ pub enum McpServerStatus {
+ /// `StageProjection::first_event_seq`. Run event seqs always start at 1.
+ #[must_use]
+ pub fn first_event_seq(seq: u32) -> NonZeroU32 {
+-    NonZeroU32::new(seq).expect("event seq starts at 1")
++    NonZeroU32::new(seq).expect("event sequence numbers are 1-based so seq is always non-zero at this call site")
+ }
+ 
+ impl StageProjection {
+diff --git a/lib/crates/fabro-workflow/src/event/convert.rs b/lib/crates/fabro-workflow/src/event/convert.rs
+index ee2d46c1e..1db6d3b56 100644
+--- a/lib/crates/fabro-workflow/src/event/convert.rs
++++ b/lib/crates/fabro-workflow/src/event/convert.rs
+@@ -651,7 +651,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                 turn_id:      None,
+             }),
+             AgentEvent::Error { error } => EventBody::AgentError(fabro_types::AgentErrorProps {
+-                error: serde_json::to_value(error).expect("serializable agent error"),
++                error: serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
+                 visit: *visit,
+             }),
+             AgentEvent::Warning {
+@@ -710,7 +710,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
+                 model:      model.clone(),
+                 attempt:    *attempt,
+                 delay_secs: *delay_secs,
+-                error:      serde_json::to_value(error).expect("serializable sdk error"),
++                error:      serde_json::to_value(error).expect("LLM SDK error derives Serialize with no custom logic that can fail"),
+                 visit:      *visit,
+             }),
+             AgentEvent::SubAgentSpawned {
+@@ -742,7 +742,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
+             } => EventBody::AgentSubFailed(fabro_types::AgentSubFailedProps {
+                 agent_id: agent_id.clone(),
+                 depth:    *depth,
+-                error:    serde_json::to_value(error).expect("serializable agent error"),
++                error:    serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
+                 visit:    *visit,
+             }),
+             AgentEvent::SubAgentClosed { agent_id, depth } => {
+diff --git a/lib/crates/fabro-workflow/src/transforms/stylesheet.rs b/lib/crates/fabro-workflow/src/transforms/stylesheet.rs
+index b6e61f6d7..eac959255 100644
+--- a/lib/crates/fabro-workflow/src/transforms/stylesheet.rs
++++ b/lib/crates/fabro-workflow/src/transforms/stylesheet.rs
+@@ -48,7 +48,7 @@ pub fn apply_stylesheet(stylesheet: &Stylesheet, graph: &mut Graph) {
+         let node = graph
+             .nodes
+             .get_mut(node_id.as_str())
+-            .expect("node must exist");
++            .expect("node_id was collected from graph.nodes.keys() on the line above, so it must still exist");
+         for (prop, (val, _)) in &applied {
+             if !node.attrs.contains_key(prop) {
+                 node.attrs
