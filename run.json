@@ -322,15 +322,96 @@
     }
   },
   "web_url": "http://127.0.0.1:32276/runs/01KSKMZ950Q1ACD41R9NSX3G0C",
-  "start": null,
-  "status": {
-    "kind": "starting"
+  "start": {
+    "start_time": "2026-05-27T02:42:26.862706Z",
+    "run_branch": "fabro/run/01KSKMZ950Q1ACD41R9NSX3G0C",
+    "base_sha": "5eb3eb1a23b4791b969f724e022005a7b4f51044"
   },
-  "status_updated_at": "2026-05-27T02:42:13.337408Z",
-  "last_event_at": "2026-05-27T02:42:26.472608Z",
+  "status": {
+    "kind": "running"
+  },
+  "status_updated_at": "2026-05-27T02:42:26.862756Z",
+  "last_event_at": "2026-05-27T03:12:24.726891Z",
   "pending_control": null,
-  "checkpoints": [],
-  "conclusion": null,
+  "checkpoints": [
+    {
+      "seq": 20,
+      "checkpoint": {
+        "timestamp": "2026-05-27T02:42:28.780241Z",
+        "current_node": "start",
+        "completed_nodes": [
+          "start"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "failure_signature": "",
+          "internal.thread_id": null,
+          "outcome": "succeeded",
+          "failure_class": "",
+          "current_node": "start",
+          "graph.goal": "# React Effects Policy\n\nThis document defines how `apps/fabro-web` should use React effects.\n\nThe goal is not to hide `useEffect` behind nicer names. The goal is to keep\ncomponent data flow declarative, localize real external integrations, and make\nthe codebase easier for people and agents to reason about.\n\n## Policy\n\nDo not call `useEffect` directly from route or component code.\n\nNew code should treat every direct `useEffect`, `React.useEffect`,\n`useLayoutEffect`, or `useInsertionEffect` call as a policy violation unless it\nlives inside an approved integration hook.\n\nThe only generic effect primitive exposed to component code should be\n`useMountEffect`, and it is only for true mount/unmount integrations. Prefer a\npurpose-named hook over `useMountEffect` whenever the integration has domain\nmeaning, such as `useRunEvents(runId)`, `useDocumentTitle(title)`, or\n`useWindowEvent(...)`.\n\n`useMountEffect` must not become a way to opt out of React dependencies. If an\nintegration depends on a changing identity, that identity belongs in the API of\na purpose-named hook or in a keyed component boundary.\n\nExisting direct effects should be migrated opportunistically when touching the\nsame area. Do not make a behavior-preserving effect harder to understand just to\nremove the word `useEffect`; the replacement must improve or preserve clarity,\ntestability, and lifecycle correctness.\n\n## What Counts As An External Integration\n\nEffects are only for synchronizing React with a system outside React.\n\nAllowed external systems include:\n\n- browser globals: `window`, `document`, history, media queries, clipboard, focus\n- browser resources: timers, animation frames, `ResizeObserver`, `MutationObserver`\n- network streams and sockets: `EventSource`, WebSocket, cross-tab channels\n- imperative third-party widgets that must be constructed, attached, and disposed\n- durable browser storage when the write cannot happen in an event handler\n- external notifications such as analytics or telemetry for a route/view becoming\n  visible, when they are safe under Strict Mode and do not perform user-visible\n  writes\n\nThese are not external systems for this policy:\n\n- props\n- React state\n- SWR data\n- derived values\n- route params\n- search params used only for rendering\n- mutation result objects\n- \"after this state changes, do another state update\"\n\nIf the effect mostly moves data from one React value to another React value, it\nis almost certainly the wrong tool.\n\n## Preferred Alternatives\n\n### Derive during render\n\nIf a value can be computed from props, route params, query data, or state, compute\nit during render. Use `useMemo` only when the computation is expensive or object\nidentity matters to a child API.\n\nAvoid:\n\n```tsx\nconst [filtered, setFiltered] = useState<Item[]>([]);\n\nuseEffect(() => {\n  setFiltered(items.filter(matchesQuery));\n}, [items, matchesQuery]);\n```\n\nPrefer:\n\n```tsx\nconst filtered = useMemo(\n  () => items.filter(matchesQuery),\n  [items, matchesQuery],\n);\n```\n\n### Handle events in event handlers\n\nIf the work is caused by a click, submit, key press, or mutation trigger, do the\nwork from that event path. Do not set a flag and wait for an effect to notice it.\n\nAvoid watching mutation data just to show a toast or navigate. Prefer mutation\ncallbacks, an explicit `try`/`catch` around `trigger(...)`, or a route action\nresult consumed by the same event flow.\n\n### Use SWR for server state\n\nServer reads belong in shared query hooks in `app/lib/queries.ts` or an adjacent\ndomain query module. Do not fetch server data in a component effect.\n\nUse SWR options such as `keepPreviousData`, `refreshInterval`,\n`revalidateOnFocus`, and `shouldRetryOnError` instead of local effect state when\nthey describe the behavior directly.\n\nPolling that is not a normal SWR refresh should live in a purpose-named hook or a\nsmall state machine, not inline in a route component.\n\n### Use mutations for writes\n\nWrites should happen in event handlers, route actions, or shared mutation hooks.\nSuccess and failure handling should stay on the write path.\n\nIf many callers need the same success behavior, put that behavior in the shared\nmutation hook instead of making every component watch `mutation.data`.\n\n### Use `key` to reset local state\n\nWhen state should reset because an identity changed, prefer a keyed component\nboundary.\n\nAvoid:\n\n```tsx\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n\n  useEffect(() => {\n    setTab(\"summary\");\n  }, [selectedId]);\n}\n```\n\nPrefer:\n\n```tsx\nfunction DetailsRoute({ selectedId }: Props) {\n  return <Details key={selectedId} selectedId={selectedId} />;\n}\n\nfunction Details({ selectedId }: Props) {\n  const [tab, setTab] = useState(\"summary\");\n}\n```\n\nUse a reducer when only part of the state should reset or when the reset is part\nof an explicit domain transition.\n\n### Use URL and router primitives\n\nRoute and URL state should be the source of truth for route-owned preferences.\nParse search params during render, and update them from event handlers.\n\nPrefer route loader/action redirects when route data or auth determines the\nredirect. Use `navigate(...)` from the event path for user-initiated navigation.\nUse `<Navigate replace />` sparingly for render-known route gates when the\ntemporary null or fallback frame is acceptable.\n\nAvoid `navigate(...)` in an effect unless the navigation follows an asynchronous\nexternal result that cannot be represented by a loader, action, mutation callback,\nor render-time route gate.\n\n### Use `useSyncExternalStore` for external stores\n\nWhen React renders from a mutable external store or browser source, prefer\n`useSyncExternalStore` over an effect that subscribes and mirrors a snapshot into\nlocal state.\n\nGood candidates include cross-tab stores, browser storage-backed state, and\nimperative models where React needs a consistent current snapshot.\n\n### Use refs deliberately\n\nA ref can hold an imperative handle or the latest value for a stable callback\npassed to an external integration. Updating `ref.current` during render is\nacceptable when the ref is not used to render UI.\n\nIn React 19, prefer `useEffectEvent` inside approved hooks when an effect-owned\ntimer, listener, subscription, or third-party callback must see the latest props\nor state without forcing the external resource to resubscribe. Use refs for\nimperative objects and for APIs that cannot call an Effect Event directly.\n\nDo not use refs to avoid dependency arrays while still depending on changing\nReact data. That usually hides temporal coupling instead of removing it.\n\n## Approved Effect Hooks\n\nApproved hooks may call React effects internally. They should expose the\nexternal integration they manage and keep dependency behavior obvious at the call\nsite.\n\nRecommended primitives:\n\n- `useMountEffect(setup)` for mount/unmount-only setup\n- `useInterval(callback, delayMs, active?)`\n- `useTimeout(callback, delayMs, active?)`\n- `useDebouncedValue(value, delayMs)`\n- `useWindowEvent(type, handler, options?)`\n- `useDocumentTitle(title)`\n- `useMediaQuery(query)`\n- `useResizeObserver(ref, callback)`\n- `useSseSubscription(...)`\n- domain hooks such as `useRunEvents(runId)` and `useBoardEvents()`\n\nApproved hooks should separate resource identity from non-reactive callbacks.\nValues that decide what resource exists, such as `runId`, URL, media query, or\ndelay, should be explicit hook inputs that control setup and cleanup. Callback\nbodies that only need the latest committed React values should use\n`useEffectEvent` internally instead of ref mirrors when that API fits.\n\n`useMountEffect` should have no dependency array at the call site. If the setup\ndepends on a changing identity, make that identity explicit by:\n\n- rendering a keyed child so the integration remounts for that identity\n- writing a purpose-named hook whose API says what identity controls the resource\n- using an event handler or router/data primitive instead, if no external\n  resource exists\n\nNew approved hooks should include a short doc comment naming the external system\nthey synchronize with and the cleanup guarantees they provide. For one-shot\nnotification hooks with no cleanup, document why duplicate development calls are\nharmless.\n\n## `useMountEffect` Rules\n\n`useMountEffect` is allowed for resource setup only when all of these are true:\n\n- the code attaches to, creates, starts, or subscribes to an external resource\n- the cleanup detaches, disposes, stops, or unsubscribes from that resource\n- the effect is not deriving React state from React inputs\n- the setup does not read changing props, state, route params, search params, or\n  SWR data unless those values are stable for the mounted lifetime by construction\n- the setup is safe under React Strict Mode mount/unmount/remount behavior\n- the component still renders a correct initial frame before the effect runs\n\nGood examples:\n\n- open an `EventSource` and close it on unmount\n- create an xterm terminal instance for a DOM node and dispose it on unmount\n- add a `window` event listener and remove it on unmount\n- start a timer whose only purpose is to tick a clock display\n\nBad examples:\n\n- copy `props.title` into local state\n- copy SWR data into local state\n- inspect a mutation result and then show a toast\n- repair a URL after the first render\n- reset selection because a prop changed\n- fetch data on mount when a query hook can own the request\n\n### One-shot external notifications\n\nSome effects legitimately notify an external system because a route or view\nbecame visible, such as analytics, telemetry, or impression tracking. Do not use\n`useMountEffect` for these unless there is also a real resource to clean up.\nPrefer a purpose-named hook such as `usePageVisit(url)` or\n`useImpressionEvent(id)`.\n\nOne-shot notification hooks must be harmless under Strict Mode's development\nmount/unmount/remount cycle. They should be disabled, de-duplicated, or directed\naway from production metrics in development and tests. They must not perform\nuser-visible writes, billable actions, purchases, destructive mutations, or any\noperation whose duplicate execution would be observable to the user.\n\n## Migration Workflow\n\nUse this workflow when auditing existing direct effects.\n\n1. List direct effect usage:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   ```\n\n2. For each hit, classify it:\n\n   - `derived-state`: replace with render-time derivation, `useMemo`, reducer, or keyed remount\n   - `event-reaction`: move into the event handler, mutation callback, route action, or submit path\n   - `server-data`: move into SWR query/mutation hooks\n   - `url-router`: move into URL-derived render state, event-time URL updates, loader, or `<Navigate>`\n   - `external-integration`: move into `useMountEffect` or a purpose-named integration hook\n   - `imperative-dom`: move into a narrow DOM hook such as `useDocumentTitle`, `useWindowEvent`, or `useResizeObserver`\n   - `one-shot-notification`: move into a purpose-named analytics/telemetry hook with Strict Mode behavior documented\n\n3. Write down the replacement before editing. If the replacement is less clear,\n   keep researching instead of performing a mechanical rewrite.\n\n4. Preserve the user-visible initial frame. The migration should not introduce a\n   flash that the old code avoided.\n\n5. Add or update focused tests for behavior that previously depended on effect\n   timing, especially redirects, toasts, focus, polling, and state resets.\n\n6. After migration, run:\n\n   ```sh\n   rg -n \"\\buseEffect\\b|React\\.useEffect|\\buse(Layout|Insertion)?Effect\\b\" apps/fabro-web/app --glob '*.{ts,tsx}'\n   cd apps/fabro-web && bun test\n   cd apps/fabro-web && bun run typecheck\n   ```\n\n## Existing Hotspots\n\nBased on the current codebase survey, prioritize these areas first:\n\n- `routes/run-detail.tsx`: mutation-result watcher effects for preview and\n  lifecycle toasts. Prefer moving success handling into the mutation/action path.\n- `routes/run-files.tsx`: several effects are legitimate DOM/timer bridges, but\n  they should be extracted into named hooks. The SWR data/ref bridge needs a\n  careful replacement that preserves failed-revalidation behavior.\n- `install-app.tsx`: session loading and health polling are component-level\n  async effects. Prefer SWR/query hooks or a small install state machine before\n  enforcing the policy there.\n- state reset effects in run stages, child runs, file trees, and filesystem\n  panels. Prefer keyed boundaries or reducers where they keep ownership clearer.\n- repeated timer/media-query/focus/document-title/listener effects. Replace with\n  shared hooks before auditing the harder cases.\n\n## Enforcement\n\nEnforcement should happen after the initial wrapper hooks exist. Until then,\nreviewers should request a replacement plan for any new direct effect and PR\ndescriptions for effect migrations should name the category being removed.\n\nDo not add a lint or CI gate until the approved hook surface exists and the\ninitial migration path is clear.\n\n## Review Checklist\n\nWhen reviewing React code, ask:\n\n- Does the component render correctly before any effect runs?\n- Is this effect synchronizing with a real external system?\n- Could this value be derived during render?\n- Could this happen in the event handler that caused it?\n- Could SWR or a route action own this data flow?\n- Is a `key` boundary a clearer reset than a reset effect?\n- Does cleanup exactly undo setup?\n- Is the Strict Mode double-mount behavior harmless?\n- Is the dependency behavior visible in the API, rather than hidden in refs?\n- Did the migration reduce temporal coupling instead of moving it elsewhere?\n\nIf the answer is unclear, keep the effect local until the correct abstraction is\nobvious. A vague wrapper is worse than an honest direct effect.\n",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.start": 0,
+          "internal.fidelity": "compact",
+          "graph.rankdir": "LR",
+          "graph.max_node_visits": "30",
+          "internal.run_id": "01KSKMZ950Q1ACD41R9NSX3G0C"
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "work",
+        "node_visits": {
+          "start": 1
+        }
+      },
+      "diff": {}
+    }
+  ],
+  "conclusion": {
+    "timestamp": "2026-05-27T03:12:24.733426Z",
+    "status": "failed",
+    "timing": {
+      "wall_time_ms": 1797862,
+      "inference_time_ms": 0,
+      "tool_time_ms": 0,
+      "active_time_ms": 0
+    },
+    "failure": {
+      "reason": "cancelled",
+      "detail": {
+        "message": "Pipeline cancelled",
+        "category": "canceled"
+      }
+    },
+    "stages": [
+      {
+        "stage_id": "start",
+        "stage_label": "start",
+        "timing": {
+          "wall_time_ms": 0,
+          "inference_time_ms": 0,
+          "tool_time_ms": 0,
+          "active_time_ms": 0
+        },
+        "retries": 0
+      }
+    ],
+    "billing": {
+      "input_tokens": 2450000,
+      "output_tokens": 26788,
+      "total_tokens": 10802318,
+      "reasoning_tokens": 17306,
+      "cache_read_tokens": 8308224,
+      "cache_write_tokens": 0
+    },
+    "total_retries": 0,
+    "diff": {}
+  },
   "sandbox": {
     "provider": "daytona",
     "snapshot": "fabro-v12",
@@ -349,5 +430,282 @@
   "pull_request": null,
   "superseded_by": null,
   "pending_interviews": {},
-  "stages": {}
+  "stages": {
+    "start@1": {
+      "first_event_seq": 17,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-27T02:42:28.779586Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T02:42:28.778752Z",
+      "handler": "start",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "work@1": {
+      "first_event_seq": 21,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "reasoning_effort": "xhigh"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-27T02:42:28.780343Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 2450000,
+        "output_tokens": 26788,
+        "total_tokens": 10802318,
+        "reasoning_tokens": 17306,
+        "cache_read_tokens": 8308224,
+        "cache_write_tokens": 0
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:33e61559-c5ab-4c10-bed4-3c2f61bf84d8",
+        "items": [
+          {
+            "id": "b1f33451e1c701cc",
+            "status": "completed",
+            "order": 0,
+            "subject": "Audit current direct effect usage and classify low-risk migration targets"
+          },
+          {
+            "id": "aef24dd919282906",
+            "status": "completed",
+            "order": 1,
+            "subject": "Add approved effect hook primitives with documented external integrations"
+          },
+          {
+            "id": "47909fe73ac0a8b5",
+            "status": "completed",
+            "order": 2,
+            "subject": "Migrate simple route/component direct effects to declarative alternatives or approved hooks"
+          },
+          {
+            "id": "e8c9e58c0b4de2f3",
+            "status": "completed",
+            "order": 3,
+            "subject": "Run effect usage audit and web checks"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "4b82f39c",
+          "depth": 1,
+          "task": "Audit direct React effect usages in apps/fabro-web/app from the current worktree. Classify each remaining useEffect/useLayoutEffect/useInsertionEffect according to docs/internal/react-effects-policy.md and recommend low-risk migrations, especially cases that can be replaced with existing or new approved hooks. Do not edit files. Return concise prioritized recommendations with file paths and line numbers.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 7
+          }
+        }
+      ],
+      "permission_level": "full",
+      "agent_tools": [
+        {
+          "name": "apply_patch",
+          "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": true
+        },
+        {
+          "name": "close_agent",
+          "description": "Close a running subagent that is no longer needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "glob",
+          "description": "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "grep",
+          "description": "Search file contents with a regex pattern. Use path to choose the search root, glob_filter to limit matching files, case_insensitive for case folding, and max_results to cap output.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "read_file",
+          "description": "Read files before editing them. Returns line-numbered text and supports offset/limit for large files. Use this instead of shell cat, head, tail, or sed when inspecting repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "request_user_input",
+          "description": "Ask the human one or more questions and wait for their answers before continuing this stage.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "send_input",
+          "description": "Send a follow-up message to a running subagent when new information or corrected instructions are needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "shell",
+          "description": "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "shell",
+          "invoked": true
+        },
+        {
+          "name": "spawn_agent",
+          "description": "Spawn a subagent for independent work or context isolation. Use it for tasks that can proceed separately, and avoid duplicating the same work in the parent session.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "update_plan",
+          "description": "Update the multi-step plan for the current task. Submit the entire plan; existing steps are reconciled by exact step text.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": true
+        },
+        {
+          "name": "wait",
+          "description": "Wait for a subagent to complete, then use the result to synthesize the outcome for the user.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "web_fetch",
+          "description": "Fetch content from a URL that starts with http:// or https://. Pass a prompt to extract specific information or summarize the page; omit prompt to return the page content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "web_search",
+          "description": "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "write_file",
+          "description": "Create new files, or overwrite an existing file only when replacement is explicitly intended. Prefer edit_file for targeted changes to existing files because write_file overwrites the full file content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        }
+      ],
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 272000,
+        "input_tokens": 144582,
+        "usage_percent": 53.15514705882353,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-05-27T03:12:21.430748Z",
+        "event_seq": 493,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 820,
+            "usage_percent": 0.3014705882352941
+          },
+          {
+            "category": "tools",
+            "tokens": 1202,
+            "usage_percent": 0.44191176470588234
+          },
+          {
+            "category": "memory",
+            "tokens": 2877,
+            "usage_percent": 1.057720588235294
+          },
+          {
+            "category": "conversation",
+            "tokens": 139676,
+            "usage_percent": 51.351470588235294
+          },
+          {
+            "category": "other",
+            "tokens": 7,
+            "usage_percent": 0.002573529411764706
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
+    }
+  }
 }
