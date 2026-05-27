@@ -1,0 +1,527 @@
+{
+  "title": "---",
+  "spec": {
+    "run_id": "01KSN4661TG7HFT3ATDKNGMGC0",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "---\ntitle: Add CLI Variable Management\ntype: feat\nstatus: active\ndate: 2026-05-27\n---\n\n# Add CLI Variable Management\n\n## Overview\n\nExpose the recently added variables API through the CLI with a singular `fabro variable`\nnamespace. Variables are non-sensitive run-configuration values, so the CLI should expose\nvalues in `list` and `get`, while continuing to direct credentials and tokens to\n`fabro secret`.\n\n## Requirements Trace\n\n- R1. Provide variables management in the CLI, similar to secrets management.\n- R2. Support the full readable-variable CRUD surface: list, get, set/upsert, and remove.\n- R3. Preserve existing server/API behavior: variable names are env-style, values may be\n  empty, and `set` preserves an existing description when `--description` is omitted.\n- R4. Keep generated CLI docs and help snapshots in sync with the new public command.\n\n## Context & Research\n\n- `lib/crates/fabro-cli/src/commands/secret/` is the command pattern to follow for\n  namespace dispatch, JSON output, tabular list output, stdin value input, and status\n  messages.\n- `lib/crates/fabro-server/src/server/handler/variables.rs` already provides\n  `GET /variables`, `POST /variables`, `GET /variables/{name}`,\n  `PUT /variables/{name}`, and `DELETE /variables/{name}`.\n- `lib/crates/fabro-types/src/variable.rs` defines the canonical API/request types and\n  validates env-style names.\n- `lib/crates/fabro-api/tests/variable_round_trip.rs` already proves OpenAPI generated\n  types reuse the canonical variable types.\n- `docs/public/workflows/variables.mdx` currently explains workflow template variables\n  but does not yet document how server-managed `{{ vars.NAME }}` values are configured.\n\n## Key Technical Decisions\n\n- Use `fabro variable`, not `fabro variables`, to match existing singular CLI namespaces\n  such as `fabro secret`, `fabro model`, and `fabro repo`.\n- Add `get` because variables are intentionally readable; secrets remain write-only.\n- Make `set` an upsert using the API's create/upsert endpoint, matching the mental model\n  of `fabro secret set`.\n- Reuse `--value-stdin` from secrets but allow empty stdin values for variables after\n  trimming trailing newlines.\n- Plain `list` should include a `VALUE` column. Do not add truncation or redaction in\n  this first pass; exact retrieval is available through JSON output and `get`.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add fabro-client variable wrappers**\n\n**Goal:** Give CLI code stable methods over the generated OpenAPI client.\n\n**Requirements:** R2, R3\n\n**Dependencies:** Existing variables API and generated `fabro-api` client.\n\n**Files:**\n- Modify: `lib/crates/fabro-client/src/client.rs`\n\n**Approach:**\n- Add wrappers for `list_variables`, `get_variable`, `create_variable`,\n  `update_variable`, and `delete_variable`.\n- Return `Vec<types::Variable>` from `list_variables` by unwrapping the API response's\n  `data`, matching `list_secrets`.\n- Use the generated path-parameter operations for `get`, `update`, and `delete`.\n\n**Patterns to follow:**\n- `list_secrets`, `create_secret`, and `delete_secret_by_name` in the same file.\n\n**Test scenarios:**\n- Happy path: CLI integration tests in later units exercise each wrapper through the\n  shared server client path.\n- Error path: missing and invalid variable operations propagate the server's API errors.\n\n**Verification:**\n- The CLI can compile against these wrapper methods without importing generated client\n  builders directly.\n\n- [ ] **Unit 2: Add CLI args, dispatch, and command module**\n\n**Goal:** Register the new top-level namespace and route subcommands to implementation\nmodules.\n\n**Requirements:** R1, R2, R4\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/args.rs`\n- Modify: `lib/crates/fabro-cli/src/main.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/mod.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/mod.rs`\n\n**Approach:**\n- Add `Commands::Variable(VariableNamespace)` with description\n  `Manage server-owned variables`.\n- Add `VariableNamespace` with `ServerTargetArgs`, matching `SecretNamespace`.\n- Add `VariableCommand::{List, Get, Rm, Set}`; give `list` the `ls` alias.\n- Add command-name mapping for analytics/logging: `variable list`, `variable get`,\n  `variable rm`, and `variable set`.\n- Dispatch through `commands::variable::dispatch`, deriving the target context with\n  `base_ctx.with_target(&ns.target)`.\n\n**Patterns to follow:**\n- `SecretNamespace`, `SecretCommand`, and `commands::secret::dispatch`.\n\n**Test scenarios:**\n- Happy path: `fabro --help` lists `variable`.\n- Happy path: `fabro variable --help` shows `list`, `get`, `rm`, and `set`.\n- Happy path: command-name mapping covers all subcommands.\n\n**Verification:**\n- The new namespace is reachable through clap and main dispatch without affecting\n  existing commands.\n\n- [ ] **Unit 3: Implement variable list/get/set/rm behavior**\n\n**Goal:** Provide the full user-facing variables management workflow.\n\n**Requirements:** R1, R2, R3\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Create: `lib/crates/fabro-cli/src/commands/variable/list.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/get.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/set.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/rm.rs`\n\n**Approach:**\n- `list`: fetch all variables, print JSON array when JSON output is active, otherwise\n  print a table with `NAME`, `VALUE`, and `UPDATED`.\n- `get`: fetch one variable, print the full variable object for JSON output, otherwise\n  print only the raw value to stdout.\n- `set`: accept `<NAME> [VALUE]`, `--value-stdin`, and `--description`; call the upsert\n  API wrapper and print the stored variable for JSON output or `Set NAME` otherwise.\n- `rm`: call the delete API wrapper and print `{ \"name\": NAME }` for JSON output or\n  `Removed NAME` otherwise.\n- For `set`, allow empty explicit values and empty stdin values. Only error when no value\n  is provided and stdin is not being used.\n\n**Patterns to follow:**\n- `commands/secret/list.rs` for table style and age formatting.\n- `commands/secret/set.rs` for argument precedence and stdin handling, adjusted so empty\n  values are valid.\n- `commands/secret/rm.rs` for delete output shape.\n\n**Test scenarios:**\n- Happy path: `set DEPLOY_ENV staging --description \"Deployment target\"` then `list`\n  shows `DEPLOY_ENV`, `staging`, and an updated age.\n- Happy path: `get DEPLOY_ENV` prints exactly `staging\\n` in plain output.\n- Happy path: `set DEPLOY_ENV production` updates the value and preserves the existing\n  description through API behavior.\n- Happy path: `set EMPTY \"\"` stores an empty value.\n- Happy path: `printf '\\n' | fabro variable set EMPTY --value-stdin` stores an empty\n  value instead of failing.\n- Error path: `get MISSING` and `rm MISSING` fail with `variable not found: MISSING`.\n- Error path: `set 1BAD value` fails with the server invalid-name error.\n\n**Verification:**\n- The command works against the default test server and does not write directly to\n  local `variables.json`.\n\n- [ ] **Unit 4: Add test harness support and CLI integration tests**\n\n**Goal:** Lock the public CLI surface and expected behavior with integration coverage.\n\n**Requirements:** R1, R2, R3, R4\n\n**Dependencies:** Units 1-3\n\n**Files:**\n- Modify: `lib/crates/fabro-test/src/lib.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/json_global.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_list.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_get.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_set.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_rm.rs`\n\n**Approach:**\n- Add `TestContext::variable()` helper mirroring `TestContext::secret()`.\n- Add help snapshots for the namespace and each subcommand.\n- Add lifecycle tests for set/list/get/update/rm, `ls` alias, empty value support, JSON\n  output, missing variable errors, and invalid-name errors.\n- Update root help and curated landing snapshots only if the final clap/landing output\n  changes.\n\n**Patterns to follow:**\n- `secret.rs`, `secret_list.rs`, `secret_set.rs`, and `secret_rm.rs`.\n\n**Test scenarios:**\n- Happy path: JSON `list` returns an array of full variable objects including `value`.\n- Happy path: JSON `get` and `set` return full variable objects.\n- Happy path: global JSON config makes `variable list` emit JSON, matching the\n  `secret list` config test.\n- Error path: missing variables and invalid names produce nonzero exits and readable\n  errors.\n\n**Verification:**\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n\n- [ ] **Unit 5: Update generated and conceptual docs**\n\n**Goal:** Keep public documentation aligned with the new command and clarify how variables\nrelate to secrets.\n\n**Requirements:** R1, R4\n\n**Dependencies:** Units 2-4\n\n**Files:**\n- Modify: `docs/public/reference/cli.mdx`\n- Modify: `docs/public/workflows/variables.mdx`\n\n**Approach:**\n- Regenerate the CLI reference with `cargo dev docs refresh`.\n- Add a short section to `docs/public/workflows/variables.mdx` explaining that\n  server-managed run config variables can be set with `fabro variable set NAME VALUE`\n  and referenced as `{{ vars.NAME }}` in run config interpolation.\n- State that variables are non-sensitive and readable; tokens, keys, and credentials\n  should use `fabro secret set`.\n\n**Patterns to follow:**\n- Existing generated docs workflow in `lib/crates/fabro-dev/src/commands/docs.rs`.\n- Existing CLI references to `fabro secret set` in administration docs.\n\n**Test scenarios:**\n- Happy path: generated CLI docs include `fabro variable` and its subcommands.\n- Documentation check: `cargo dev docs check` succeeds after regeneration.\n\n**Verification:**\n- The docs describe the CLI surface without implying variables are secret storage.\n\n## System-Wide Impact\n\n- **API surface parity:** No server or OpenAPI changes are planned; the CLI consumes the\n  existing variables API.\n- **Error propagation:** Invalid names, missing variables, and write failures should flow\n  through the existing `fabro-client` API error classification.\n- **State lifecycle risks:** CLI commands must use the server API rather than editing\n  `variables.json` locally, so behavior remains correct for remote and socket-backed\n  servers.\n- **Security boundary:** Values are intentionally visible for variables. Documentation\n  must clearly distinguish variables from secrets to avoid accidental credential storage.\n- **Unchanged invariants:** `fabro secret` remains write-only and unchanged.\n\n## Risks & Dependencies\n\n| Risk | Mitigation |\n| --- | --- |\n| Users put credentials in variables because the command looks like secrets | Document variables as non-sensitive and keep secret guidance explicit. |\n| Empty values accidentally fail because secret handling rejects empties | Test explicit empty strings and newline-only stdin for `variable set`. |\n| CLI docs drift after adding clap args | Regenerate with `cargo dev docs refresh` and verify with `cargo dev docs check`. |\n| Plain `list` becomes awkward for long values | Accept for v1; `get` and JSON output provide exact machine-readable retrieval. |\n\n## Verification Plan\n\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n- `cargo dev docs check`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The chosen CLI surface is full CRUD with readable values.\n- The namespace is singular: `fabro variable`.\n- No TypeScript client regeneration is required for this CLI-only change.\n- No server API, OpenAPI schema, or storage migration changes are required."
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "reasoning_effort": {
+              "String": "xhigh"
+            },
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "provider": {
+              "String": "openai"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "script": {
+              "String": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1"
+            },
+            "label": {
+              "String": "Verify"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "retry_target": {
+              "String": "fixup"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "label": {
+              "String": "Exit"
+            },
+            "shape": {
+              "String": "Msquare"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "label": {
+              "String": "Start"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures."
+            },
+            "label": {
+              "String": "Fixup"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "max_retries": {
+              "Integer": 0
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "goal": {
+          "String": "---\ntitle: Add CLI Variable Management\ntype: feat\nstatus: active\ndate: 2026-05-27\n---\n\n# Add CLI Variable Management\n\n## Overview\n\nExpose the recently added variables API through the CLI with a singular `fabro variable`\nnamespace. Variables are non-sensitive run-configuration values, so the CLI should expose\nvalues in `list` and `get`, while continuing to direct credentials and tokens to\n`fabro secret`.\n\n## Requirements Trace\n\n- R1. Provide variables management in the CLI, similar to secrets management.\n- R2. Support the full readable-variable CRUD surface: list, get, set/upsert, and remove.\n- R3. Preserve existing server/API behavior: variable names are env-style, values may be\n  empty, and `set` preserves an existing description when `--description` is omitted.\n- R4. Keep generated CLI docs and help snapshots in sync with the new public command.\n\n## Context & Research\n\n- `lib/crates/fabro-cli/src/commands/secret/` is the command pattern to follow for\n  namespace dispatch, JSON output, tabular list output, stdin value input, and status\n  messages.\n- `lib/crates/fabro-server/src/server/handler/variables.rs` already provides\n  `GET /variables`, `POST /variables`, `GET /variables/{name}`,\n  `PUT /variables/{name}`, and `DELETE /variables/{name}`.\n- `lib/crates/fabro-types/src/variable.rs` defines the canonical API/request types and\n  validates env-style names.\n- `lib/crates/fabro-api/tests/variable_round_trip.rs` already proves OpenAPI generated\n  types reuse the canonical variable types.\n- `docs/public/workflows/variables.mdx` currently explains workflow template variables\n  but does not yet document how server-managed `{{ vars.NAME }}` values are configured.\n\n## Key Technical Decisions\n\n- Use `fabro variable`, not `fabro variables`, to match existing singular CLI namespaces\n  such as `fabro secret`, `fabro model`, and `fabro repo`.\n- Add `get` because variables are intentionally readable; secrets remain write-only.\n- Make `set` an upsert using the API's create/upsert endpoint, matching the mental model\n  of `fabro secret set`.\n- Reuse `--value-stdin` from secrets but allow empty stdin values for variables after\n  trimming trailing newlines.\n- Plain `list` should include a `VALUE` column. Do not add truncation or redaction in\n  this first pass; exact retrieval is available through JSON output and `get`.\n\n## Implementation Units\n\n- [ ] **Unit 1: Add fabro-client variable wrappers**\n\n**Goal:** Give CLI code stable methods over the generated OpenAPI client.\n\n**Requirements:** R2, R3\n\n**Dependencies:** Existing variables API and generated `fabro-api` client.\n\n**Files:**\n- Modify: `lib/crates/fabro-client/src/client.rs`\n\n**Approach:**\n- Add wrappers for `list_variables`, `get_variable`, `create_variable`,\n  `update_variable`, and `delete_variable`.\n- Return `Vec<types::Variable>` from `list_variables` by unwrapping the API response's\n  `data`, matching `list_secrets`.\n- Use the generated path-parameter operations for `get`, `update`, and `delete`.\n\n**Patterns to follow:**\n- `list_secrets`, `create_secret`, and `delete_secret_by_name` in the same file.\n\n**Test scenarios:**\n- Happy path: CLI integration tests in later units exercise each wrapper through the\n  shared server client path.\n- Error path: missing and invalid variable operations propagate the server's API errors.\n\n**Verification:**\n- The CLI can compile against these wrapper methods without importing generated client\n  builders directly.\n\n- [ ] **Unit 2: Add CLI args, dispatch, and command module**\n\n**Goal:** Register the new top-level namespace and route subcommands to implementation\nmodules.\n\n**Requirements:** R1, R2, R4\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/args.rs`\n- Modify: `lib/crates/fabro-cli/src/main.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/mod.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/mod.rs`\n\n**Approach:**\n- Add `Commands::Variable(VariableNamespace)` with description\n  `Manage server-owned variables`.\n- Add `VariableNamespace` with `ServerTargetArgs`, matching `SecretNamespace`.\n- Add `VariableCommand::{List, Get, Rm, Set}`; give `list` the `ls` alias.\n- Add command-name mapping for analytics/logging: `variable list`, `variable get`,\n  `variable rm`, and `variable set`.\n- Dispatch through `commands::variable::dispatch`, deriving the target context with\n  `base_ctx.with_target(&ns.target)`.\n\n**Patterns to follow:**\n- `SecretNamespace`, `SecretCommand`, and `commands::secret::dispatch`.\n\n**Test scenarios:**\n- Happy path: `fabro --help` lists `variable`.\n- Happy path: `fabro variable --help` shows `list`, `get`, `rm`, and `set`.\n- Happy path: command-name mapping covers all subcommands.\n\n**Verification:**\n- The new namespace is reachable through clap and main dispatch without affecting\n  existing commands.\n\n- [ ] **Unit 3: Implement variable list/get/set/rm behavior**\n\n**Goal:** Provide the full user-facing variables management workflow.\n\n**Requirements:** R1, R2, R3\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Create: `lib/crates/fabro-cli/src/commands/variable/list.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/get.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/set.rs`\n- Create: `lib/crates/fabro-cli/src/commands/variable/rm.rs`\n\n**Approach:**\n- `list`: fetch all variables, print JSON array when JSON output is active, otherwise\n  print a table with `NAME`, `VALUE`, and `UPDATED`.\n- `get`: fetch one variable, print the full variable object for JSON output, otherwise\n  print only the raw value to stdout.\n- `set`: accept `<NAME> [VALUE]`, `--value-stdin`, and `--description`; call the upsert\n  API wrapper and print the stored variable for JSON output or `Set NAME` otherwise.\n- `rm`: call the delete API wrapper and print `{ \"name\": NAME }` for JSON output or\n  `Removed NAME` otherwise.\n- For `set`, allow empty explicit values and empty stdin values. Only error when no value\n  is provided and stdin is not being used.\n\n**Patterns to follow:**\n- `commands/secret/list.rs` for table style and age formatting.\n- `commands/secret/set.rs` for argument precedence and stdin handling, adjusted so empty\n  values are valid.\n- `commands/secret/rm.rs` for delete output shape.\n\n**Test scenarios:**\n- Happy path: `set DEPLOY_ENV staging --description \"Deployment target\"` then `list`\n  shows `DEPLOY_ENV`, `staging`, and an updated age.\n- Happy path: `get DEPLOY_ENV` prints exactly `staging\\n` in plain output.\n- Happy path: `set DEPLOY_ENV production` updates the value and preserves the existing\n  description through API behavior.\n- Happy path: `set EMPTY \"\"` stores an empty value.\n- Happy path: `printf '\\n' | fabro variable set EMPTY --value-stdin` stores an empty\n  value instead of failing.\n- Error path: `get MISSING` and `rm MISSING` fail with `variable not found: MISSING`.\n- Error path: `set 1BAD value` fails with the server invalid-name error.\n\n**Verification:**\n- The command works against the default test server and does not write directly to\n  local `variables.json`.\n\n- [ ] **Unit 4: Add test harness support and CLI integration tests**\n\n**Goal:** Lock the public CLI surface and expected behavior with integration coverage.\n\n**Requirements:** R1, R2, R3, R4\n\n**Dependencies:** Units 1-3\n\n**Files:**\n- Modify: `lib/crates/fabro-test/src/lib.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/mod.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/fabro.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/cmd/json_global.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_list.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_get.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_set.rs`\n- Create: `lib/crates/fabro-cli/tests/it/cmd/variable_rm.rs`\n\n**Approach:**\n- Add `TestContext::variable()` helper mirroring `TestContext::secret()`.\n- Add help snapshots for the namespace and each subcommand.\n- Add lifecycle tests for set/list/get/update/rm, `ls` alias, empty value support, JSON\n  output, missing variable errors, and invalid-name errors.\n- Update root help and curated landing snapshots only if the final clap/landing output\n  changes.\n\n**Patterns to follow:**\n- `secret.rs`, `secret_list.rs`, `secret_set.rs`, and `secret_rm.rs`.\n\n**Test scenarios:**\n- Happy path: JSON `list` returns an array of full variable objects including `value`.\n- Happy path: JSON `get` and `set` return full variable objects.\n- Happy path: global JSON config makes `variable list` emit JSON, matching the\n  `secret list` config test.\n- Error path: missing variables and invalid names produce nonzero exits and readable\n  errors.\n\n**Verification:**\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n\n- [ ] **Unit 5: Update generated and conceptual docs**\n\n**Goal:** Keep public documentation aligned with the new command and clarify how variables\nrelate to secrets.\n\n**Requirements:** R1, R4\n\n**Dependencies:** Units 2-4\n\n**Files:**\n- Modify: `docs/public/reference/cli.mdx`\n- Modify: `docs/public/workflows/variables.mdx`\n\n**Approach:**\n- Regenerate the CLI reference with `cargo dev docs refresh`.\n- Add a short section to `docs/public/workflows/variables.mdx` explaining that\n  server-managed run config variables can be set with `fabro variable set NAME VALUE`\n  and referenced as `{{ vars.NAME }}` in run config interpolation.\n- State that variables are non-sensitive and readable; tokens, keys, and credentials\n  should use `fabro secret set`.\n\n**Patterns to follow:**\n- Existing generated docs workflow in `lib/crates/fabro-dev/src/commands/docs.rs`.\n- Existing CLI references to `fabro secret set` in administration docs.\n\n**Test scenarios:**\n- Happy path: generated CLI docs include `fabro variable` and its subcommands.\n- Documentation check: `cargo dev docs check` succeeds after regeneration.\n\n**Verification:**\n- The docs describe the CLI surface without implying variables are secret storage.\n\n## System-Wide Impact\n\n- **API surface parity:** No server or OpenAPI changes are planned; the CLI consumes the\n  existing variables API.\n- **Error propagation:** Invalid names, missing variables, and write failures should flow\n  through the existing `fabro-client` API error classification.\n- **State lifecycle risks:** CLI commands must use the server API rather than editing\n  `variables.json` locally, so behavior remains correct for remote and socket-backed\n  servers.\n- **Security boundary:** Values are intentionally visible for variables. Documentation\n  must clearly distinguish variables from secrets to avoid accidental credential storage.\n- **Unchanged invariants:** `fabro secret` remains write-only and unchanged.\n\n## Risks & Dependencies\n\n| Risk | Mitigation |\n| --- | --- |\n| Users put credentials in variables because the command looks like secrets | Document variables as non-sensitive and keep secret guidance explicit. |\n| Empty values accidentally fail because secret handling rejects empties | Test explicit empty strings and newline-only stdin for `variable set`. |\n| CLI docs drift after adding clap args | Regenerate with `cargo dev docs refresh` and verify with `cargo dev docs check`. |\n| Plain `list` becomes awkward for long values | Accept for v1; `get` and JSON output provide exact machine-readable retrieval. |\n\n## Verification Plan\n\n- `cargo nextest run -p fabro-cli -- variable`\n- `cargo nextest run -p fabro-cli -- fabro`\n- `cargo dev docs check`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The chosen CLI surface is full CRUD with readable values.\n- The namespace is singular: `fabro variable`.\n- No TypeScript client regeneration is required for this CLI-only change.\n- No server API, OpenAPI schema, or storage migration changes are required."
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "rankdir": {
+          "String": "LR"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\", model=\"gpt-55\", reasoning_effort=\"xhigh\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\\\"disabled\\\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures.\", max_visits=3]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> exit  [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.246.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.246.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.246.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "1059aa7ddc5eb02f6662f4f7b235168f9a77964d5aa2258e14c97bbaa829afee",
+    "definition_blob": "f13f100f4f1f386c63f22b375c331077f1c1b3bd2df0dd17388b26786f23b9a6",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "8df6fff94718bbbf2054006d9d14f99048f45d11",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KSN4661TG7HFT3ATDKNGMGC0",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-27T16:27:22.627922Z",
+  "last_event_at": "2026-05-27T16:27:36.780594Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+    "runtime": {
+      "id": "fabro-01KSN4661TG7HFT3ATDKNGMGC0",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
