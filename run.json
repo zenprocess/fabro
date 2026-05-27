@@ -1,0 +1,527 @@
+{
+  "title": "Align Concrete Stores Implementation Plan",
+  "spec": {
+    "run_id": "01KSN65019DJTRSDSV6VQZ6ZR0",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "# Align Concrete Stores Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Align automation, secret, and variable storage around concrete product-facing store types that own their own synchronization and persistence.\n\n**Architecture:** `AutomationStore` is already the desired shape and remains the reference. Collapse the public `Vault` type into `SecretStore`, convert `VariableStore` to the same internally synchronized concrete-store pattern, and update server/auth/CLI call sites to depend on those concrete stores directly. Do not introduce storage traits, SQL dispatch, backend enums, or file-format migrations in this pass.\n\n**Tech Stack:** Rust, Tokio `Mutex`/`RwLock`, JSON file persistence for secrets and variables, existing automation TOML storage, cargo-nextest.\n\n---\n\n## File Structure\n\n- `lib/crates/fabro-vault/src/lib.rs`: rename `Vault` to `SecretStore`, add internal synchronization, keep `SecretEntry`, `SecretType`, validation, and JSON file format compatible.\n- `lib/crates/fabro-variable/src/lib.rs`: make `VariableStore` internally synchronized and keep its existing JSON file format compatible.\n- `lib/crates/fabro-auth/src/vault_source.rs`, `lib/crates/fabro-auth/src/vault_ext.rs`, `lib/crates/fabro-auth/src/resolve.rs`: update secret-store naming and remove external `AsyncRwLock<Vault>` assumptions from auth resolution.\n- `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/startup.rs`, `lib/crates/fabro-server/src/migrations.rs`, and server handlers: update state wiring and call sites from externally locked `Vault`/`VariableStore` to direct `Arc<SecretStore>`/`Arc<VariableStore>`.\n- CLI and tests that load local secrets directly: update imports and names from `Vault` to `SecretStore`.\n\n## Task 1: Convert `Vault` Into Concrete `SecretStore`\n\n**Files:**\n- Modify: `lib/crates/fabro-vault/src/lib.rs`\n\n- [ ] **Step 1: Update the store shape**\n\nChange the public store struct from `Vault` to `SecretStore`, and give it the same synchronization shape as `AutomationStore`:\n\n```rust\nuse tokio::sync::{Mutex, RwLock};\n\n#[derive(Debug)]\npub struct SecretStore {\n    path:      PathBuf,\n    mutations: Mutex<()>,\n    entries:   RwLock<HashMap<String, SecretEntry>>,\n}\n```\n\nAdd `tokio.workspace = true` to `lib/crates/fabro-vault/Cargo.toml`.\n\n- [ ] **Step 2: Make load asynchronous**\n\nReplace `Vault::load` with:\n\n```rust\nimpl SecretStore {\n    pub async fn load(path: PathBuf) -> Result<Self, Error> {\n        let entries = match tokio::fs::read_to_string(&path).await {\n            Ok(contents) => serde_json::from_str(&contents)?,\n            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),\n            Err(err) => return Err(io_context(\"read secrets\", &path, &err).into()),\n        };\n\n        Ok(Self {\n            path,\n            mutations: Mutex::new(()),\n            entries: RwLock::new(entries),\n        })\n    }\n}\n```\n\n- [ ] **Step 3: Convert read methods to internally locked methods**\n\nUse these signatures and preserve existing sort/order behavior:\n\n```rust\npub async fn list(&self) -> Vec<SecretMetadata>;\npub async fn get(&self, name: &str) -> Option<String>;\npub async fn get_entry(&self, name: &str) -> Option<SecretEntry>;\npub async fn file_secrets(&self) -> Vec<(String, String)>;\n```\n\n`get` must return an owned `String`, and `get_entry` must return a cloned `SecretEntry`, because callers no longer hold a read guard over the store internals.\n\n- [ ] **Step 4: Convert mutation methods to internally locked methods**\n\nUse these signatures:\n\n```rust\npub async fn set(\n    &self,\n    name: &str,\n    value: &str,\n    secret_type: SecretType,\n    description: Option<&str>,\n) -> Result<SecretMetadata, Error>;\n\npub async fn remove(&self, name: &str) -> Result<(), Error>;\n```\n\nImplementation order for `set`:\n\n```rust\nSelf::validate_name(name, secret_type)?;\nlet _mutation = self.mutations.lock().await;\nlet mut entries = self.entries.write().await;\nlet now = Utc::now();\nlet (created_at, description) = entries.get(name).map_or_else(\n    || (now, description.map(str::to_string)),\n    |entry| {\n        (\n            entry.created_at,\n            description.map(str::to_string).or_else(|| entry.description.clone()),\n        )\n    },\n);\nlet entry = SecretEntry {\n    value: value.to_string(),\n    secret_type,\n    description: description.clone(),\n    created_at,\n    updated_at: now,\n};\nlet mut next_entries = entries.clone();\nnext_entries.insert(name.to_string(), entry);\nself.write_atomic(&next_entries).await?;\n*entries = next_entries;\nOk(SecretMetadata {\n    name: name.to_string(),\n    secret_type,\n    description,\n    created_at,\n    updated_at: now,\n})\n```\n\nImplementation order for `remove`:\n\n```rust\nlet _mutation = self.mutations.lock().await;\nlet mut entries = self.entries.write().await;\nif !entries.contains_key(name) {\n    return Err(Error::NotFound(name.to_string()));\n}\nlet mut next_entries = entries.clone();\nnext_entries.remove(name);\nself.write_atomic(&next_entries).await?;\n*entries = next_entries;\nOk(())\n```\n\nThis preserves in-memory state when the durable write fails.\n\n- [ ] **Step 5: Convert `write_atomic` to async**\n\nUse `tokio::fs` and `tokio::io::AsyncWriteExt` like `AutomationStore`, and keep private permissions for secret files:\n\n```rust\nasync fn write_atomic(&self, entries: &HashMap<String, SecretEntry>) -> Result<(), Error> {\n    let parent = self\n        .path\n        .parent()\n        .map_or_else(|| PathBuf::from(\".\"), Path::to_path_buf);\n    tokio::fs::create_dir_all(&parent)\n        .await\n        .map_err(|err| io_context(\"create secrets directory\", &parent, &err))?;\n\n    let file_name = self\n        .path\n        .file_name()\n        .and_then(|name| name.to_str())\n        .unwrap_or(\"secrets.json\");\n    let tmp_path = parent.join(format!(\".{file_name}.tmp-{}\", ulid::Ulid::new()));\n    let json = serde_json::to_vec_pretty(entries)?;\n\n    let mut file = tokio::fs::OpenOptions::new()\n        .write(true)\n        .create_new(true)\n        .open(&tmp_path)\n        .await\n        .map_err(|err| io_context(\"create secrets temp file\", &tmp_path, &err))?;\n    file.write_all(&json)\n        .await\n        .map_err(|err| io_context(\"write secrets temp file\", &tmp_path, &err))?;\n    file.sync_all()\n        .await\n        .map_err(|err| io_context(\"sync secrets temp file\", &tmp_path, &err))?;\n    drop(file);\n    set_private_permissions(&tmp_path)?;\n    tokio::fs::rename(&tmp_path, &self.path).await.map_err(|err| {\n        io_context(\n            &format!(\"rename secrets temp file to {}\", self.path.display()),\n            &tmp_path,\n            &err,\n        )\n    })?;\n    Ok(())\n}\n```\n\n- [ ] **Step 6: Run focused secret-store tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\n```\n\nExpected: tests initially fail until test imports and async calls are updated in Task 2.\n\n## Task 2: Update Secret Store Tests\n\n**Files:**\n- Modify: `lib/crates/fabro-vault/src/lib.rs`\n\n- [ ] **Step 1: Convert existing tests to Tokio tests**\n\nUse `#[tokio::test]` for tests that call `SecretStore::load`, `set`, `remove`, `list`, `get`, `get_entry`, or `file_secrets`.\n\nExample conversion:\n\n```rust\n#[tokio::test]\nasync fn set_creates_entry_and_writes_file() {\n    let dir = tempfile::tempdir().unwrap();\n    let path = dir.path().join(\"secrets.json\");\n    let store = SecretStore::load(path.clone()).await.unwrap();\n\n    let meta = store\n        .set(\"OPENAI_API_KEY\", \"secret\", SecretType::Token, None)\n        .await\n        .unwrap();\n\n    assert_eq!(meta.name, \"OPENAI_API_KEY\");\n    assert_eq!(meta.secret_type, SecretType::Token);\n    assert_eq!(store.get(\"OPENAI_API_KEY\").await.as_deref(), Some(\"secret\"));\n    assert!(path.exists());\n}\n```\n\n- [ ] **Step 2: Keep serde compatibility test coverage**\n\nPreserve tests that prove:\n\n```rust\nlet reloaded = SecretStore::load(path).await.unwrap();\nassert_eq!(\n    reloaded.file_secrets().await,\n    vec![(\"/tmp/key.pem\".to_string(), \"pem\".to_string())]\n);\n```\n\n- [ ] **Step 3: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\n```\n\nExpected: PASS.\n\n## Task 3: Convert `VariableStore` to the Same Concrete Store Pattern\n\n**Files:**\n- Modify: `lib/crates/fabro-variable/src/lib.rs`\n- Modify: `lib/crates/fabro-variable/Cargo.toml`\n\n- [ ] **Step 1: Add internal synchronization**\n\nAdd `tokio.workspace = true` to `lib/crates/fabro-variable/Cargo.toml`.\n\nChange the store shape to:\n\n```rust\nuse tokio::sync::{Mutex, RwLock};\n\n#[derive(Debug)]\npub struct VariableStore {\n    path:      PathBuf,\n    mutations: Mutex<()>,\n    entries:   RwLock<HashMap<String, VariableEntry>>,\n}\n```\n\n- [ ] **Step 2: Make load asynchronous**\n\nUse:\n\n```rust\npub async fn load(path: PathBuf) -> Result<Self, Error> {\n    let entries = match tokio::fs::read_to_string(&path).await {\n        Ok(contents) => serde_json::from_str(&contents)?,\n        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),\n        Err(err) => return Err(io_context(\"read variables\", &path, &err).into()),\n    };\n\n    Ok(Self {\n        path,\n        mutations: Mutex::new(()),\n        entries: RwLock::new(entries),\n    })\n}\n```\n\n- [ ] **Step 3: Convert read and mutation methods**\n\nUse these signatures:\n\n```rust\npub async fn set(&self, name: &str, value: &str, description: Option<&str>) -> Result<Variable, Error>;\npub async fn update_existing(&self, name: &str, value: &str, description: Option<&str>) -> Result<Variable, Error>;\npub async fn get(&self, name: &str) -> Option<Variable>;\npub async fn get_value(&self, name: &str) -> Option<String>;\npub async fn list(&self) -> Vec<Variable>;\npub async fn remove(&self, name: &str) -> Result<(), Error>;\n```\n\nUse the same copy-then-write-then-swap mutation pattern from `SecretStore` so failed durable writes do not change memory.\n\n- [ ] **Step 4: Convert variable file writes to async**\n\nReplace synchronous write calls with `tokio::fs` and `tokio::io::AsyncWriteExt`, using the same temp-file and rename pattern as `SecretStore`. The output JSON shape must remain `HashMap<String, VariableEntry>`.\n\n- [ ] **Step 5: Update variable tests**\n\nConvert tests in `lib/crates/fabro-variable/tests/store.rs` to `#[tokio::test]` and add `.await` to store calls.\n\nExample:\n\n```rust\n#[tokio::test]\nasync fn update_existing_requires_existing_variable() {\n    let dir = tempfile::tempdir().unwrap();\n    let store = VariableStore::load(dir.path().join(\"variables.json\")).await.unwrap();\n\n    let err = store\n        .update_existing(\"MISSING\", \"value\", None)\n        .await\n        .unwrap_err();\n\n    assert!(matches!(err, Error::NotFound(name) if name == \"MISSING\"));\n}\n```\n\n- [ ] **Step 6: Run focused variable-store tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-variable\n```\n\nExpected: PASS.\n\n## Task 4: Update Auth Secret Helpers and Credential Source Naming\n\n**Files:**\n- Modify: `lib/crates/fabro-auth/src/lib.rs`\n- Modify: `lib/crates/fabro-auth/src/vault_ext.rs`\n- Modify: `lib/crates/fabro-auth/src/vault_source.rs`\n- Modify: `lib/crates/fabro-auth/src/resolve.rs`\n\n- [ ] **Step 1: Rename public auth helper concepts**\n\nKeep file names for this task if that minimizes churn, but update public symbols:\n\n```rust\npub use secret_ext::{\n    SecretLookupError, secret_get_oauth, secret_get_token, secret_set_oauth, secret_set_token,\n};\npub use secret_source::SecretCredentialSource;\n```\n\nIf files are renamed, update `mod vault_ext;` to `mod secret_ext;` and `mod vault_source;` to `mod secret_source;`.\n\n- [ ] **Step 2: Update helper signatures**\n\nReplace `Vault` references with `SecretStore` and async store calls. Use:\n\n```rust\npub async fn secret_get_token(\n    secrets: &SecretStore,\n    name: &str,\n) -> Result<Option<String>, SecretLookupError>;\n\npub async fn secret_get_oauth(\n    secrets: &SecretStore,\n    name: &str,\n) -> Result<Option<OAuthCredential>, SecretLookupError>;\n\npub async fn secret_set_token(\n    secrets: &SecretStore,\n    name: &str,\n    value: &str,\n) -> Result<SecretMetadata, SecretStoreError>;\n\npub async fn secret_set_oauth(\n    secrets: &SecretStore,\n    name: &str,\n    credential: &OAuthCredential,\n) -> Result<SecretMetadata, SecretStoreError>;\n```\n\n- [ ] **Step 3: Update `CredentialResolver`**\n\nChange:\n\n```rust\nvault: Arc<AsyncRwLock<Vault>>,\n```\n\nto:\n\n```rust\nsecrets: Arc<SecretStore>,\n```\n\nRemove explicit `read().await` / `blocking_write()` usage and call `SecretStore` methods directly. `configured_providers_from_process_env` should accept `Option<&Arc<SecretStore>>`.\n\n- [ ] **Step 4: Update OAuth refresh persistence**\n\nReplace the `spawn_blocking` refresh write with:\n\n```rust\nsecret_set_oauth(&self.secrets, &vault_name_for_store, &refreshed_for_store)\n    .await\n    .map(|_| ())\n    .map_err(|source| ResolveError::RefreshFailed {\n        provider: provider_id.clone(),\n        source: anyhow::Error::from(source),\n    })?;\n```\n\n- [ ] **Step 5: Run auth tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-auth\n```\n\nExpected: PASS.\n\n## Task 5: Update Server State and HTTP Handlers\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/secrets.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/variables.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/runs.rs`\n\n- [ ] **Step 1: Update `AppState` fields**\n\nChange:\n\n```rust\npub(crate) vault: Arc<AsyncRwLock<Vault>>,\npub(crate) variables: Arc<AsyncRwLock<VariableStore>>,\n```\n\nto:\n\n```rust\npub(crate) secrets: Arc<SecretStore>,\npub(crate) variables: Arc<VariableStore>,\n```\n\n- [ ] **Step 2: Update app-state construction**\n\nUse:\n\n```rust\nlet variables = Arc::new(VariableStore::load(variables_path).await.context(\"load variables\")?);\nlet secrets = match preloaded_secrets {\n    Some(secrets) => secrets,\n    None => load_startup_secrets(&vault_path).await?,\n};\nlet daytona_api_key = secrets.get(EnvVars::DAYTONA_API_KEY).await;\nlet secrets = Arc::new(secrets);\nlet llm_source: Arc<dyn CredentialSource> =\n    Arc::new(SecretCredentialSource::secrets_only(Arc::clone(&secrets)));\n```\n\nMake `build_app_state` async if needed, and update callers to `.await`.\n\n- [ ] **Step 3: Rename the secret lookup helper**\n\nReplace `vault_secret` with:\n\n```rust\npub(crate) async fn secret_value(&self, name: &str) -> Option<String> {\n    self.secrets.get(name).await\n}\n```\n\nUpdate call sites to await this method. If a call site is synchronous and cannot be made async without large churn, use `self.secrets.try_get(name)` only if a non-blocking read helper is added to `SecretStore`; otherwise convert the caller to async.\n\n- [ ] **Step 4: Update secrets handler**\n\nRemove handler-level `spawn_blocking` and external lock access. Use:\n\n```rust\nlet data = state.secrets.list().await;\nlet result = state\n    .secrets\n    .set(&name, &value, secret_type, description.as_deref())\n    .await;\nlet result = state.secrets.remove(&name).await;\n```\n\nKeep existing validation for bootstrap secrets, OAuth JSON, and Daytona key checks.\n\n- [ ] **Step 5: Update variables handler**\n\nRemove handler-level `spawn_blocking` and external lock access. Use:\n\n```rust\nlet data = state.variables.list().await;\nlet result = state.variables.set(&name, &value, description.as_deref()).await;\nlet result = state\n    .variables\n    .update_existing(&name, &value, description.as_deref())\n    .await;\nlet result = state.variables.remove(&name).await;\n```\n\nUpdate run variable substitution to call:\n\n```rust\nlet variables = Arc::clone(&state.variables);\nsettings.substitute_variables_async(|name| {\n    let variables = Arc::clone(&variables);\n    async move { variables.get_value(name).await }\n})\n```\n\nIf `substitute_variables_async` does not exist, add a small local snapshot helper:\n\n```rust\nlet variable_values = state.variables.values_map().await;\nsettings.substitute_variables(|name| variable_values.get(name).cloned())\n```\n\nPrefer the snapshot helper because it keeps variable interpolation synchronous after one async read.\n\n- [ ] **Step 6: Run focused server tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server variables secrets\n```\n\nExpected: PASS for matching test filters. If nextest reports no tests for one filter, run the full crate command in Task 8.\n\n## Task 6: Update Startup, Migrations, Install, and CLI Call Sites\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/startup.rs`\n- Modify: `lib/crates/fabro-server/src/migrations.rs`\n- Modify: `lib/crates/fabro-server/migrations/2026052501_optional_server_env_secrets_to_vault.rs`\n- Modify: CLI/server tests and direct secret-store imports found by `rg -n \"Vault|vault\" lib/crates`.\n\n- [ ] **Step 1: Rename startup functions**\n\nUse these names:\n\n```rust\npub async fn load_startup_secrets(vault_path: impl AsRef<Path>) -> anyhow::Result<SecretStore>;\npub async fn prepare_startup_secrets(\n    vault_path: impl AsRef<Path>,\n    server_env_path: impl AsRef<Path>,\n    env_entries: &HashMap<String, String>,\n) -> anyhow::Result<SecretStore>;\n```\n\nKeep the storage path variable name `vault_path` only where it refers to the existing on-disk `vaults/default/secrets.json` path.\n\n- [ ] **Step 2: Update optional env migration**\n\nChange migration input from `&mut Vault` to `&SecretStore`, and call async `set`/`get` methods. Make the migration function async:\n\n```rust\npub(crate) async fn migrate(\n    secrets: &SecretStore,\n    server_env_path: &Path,\n    env_entries: &HashMap<String, String>,\n) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport>\n```\n\n- [ ] **Step 3: Update direct CLI/test imports**\n\nReplace direct imports:\n\n```rust\nuse fabro_vault::{SecretType, Vault};\n```\n\nwith:\n\n```rust\nuse fabro_vault::{SecretStore, SecretType};\n```\n\nReplace `Vault::load(...).unwrap()` with `SecretStore::load(...).await.unwrap()` in async tests. For synchronous tests that only inspect a file after a command, convert the test to `#[tokio::test]` if it is not already async.\n\n- [ ] **Step 4: Update worker runner secret loading**\n\nChange worker storage from `Option<Arc<AsyncRwLock<Vault>>>` to `Option<Arc<SecretStore>>`. Update GitHub credential helpers to accept `Option<&SecretStore>` and call async secret access. If the surrounding function is synchronous, make it async and update its callers.\n\n- [ ] **Step 5: Search until legacy public names are gone**\n\nRun:\n\n```bash\nrg -n \"\\bVault\\b|VaultCredentialSource|vault_get_|vault_set_|state\\.vault|vault_secret\" lib/crates\n```\n\nExpected: no matches outside migration names, comments that explicitly describe historical vault files, or file paths containing `vaults/default/secrets.json`.\n\n## Task 7: Preserve Compatibility and Naming Boundaries\n\n**Files:**\n- Modify: docs or comments only where old public names appear in changed code.\n\n- [ ] **Step 1: Keep file paths and wire names stable**\n\nDo not rename:\n\n```rust\nStorage::secrets_path()\n```\n\nDo not change the path:\n\n```text\nvaults/default/secrets.json\n```\n\nDo not change JSON field names in `SecretEntry`:\n\n```rust\n#[serde(rename = \"type\", default)]\npub secret_type: SecretType,\n```\n\n- [ ] **Step 2: Keep existing API response shapes stable**\n\nSecrets list response remains:\n\n```json\n{ \"data\": [ { \"name\": \"...\", \"type\": \"token\", \"created_at\": \"...\", \"updated_at\": \"...\" } ] }\n```\n\nVariables list response remains:\n\n```json\n{ \"data\": [ { \"name\": \"...\", \"value\": \"...\", \"created_at\": \"...\", \"updated_at\": \"...\" } ] }\n```\n\n- [ ] **Step 3: Avoid introducing future abstractions**\n\nDo not add:\n\n```rust\ntrait SecretStore\ntrait VariableStore\nenum SecretStoreBackend\nenum VariableStoreBackend\nSqlSecretStore\nSqlVariableStore\n```\n\nThis plan is only for concrete local stores.\n\n## Task 8: Full Verification\n\n**Files:**\n- No source edits in this task.\n\n- [ ] **Step 1: Run focused crates**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\ncargo nextest run -p fabro-variable\ncargo nextest run -p fabro-auth\ncargo nextest run -p fabro-server\n```\n\nExpected: PASS.\n\n- [ ] **Step 2: Run formatting check**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\nExpected: PASS.\n\n- [ ] **Step 3: Run workspace clippy**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nExpected: PASS.\n\n- [ ] **Step 4: Run name-boundary search**\n\nRun:\n\n```bash\nrg -n \"\\bVault\\b|VaultCredentialSource|vault_get_|vault_set_|state\\.vault|vault_secret\" lib/crates\n```\n\nExpected: only intentional historical references remain, such as migration comments or on-disk path references. Any active Rust type/function references should be renamed before completion.\n\n## Self-Review Checklist\n\n- [ ] No storage trait, backend enum, SQL type, or feature flag was added.\n- [ ] `AutomationStore` behavior and file layout were not changed.\n- [ ] Secrets and variables keep their current JSON file formats.\n- [ ] Server handlers no longer take external write locks around secret/variable stores.\n- [ ] Public code uses `SecretStore` terminology instead of `Vault`.\n- [ ] Tests cover local file compatibility for both stores.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Start"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "reasoning_effort": {
+              "String": "xhigh"
+            },
+            "provider": {
+              "String": "openai"
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "label": {
+              "String": "Exit"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "max_visits": {
+              "Integer": 3
+            },
+            "label": {
+              "String": "Fixup"
+            },
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "label": {
+              "String": "Fix Lints"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "label": {
+              "String": "Preflight Lint"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            },
+            "provider": {
+              "String": "openai"
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "script": {
+              "String": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "retry_target": {
+              "String": "fixup"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Verify"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Simplify (Opus)"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "goal": {
+          "String": "# Align Concrete Stores Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Align automation, secret, and variable storage around concrete product-facing store types that own their own synchronization and persistence.\n\n**Architecture:** `AutomationStore` is already the desired shape and remains the reference. Collapse the public `Vault` type into `SecretStore`, convert `VariableStore` to the same internally synchronized concrete-store pattern, and update server/auth/CLI call sites to depend on those concrete stores directly. Do not introduce storage traits, SQL dispatch, backend enums, or file-format migrations in this pass.\n\n**Tech Stack:** Rust, Tokio `Mutex`/`RwLock`, JSON file persistence for secrets and variables, existing automation TOML storage, cargo-nextest.\n\n---\n\n## File Structure\n\n- `lib/crates/fabro-vault/src/lib.rs`: rename `Vault` to `SecretStore`, add internal synchronization, keep `SecretEntry`, `SecretType`, validation, and JSON file format compatible.\n- `lib/crates/fabro-variable/src/lib.rs`: make `VariableStore` internally synchronized and keep its existing JSON file format compatible.\n- `lib/crates/fabro-auth/src/vault_source.rs`, `lib/crates/fabro-auth/src/vault_ext.rs`, `lib/crates/fabro-auth/src/resolve.rs`: update secret-store naming and remove external `AsyncRwLock<Vault>` assumptions from auth resolution.\n- `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/startup.rs`, `lib/crates/fabro-server/src/migrations.rs`, and server handlers: update state wiring and call sites from externally locked `Vault`/`VariableStore` to direct `Arc<SecretStore>`/`Arc<VariableStore>`.\n- CLI and tests that load local secrets directly: update imports and names from `Vault` to `SecretStore`.\n\n## Task 1: Convert `Vault` Into Concrete `SecretStore`\n\n**Files:**\n- Modify: `lib/crates/fabro-vault/src/lib.rs`\n\n- [ ] **Step 1: Update the store shape**\n\nChange the public store struct from `Vault` to `SecretStore`, and give it the same synchronization shape as `AutomationStore`:\n\n```rust\nuse tokio::sync::{Mutex, RwLock};\n\n#[derive(Debug)]\npub struct SecretStore {\n    path:      PathBuf,\n    mutations: Mutex<()>,\n    entries:   RwLock<HashMap<String, SecretEntry>>,\n}\n```\n\nAdd `tokio.workspace = true` to `lib/crates/fabro-vault/Cargo.toml`.\n\n- [ ] **Step 2: Make load asynchronous**\n\nReplace `Vault::load` with:\n\n```rust\nimpl SecretStore {\n    pub async fn load(path: PathBuf) -> Result<Self, Error> {\n        let entries = match tokio::fs::read_to_string(&path).await {\n            Ok(contents) => serde_json::from_str(&contents)?,\n            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),\n            Err(err) => return Err(io_context(\"read secrets\", &path, &err).into()),\n        };\n\n        Ok(Self {\n            path,\n            mutations: Mutex::new(()),\n            entries: RwLock::new(entries),\n        })\n    }\n}\n```\n\n- [ ] **Step 3: Convert read methods to internally locked methods**\n\nUse these signatures and preserve existing sort/order behavior:\n\n```rust\npub async fn list(&self) -> Vec<SecretMetadata>;\npub async fn get(&self, name: &str) -> Option<String>;\npub async fn get_entry(&self, name: &str) -> Option<SecretEntry>;\npub async fn file_secrets(&self) -> Vec<(String, String)>;\n```\n\n`get` must return an owned `String`, and `get_entry` must return a cloned `SecretEntry`, because callers no longer hold a read guard over the store internals.\n\n- [ ] **Step 4: Convert mutation methods to internally locked methods**\n\nUse these signatures:\n\n```rust\npub async fn set(\n    &self,\n    name: &str,\n    value: &str,\n    secret_type: SecretType,\n    description: Option<&str>,\n) -> Result<SecretMetadata, Error>;\n\npub async fn remove(&self, name: &str) -> Result<(), Error>;\n```\n\nImplementation order for `set`:\n\n```rust\nSelf::validate_name(name, secret_type)?;\nlet _mutation = self.mutations.lock().await;\nlet mut entries = self.entries.write().await;\nlet now = Utc::now();\nlet (created_at, description) = entries.get(name).map_or_else(\n    || (now, description.map(str::to_string)),\n    |entry| {\n        (\n            entry.created_at,\n            description.map(str::to_string).or_else(|| entry.description.clone()),\n        )\n    },\n);\nlet entry = SecretEntry {\n    value: value.to_string(),\n    secret_type,\n    description: description.clone(),\n    created_at,\n    updated_at: now,\n};\nlet mut next_entries = entries.clone();\nnext_entries.insert(name.to_string(), entry);\nself.write_atomic(&next_entries).await?;\n*entries = next_entries;\nOk(SecretMetadata {\n    name: name.to_string(),\n    secret_type,\n    description,\n    created_at,\n    updated_at: now,\n})\n```\n\nImplementation order for `remove`:\n\n```rust\nlet _mutation = self.mutations.lock().await;\nlet mut entries = self.entries.write().await;\nif !entries.contains_key(name) {\n    return Err(Error::NotFound(name.to_string()));\n}\nlet mut next_entries = entries.clone();\nnext_entries.remove(name);\nself.write_atomic(&next_entries).await?;\n*entries = next_entries;\nOk(())\n```\n\nThis preserves in-memory state when the durable write fails.\n\n- [ ] **Step 5: Convert `write_atomic` to async**\n\nUse `tokio::fs` and `tokio::io::AsyncWriteExt` like `AutomationStore`, and keep private permissions for secret files:\n\n```rust\nasync fn write_atomic(&self, entries: &HashMap<String, SecretEntry>) -> Result<(), Error> {\n    let parent = self\n        .path\n        .parent()\n        .map_or_else(|| PathBuf::from(\".\"), Path::to_path_buf);\n    tokio::fs::create_dir_all(&parent)\n        .await\n        .map_err(|err| io_context(\"create secrets directory\", &parent, &err))?;\n\n    let file_name = self\n        .path\n        .file_name()\n        .and_then(|name| name.to_str())\n        .unwrap_or(\"secrets.json\");\n    let tmp_path = parent.join(format!(\".{file_name}.tmp-{}\", ulid::Ulid::new()));\n    let json = serde_json::to_vec_pretty(entries)?;\n\n    let mut file = tokio::fs::OpenOptions::new()\n        .write(true)\n        .create_new(true)\n        .open(&tmp_path)\n        .await\n        .map_err(|err| io_context(\"create secrets temp file\", &tmp_path, &err))?;\n    file.write_all(&json)\n        .await\n        .map_err(|err| io_context(\"write secrets temp file\", &tmp_path, &err))?;\n    file.sync_all()\n        .await\n        .map_err(|err| io_context(\"sync secrets temp file\", &tmp_path, &err))?;\n    drop(file);\n    set_private_permissions(&tmp_path)?;\n    tokio::fs::rename(&tmp_path, &self.path).await.map_err(|err| {\n        io_context(\n            &format!(\"rename secrets temp file to {}\", self.path.display()),\n            &tmp_path,\n            &err,\n        )\n    })?;\n    Ok(())\n}\n```\n\n- [ ] **Step 6: Run focused secret-store tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\n```\n\nExpected: tests initially fail until test imports and async calls are updated in Task 2.\n\n## Task 2: Update Secret Store Tests\n\n**Files:**\n- Modify: `lib/crates/fabro-vault/src/lib.rs`\n\n- [ ] **Step 1: Convert existing tests to Tokio tests**\n\nUse `#[tokio::test]` for tests that call `SecretStore::load`, `set`, `remove`, `list`, `get`, `get_entry`, or `file_secrets`.\n\nExample conversion:\n\n```rust\n#[tokio::test]\nasync fn set_creates_entry_and_writes_file() {\n    let dir = tempfile::tempdir().unwrap();\n    let path = dir.path().join(\"secrets.json\");\n    let store = SecretStore::load(path.clone()).await.unwrap();\n\n    let meta = store\n        .set(\"OPENAI_API_KEY\", \"secret\", SecretType::Token, None)\n        .await\n        .unwrap();\n\n    assert_eq!(meta.name, \"OPENAI_API_KEY\");\n    assert_eq!(meta.secret_type, SecretType::Token);\n    assert_eq!(store.get(\"OPENAI_API_KEY\").await.as_deref(), Some(\"secret\"));\n    assert!(path.exists());\n}\n```\n\n- [ ] **Step 2: Keep serde compatibility test coverage**\n\nPreserve tests that prove:\n\n```rust\nlet reloaded = SecretStore::load(path).await.unwrap();\nassert_eq!(\n    reloaded.file_secrets().await,\n    vec![(\"/tmp/key.pem\".to_string(), \"pem\".to_string())]\n);\n```\n\n- [ ] **Step 3: Run focused tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\n```\n\nExpected: PASS.\n\n## Task 3: Convert `VariableStore` to the Same Concrete Store Pattern\n\n**Files:**\n- Modify: `lib/crates/fabro-variable/src/lib.rs`\n- Modify: `lib/crates/fabro-variable/Cargo.toml`\n\n- [ ] **Step 1: Add internal synchronization**\n\nAdd `tokio.workspace = true` to `lib/crates/fabro-variable/Cargo.toml`.\n\nChange the store shape to:\n\n```rust\nuse tokio::sync::{Mutex, RwLock};\n\n#[derive(Debug)]\npub struct VariableStore {\n    path:      PathBuf,\n    mutations: Mutex<()>,\n    entries:   RwLock<HashMap<String, VariableEntry>>,\n}\n```\n\n- [ ] **Step 2: Make load asynchronous**\n\nUse:\n\n```rust\npub async fn load(path: PathBuf) -> Result<Self, Error> {\n    let entries = match tokio::fs::read_to_string(&path).await {\n        Ok(contents) => serde_json::from_str(&contents)?,\n        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),\n        Err(err) => return Err(io_context(\"read variables\", &path, &err).into()),\n    };\n\n    Ok(Self {\n        path,\n        mutations: Mutex::new(()),\n        entries: RwLock::new(entries),\n    })\n}\n```\n\n- [ ] **Step 3: Convert read and mutation methods**\n\nUse these signatures:\n\n```rust\npub async fn set(&self, name: &str, value: &str, description: Option<&str>) -> Result<Variable, Error>;\npub async fn update_existing(&self, name: &str, value: &str, description: Option<&str>) -> Result<Variable, Error>;\npub async fn get(&self, name: &str) -> Option<Variable>;\npub async fn get_value(&self, name: &str) -> Option<String>;\npub async fn list(&self) -> Vec<Variable>;\npub async fn remove(&self, name: &str) -> Result<(), Error>;\n```\n\nUse the same copy-then-write-then-swap mutation pattern from `SecretStore` so failed durable writes do not change memory.\n\n- [ ] **Step 4: Convert variable file writes to async**\n\nReplace synchronous write calls with `tokio::fs` and `tokio::io::AsyncWriteExt`, using the same temp-file and rename pattern as `SecretStore`. The output JSON shape must remain `HashMap<String, VariableEntry>`.\n\n- [ ] **Step 5: Update variable tests**\n\nConvert tests in `lib/crates/fabro-variable/tests/store.rs` to `#[tokio::test]` and add `.await` to store calls.\n\nExample:\n\n```rust\n#[tokio::test]\nasync fn update_existing_requires_existing_variable() {\n    let dir = tempfile::tempdir().unwrap();\n    let store = VariableStore::load(dir.path().join(\"variables.json\")).await.unwrap();\n\n    let err = store\n        .update_existing(\"MISSING\", \"value\", None)\n        .await\n        .unwrap_err();\n\n    assert!(matches!(err, Error::NotFound(name) if name == \"MISSING\"));\n}\n```\n\n- [ ] **Step 6: Run focused variable-store tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-variable\n```\n\nExpected: PASS.\n\n## Task 4: Update Auth Secret Helpers and Credential Source Naming\n\n**Files:**\n- Modify: `lib/crates/fabro-auth/src/lib.rs`\n- Modify: `lib/crates/fabro-auth/src/vault_ext.rs`\n- Modify: `lib/crates/fabro-auth/src/vault_source.rs`\n- Modify: `lib/crates/fabro-auth/src/resolve.rs`\n\n- [ ] **Step 1: Rename public auth helper concepts**\n\nKeep file names for this task if that minimizes churn, but update public symbols:\n\n```rust\npub use secret_ext::{\n    SecretLookupError, secret_get_oauth, secret_get_token, secret_set_oauth, secret_set_token,\n};\npub use secret_source::SecretCredentialSource;\n```\n\nIf files are renamed, update `mod vault_ext;` to `mod secret_ext;` and `mod vault_source;` to `mod secret_source;`.\n\n- [ ] **Step 2: Update helper signatures**\n\nReplace `Vault` references with `SecretStore` and async store calls. Use:\n\n```rust\npub async fn secret_get_token(\n    secrets: &SecretStore,\n    name: &str,\n) -> Result<Option<String>, SecretLookupError>;\n\npub async fn secret_get_oauth(\n    secrets: &SecretStore,\n    name: &str,\n) -> Result<Option<OAuthCredential>, SecretLookupError>;\n\npub async fn secret_set_token(\n    secrets: &SecretStore,\n    name: &str,\n    value: &str,\n) -> Result<SecretMetadata, SecretStoreError>;\n\npub async fn secret_set_oauth(\n    secrets: &SecretStore,\n    name: &str,\n    credential: &OAuthCredential,\n) -> Result<SecretMetadata, SecretStoreError>;\n```\n\n- [ ] **Step 3: Update `CredentialResolver`**\n\nChange:\n\n```rust\nvault: Arc<AsyncRwLock<Vault>>,\n```\n\nto:\n\n```rust\nsecrets: Arc<SecretStore>,\n```\n\nRemove explicit `read().await` / `blocking_write()` usage and call `SecretStore` methods directly. `configured_providers_from_process_env` should accept `Option<&Arc<SecretStore>>`.\n\n- [ ] **Step 4: Update OAuth refresh persistence**\n\nReplace the `spawn_blocking` refresh write with:\n\n```rust\nsecret_set_oauth(&self.secrets, &vault_name_for_store, &refreshed_for_store)\n    .await\n    .map(|_| ())\n    .map_err(|source| ResolveError::RefreshFailed {\n        provider: provider_id.clone(),\n        source: anyhow::Error::from(source),\n    })?;\n```\n\n- [ ] **Step 5: Run auth tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-auth\n```\n\nExpected: PASS.\n\n## Task 5: Update Server State and HTTP Handlers\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/secrets.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/variables.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/runs.rs`\n\n- [ ] **Step 1: Update `AppState` fields**\n\nChange:\n\n```rust\npub(crate) vault: Arc<AsyncRwLock<Vault>>,\npub(crate) variables: Arc<AsyncRwLock<VariableStore>>,\n```\n\nto:\n\n```rust\npub(crate) secrets: Arc<SecretStore>,\npub(crate) variables: Arc<VariableStore>,\n```\n\n- [ ] **Step 2: Update app-state construction**\n\nUse:\n\n```rust\nlet variables = Arc::new(VariableStore::load(variables_path).await.context(\"load variables\")?);\nlet secrets = match preloaded_secrets {\n    Some(secrets) => secrets,\n    None => load_startup_secrets(&vault_path).await?,\n};\nlet daytona_api_key = secrets.get(EnvVars::DAYTONA_API_KEY).await;\nlet secrets = Arc::new(secrets);\nlet llm_source: Arc<dyn CredentialSource> =\n    Arc::new(SecretCredentialSource::secrets_only(Arc::clone(&secrets)));\n```\n\nMake `build_app_state` async if needed, and update callers to `.await`.\n\n- [ ] **Step 3: Rename the secret lookup helper**\n\nReplace `vault_secret` with:\n\n```rust\npub(crate) async fn secret_value(&self, name: &str) -> Option<String> {\n    self.secrets.get(name).await\n}\n```\n\nUpdate call sites to await this method. If a call site is synchronous and cannot be made async without large churn, use `self.secrets.try_get(name)` only if a non-blocking read helper is added to `SecretStore`; otherwise convert the caller to async.\n\n- [ ] **Step 4: Update secrets handler**\n\nRemove handler-level `spawn_blocking` and external lock access. Use:\n\n```rust\nlet data = state.secrets.list().await;\nlet result = state\n    .secrets\n    .set(&name, &value, secret_type, description.as_deref())\n    .await;\nlet result = state.secrets.remove(&name).await;\n```\n\nKeep existing validation for bootstrap secrets, OAuth JSON, and Daytona key checks.\n\n- [ ] **Step 5: Update variables handler**\n\nRemove handler-level `spawn_blocking` and external lock access. Use:\n\n```rust\nlet data = state.variables.list().await;\nlet result = state.variables.set(&name, &value, description.as_deref()).await;\nlet result = state\n    .variables\n    .update_existing(&name, &value, description.as_deref())\n    .await;\nlet result = state.variables.remove(&name).await;\n```\n\nUpdate run variable substitution to call:\n\n```rust\nlet variables = Arc::clone(&state.variables);\nsettings.substitute_variables_async(|name| {\n    let variables = Arc::clone(&variables);\n    async move { variables.get_value(name).await }\n})\n```\n\nIf `substitute_variables_async` does not exist, add a small local snapshot helper:\n\n```rust\nlet variable_values = state.variables.values_map().await;\nsettings.substitute_variables(|name| variable_values.get(name).cloned())\n```\n\nPrefer the snapshot helper because it keeps variable interpolation synchronous after one async read.\n\n- [ ] **Step 6: Run focused server tests**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server variables secrets\n```\n\nExpected: PASS for matching test filters. If nextest reports no tests for one filter, run the full crate command in Task 8.\n\n## Task 6: Update Startup, Migrations, Install, and CLI Call Sites\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/startup.rs`\n- Modify: `lib/crates/fabro-server/src/migrations.rs`\n- Modify: `lib/crates/fabro-server/migrations/2026052501_optional_server_env_secrets_to_vault.rs`\n- Modify: CLI/server tests and direct secret-store imports found by `rg -n \"Vault|vault\" lib/crates`.\n\n- [ ] **Step 1: Rename startup functions**\n\nUse these names:\n\n```rust\npub async fn load_startup_secrets(vault_path: impl AsRef<Path>) -> anyhow::Result<SecretStore>;\npub async fn prepare_startup_secrets(\n    vault_path: impl AsRef<Path>,\n    server_env_path: impl AsRef<Path>,\n    env_entries: &HashMap<String, String>,\n) -> anyhow::Result<SecretStore>;\n```\n\nKeep the storage path variable name `vault_path` only where it refers to the existing on-disk `vaults/default/secrets.json` path.\n\n- [ ] **Step 2: Update optional env migration**\n\nChange migration input from `&mut Vault` to `&SecretStore`, and call async `set`/`get` methods. Make the migration function async:\n\n```rust\npub(crate) async fn migrate(\n    secrets: &SecretStore,\n    server_env_path: &Path,\n    env_entries: &HashMap<String, String>,\n) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport>\n```\n\n- [ ] **Step 3: Update direct CLI/test imports**\n\nReplace direct imports:\n\n```rust\nuse fabro_vault::{SecretType, Vault};\n```\n\nwith:\n\n```rust\nuse fabro_vault::{SecretStore, SecretType};\n```\n\nReplace `Vault::load(...).unwrap()` with `SecretStore::load(...).await.unwrap()` in async tests. For synchronous tests that only inspect a file after a command, convert the test to `#[tokio::test]` if it is not already async.\n\n- [ ] **Step 4: Update worker runner secret loading**\n\nChange worker storage from `Option<Arc<AsyncRwLock<Vault>>>` to `Option<Arc<SecretStore>>`. Update GitHub credential helpers to accept `Option<&SecretStore>` and call async secret access. If the surrounding function is synchronous, make it async and update its callers.\n\n- [ ] **Step 5: Search until legacy public names are gone**\n\nRun:\n\n```bash\nrg -n \"\\bVault\\b|VaultCredentialSource|vault_get_|vault_set_|state\\.vault|vault_secret\" lib/crates\n```\n\nExpected: no matches outside migration names, comments that explicitly describe historical vault files, or file paths containing `vaults/default/secrets.json`.\n\n## Task 7: Preserve Compatibility and Naming Boundaries\n\n**Files:**\n- Modify: docs or comments only where old public names appear in changed code.\n\n- [ ] **Step 1: Keep file paths and wire names stable**\n\nDo not rename:\n\n```rust\nStorage::secrets_path()\n```\n\nDo not change the path:\n\n```text\nvaults/default/secrets.json\n```\n\nDo not change JSON field names in `SecretEntry`:\n\n```rust\n#[serde(rename = \"type\", default)]\npub secret_type: SecretType,\n```\n\n- [ ] **Step 2: Keep existing API response shapes stable**\n\nSecrets list response remains:\n\n```json\n{ \"data\": [ { \"name\": \"...\", \"type\": \"token\", \"created_at\": \"...\", \"updated_at\": \"...\" } ] }\n```\n\nVariables list response remains:\n\n```json\n{ \"data\": [ { \"name\": \"...\", \"value\": \"...\", \"created_at\": \"...\", \"updated_at\": \"...\" } ] }\n```\n\n- [ ] **Step 3: Avoid introducing future abstractions**\n\nDo not add:\n\n```rust\ntrait SecretStore\ntrait VariableStore\nenum SecretStoreBackend\nenum VariableStoreBackend\nSqlSecretStore\nSqlVariableStore\n```\n\nThis plan is only for concrete local stores.\n\n## Task 8: Full Verification\n\n**Files:**\n- No source edits in this task.\n\n- [ ] **Step 1: Run focused crates**\n\nRun:\n\n```bash\ncargo nextest run -p fabro-vault\ncargo nextest run -p fabro-variable\ncargo nextest run -p fabro-auth\ncargo nextest run -p fabro-server\n```\n\nExpected: PASS.\n\n- [ ] **Step 2: Run formatting check**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\nExpected: PASS.\n\n- [ ] **Step 3: Run workspace clippy**\n\nRun:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\nExpected: PASS.\n\n- [ ] **Step 4: Run name-boundary search**\n\nRun:\n\n```bash\nrg -n \"\\bVault\\b|VaultCredentialSource|vault_get_|vault_set_|state\\.vault|vault_secret\" lib/crates\n```\n\nExpected: only intentional historical references remain, such as migration comments or on-disk path references. Any active Rust type/function references should be renamed before completion.\n\n## Self-Review Checklist\n\n- [ ] No storage trait, backend enum, SQL type, or feature flag was added.\n- [ ] `AutomationStore` behavior and file layout were not changed.\n- [ ] Secrets and variables keep their current JSON file formats.\n- [ ] Server handlers no longer take external write locks around secret/variable stores.\n- [ ] Public code uses `SecretStore` terminology instead of `Vault`.\n- [ ] Tests cover local file compatibility for both stores.\n"
+        },
+        "rankdir": {
+          "String": "LR"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\", model=\"gpt-55\", reasoning_effort=\"xhigh\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\\\"disabled\\\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures.\", max_visits=3]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> exit  [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.246.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.246.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.246.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "22e697cf90dae53cf2b9a946fa6dfc52564fb17fc585ac681caade2ca5439abb",
+    "definition_blob": "303626c83b308220ef99468ae5d93ca4e254084c746b7c13fb24072fe5b0bfb2",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "8df6fff94718bbbf2054006d9d14f99048f45d11",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KSN65019DJTRSDSV6VQZ6ZR0",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-27T17:01:40.830883Z",
+  "last_event_at": "2026-05-27T17:01:54.664365Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "provider": "daytona",
+    "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+    "runtime": {
+      "id": "fabro-01KSN65019DJTRSDSV6VQZ6ZR0",
+      "working_directory": "/home/daytona/workspace/fabro",
+      "repo_cloned": true,
+      "clone_origin_url": "https://github.com/fabro-sh/fabro",
+      "clone_branch": "main",
+      "workspace_root": "/home/daytona/workspace",
+      "repos_root": "/home/daytona/repos",
+      "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+      "primary_repo_link": "/home/daytona/workspace/fabro"
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
