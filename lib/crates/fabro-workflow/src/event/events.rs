@@ -39,8 +39,7 @@ pub enum Event {
         workflow_slug:    Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         db_prefix:        Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provenance:       Option<RunProvenance>,
+        provenance:       RunProvenance,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest_blob:    Option<RunBlobId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -4,6 +4,7 @@ import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter, Route, Routes } from "react-router";
 
 import { ToastProvider } from "../components/toast";
+import { testPrincipal } from "../lib/test-principal";
 
 let currentFilesPayload: any = null;
 let currentCommitsPayload: any = null;
@@ -50,7 +51,7 @@ mock.module("../lib/queries", () => ({
       workflow:         { slug: "default", name: "Default", graph_name: null, node_count: 0, edge_count: 0 },
       automation:       null,
       repository:       { name: "fabro", origin_url: null, provider: "unknown" },
-      created_by:       null,
+      created_by:       testPrincipal(),
       origin:           { kind: "api" },
       labels:           {},
       lifecycle:        {

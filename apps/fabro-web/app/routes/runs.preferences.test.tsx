@@ -4,6 +4,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import type { PaginatedRunList, Run } from "@qltysh/fabro-api-client";
 
 import { ToastProvider } from "../components/toast";
+import { testPrincipal } from "../lib/test-principal";
 import { setupReactTestEnv } from "../lib/test-utils";
 
 class MemoryStorage {
@@ -34,7 +35,7 @@ function run(id: string, repo = "qlty/fabro", workflow = "release"): Run {
     workflow:         { slug: workflow, name: workflow, graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: repo, origin_url: null, provider: "github" },
-    created_by:       null,
+    created_by:       testPrincipal(),
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -178,6 +178,7 @@ import {
 } from "./run-detail/lifecycle-toasts";
 
 const { default: RunDetail } = await import("./run-detail");
+const { testPrincipal } = await import("../lib/test-principal");
 mock.restore();
 type LifecycleToastState = import("./run-detail/lifecycle-toasts").LifecycleToastState;
 type RunDetailActionResult = import("./run-detail/lifecycle-toasts").RunDetailActionResult;
@@ -209,7 +210,7 @@ function makeRunSummary(
     workflow:         { slug: "default", name: "Default", graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "fabro", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       testPrincipal(),
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -9,7 +9,7 @@ pub(crate) use auth_harness::{
 pub(crate) use auth_tokens::{TEST_SESSION_SECRET, issue_test_github_jwt, issue_test_worker_jwt};
 use fabro_store::EventEnvelope;
 use fabro_test::{EnvVars, TestContext, preserve_coverage_env};
-use fabro_types::{Graph, RunId, RunSpec, WorkflowSettings};
+use fabro_types::{Graph, RunId, RunSpec, WorkflowSettings, test_support};
 
 pub(crate) fn run_output_filters(context: &TestContext) -> Vec<(String, String)> {
     let mut filters = context.filters();
@@ -48,7 +48,7 @@ pub(crate) fn run_projection_json(run_id: &str, status: &serde_json::Value) -> s
         workflow_slug: Some("remote-workflow".to_string()),
         source_directory: Some("/srv/repo".to_string()),
         labels: std::collections::HashMap::default(),
-        provenance: None,
+        provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         definition_blob: None,
         git: None,

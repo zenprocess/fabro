@@ -692,7 +692,7 @@ mod tests {
 
     use fabro_graphviz::graph::{AttrValue, Edge};
     use fabro_store::{Database, StageId};
-    use fabro_types::fixtures;
+    use fabro_types::{fixtures, test_support};
     use object_store::memory::InMemory;
 
     use super::*;
@@ -727,7 +727,7 @@ mod tests {
                 source_directory: None,
                 workflow_slug:    None,
                 db_prefix:        None,
-                provenance:       None,
+                provenance:       test_support::test_run_provenance(),
                 manifest_blob:    None,
                 git:              None,
                 fork_source_ref:  None,

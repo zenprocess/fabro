@@ -174,7 +174,13 @@ async fn initialized(
         source_directory: Some(sandbox.working_directory().to_string()),
         workflow_slug:    run_options.workflow_slug.clone(),
         db_prefix:        None,
-        provenance:       None,
+        provenance:       fabro_types::RunProvenance {
+            server:  None,
+            client:  None,
+            subject: fabro_types::Principal::System {
+                system_kind: fabro_types::SystemActorKind::Engine,
+            },
+        },
         manifest_blob:    None,
         git:              run_options.pre_run_git.clone(),
         fork_source_ref:  run_options.fork_source_ref.clone(),

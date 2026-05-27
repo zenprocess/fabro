@@ -283,7 +283,7 @@ mod tests {
 
     use fabro_graphviz::graph::Graph;
     use fabro_store::{Database, RunProjectionReducer};
-    use fabro_types::{StageId, WorkflowSettings, fixtures};
+    use fabro_types::{StageId, WorkflowSettings, fixtures, test_support};
     use object_store::memory::InMemory;
 
     use super::*;
@@ -381,7 +381,7 @@ mod tests {
             source_directory: Some("/client/source".to_string()),
             workflow_slug:    Some("fork-source".to_string()),
             db_prefix:        None,
-            provenance:       None,
+            provenance:       test_support::test_run_provenance(),
             manifest_blob:    None,
             git:              Some(fabro_types::GitContext {
                 origin_url:   "https://github.com/example/repo.git".to_string(),

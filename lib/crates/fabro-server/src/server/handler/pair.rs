@@ -850,7 +850,7 @@ mod tests {
     use fabro_types::run_event::AgentMessageProps;
     use fabro_types::{
         BilledTokenCounts, EventEnvelope, Graph, PairMessageId, RunEvent, StageId,
-        WorkflowSettings, fixtures,
+        WorkflowSettings, fixtures, test_support,
     };
     use fabro_workflow::event as workflow_event;
     use tower::ServiceExt;
@@ -1023,7 +1023,7 @@ mod tests {
             source_directory: None,
             workflow_slug: None,
             db_prefix: None,
-            provenance: None,
+            provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
             fork_source_ref: None,

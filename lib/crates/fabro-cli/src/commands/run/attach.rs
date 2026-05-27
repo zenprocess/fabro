@@ -822,6 +822,7 @@ mod tests {
     )]
 
     use fabro_interview::{Answer, AnswerValue};
+    use fabro_types::test_support;
     use fabro_util::terminal::Styles;
     use httpmock::MockServer;
 
@@ -840,7 +841,7 @@ mod tests {
             workflow_slug: None,
             source_directory: None,
             labels: std::collections::HashMap::default(),
-            provenance: None,
+            provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
             git: None,

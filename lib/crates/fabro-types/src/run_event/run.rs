@@ -28,8 +28,7 @@ pub struct RunCreatedProps {
     pub workflow_slug:    Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_prefix:        Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provenance:       Option<RunProvenance>,
+    pub provenance:       RunProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_blob:    Option<RunBlobId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

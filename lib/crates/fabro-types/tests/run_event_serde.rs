@@ -8,6 +8,16 @@ use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
 use fabro_types::{EventBody, TurnId, WorkflowSettings, fixtures};
 
+fn test_run_provenance() -> fabro_types::RunProvenance {
+    fabro_types::RunProvenance {
+        server:  None,
+        client:  None,
+        subject: fabro_types::Principal::System {
+            system_kind: fabro_types::SystemActorKind::Engine,
+        },
+    }
+}
+
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
     settings.run.goal = Some(RunGoal::Inline(InterpString::parse("Ship {{ env.TASK }}")));
@@ -27,7 +37,7 @@ fn run_created_props_round_trip_templated_settings() {
         source_directory: Some("/Users/client/project".to_string()),
         workflow_slug:    Some("demo".to_string()),
         db_prefix:        Some("run_".to_string()),
-        provenance:       None,
+        provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
             origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
@@ -89,7 +99,7 @@ fn run_created_props_omits_web_url_when_absent() {
         source_directory: None,
         workflow_slug:    None,
         db_prefix:        None,
-        provenance:       None,
+        provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              None,
         fork_source_ref:  None,
@@ -120,17 +130,17 @@ fn run_created_props_omits_web_url_when_absent() {
 }
 
 #[test]
-fn run_created_props_defaults_retried_from_for_legacy_events() {
+fn run_created_props_defaults_retried_from_when_absent() {
     let json = serde_json::json!({
         "title": null,
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
         "labels": {},
-        "run_dir": "/tmp/run"
+        "run_dir": "/tmp/run",
+        "provenance": test_run_provenance()
     });
 
-    let props: RunCreatedProps =
-        serde_json::from_value(json).expect("legacy props should deserialize");
+    let props: RunCreatedProps = serde_json::from_value(json).expect("props should deserialize");
     assert_eq!(props.retried_from, None);
 }
 

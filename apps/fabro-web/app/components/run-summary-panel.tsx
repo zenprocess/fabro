@@ -92,7 +92,7 @@ export function RunSummaryPanelView({
   artifactsCount,
   artifactsLoading,
 }: RunSummaryPanelViewProps) {
-  const created = run?.created_by ? principalDisplay(run.created_by) : null;
+  const created = run ? principalDisplay(run.created_by) : null;
   const diff = run?.diff ?? null;
   const cost = formatUsdMicros(run?.billing?.total_usd_micros);
 
