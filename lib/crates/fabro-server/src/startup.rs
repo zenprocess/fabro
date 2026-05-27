@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use fabro_static::EnvVars;
 use fabro_types::settings::ServerNamespace;
-use fabro_vault::Vault;
+use fabro_vault::SecretStore;
 use tracing::warn;
 
 use crate::jwt_auth::{AuthMode, resolve_auth_mode_with_lookup, validate_auth_configuration};
@@ -15,18 +15,18 @@ pub(crate) fn resolve_startup(
     env_path: &Path,
     env_entries: HashMap<String, String>,
     settings: &ServerNamespace,
-    vault: &Vault,
+    secrets: &SecretStore,
 ) -> anyhow::Result<(AuthMode, ServerSecrets)> {
     let server_secrets = ServerSecrets::load(env_path, env_entries)?;
     let auth_secret_lookup = |name: &str| match name {
-        EnvVars::GITHUB_APP_CLIENT_SECRET => vault.get(name).map(str::to_string),
+        EnvVars::GITHUB_APP_CLIENT_SECRET => secrets.try_get(name),
         _ => server_secrets.get(name),
     };
     let auth_mode = resolve_auth_mode_with_lookup(settings, auth_secret_lookup)?;
     Ok((auth_mode, server_secrets))
 }
 
-pub fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault> {
+pub async fn load_startup_secrets(vault_path: impl AsRef<Path>) -> anyhow::Result<SecretStore> {
     let vault_path = vault_path.as_ref();
     match migrations::migrate_legacy_vault_file(vault_path) {
         Ok(report) if report.changed() => {
@@ -51,21 +51,23 @@ pub fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault>
             );
         }
     }
-    Vault::load(vault_path.to_path_buf())
+    SecretStore::load(vault_path.to_path_buf())
+        .await
         .with_context(|| format!("load vault {}", vault_path.display()))
 }
 
-pub(crate) fn prepare_startup_vault(
+pub(crate) async fn prepare_startup_secrets(
     vault_path: impl AsRef<Path>,
     server_env_path: impl AsRef<Path>,
     env_entries: &HashMap<String, String>,
-) -> anyhow::Result<Vault> {
-    let mut vault = load_startup_vault(vault_path)?;
+) -> anyhow::Result<SecretStore> {
+    let secrets = load_startup_secrets(vault_path).await?;
     let report = migrations::migrate_optional_server_env_secrets_to_vault(
-        &mut vault,
+        &secrets,
         server_env_path.as_ref(),
         env_entries,
     )
+    .await
     .context("migrate optional server env secrets into vault")?;
 
     for warning in &report.warnings {
@@ -91,16 +93,16 @@ pub(crate) fn prepare_startup_vault(
         );
     }
 
-    Ok(vault)
+    Ok(secrets)
 }
 
 pub fn validate_startup(
     env_path: &Path,
     env_entries: HashMap<String, String>,
     settings: &ServerNamespace,
-    vault: &Vault,
+    secrets: &SecretStore,
 ) -> anyhow::Result<()> {
-    resolve_startup(env_path, env_entries, settings, vault).map(|_| ())
+    resolve_startup(env_path, env_entries, settings, secrets).map(|_| ())
 }
 
 pub fn validate_startup_configuration(settings: &ServerNamespace) -> anyhow::Result<()> {
@@ -115,9 +117,9 @@ mod tests {
     use fabro_config::{ServerSettingsBuilder, envfile};
     use fabro_static::EnvVars;
     use fabro_types::settings::ServerNamespace;
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
 
-    use super::{prepare_startup_vault, validate_startup};
+    use super::{prepare_startup_secrets, validate_startup};
 
     fn resolved_settings(auth_methods: &[&str]) -> ServerNamespace {
         ServerSettingsBuilder::from_toml(&format!(
@@ -143,8 +145,10 @@ client_id = "Iv1.test"
         .server
     }
 
-    fn empty_vault(dir: &tempfile::TempDir) -> Vault {
-        Vault::load(dir.path().join("secrets.json")).unwrap()
+    async fn empty_secrets(dir: &tempfile::TempDir) -> SecretStore {
+        SecretStore::load(dir.path().join("secrets.json"))
+            .await
+            .unwrap()
     }
 
     fn env_path(dir: &tempfile::TempDir) -> PathBuf {
@@ -173,10 +177,10 @@ client_id = "Iv1.test"
             .collect()
     }
 
-    #[test]
-    fn validate_startup_accepts_configured_secrets() {
+    #[tokio::test]
+    async fn validate_startup_accepts_configured_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = empty_vault(&dir);
+        let secrets = empty_secrets(&dir).await;
         let env = HashMap::from([
             (
                 EnvVars::SESSION_SECRET.to_string(),
@@ -195,31 +199,31 @@ client_id = "Iv1.test"
                 dir.path().join("server.env").as_path(),
                 env,
                 &settings,
-                &vault,
+                &secrets,
             )
             .is_ok()
         );
     }
 
-    #[test]
-    fn validate_startup_rejects_missing_secrets() {
+    #[tokio::test]
+    async fn validate_startup_rejects_missing_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let settings = resolved_settings(&["dev-token"]);
-        let vault = empty_vault(&dir);
+        let secrets = empty_secrets(&dir).await;
 
         assert!(
             validate_startup(
                 dir.path().join("server.env").as_path(),
                 HashMap::new(),
                 &settings,
-                &vault,
+                &secrets,
             )
             .is_err()
         );
     }
 
-    #[test]
-    fn validate_startup_requires_github_client_secret_from_vault() {
+    #[tokio::test]
+    async fn validate_startup_requires_github_client_secret_from_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([
             (
@@ -232,48 +236,49 @@ client_id = "Iv1.test"
             ),
         ]);
         let settings = resolved_settings(&["github"]);
-        let vault = empty_vault(&dir);
+        let secrets = empty_secrets(&dir).await;
 
         let err = validate_startup(
             dir.path().join("server.env").as_path(),
             env,
             &settings,
-            &vault,
+            &secrets,
         )
         .expect_err("github client secret in server.env should not satisfy startup");
 
         assert!(err.to_string().contains("GITHUB_APP_CLIENT_SECRET"));
     }
 
-    #[test]
-    fn validate_startup_accepts_github_client_secret_from_vault() {
+    #[tokio::test]
+    async fn validate_startup_accepts_github_client_secret_from_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([(
             EnvVars::SESSION_SECRET.to_string(),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         )]);
         let settings = resolved_settings(&["github"]);
-        let mut vault = empty_vault(&dir);
-        vault
+        let secrets = empty_secrets(&dir).await;
+        secrets
             .set(
                 EnvVars::GITHUB_APP_CLIENT_SECRET,
                 "vault-client-secret",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
 
         validate_startup(
             dir.path().join("server.env").as_path(),
             env,
             &settings,
-            &vault,
+            &secrets,
         )
         .expect("github client secret in vault should satisfy startup");
     }
 
-    #[test]
-    fn prepare_startup_vault_migrates_server_env_optional_secrets_to_vault() {
+    #[tokio::test]
+    async fn prepare_startup_secrets_migrates_server_env_optional_secrets_to_store() {
         let dir = tempfile::tempdir().unwrap();
         let server_env_path = env_path(&dir);
         envfile::write_env_file(
@@ -296,32 +301,44 @@ client_id = "Iv1.test"
         )
         .unwrap();
 
-        let vault = prepare_startup_vault(vault_path(&dir), &server_env_path, &HashMap::new())
+        let secrets = prepare_startup_secrets(vault_path(&dir), &server_env_path, &HashMap::new())
+            .await
             .expect("legacy optional secrets should migrate");
 
         assert_eq!(
-            vault.get(EnvVars::GITHUB_APP_CLIENT_SECRET),
+            secrets
+                .get(EnvVars::GITHUB_APP_CLIENT_SECRET)
+                .await
+                .as_deref(),
             Some("legacy-client-secret")
         );
         assert_eq!(
-            vault
+            secrets
                 .get_entry(EnvVars::GITHUB_APP_CLIENT_SECRET)
+                .await
                 .unwrap()
                 .secret_type,
             SecretType::Token
         );
         assert_eq!(
-            vault.get(EnvVars::GITHUB_APP_PRIVATE_KEY),
+            secrets
+                .get(EnvVars::GITHUB_APP_PRIVATE_KEY)
+                .await
+                .as_deref(),
             Some("legacy-private-key")
         );
         assert_eq!(
-            vault
+            secrets
                 .get_entry(EnvVars::GITHUB_APP_PRIVATE_KEY)
+                .await
                 .unwrap()
                 .secret_type,
             SecretType::File
         );
-        assert_eq!(vault.get(EnvVars::OPENAI_API_KEY), Some("sk-legacy"));
+        assert_eq!(
+            secrets.get(EnvVars::OPENAI_API_KEY).await.as_deref(),
+            Some("sk-legacy")
+        );
 
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
         assert!(server_env.contains_key(EnvVars::SESSION_SECRET));
@@ -331,8 +348,8 @@ client_id = "Iv1.test"
         assert_eq!(migration_backups(dir.path()).len(), 1);
     }
 
-    #[test]
-    fn prepare_startup_vault_prefers_process_env_and_preserves_conflicting_server_env() {
+    #[tokio::test]
+    async fn prepare_startup_secrets_prefers_process_env_and_preserves_conflicting_server_env() {
         let dir = tempfile::tempdir().unwrap();
         let server_env_path = env_path(&dir);
         envfile::write_env_file(
@@ -348,11 +365,15 @@ client_id = "Iv1.test"
             "process-client-secret".to_string(),
         )]);
 
-        let vault = prepare_startup_vault(vault_path(&dir), &server_env_path, &env_entries)
+        let secrets = prepare_startup_secrets(vault_path(&dir), &server_env_path, &env_entries)
+            .await
             .expect("process env secret should migrate");
 
         assert_eq!(
-            vault.get(EnvVars::GITHUB_APP_CLIENT_SECRET),
+            secrets
+                .get(EnvVars::GITHUB_APP_CLIENT_SECRET)
+                .await
+                .as_deref(),
             Some("process-client-secret")
         );
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
@@ -365,8 +386,8 @@ client_id = "Iv1.test"
         assert!(migration_backups(dir.path()).is_empty());
     }
 
-    #[test]
-    fn prepare_startup_vault_keeps_existing_vault_secret_and_removes_matching_server_env() {
+    #[tokio::test]
+    async fn prepare_startup_secrets_keeps_existing_secret_and_removes_matching_server_env() {
         let dir = tempfile::tempdir().unwrap();
         let server_env_path = env_path(&dir);
         envfile::write_env_file(
@@ -377,21 +398,26 @@ client_id = "Iv1.test"
             )]),
         )
         .unwrap();
-        let mut vault = Vault::load(vault_path(&dir)).unwrap();
-        vault
+        let secrets = SecretStore::load(vault_path(&dir)).await.unwrap();
+        secrets
             .set(
                 EnvVars::GITHUB_APP_CLIENT_SECRET,
                 "vault-client-secret",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
 
-        let vault = prepare_startup_vault(vault_path(&dir), &server_env_path, &HashMap::new())
+        let secrets = prepare_startup_secrets(vault_path(&dir), &server_env_path, &HashMap::new())
+            .await
             .expect("redundant server env secret should be cleaned up");
 
         assert_eq!(
-            vault.get(EnvVars::GITHUB_APP_CLIENT_SECRET),
+            secrets
+                .get(EnvVars::GITHUB_APP_CLIENT_SECRET)
+                .await
+                .as_deref(),
             Some("vault-client-secret")
         );
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
@@ -399,8 +425,8 @@ client_id = "Iv1.test"
         assert_eq!(migration_backups(dir.path()).len(), 1);
     }
 
-    #[test]
-    fn prepare_startup_vault_migrated_github_client_secret_satisfies_startup() {
+    #[tokio::test]
+    async fn prepare_startup_secrets_migrated_github_client_secret_satisfies_startup() {
         let dir = tempfile::tempdir().unwrap();
         let server_env_path = env_path(&dir);
         envfile::write_env_file(
@@ -419,10 +445,11 @@ client_id = "Iv1.test"
         .unwrap();
         let settings = resolved_settings(&["github"]);
 
-        let vault = prepare_startup_vault(vault_path(&dir), &server_env_path, &HashMap::new())
+        let secrets = prepare_startup_secrets(vault_path(&dir), &server_env_path, &HashMap::new())
+            .await
             .expect("legacy github client secret should migrate");
 
-        validate_startup(&server_env_path, HashMap::new(), &settings, &vault)
+        validate_startup(&server_env_path, HashMap::new(), &settings, &secrets)
             .expect("migrated github client secret should satisfy startup");
     }
 }

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use fabro_config::envfile::{self, EnvFileRemoval};
 use fabro_static::{EnvVars, optional_vault_secrets};
-use fabro_vault::{SecretType, Vault};
+use fabro_vault::{SecretStore, SecretType};
 
 pub(crate) const REMOVAL_DEADLINE: &str = "2026-08-18";
 
@@ -34,14 +34,14 @@ impl OptionalServerEnvSecretsMigrationReport {
     }
 }
 
-pub(crate) fn migrate(
-    vault: &mut Vault,
+pub(crate) async fn migrate(
+    secrets: &SecretStore,
     server_env_path: &Path,
     env_entries: &HashMap<String, String>,
 ) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport> {
     let server_env_entries = envfile::read_env_file(server_env_path)
         .with_context(|| format!("read server env file {}", server_env_path.display()))?;
-    let mut vault_writes = Vec::new();
+    let mut secret_writes = Vec::new();
     let mut env_removals = Vec::new();
     let mut warnings = Vec::new();
     let mut preserved_env_entries = 0;
@@ -50,9 +50,9 @@ pub(crate) fn migrate(
         let process_value = env_entries.get(name);
         let file_value = server_env_entries.get(name);
 
-        if let Some(vault_value) = vault.get(name) {
+        if let Some(secret_value) = secrets.get(name).await {
             if let Some(file_value) = file_value {
-                if file_value == vault_value {
+                if file_value == &secret_value {
                     env_removals.push(env_removal(name));
                 } else {
                     preserved_env_entries += 1;
@@ -66,7 +66,7 @@ pub(crate) fn migrate(
 
         match (process_value, file_value) {
             (Some(value), Some(file_value)) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
+                secret_writes.push((name, value.clone(), secret_type_for(name)));
                 if value == file_value {
                     env_removals.push(env_removal(name));
                 } else {
@@ -77,10 +77,10 @@ pub(crate) fn migrate(
                 }
             }
             (Some(value), None) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
+                secret_writes.push((name, value.clone(), secret_type_for(name)));
             }
             (None, Some(value)) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
+                secret_writes.push((name, value.clone(), secret_type_for(name)));
                 env_removals.push(env_removal(name));
             }
             (None, None) => {}
@@ -88,19 +88,20 @@ pub(crate) fn migrate(
     }
 
     let mut report = OptionalServerEnvSecretsMigrationReport {
-        migrated_secrets: vault_writes.len(),
+        migrated_secrets: secret_writes.len(),
         removed_env_entries: 0,
         preserved_env_entries,
         backup_path: None,
         warnings,
     };
-    if vault_writes.is_empty() && env_removals.is_empty() {
+    if secret_writes.is_empty() && env_removals.is_empty() {
         return Ok(report);
     }
 
-    for (name, value, secret_type) in vault_writes {
-        vault
+    for (name, value, secret_type) in secret_writes {
+        secrets
             .set(name, &value, secret_type, None)
+            .await
             .with_context(|| format!("write migrated secret {name} to vault"))?;
     }
 

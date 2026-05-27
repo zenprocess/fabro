@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use fabro_agent::{Sandbox, ToolSecrets};
 use fabro_auth::{
-    CredentialSource, EnvCredentialSource, VaultCredentialSource, auth_issue_message,
+    CredentialSource, EnvCredentialSource, SecretCredentialSource, auth_issue_message,
 };
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
@@ -15,9 +15,8 @@ use fabro_sandbox::{
     reconnect_for_run_with_callback, shell_quote,
 };
 use fabro_static::EnvVars;
-use fabro_vault::Vault;
+use fabro_vault::SecretStore;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock as AsyncRwLock;
 
 use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::error::Error;
@@ -241,14 +240,10 @@ async fn build_registry(
     reason = "CLI/library workflow runs without a vault explicitly pass the Brave Search process-env credential into tool configuration; server runs pass a vault."
 )]
 async fn tool_secrets_from_configured_sources(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
+    vault: Option<&Arc<SecretStore>>,
 ) -> ToolSecrets {
     let brave_search_api_key = match vault {
-        Some(vault) => vault
-            .read()
-            .await
-            .get(EnvVars::BRAVE_SEARCH_API_KEY)
-            .map(str::to_string),
+        Some(secrets) => secrets.get(EnvVars::BRAVE_SEARCH_API_KEY).await,
         None => std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).ok(),
     };
     ToolSecrets {
@@ -260,9 +255,9 @@ fn graph_needs_api_backend(graph: &graph::Graph) -> bool {
     graph.nodes.values().any(routing::node_needs_api_backend)
 }
 
-fn build_llm_source(vault: Option<Arc<AsyncRwLock<Vault>>>) -> Arc<dyn CredentialSource> {
+fn build_llm_source(vault: Option<Arc<SecretStore>>) -> Arc<dyn CredentialSource> {
     match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::new(vault)),
+        Some(vault) => Arc::new(SecretCredentialSource::new(vault)),
         None => Arc::new(EnvCredentialSource::new()),
     }
 }
@@ -337,11 +332,7 @@ pub async fn initialize(
             Error::Precondition("cannot resume run: run sandbox was not initialized".to_string())
         })?;
         let daytona_api_key = match &options.vault {
-            Some(vault) => vault
-                .read()
-                .await
-                .get(EnvVars::DAYTONA_API_KEY)
-                .map(str::to_string),
+            Some(vault) => vault.get(EnvVars::DAYTONA_API_KEY).await,
             None => None,
         };
         let sandbox = reconnect_for_run_with_callback(
@@ -649,10 +640,9 @@ mod tests {
     use fabro_store::Database;
     use fabro_types::settings::run::RunModelControls;
     use fabro_types::{EventBody, RunEvent, RunId, WorkflowSettings, fixtures};
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
     use object_store::memory::InMemory;
     use tokio::fs::{create_dir_all, write};
-    use tokio::sync::RwLock as AsyncRwLock;
 
     use super::*;
     use crate::context::{Context, keys};
@@ -971,17 +961,20 @@ mod tests {
     #[tokio::test]
     async fn build_registry_accepts_vault_only_llm_provider() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
-        vault
+        let secrets = SecretStore::load(dir.path().join("secrets.json"))
+            .await
+            .unwrap();
+        secrets
             .set(
                 "ANTHROPIC_API_KEY",
                 "anthropic-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
         let (graph, _) = llm_graph();
-        let vault = Arc::new(AsyncRwLock::new(vault));
+        let secrets = Arc::new(secrets);
 
         let test_emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
@@ -1002,7 +995,7 @@ mod tests {
             tool_env_provider,
             false,
             &graph,
-            Arc::new(VaultCredentialSource::new(Arc::clone(&vault))),
+            Arc::new(SecretCredentialSource::new(Arc::clone(&secrets))),
             test_catalog(),
             ToolSecrets::default(),
             None,
@@ -1066,11 +1059,14 @@ mod tests {
         graph.edges.push(Edge::new("start", "writer"));
         graph.edges.push(Edge::new("writer", "exit"));
 
-        let mut vault = Vault::load(temp.path().join("secrets.json")).unwrap();
-        vault
-            .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        let secrets = SecretStore::load(temp.path().join("secrets.json"))
+            .await
             .unwrap();
-        let vault = Arc::new(AsyncRwLock::new(vault));
+        secrets
+            .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+            .await
+            .unwrap();
+        let secrets = Arc::new(secrets);
 
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1112,7 +1108,7 @@ mod tests {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             Some(vault),
+            vault:             Some(secrets),
             git:               None,
             run_control:       None,
             registry_override: None,

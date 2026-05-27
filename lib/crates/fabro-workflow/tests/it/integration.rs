@@ -7264,12 +7264,11 @@ fn openai_responses_payload(text: &str) -> serde_json::Value {
 #[tokio::test]
 async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     use chrono::Utc;
-    use fabro_auth::{CredentialSource, VaultCredentialSource};
+    use fabro_auth::{CredentialSource, SecretCredentialSource};
     use fabro_types::Conclusion;
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
     use httpmock::Method::POST;
     use httpmock::MockServer;
-    use tokio::sync::RwLock as AsyncRwLock;
 
     let server = MockServer::start_async().await;
     let response_mock = server
@@ -7312,18 +7311,20 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     graph.edges.push(Edge::new("start", "exit"));
 
     let vault_dir = tempfile::tempdir().unwrap();
-    let mut vault = Vault::load(vault_dir.path().join("secrets.json")).unwrap();
-    vault
+    let secrets = SecretStore::load(vault_dir.path().join("secrets.json"))
+        .await
+        .unwrap();
+    secrets
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
-    let llm_source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::new(Arc::new(
-        AsyncRwLock::new(vault),
-    )));
+    let llm_source: Arc<dyn CredentialSource> =
+        Arc::new(SecretCredentialSource::new(Arc::new(secrets)));
     // Use catalog settings to override base_url instead of env var
     let catalog = catalog_with_provider_base_url("openai", &server.url("/v1"));
 

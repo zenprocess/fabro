@@ -49,7 +49,7 @@ pub use fabro_api::types::{
     TimelineEntryResponse, UpdateVariableRequest, VariableListResponse, VncPreviewResponse,
     WriteBlobResponse,
 };
-use fabro_auth::{CredentialSource, VaultCredentialSource, auth_issue_message};
+use fabro_auth::{CredentialSource, SecretCredentialSource, auth_issue_message};
 #[cfg(test)]
 use fabro_config::RunSettingsBuilder;
 use fabro_config::daemon::ServerDaemon;
@@ -105,7 +105,7 @@ use fabro_util::error::{
 };
 use fabro_util::version::FABRO_VERSION;
 use fabro_variable::{Error as VariableError, VariableStore};
-use fabro_vault::{Error as VaultError, SecretType, Vault};
+use fabro_vault::{Error as VaultError, SecretStore, SecretType};
 use fabro_workflow::artifact_upload::ArtifactSink;
 #[cfg(test)]
 use fabro_workflow::command_log::command_log_path;
@@ -125,10 +125,7 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, Command};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{
-    Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore, broadcast,
-    mpsc, oneshot,
-};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
@@ -155,7 +152,7 @@ use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
 use crate::server_secrets::{LlmClientResult, ServerSecrets};
 use crate::spawn_env::{apply_render_graph_env, apply_worker_env};
-use crate::startup::load_startup_vault;
+use crate::startup::load_startup_secrets;
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
     canonical_host, demo, diagnostics, run_manifest, security_headers, static_files, web_auth,
@@ -1020,8 +1017,8 @@ pub struct AppState {
     pull_request_create_locks: PullRequestCreateLocks,
     parent_link_lock: AsyncMutex<()>,
 
-    pub(crate) vault: Arc<AsyncRwLock<Vault>>,
-    pub(crate) variables: Arc<AsyncRwLock<VariableStore>>,
+    pub(crate) secrets: Arc<SecretStore>,
+    pub(crate) variables: Arc<VariableStore>,
     pub(super) server_secrets: ServerSecrets,
     pub(crate) llm_source: Arc<dyn CredentialSource>,
     manifest_run_defaults: RwLock<Arc<RunLayer>>,
@@ -1129,7 +1126,7 @@ pub(crate) struct AppStateConfig {
     pub(crate) artifact_store:            ArtifactStore,
     pub(crate) vault_path:                PathBuf,
     pub(crate) variables_path:            PathBuf,
-    pub(crate) preloaded_vault:           Option<Vault>,
+    pub(crate) preloaded_secrets:         Option<SecretStore>,
     pub(crate) server_secrets:            ServerSecrets,
     pub(crate) env_lookup:                EnvLookup,
     pub(crate) github_api_base_url:       Option<String>,
@@ -1300,11 +1297,12 @@ impl AppState {
         AskFabroReadiness { default_model }
     }
 
-    pub(crate) fn vault_secret(&self, name: &str) -> Option<String> {
-        self.vault
-            .try_read()
-            .ok()
-            .and_then(|vault| vault.get(name).map(str::to_string))
+    pub(crate) async fn secret_value(&self, name: &str) -> Option<String> {
+        self.secrets.get(name).await
+    }
+
+    pub(crate) fn try_secret_value(&self, name: &str) -> Option<String> {
+        self.secrets.try_get(name)
     }
 
     pub(crate) fn config_env_lookup(&self, name: &str) -> Option<String> {
@@ -1381,7 +1379,7 @@ impl AppState {
             .and_then(|value| auth::derive_cookie_key(value.as_bytes()).ok())
     }
 
-    pub(crate) fn github_credentials(
+    pub(crate) async fn github_credentials(
         &self,
         settings: &GithubIntegrationSettings,
     ) -> Result<Option<fabro_github::GitHubCredentials>, String> {
@@ -1390,7 +1388,7 @@ impl AppState {
                 let Some(app_id) = settings.app_id.as_ref().map(InterpString::as_source) else {
                     return Ok(None);
                 };
-                let raw = self.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);
+                let raw = self.secret_value(EnvVars::GITHUB_APP_PRIVATE_KEY).await;
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
@@ -1405,7 +1403,8 @@ impl AppState {
             }
             GithubIntegrationStrategy::Token => {
                 let token = self
-                    .vault_secret(EnvVars::GITHUB_TOKEN)
+                    .secret_value(EnvVars::GITHUB_TOKEN)
+                    .await
                     .as_deref()
                     .map(str::trim)
                     .filter(|token| !token.is_empty())
@@ -1636,7 +1635,7 @@ pub fn build_router_with_options(
         .github_endpoints
         .clone()
         .unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
-    let webhook_secret = state.vault_secret(WEBHOOK_SECRET_ENV);
+    let webhook_secret = state.try_secret_value(WEBHOOK_SECRET_ENV);
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
@@ -2163,7 +2162,7 @@ fn build_sandbox_provider_registry(
     SandboxProviderRegistry::new(providers)
 }
 
-pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppState>> {
+pub(crate) async fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppState>> {
     let AppStateConfig {
         resolved_settings,
         registry_factory_override,
@@ -2172,7 +2171,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         artifact_store,
         vault_path,
         variables_path,
-        preloaded_vault,
+        preloaded_secrets,
         server_secrets,
         env_lookup,
         github_api_base_url,
@@ -2182,18 +2181,29 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         shutdown,
     } = config;
 
-    let variables = VariableStore::load(variables_path).context("load variables")?;
-    let variables = Arc::new(AsyncRwLock::new(variables));
-    let vault = match preloaded_vault {
-        Some(vault) => vault,
-        None => load_startup_vault(&vault_path)?,
+    let variables = Arc::new(
+        VariableStore::load(variables_path)
+            .await
+            .context("load variables")?,
+    );
+    let secrets = match preloaded_secrets {
+        Some(secrets) => secrets,
+        None => load_startup_secrets(&vault_path).await?,
     };
-    // Read vault secrets needed for synchronous setup before we wrap the vault in
-    // an async lock for the rest of AppState.
-    let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
-    let vault = Arc::new(AsyncRwLock::new(vault));
+    let daytona_api_key = secrets.get(EnvVars::DAYTONA_API_KEY).await;
+    let slack_lookup = HashMap::from([
+        (
+            EnvVars::FABRO_SLACK_BOT_TOKEN,
+            secrets.get(EnvVars::FABRO_SLACK_BOT_TOKEN).await,
+        ),
+        (
+            EnvVars::FABRO_SLACK_APP_TOKEN,
+            secrets.get(EnvVars::FABRO_SLACK_APP_TOKEN).await,
+        ),
+    ]);
+    let secrets = Arc::new(secrets);
     let llm_source: Arc<dyn CredentialSource> =
-        Arc::new(VaultCredentialSource::vault_only(Arc::clone(&vault)));
+        Arc::new(SecretCredentialSource::secrets_only(Arc::clone(&secrets)));
     let (global_event_tx, _) = broadcast::channel(4096);
     let current_server_settings = Arc::new(resolved_settings.server_settings);
     let current_manifest_run_defaults = Arc::new(resolved_settings.manifest_run_defaults);
@@ -2225,11 +2235,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
                         .map_err(anyhow::Error::from)
                 })
                 .transpose()?;
-            let vault_guard = vault.try_read().ok();
             match resolve_slack_credentials_status_with_lookup(|name| {
-                vault_guard
-                    .as_ref()
-                    .and_then(|vault| vault.get(name).map(str::to_string))
+                slack_lookup.get(name).and_then(Clone::clone)
             }) {
                 SlackCredentialResolution::Configured(credentials) => {
                     info!(
@@ -2272,7 +2279,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         files_in_flight: new_files_in_flight(),
         pull_request_create_locks: Arc::new(Mutex::new(HashMap::new())),
         parent_link_lock: AsyncMutex::new(()),
-        vault,
+        secrets,
         variables,
         server_secrets,
         llm_source,
@@ -2459,7 +2466,7 @@ async fn delete_run_sandbox_resource(
         }));
     }
 
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let sandbox = match reconnect_for_run(&record, daytona_api_key, Some(id)).await {
         Ok(sandbox) => sandbox,
         Err(err) if force || delete_started => {
@@ -3380,7 +3387,7 @@ fn worker_command(
     cmd.env(EnvVars::FABRO_CONFIG, state.active_config_path());
     cmd.env_remove(EnvVars::FABRO_WORKER_TOKEN);
     cmd.env(EnvVars::FABRO_WORKER_TOKEN, worker_token);
-    if let Some(pem) = state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY) {
+    if let Some(pem) = state.try_secret_value(EnvVars::GITHUB_APP_PRIVATE_KEY) {
         cmd.env(EnvVars::GITHUB_APP_PRIVATE_KEY, pem);
     }
 
@@ -3754,9 +3761,9 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         let pull_request_can_use_github_credentials =
             settings.execution.mode != RunMode::DryRun && settings.pull_request.is_some();
         if settings.integrations.github.is_token_requested() {
-            state.github_credentials(github_settings)
+            state.github_credentials(github_settings).await
         } else if clone_can_use_github_credentials || pull_request_can_use_github_credentials {
-            match state.github_credentials(github_settings) {
+            match state.github_credentials(github_settings).await {
                 Ok(github_app) => Ok(github_app),
                 Err(err) => {
                     tracing::warn!(
@@ -3808,7 +3815,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         run_control: None,
         github_app,
         github_permissions,
-        vault: Some(Arc::clone(&state.vault)),
+        vault: Some(Arc::clone(&state.secrets)),
         catalog: state.catalog(),
         on_node: None,
         registry_override,

@@ -10,8 +10,7 @@ use fabro_sandbox::SandboxSpec;
 use fabro_types::settings::run::{PullRequestSettings, RunModelControls};
 use fabro_types::{ManifestPath, RunId};
 use fabro_validate::{Diagnostic, Severity};
-use fabro_vault::Vault;
-use tokio::sync::RwLock as AsyncRwLock;
+use fabro_vault::SecretStore;
 
 use crate::artifact_upload::ArtifactSink;
 use crate::context::Context;
@@ -260,7 +259,7 @@ pub struct InitOptions {
     pub workflow_bundle:   Option<Arc<WorkflowBundle>>,
     pub hooks:             fabro_hooks::HookSettings,
     pub sandbox_env:       SandboxEnvSpec,
-    pub vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:             Option<Arc<SecretStore>>,
     pub git:               Option<GitCheckpointOptions>,
     pub registry_override: Option<Arc<HandlerRegistry>>,
     pub artifact_sink:     Option<ArtifactSink>,

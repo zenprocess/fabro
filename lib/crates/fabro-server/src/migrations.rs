@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use fabro_vault::Vault;
+use fabro_vault::SecretStore;
 
 #[path = "../migrations/2026051801_legacy_vault_entries.rs"]
 mod legacy_vault_entries;
@@ -19,10 +19,10 @@ pub(crate) fn migrate_legacy_vault_file(path: &Path) -> anyhow::Result<LegacyVau
     legacy_vault_entries::migrate_legacy_vault_file(path)
 }
 
-pub(crate) fn migrate_optional_server_env_secrets_to_vault(
-    vault: &mut Vault,
+pub(crate) async fn migrate_optional_server_env_secrets_to_vault(
+    secrets: &SecretStore,
     server_env_path: &Path,
     env_entries: &HashMap<String, String>,
 ) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport> {
-    optional_server_env_secrets_to_vault::migrate(vault, server_env_path, env_entries)
+    optional_server_env_secrets_to_vault::migrate(secrets, server_env_path, env_entries).await
 }

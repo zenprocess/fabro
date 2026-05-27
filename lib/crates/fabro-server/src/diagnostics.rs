@@ -94,7 +94,7 @@ pub async fn run_all(state: &AppState) -> DiagnosticsReport {
         check_sandbox(state),
         check_brave_search(state),
     );
-    let crypto = check_crypto(state);
+    let crypto = check_crypto(state).await;
 
     DiagnosticsReport {
         version:  FABRO_VERSION.to_string(),
@@ -330,7 +330,10 @@ fn short_error_line(rendered: &str) -> String {
 async fn check_github_app(state: &AppState) -> CheckResult {
     let settings = state.server_settings();
     if settings.server.integrations.github.strategy == GithubIntegrationStrategy::Token {
-        let token = match state.github_credentials(&settings.server.integrations.github) {
+        let token = match state
+            .github_credentials(&settings.server.integrations.github)
+            .await
+        {
             Ok(Some(fabro_github::GitHubCredentials::Pat(token))) => token,
             Ok(Some(fabro_github::GitHubCredentials::Installation(token))) => {
                 match token.valid_token() {
@@ -455,13 +458,15 @@ async fn check_github_app(state: &AppState) -> CheckResult {
         .slug
         .as_ref()
         .map(InterpString::as_source);
-    let private_key_raw = state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);
+    let private_key_raw = state.secret_value(EnvVars::GITHUB_APP_PRIVATE_KEY).await;
     let client_id = settings.server.integrations.github.client_id.is_some();
     let client_secret = state
-        .vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)
+        .secret_value(EnvVars::GITHUB_APP_CLIENT_SECRET)
+        .await
         .is_some();
     let webhook_secret = state
-        .vault_secret(EnvVars::GITHUB_APP_WEBHOOK_SECRET)
+        .secret_value(EnvVars::GITHUB_APP_WEBHOOK_SECRET)
+        .await
         .is_some();
 
     if app_id.is_none()
@@ -561,7 +566,7 @@ async fn check_github_app(state: &AppState) -> CheckResult {
 }
 
 async fn check_sandbox(state: &AppState) -> CheckResult {
-    let Some(api_key) = state.vault_secret(EnvVars::DAYTONA_API_KEY) else {
+    let Some(api_key) = state.secret_value(EnvVars::DAYTONA_API_KEY).await else {
         return CheckResult {
             name:        "Sandbox".to_string(),
             status:      CheckStatus::Warning,
@@ -646,7 +651,7 @@ fn check_storage_dir_path(path: &std::path::Path) -> CheckResult {
 }
 
 async fn check_brave_search(state: &AppState) -> CheckResult {
-    let Some(api_key) = state.vault_secret(EnvVars::BRAVE_SEARCH_API_KEY) else {
+    let Some(api_key) = state.secret_value(EnvVars::BRAVE_SEARCH_API_KEY).await else {
         return CheckResult {
             name:        "Web Search (Brave)".to_string(),
             status:      CheckStatus::Warning,
@@ -706,7 +711,7 @@ async fn check_brave_search(state: &AppState) -> CheckResult {
     }
 }
 
-fn check_crypto(state: &AppState) -> CheckResult {
+async fn check_crypto(state: &AppState) -> CheckResult {
     let resolved_server_settings = state.server_settings();
 
     let mut details = Vec::new();
@@ -742,7 +747,8 @@ fn check_crypto(state: &AppState) -> CheckResult {
             errors.push("server.integrations.github.client_id is not configured".to_string());
         }
         if state
-            .vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)
+            .secret_value(EnvVars::GITHUB_APP_CLIENT_SECRET)
+            .await
             .is_none()
         {
             errors.push("GITHUB_APP_CLIENT_SECRET not configured in vault".to_string());

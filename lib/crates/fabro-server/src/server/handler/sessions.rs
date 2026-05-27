@@ -707,7 +707,7 @@ async fn build_agent_session(
     })?;
     let sandbox = reconnect_for_run(
         sandbox_instance,
-        state.vault_secret(EnvVars::DAYTONA_API_KEY),
+        state.secret_value(EnvVars::DAYTONA_API_KEY).await,
         Some(run_id),
     )
     .await
@@ -756,7 +756,7 @@ async fn build_agent_session(
         tool_access_policy: Some(ask_fabro_policy),
         tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
         tool_secrets: ToolSecrets {
-            brave_search_api_key: state.vault_secret(EnvVars::BRAVE_SEARCH_API_KEY),
+            brave_search_api_key: state.secret_value(EnvVars::BRAVE_SEARCH_API_KEY).await,
         },
         ..SessionOptions::default()
     };

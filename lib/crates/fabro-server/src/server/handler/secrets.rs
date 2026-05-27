@@ -5,7 +5,7 @@ use fabro_static::EnvVars;
 
 use super::super::{
     ApiError, AppState, CreateSecretRequest, DeleteSecretRequest, IntoResponse, Json, RequiredUser,
-    Response, Router, SecretType, State, StatusCode, VaultError, get, spawn_blocking,
+    Response, Router, SecretType, State, StatusCode, VaultError, get,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -18,7 +18,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn list_secrets(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.vault.read().await.list();
+    let data = state.secrets.list().await;
     (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response()
 }
 
@@ -59,32 +59,25 @@ async fn create_secret(
             }
         }
     }
-    let state_for_write = Arc::clone(&state);
-    let result = spawn_blocking(move || {
-        let mut vault = state_for_write.vault.blocking_write();
-        vault.set(&name, &value, secret_type, description.as_deref())
-    })
-    .await;
+    let result = state
+        .secrets
+        .set(&name, &value, secret_type, description.as_deref())
+        .await;
 
     match result {
-        Ok(Ok(meta)) => (StatusCode::OK, Json(meta)).into_response(),
-        Ok(Err(VaultError::InvalidName(_))) => {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(VaultError::InvalidName(_)) => {
             ApiError::bad_request("invalid secret name").into_response()
         }
-        Ok(Err(VaultError::Io(err))) => {
+        Err(VaultError::Io(err)) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
-        Ok(Err(VaultError::Serde(err))) => {
+        Err(VaultError::Serde(err)) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
-        Ok(Err(VaultError::NotFound(_))) => ApiError::new(
+        Err(VaultError::NotFound(_)) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "secret unexpectedly missing",
-        )
-        .into_response(),
-        Err(err) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("secret write task failed: {err}"),
         )
         .into_response(),
     }
@@ -96,32 +89,22 @@ async fn delete_secret_by_name(
     Json(body): Json<DeleteSecretRequest>,
 ) -> Response {
     let name = body.name;
-    let state_for_write = Arc::clone(&state);
-    let result = spawn_blocking(move || {
-        let mut vault = state_for_write.vault.blocking_write();
-        vault.remove(&name)
-    })
-    .await;
+    let result = state.secrets.remove(&name).await;
 
     match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(VaultError::InvalidName(_))) => {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(VaultError::InvalidName(_)) => {
             ApiError::bad_request("invalid secret name").into_response()
         }
-        Ok(Err(VaultError::NotFound(name))) => {
+        Err(VaultError::NotFound(name)) => {
             ApiError::new(StatusCode::NOT_FOUND, format!("secret not found: {name}"))
                 .into_response()
         }
-        Ok(Err(VaultError::Io(err))) => {
+        Err(VaultError::Io(err)) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
-        Ok(Err(VaultError::Serde(err))) => {
+        Err(VaultError::Serde(err)) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
-        Err(err) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("secret delete task failed: {err}"),
-        )
-        .into_response(),
     }
 }

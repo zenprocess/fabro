@@ -670,7 +670,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
-    use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+    use fabro_auth::{CredentialSource, EnvCredentialSource, SecretCredentialSource};
     use fabro_graphviz::graph::Graph;
     use fabro_llm::Error as LlmError;
     use fabro_llm::client::Client;
@@ -682,12 +682,11 @@ mod tests {
         BilledTokenCounts, RunProjection, RunSpec, SuccessReason, WorkflowSettings,
         first_event_seq, fixtures,
     };
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
     use futures::stream;
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use object_store::memory::InMemory;
-    use tokio::sync::RwLock as AsyncRwLock;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1336,18 +1335,20 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
-        vault
+        let secrets = SecretStore::load(dir.path().join("secrets.json"))
+            .await
+            .unwrap();
+        secrets
             .set(
                 "OPENAI_API_KEY",
                 "vault-openai-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
-        let llm_source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::new(Arc::new(
-            AsyncRwLock::new(vault),
-        )));
+        let llm_source: Arc<dyn CredentialSource> =
+            Arc::new(SecretCredentialSource::new(Arc::new(secrets)));
         // Use catalog settings to override base_url instead of env var
         let catalog = test_catalog_with_provider_base_url("openai", &server.url("/v1"));
 
@@ -1844,18 +1845,20 @@ mod tests {
             .await;
 
         let vault_dir = tempfile::tempdir().unwrap();
-        let mut vault = Vault::load(vault_dir.path().join("secrets.json")).unwrap();
-        vault
+        let secrets = SecretStore::load(vault_dir.path().join("secrets.json"))
+            .await
+            .unwrap();
+        secrets
             .set(
                 "OPENAI_API_KEY",
                 "vault-openai-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
-        let llm_source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::new(Arc::new(
-            AsyncRwLock::new(vault),
-        )));
+        let llm_source: Arc<dyn CredentialSource> =
+            Arc::new(SecretCredentialSource::new(Arc::new(secrets)));
         // Use catalog settings to override base_url instead of env var
         let catalog = test_catalog_with_provider_base_url("openai", &openai_server.url("/v1"));
 

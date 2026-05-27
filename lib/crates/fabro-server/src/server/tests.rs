@@ -455,7 +455,7 @@ async fn http_log_records_worker_principal_fields() {
 async fn http_log_records_webhook_principal_fields() {
     let body = br#"{"repository":{"full_name":"owner/repo"},"action":"opened"}"#;
     let signature = compute_signature(TEST_WEBHOOK_SECRET.as_bytes(), body);
-    let app = webhook_test_app(dev_token_auth_mode());
+    let app = webhook_test_app(dev_token_auth_mode()).await;
     let (_guard, events) = capture_server_logs();
 
     let response = app
@@ -477,7 +477,7 @@ async fn http_log_records_webhook_principal_fields() {
     clippy::needless_pass_by_value,
     reason = "Test helper mirrors the public build_router convenience API."
 )]
-fn webhook_test_app(auth_mode: AuthMode) -> Router {
+async fn webhook_test_app(auth_mode: AuthMode) -> Router {
     let secret = TEST_WEBHOOK_SECRET.to_string();
     let state = test_app_state_with_env_lookup(
         default_test_server_settings(),
@@ -486,10 +486,9 @@ fn webhook_test_app(auth_mode: AuthMode) -> Router {
         |_| None,
     );
     state
-        .vault
-        .try_write()
-        .expect("test vault should not be locked")
+        .secrets
         .set(WEBHOOK_SECRET_ENV, &secret, SecretType::Token, None)
+        .await
         .unwrap();
     build_router_with_options(
         state,
@@ -1021,12 +1020,16 @@ async fn create_secret_stores_file_secret_outside_token_lookups() {
     assert_eq!(body["type"], "file");
     assert_eq!(body["description"], "Test certificate");
 
-    let vault = state.vault.read().await;
     assert_eq!(
-        vault.get_entry("/tmp/test.pem").unwrap().secret_type,
+        state
+            .secrets
+            .get_entry("/tmp/test.pem")
+            .await
+            .unwrap()
+            .secret_type,
         SecretType::File
     );
-    assert_eq!(vault.file_secrets(), vec![(
+    assert_eq!(state.secrets.file_secrets().await, vec![(
         "/tmp/test.pem".to_string(),
         "pem-data".to_string()
     )]);
@@ -1065,7 +1068,7 @@ async fn create_secret_rejects_bootstrap_secret_names() {
             body["errors"][0]["detail"],
             format!("{name} is a bootstrap secret; configure it with process env or server.env")
         );
-        assert!(state.vault.read().await.get(name).is_none());
+        assert!(state.secrets.get(name).await.is_none());
     }
 }
 
@@ -1085,13 +1088,13 @@ async fn create_secret_allows_optional_vault_and_custom_secret_names() {
             .unwrap();
 
         assert_status!(response, StatusCode::OK).await;
-        assert_eq!(state.vault.read().await.get(name), Some(value));
+        assert_eq!(state.secrets.get(name).await.as_deref(), Some(value));
     }
 }
 
 #[tokio::test]
 async fn github_webhook_rejects_missing_signature() {
-    let app = webhook_test_app(crate::test_support::test_auth_mode());
+    let app = webhook_test_app(crate::test_support::test_auth_mode()).await;
     let body = br#"{"action":"opened"}"#;
 
     let response = app
@@ -1103,7 +1106,7 @@ async fn github_webhook_rejects_missing_signature() {
 
 #[tokio::test]
 async fn github_webhook_rejects_signature_signed_with_wrong_secret() {
-    let app = webhook_test_app(crate::test_support::test_auth_mode());
+    let app = webhook_test_app(crate::test_support::test_auth_mode()).await;
     let body = br#"{"action":"opened"}"#;
     let bad_signature = compute_signature(b"wrong-secret", body);
 
@@ -1118,7 +1121,7 @@ async fn github_webhook_rejects_signature_signed_with_wrong_secret() {
 async fn github_webhook_accepts_valid_signature_when_auth_disabled() {
     let body = br#"{"repository":{"full_name":"owner/repo"},"action":"opened"}"#;
     let signature = compute_signature(TEST_WEBHOOK_SECRET.as_bytes(), body);
-    let app = webhook_test_app(crate::test_support::test_auth_mode());
+    let app = webhook_test_app(crate::test_support::test_auth_mode()).await;
 
     let response = app
         .oneshot(webhook_request(Some(&signature), None, body))
@@ -1131,7 +1134,7 @@ async fn github_webhook_accepts_valid_signature_when_auth_disabled() {
 async fn github_webhook_accepts_valid_signature_without_bearer_token() {
     let body = br#"{"repository":{"full_name":"owner/repo"},"action":"opened"}"#;
     let signature = compute_signature(TEST_WEBHOOK_SECRET.as_bytes(), body);
-    let app = webhook_test_app(dev_token_auth_mode());
+    let app = webhook_test_app(dev_token_auth_mode()).await;
 
     let response = app
         .oneshot(webhook_request(Some(&signature), None, body))
@@ -1144,7 +1147,7 @@ async fn github_webhook_accepts_valid_signature_without_bearer_token() {
 async fn github_webhook_accepts_valid_signature_with_wrong_bearer_token() {
     let body = br#"{"repository":{"full_name":"owner/repo"},"action":"opened"}"#;
     let signature = compute_signature(TEST_WEBHOOK_SECRET.as_bytes(), body);
-    let app = webhook_test_app(dev_token_auth_mode());
+    let app = webhook_test_app(dev_token_auth_mode()).await;
 
     let response = app
         .oneshot(webhook_request(
@@ -1178,11 +1181,11 @@ async fn create_secret_stores_valid_oauth_entries() {
 
     let response = app.oneshot(req).await.unwrap();
     assert_status!(response, StatusCode::OK).await;
-    let listed = state.vault.read().await.list();
+    let listed = state.secrets.list().await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "OPENAI_CODEX");
     assert_eq!(listed[0].secret_type, SecretType::Oauth);
-    assert!(state.vault.read().await.get("OPENAI_CODEX").is_some());
+    assert!(state.secrets.get("OPENAI_CODEX").await.is_some());
 }
 
 #[tokio::test]
@@ -1206,15 +1209,14 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
         },
     );
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set(
             EnvVars::DAYTONA_API_KEY,
             "existing",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -1242,7 +1244,11 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
          snapshot and sandbox scopes."
     );
     assert_eq!(
-        state.vault.read().await.get(EnvVars::DAYTONA_API_KEY),
+        state
+            .secrets
+            .get(EnvVars::DAYTONA_API_KEY)
+            .await
+            .as_deref(),
         Some("existing")
     );
     auth.assert_async().await;
@@ -1270,15 +1276,14 @@ async fn diagnostics_reports_under_scoped_daytona_api_key() {
         },
     );
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set(
             EnvVars::DAYTONA_API_KEY,
             "dtn_test",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let report = crate::diagnostics::run_all(&state).await;
@@ -1319,15 +1324,14 @@ async fn resolve_llm_client_reads_openai_token_from_vault() {
         |_| None,
     );
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let llm_result = state.resolve_llm_client().await.unwrap();
@@ -1405,15 +1409,14 @@ async fn llm_source_configured_providers_reads_openai_token_from_vault() {
         |_| None,
     );
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let catalog = state.catalog();
@@ -1449,15 +1452,14 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
         .provider_base_url("openai", server.url("/v1"))
         .build();
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let llm_result = state.resolve_llm_client().await.unwrap();
@@ -1489,17 +1491,16 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
 #[tokio::test]
 async fn list_secrets_includes_oauth_metadata() {
     let state = test_app_state();
-    {
-        let mut vault = state.vault.write().await;
-        vault
-            .set(
-                "OPENAI_CODEX",
-                &openai_oauth_credential_json(),
-                SecretType::Oauth,
-                Some("saved auth"),
-            )
-            .unwrap();
-    }
+    state
+        .secrets
+        .set(
+            "OPENAI_CODEX",
+            &openai_oauth_credential_json(),
+            SecretType::Oauth,
+            Some("saved auth"),
+        )
+        .await
+        .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let response = app
@@ -1606,7 +1607,7 @@ async fn delete_secret_by_name_removes_file_secret() {
 
     let delete_response = app.oneshot(delete_req).await.unwrap();
     assert_status!(delete_response, StatusCode::NO_CONTENT).await;
-    assert!(state.vault.read().await.list().is_empty());
+    assert!(state.secrets.list().await.is_empty());
 }
 
 #[test]
@@ -1631,16 +1632,19 @@ fn server_secrets_resolve_bootstrap_process_env_before_server_env() {
     );
 }
 
-fn slack_app_state_with_secret_sources(
+async fn slack_app_state_with_secret_sources(
     vault_entries: &[(&str, &str, SecretType)],
     server_secret_env: HashMap<String, String>,
 ) -> Arc<AppState> {
     let (store, artifact_store) = test_store_bundle();
     let vault_path = test_secret_store_path();
     let server_env_path = vault_path.with_file_name("server.env");
-    let mut vault = Vault::load(vault_path.clone()).unwrap();
+    let secrets = SecretStore::load(vault_path.clone()).await.unwrap();
     for (name, value, secret_type) in vault_entries {
-        vault.set(name, value, *secret_type, None).unwrap();
+        secrets
+            .set(name, value, *secret_type, None)
+            .await
+            .unwrap();
     }
     build_app_state(AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
@@ -1654,7 +1658,7 @@ fn slack_app_state_with_secret_sources(
         artifact_store,
         variables_path: vault_path.with_file_name("variables.json"),
         vault_path,
-        preloaded_vault: Some(vault),
+        preloaded_secrets: Some(secrets),
         server_secrets: load_test_server_secrets(server_env_path, server_secret_env),
         env_lookup: default_env_lookup(),
         github_api_base_url: None,
@@ -1663,11 +1667,12 @@ fn slack_app_state_with_secret_sources(
         sandbox_provider_registry: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
+    .await
     .expect("slack test app state should build")
 }
 
-#[test]
-fn slack_service_is_enabled_by_vault_tokens() {
+#[tokio::test]
+async fn slack_service_is_enabled_by_secret_tokens() {
     let state = slack_app_state_with_secret_sources(
         &[
             (
@@ -1682,7 +1687,8 @@ fn slack_service_is_enabled_by_vault_tokens() {
             ),
         ],
         HashMap::new(),
-    );
+    )
+    .await;
 
     let service = state
         .slack_service
@@ -1695,8 +1701,8 @@ fn slack_service_is_enabled_by_vault_tokens() {
     assert!(connection.last_error.is_none());
 }
 
-#[test]
-fn slack_service_ignores_server_env_tokens() {
+#[tokio::test]
+async fn slack_service_ignores_server_env_tokens() {
     let state = slack_app_state_with_secret_sources(
         &[],
         HashMap::from([
@@ -1709,33 +1715,36 @@ fn slack_service_ignores_server_env_tokens() {
                 "xapp-server-env".to_string(),
             ),
         ]),
-    );
+    )
+    .await;
 
     assert!(state.slack_service.is_none());
 }
 
-#[test]
-fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
+#[tokio::test]
+async fn slack_service_respects_disabled_server_config_even_with_secret_tokens() {
     let mut settings = default_test_server_settings();
     settings.server.integrations.slack.enabled = false;
     let (store, artifact_store) = test_store_bundle();
     let vault_path = test_secret_store_path();
-    let mut vault = Vault::load(vault_path.clone()).unwrap();
-    vault
+    let secrets = SecretStore::load(vault_path.clone()).await.unwrap();
+    secrets
         .set(
             EnvVars::FABRO_SLACK_BOT_TOKEN,
             "xoxb-test",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
-    vault
+    secrets
         .set(
             EnvVars::FABRO_SLACK_APP_TOKEN,
             "xapp-test",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let state = build_app_state(AppStateConfig {
@@ -1750,7 +1759,7 @@ fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
         artifact_store,
         variables_path: vault_path.with_file_name("variables.json"),
         vault_path,
-        preloaded_vault: Some(vault),
+        preloaded_secrets: Some(secrets),
         server_secrets: load_test_server_secrets(
             tempfile::tempdir().unwrap().path().join("server.env"),
             HashMap::new(),
@@ -1762,6 +1771,7 @@ fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
         sandbox_provider_registry: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
+    .await
     .expect("slack disabled test app state should build");
 
     assert!(state.slack_service.is_none());
@@ -1819,20 +1829,19 @@ fn worker_command_opt_in_token_includes_agent_run_tools_scope() {
 }
 
 #[cfg(unix)]
-#[test]
-fn worker_command_forwards_github_app_private_key_from_vault() {
+#[tokio::test]
+async fn worker_command_forwards_github_app_private_key_from_secrets() {
     let storage_dir = tempfile::tempdir().unwrap();
     let state = worker_command_test_state(storage_dir.path(), &["dev-token"], Some(TEST_DEV_TOKEN));
     state
-        .vault
-        .try_write()
-        .expect("test vault should not be locked")
+        .secrets
         .set(
             EnvVars::GITHUB_APP_PRIVATE_KEY,
             "test-private-key",
             SecretType::File,
             None,
         )
+        .await
         .unwrap();
     let cmd = worker_command(
         state.as_ref(),
@@ -2032,8 +2041,8 @@ destination = "file"
     assert!(message.contains("stdot"));
 }
 
-#[test]
-fn build_app_state_requires_session_secret_for_worker_tokens() {
+#[tokio::test]
+async fn build_app_state_requires_session_secret_for_worker_tokens() {
     let server_settings = server_settings_from_toml(
         r#"
 _version = 1
@@ -2057,7 +2066,7 @@ methods = ["dev-token"]
         artifact_store,
         variables_path: vault_path.with_file_name("variables.json"),
         vault_path,
-        preloaded_vault: None,
+        preloaded_secrets: None,
         server_secrets: ServerSecrets::load(server_env_path, HashMap::new()).unwrap(),
         env_lookup: default_env_lookup(),
         github_api_base_url: None,
@@ -2065,7 +2074,8 @@ methods = ["dev-token"]
         http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
         sandbox_provider_registry: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
-    }) else {
+    })
+    .await else {
         panic!("build_app_state should require SESSION_SECRET")
     };
 
@@ -2074,8 +2084,8 @@ methods = ["dev-token"]
     ));
 }
 
-#[test]
-fn build_app_state_migrates_legacy_vault_file_on_boot() {
+#[tokio::test]
+async fn build_app_state_migrates_legacy_vault_file_on_boot() {
     let vault_path = test_secret_store_path();
     let timestamp = "2026-05-18T12:00:00Z";
     let legacy_api_key = json!({
@@ -2134,40 +2144,51 @@ fn build_app_state_migrates_legacy_vault_file_on_boot() {
     .expect("legacy vault should be writable");
 
     let state = build_test_app_state_with_vault_path(&vault_path)
+        .await
         .expect("legacy vault should not prevent server boot");
 
-    let vault = state
-        .vault
-        .try_read()
-        .expect("test vault should not be locked");
-    let api_key_entry = vault
+    let api_key_entry = state
+        .secrets
         .get_entry("ANTHROPIC_API_KEY")
+        .await
         .expect("legacy provider credential should be migrated to token name");
     assert_eq!(api_key_entry.secret_type, SecretType::Token);
     assert_eq!(api_key_entry.value, "sk-ant-legacy");
-    assert!(vault.get_entry("anthropic").is_none());
+    assert!(state.secrets.get_entry("anthropic").await.is_none());
 
-    let oauth_entry = vault
+    let oauth_entry = state
+        .secrets
         .get_entry("OPENAI_CODEX")
+        .await
         .expect("legacy Codex credential should be migrated to canonical OAuth name");
     assert_eq!(oauth_entry.secret_type, SecretType::Oauth);
     let oauth: fabro_auth::OAuthCredential =
         serde_json::from_str(&oauth_entry.value).expect("migrated OAuth JSON should parse");
     assert_eq!(oauth.tokens.access_token, "codex-access");
     assert_eq!(oauth.account_id.as_deref(), Some("acct_legacy"));
-    assert!(vault.get_entry("openai_codex").is_none());
+    assert!(state.secrets.get_entry("openai_codex").await.is_none());
 
     assert_eq!(
-        vault.get_entry("GITHUB_TOKEN").unwrap().secret_type,
+        state
+            .secrets
+            .get_entry("GITHUB_TOKEN")
+            .await
+            .unwrap()
+            .secret_type,
         SecretType::Token
     );
     assert_eq!(
-        vault.get_entry("/tmp/github.pem").unwrap().secret_type,
+        state
+            .secrets
+            .get_entry("/tmp/github.pem")
+            .await
+            .unwrap()
+            .secret_type,
         SecretType::File
     );
 }
 
-fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc<AppState>> {
+async fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc<AppState>> {
     let (store, artifact_store) = test_store_bundle();
     build_app_state(AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
@@ -2181,7 +2202,7 @@ fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc
         artifact_store,
         variables_path: vault_path.with_file_name("variables.json"),
         vault_path: vault_path.to_path_buf(),
-        preloaded_vault: None,
+        preloaded_secrets: None,
         server_secrets: load_test_server_secrets(
             vault_path.with_file_name("server.env"),
             HashMap::new(),
@@ -2193,6 +2214,7 @@ fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc
         sandbox_provider_registry: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
+    .await
 }
 
 fn worker_command_test_state(
@@ -2688,10 +2710,9 @@ async fn create_run_without_explicit_title_returns_deterministic_then_updates_ge
         .env_lookup(|_| None)
         .build();
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -2713,10 +2734,9 @@ async fn create_run_with_explicit_title_skips_generated_title_work() {
         .env_lookup(|_| None)
         .build();
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let mut manifest = minimal_manifest_json(MINIMAL_DOT);
@@ -2778,10 +2798,9 @@ async fn generated_title_failure_leaves_deterministic_title_unchanged() {
         .env_lookup(|_| None)
         .build();
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -2817,10 +2836,9 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
         .env_lookup(|_| None)
         .build();
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -5240,14 +5258,14 @@ strategy = "token"
     .expect("github token settings fixture should resolve")
 }
 
-fn create_github_token_app_state(
+async fn create_github_token_app_state(
     token: Option<&str>,
     github_api_base_url: Option<String>,
 ) -> Arc<AppState> {
-    create_github_token_app_state_with_env_lookup(token, github_api_base_url, |_| None)
+    create_github_token_app_state_with_env_lookup(token, github_api_base_url, |_| None).await
 }
 
-fn create_github_token_app_state_with_env_lookup(
+async fn create_github_token_app_state_with_env_lookup(
     token: Option<&str>,
     github_api_base_url: Option<String>,
     env_lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
@@ -5258,9 +5276,10 @@ fn create_github_token_app_state_with_env_lookup(
         env_lookup,
         LlmCatalogSettings::default(),
     )
+    .await
 }
 
-fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
+async fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
     token: Option<&str>,
     github_api_base_url: Option<String>,
     env_lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
@@ -5281,7 +5300,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         artifact_store,
         variables_path: vault_path.with_file_name("variables.json"),
         vault_path,
-        preloaded_vault: None,
+        preloaded_secrets: None,
         server_secrets: load_test_server_secrets(server_env_path, HashMap::new()),
         env_lookup: Arc::new(env_lookup),
         github_api_base_url,
@@ -5290,28 +5309,31 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         sandbox_provider_registry: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
-    let state = build_app_state(config).expect("test app state should build");
+    let state = build_app_state(config)
+        .await
+        .expect("test app state should build");
     if let Some(token) = token {
         state
-            .vault
-            .try_write()
-            .expect("test vault should not already be locked")
+            .secrets
             .set("GITHUB_TOKEN", token, SecretType::Token, None)
+            .await
             .expect("test github token should be writable");
     }
     state
 }
 
-#[test]
-fn github_token_strategy_ignores_process_env_token() {
+#[tokio::test]
+async fn github_token_strategy_ignores_process_env_token() {
     let state = create_github_token_app_state_with_env_lookup(None, None, |name| match name {
         EnvVars::GITHUB_TOKEN => Some("ghu_from_env".to_string()),
         _ => None,
-    });
+    })
+    .await;
     let settings = state.server_settings();
 
     let err = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect_err("server runtime should ignore env-backed GitHub tokens");
 
     assert_eq!(
@@ -5320,27 +5342,28 @@ fn github_token_strategy_ignores_process_env_token() {
     );
 }
 
-#[test]
-fn github_token_strategy_ignores_gh_token_alias() {
+#[tokio::test]
+async fn github_token_strategy_ignores_gh_token_alias() {
     let state = create_github_token_app_state_with_env_lookup(None, None, |name| match name {
         EnvVars::GH_TOKEN => Some("ghu_from_env_alias".to_string()),
         _ => None,
-    });
+    })
+    .await;
     state
-        .vault
-        .try_write()
-        .expect("test vault should not already be locked")
+        .secrets
         .set(
             EnvVars::GH_TOKEN,
             "ghu_from_vault_alias",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let settings = state.server_settings();
 
     let err = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect_err("server runtime should ignore GH_TOKEN in env and vault");
 
     assert_eq!(
@@ -5349,13 +5372,14 @@ fn github_token_strategy_ignores_gh_token_alias() {
     );
 }
 
-#[test]
-fn github_token_strategy_reads_github_token_from_vault() {
-    let state = create_github_token_app_state(Some("ghu_test"), None);
+#[tokio::test]
+async fn github_token_strategy_reads_github_token_from_secrets() {
+    let state = create_github_token_app_state(Some("ghu_test"), None).await;
     let settings = state.server_settings();
 
     let credentials = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect("vault GitHub token should resolve")
         .expect("vault GitHub token should produce credentials");
 
@@ -5367,11 +5391,11 @@ fn github_token_strategy_reads_github_token_from_vault() {
 /// Build the (state, router, run_id) triple every PR-endpoint test
 /// needs. Use this instead of repeating the
 /// state/build_router/fixtures::RUN_1 incantation per test.
-fn pr_test_app(
+async fn pr_test_app(
     token: Option<&str>,
     github_api_base_url: Option<String>,
 ) -> (Arc<AppState>, Router, RunId) {
-    let state = create_github_token_app_state(token, github_api_base_url);
+    let state = create_github_token_app_state(token, github_api_base_url).await;
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     (state, app, fixtures::RUN_1)
 }
@@ -5384,7 +5408,7 @@ async fn pr_test_app_with_minimal_run(
     token: Option<&str>,
     github_api_base_url: Option<String>,
 ) -> (Arc<AppState>, Router, String) {
-    let state = create_github_token_app_state(token, github_api_base_url);
+    let state = create_github_token_app_state(token, github_api_base_url).await;
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = create_run(&app, MINIMAL_DOT).await;
     (state, app, run_id)
@@ -5400,7 +5424,7 @@ async fn pr_test_app_with_completed_run(
     github_api_base_url: Option<String>,
     repo_origin_url: Option<&str>,
 ) -> (Arc<AppState>, Router, RunId) {
-    let (state, app, run_id) = pr_test_app(token, github_api_base_url);
+    let (state, app, run_id) = pr_test_app(token, github_api_base_url).await;
     Box::pin(create_completed_run_ready_for_pull_request(
         &state,
         run_id,
@@ -7478,7 +7502,7 @@ async fn get_run_pull_request_returns_live_detail_from_github() {
                 .to_string(),
             );
     });
-    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url()));
+    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url())).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -7667,7 +7691,7 @@ async fn unlink_run_pull_request_appends_event_and_clears_projected_state() {
 
 #[tokio::test]
 async fn get_run_pull_request_returns_stored_github_association_without_github_credentials() {
-    let (state, app, run_id) = pr_test_app(None, None);
+    let (state, app, run_id) = pr_test_app(None, None).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -7714,7 +7738,7 @@ async fn get_run_pull_request_returns_stored_github_association_when_github_pr_i
             .header("content-type", "application/json")
             .body(json!({ "message": "Not Found" }).to_string());
     });
-    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url()));
+    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url())).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -7788,12 +7812,12 @@ async fn create_run_pull_request_creates_and_persists_record() {
         Some(github.base_url()),
         |_| None,
         llm_catalog_settings_with_provider_base_url("openai", llm.url("/v1")),
-    );
+    )
+    .await;
     state
-        .vault
-        .write()
-        .await
+        .secrets
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = fixtures::RUN_1;
@@ -7853,7 +7877,7 @@ async fn create_run_pull_request_creates_and_persists_record() {
 
 #[tokio::test]
 async fn create_run_pull_request_returns_conflict_when_record_exists() {
-    let (state, app, run_id) = pr_test_app(None, None);
+    let (state, app, run_id) = pr_test_app(None, None).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -8007,7 +8031,7 @@ async fn pull_request_endpoints_use_github_base_url_captured_at_startup() {
                 .to_string(),
             );
     });
-    let state = create_github_token_app_state(Some("ghu_test"), Some(github.base_url()));
+    let state = create_github_token_app_state(Some("ghu_test"), Some(github.base_url())).await;
     assert_eq!(state.github_api_base_url, github.base_url());
 
     let app = crate::test_support::build_test_router(Arc::clone(&state));
@@ -8062,7 +8086,7 @@ async fn merge_run_pull_request_returns_not_found_when_record_missing() {
 
 #[tokio::test]
 async fn merge_run_pull_request_rejects_invalid_method() {
-    let (state, app, run_id) = pr_test_app(Some("ghu_test"), None);
+    let (state, app, run_id) = pr_test_app(Some("ghu_test"), None).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -8090,7 +8114,7 @@ async fn merge_run_pull_request_rejects_invalid_method() {
 
 #[tokio::test]
 async fn merge_run_pull_request_returns_service_unavailable_without_github_credentials() {
-    let (state, app, run_id) = pr_test_app(None, None);
+    let (state, app, run_id) = pr_test_app(None, None).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -8129,7 +8153,7 @@ async fn merge_run_pull_request_uses_stored_link_coordinates() {
             .header("content-type", "application/json")
             .body(json!({}).to_string());
     });
-    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url()));
+    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url())).await;
 
     create_run_with_linked_pull_request_record(&state, run_id, PullRequestLink {
         owner:  "acme".to_string(),
@@ -8177,7 +8201,7 @@ async fn close_run_pull_request_returns_not_found_when_record_missing() {
 
 #[tokio::test]
 async fn close_run_pull_request_returns_service_unavailable_without_github_credentials() {
-    let (state, app, run_id) = pr_test_app(None, None);
+    let (state, app, run_id) = pr_test_app(None, None).await;
 
     create_run_with_pull_request_record(
         &state,
@@ -8214,7 +8238,7 @@ async fn close_run_pull_request_returns_bad_gateway_when_github_pr_is_missing() 
             .header("content-type", "application/json")
             .body(json!({ "message": "Not Found" }).to_string());
     });
-    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url()));
+    let (state, app, run_id) = pr_test_app(Some("ghu_test"), Some(github.base_url())).await;
 
     create_run_with_pull_request_record(
         &state,

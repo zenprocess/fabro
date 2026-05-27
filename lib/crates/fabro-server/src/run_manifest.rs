@@ -529,12 +529,13 @@ async fn build_preflight_report(
     let github_app = if needs_github_credentials {
         state
             .github_credentials(github_integration)
+            .await
             .unwrap_or_default()
     } else {
         None
     };
 
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let sandbox_ok = run_sandbox_check(
         &mut checks,
         sandbox_provider,

@@ -1,17 +1,17 @@
 use fabro_types::SecretMetadata;
-use fabro_vault::{Error as VaultError, SecretType, Vault};
+use fabro_vault::{Error as SecretStoreError, SecretStore, SecretType};
 
 use crate::credential::OAuthCredential;
 
 #[derive(Debug, thiserror::Error)]
-pub enum VaultLookupError {
-    #[error("vault entry '{name}' has schema {actual:?}, expected {expected:?}")]
+pub enum SecretLookupError {
+    #[error("secret entry '{name}' has schema {actual:?}, expected {expected:?}")]
     SchemaMismatch {
         name:     String,
         expected: SecretType,
         actual:   SecretType,
     },
-    #[error("vault entry '{name}' is not valid {expected:?} JSON: {source}")]
+    #[error("secret entry '{name}' is not valid {expected:?} JSON: {source}")]
     DecodeFailed {
         name:     String,
         expected: SecretType,
@@ -20,12 +20,15 @@ pub enum VaultLookupError {
     },
 }
 
-pub fn vault_get_token(vault: &Vault, name: &str) -> Result<Option<String>, VaultLookupError> {
-    let Some(entry) = vault.get_entry(name) else {
+pub async fn secret_get_token(
+    secrets: &SecretStore,
+    name: &str,
+) -> Result<Option<String>, SecretLookupError> {
+    let Some(entry) = secrets.get_entry(name).await else {
         return Ok(None);
     };
     if entry.secret_type != SecretType::Token {
-        return Err(VaultLookupError::SchemaMismatch {
+        return Err(SecretLookupError::SchemaMismatch {
             name:     name.to_string(),
             expected: SecretType::Token,
             actual:   entry.secret_type,
@@ -34,15 +37,15 @@ pub fn vault_get_token(vault: &Vault, name: &str) -> Result<Option<String>, Vaul
     Ok(Some(entry.value.clone()))
 }
 
-pub fn vault_get_oauth(
-    vault: &Vault,
+pub async fn secret_get_oauth(
+    secrets: &SecretStore,
     name: &str,
-) -> Result<Option<OAuthCredential>, VaultLookupError> {
-    let Some(entry) = vault.get_entry(name) else {
+) -> Result<Option<OAuthCredential>, SecretLookupError> {
+    let Some(entry) = secrets.get_entry(name).await else {
         return Ok(None);
     };
     if entry.secret_type != SecretType::Oauth {
-        return Err(VaultLookupError::SchemaMismatch {
+        return Err(SecretLookupError::SchemaMismatch {
             name:     name.to_string(),
             expected: SecretType::Oauth,
             actual:   entry.secret_type,
@@ -50,28 +53,28 @@ pub fn vault_get_oauth(
     }
     serde_json::from_str(&entry.value)
         .map(Some)
-        .map_err(|source| VaultLookupError::DecodeFailed {
+        .map_err(|source| SecretLookupError::DecodeFailed {
             name: name.to_string(),
             expected: SecretType::Oauth,
             source,
         })
 }
 
-pub fn vault_set_token(
-    vault: &mut Vault,
+pub async fn secret_set_token(
+    secrets: &SecretStore,
     name: &str,
     value: &str,
-) -> Result<SecretMetadata, VaultError> {
-    vault.set(name, value, SecretType::Token, None)
+) -> Result<SecretMetadata, SecretStoreError> {
+    secrets.set(name, value, SecretType::Token, None).await
 }
 
-pub fn vault_set_oauth(
-    vault: &mut Vault,
+pub async fn secret_set_oauth(
+    secrets: &SecretStore,
     name: &str,
     credential: &OAuthCredential,
-) -> Result<SecretMetadata, VaultError> {
+) -> Result<SecretMetadata, SecretStoreError> {
     let json = serde_json::to_string(credential)?;
-    vault.set(name, &json, SecretType::Oauth, None)
+    secrets.set(name, &json, SecretType::Oauth, None).await
 }
 
 #[cfg(test)]
@@ -81,9 +84,11 @@ mod tests {
     use super::*;
     use crate::credential::{OAuthConfig, OAuthTokens};
 
-    fn temp_vault() -> Vault {
+    async fn temp_secrets() -> SecretStore {
         let dir = tempfile::tempdir().unwrap();
-        Vault::load(dir.path().join("secrets.json")).unwrap()
+        SecretStore::load(dir.path().join("secrets.json"))
+            .await
+            .unwrap()
     }
 
     fn fixture() -> OAuthCredential {
@@ -105,53 +110,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vault_get_token_returns_none_when_absent() {
-        let vault = temp_vault();
+    #[tokio::test]
+    async fn secret_get_token_returns_none_when_absent() {
+        let secrets = temp_secrets().await;
         assert!(
-            vault_get_token(&vault, "ANTHROPIC_API_KEY")
+            secret_get_token(&secrets, "ANTHROPIC_API_KEY")
+                .await
                 .unwrap()
                 .is_none()
         );
     }
 
-    #[test]
-    fn vault_get_token_returns_value_when_present() {
-        let mut vault = temp_vault();
-        vault_set_token(&mut vault, "ANTHROPIC_API_KEY", "sk-test").unwrap();
+    #[tokio::test]
+    async fn secret_get_token_returns_value_when_present() {
+        let secrets = temp_secrets().await;
+        secret_set_token(&secrets, "ANTHROPIC_API_KEY", "sk-test")
+            .await
+            .unwrap();
         assert_eq!(
-            vault_get_token(&vault, "ANTHROPIC_API_KEY")
+            secret_get_token(&secrets, "ANTHROPIC_API_KEY")
+                .await
                 .unwrap()
                 .as_deref(),
             Some("sk-test"),
         );
     }
 
-    #[test]
-    fn vault_get_token_errors_on_oauth_entry() {
-        let mut vault = temp_vault();
-        vault_set_oauth(
-            &mut vault,
+    #[tokio::test]
+    async fn secret_get_token_errors_on_oauth_entry() {
+        let secrets = temp_secrets().await;
+        secret_set_oauth(
+            &secrets,
             crate::OPENAI_CODEX_VAULT_SECRET_NAME,
             &fixture(),
         )
+        .await
         .unwrap();
-        let err = vault_get_token(&vault, crate::OPENAI_CODEX_VAULT_SECRET_NAME).unwrap_err();
-        assert!(matches!(err, VaultLookupError::SchemaMismatch { .. }));
+        let err = secret_get_token(&secrets, crate::OPENAI_CODEX_VAULT_SECRET_NAME)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SecretLookupError::SchemaMismatch { .. }));
     }
 
-    #[test]
-    fn vault_get_oauth_round_trips() {
-        let mut vault = temp_vault();
+    #[tokio::test]
+    async fn secret_get_oauth_round_trips() {
+        let secrets = temp_secrets().await;
         let credential = fixture();
-        vault_set_oauth(
-            &mut vault,
+        secret_set_oauth(
+            &secrets,
             crate::OPENAI_CODEX_VAULT_SECRET_NAME,
             &credential,
         )
+        .await
         .unwrap();
         assert_eq!(
-            vault_get_oauth(&vault, crate::OPENAI_CODEX_VAULT_SECRET_NAME)
+            secret_get_oauth(&secrets, crate::OPENAI_CODEX_VAULT_SECRET_NAME)
+                .await
                 .unwrap()
                 .unwrap(),
             credential,

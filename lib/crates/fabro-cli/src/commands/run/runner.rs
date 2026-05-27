@@ -27,7 +27,7 @@ use fabro_types::{
     ArtifactUpload, EventBody, FailureReason, Principal, RunBlobId, RunEvent, RunId,
     WorkflowSettings,
 };
-use fabro_vault::Vault;
+use fabro_vault::SecretStore;
 use fabro_workflow::artifact_upload::{ArtifactSink, StageArtifactUploader};
 use fabro_workflow::event::{Emitter, RunEventSink};
 use fabro_workflow::operations::{self, StartServices};
@@ -37,7 +37,7 @@ use fabro_workflow::services::FabroRunToolServices;
 use jsonwebtoken::dangerous::insecure_decode;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Mutex, RwLock as AsyncRwLock, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -117,14 +117,8 @@ pub(crate) async fn execute(
     )?;
     let run_control = RunControlState::new();
     install_signal_handlers(Arc::clone(&run_control), cancel_token.clone())?;
-    let vault = load_worker_vault(storage_dir.as_deref())?;
-    let github_app = {
-        let vault_guard = match &vault {
-            Some(arc) => Some(arc.read().await),
-            None => None,
-        };
-        maybe_build_github_credentials(&run_spec.settings, vault_guard.as_deref())?
-    };
+    let secrets = load_worker_secrets(storage_dir.as_deref()).await?;
+    let github_app = maybe_build_github_credentials(&run_spec.settings, secrets.as_deref()).await?;
     let services = StartServices {
         run_id,
         cancel_token: cancel_token.clone(),
@@ -151,7 +145,7 @@ pub(crate) async fn execute(
             .integrations
             .github
             .resolve_permissions(process_env_var),
-        vault,
+        vault: secrets,
         catalog,
         on_node: None,
         registry_override: None,
@@ -239,19 +233,19 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
     }
 }
 
-fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLock<Vault>>>> {
+async fn load_worker_secrets(storage_dir: Option<&Path>) -> Result<Option<Arc<SecretStore>>> {
     let Some(storage_dir) = storage_dir else {
         return Ok(None);
     };
 
     let storage = Storage::new(storage_dir);
-    let vault = Vault::load(storage.secrets_path()).with_context(|| {
+    let secrets = SecretStore::load(storage.secrets_path()).await.with_context(|| {
         format!(
-            "failed to load worker vault from {}",
+            "failed to load worker secrets from {}",
             storage.root().display()
         )
     })?;
-    Ok(Some(Arc::new(AsyncRwLock::new(vault))))
+    Ok(Some(Arc::new(secrets)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -654,9 +648,9 @@ fn stamp_system_worker(mut event: RunEvent) -> RunEvent {
     event
 }
 
-fn maybe_build_github_credentials(
+async fn maybe_build_github_credentials(
     settings: &WorkflowSettings,
-    vault: Option<&fabro_vault::Vault>,
+    secrets: Option<&SecretStore>,
 ) -> Result<Option<fabro_github::GitHubCredentials>> {
     let resolved_run = &settings.run;
     let resolved_server = ServerSettingsBuilder::load_default().ok();
@@ -672,7 +666,8 @@ fn maybe_build_github_credentials(
         .map(InterpString::as_source);
 
     if requires_github_credentials(resolved_run) {
-        return build_github_credentials(strategy, app_id.as_deref(), app_slug.as_deref(), vault);
+        return build_github_credentials(strategy, app_id.as_deref(), app_slug.as_deref(), secrets)
+            .await;
     }
 
     let pull_request_enabled =
@@ -682,8 +677,9 @@ fn maybe_build_github_credentials(
             strategy,
             app_id.as_deref(),
             app_slug.as_deref(),
-            vault,
+            secrets,
         )
+        .await
         .ok()
         .flatten());
     }
@@ -769,13 +765,13 @@ mod tests {
         AuthMethod, EventBody, FailureCategory, FailureDetail, FailureReason, IdpIdentity,
         Principal, QuestionType, RunFailure, SuccessReason, fixtures,
     };
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
     use fabro_workflow::event::RunEventSink;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         WorkerControlStreamEvent, WorkerTitlePhase, apply_worker_control_line,
-        handle_worker_control_stream_events, initial_worker_title_phase, load_worker_vault,
+        handle_worker_control_stream_events, initial_worker_title_phase, load_worker_secrets,
         read_worker_control_stream_blocking, stamp_system_worker, worker_title,
         worker_title_phase_for_event,
     };
@@ -1119,17 +1115,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_worker_vault_reads_credentials_from_storage_dir() {
+    async fn load_worker_secrets_reads_credentials_from_storage_dir() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::new(temp.path());
-        let mut vault = Vault::load(storage.secrets_path()).unwrap();
-        vault
+        let secrets = SecretStore::load(storage.secrets_path()).await.unwrap();
+        secrets
             .set("ANTHROPIC_API_KEY", "vault-key", SecretType::Token, None)
+            .await
             .unwrap();
 
-        let loaded = load_worker_vault(Some(temp.path())).unwrap().unwrap();
-        let guard = loaded.read().await;
-        let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
+        let loaded = load_worker_secrets(Some(temp.path())).await.unwrap().unwrap();
+        let credential = loaded.get("ANTHROPIC_API_KEY").await.unwrap();
 
         assert!(credential.contains("vault-key"));
     }

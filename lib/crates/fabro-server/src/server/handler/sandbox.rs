@@ -109,7 +109,7 @@ async fn retrieve_run_sandbox(
         Ok(record) => record,
         Err(response) => return response,
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
     match sandbox_details(&record, daytona_api_key, daytona_organization_id, Some(id)).await {
         Ok(details) => Json::<SandboxDetails>(details).into_response(),
@@ -228,7 +228,7 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
             return;
         }
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
     let session = match open_terminal_for_run(
         &record,
@@ -859,7 +859,7 @@ async fn reconnect_run_sandbox_instance(
     run_id: &RunId,
     record: &RunSandboxInstance,
 ) -> Result<Box<dyn Sandbox>, Response> {
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let sandbox = reconnect_for_run(record, daytona_api_key, Some(*run_id))
         .await
         .map_err(|err| {
@@ -899,7 +899,7 @@ async fn reconnect_daytona_sandbox_instance(
         )
         .into_response());
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.secret_value(EnvVars::DAYTONA_API_KEY).await;
     let sandbox = DaytonaSandbox::reconnect(
         &runtime.id,
         daytona_api_key,

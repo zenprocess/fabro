@@ -105,14 +105,14 @@ async fn get_system_integrations(
     let settings = state.server_settings();
     let response = SystemIntegrationsResponse {
         data: vec![
-            github_integration_status(state.as_ref(), &settings.server.integrations.github),
-            slack_integration_status(state.as_ref()),
+            github_integration_status(state.as_ref(), &settings.server.integrations.github).await,
+            slack_integration_status(state.as_ref()).await,
         ],
     };
     (StatusCode::OK, Json(response)).into_response()
 }
 
-fn github_integration_status(
+async fn github_integration_status(
     state: &AppState,
     settings: &GithubIntegrationSettings,
 ) -> SystemIntegrationStatus {
@@ -146,7 +146,7 @@ fn github_integration_status(
     let mut missing = Vec::new();
     match settings.strategy {
         GithubIntegrationStrategy::Token => {
-            if missing_vault_secret(state, EnvVars::GITHUB_TOKEN) {
+            if missing_secret(state, EnvVars::GITHUB_TOKEN).await {
                 missing.push(EnvVars::GITHUB_TOKEN.to_string());
             }
         }
@@ -157,10 +157,10 @@ fn github_integration_status(
             if settings.client_id.is_none() {
                 missing.push("server.integrations.github.client_id".to_string());
             }
-            if missing_vault_secret(state, EnvVars::GITHUB_APP_CLIENT_SECRET) {
+            if missing_secret(state, EnvVars::GITHUB_APP_CLIENT_SECRET).await {
                 missing.push(EnvVars::GITHUB_APP_CLIENT_SECRET.to_string());
             }
-            if missing_vault_secret(state, EnvVars::GITHUB_APP_PRIVATE_KEY) {
+            if missing_secret(state, EnvVars::GITHUB_APP_PRIVATE_KEY).await {
                 missing.push(EnvVars::GITHUB_APP_PRIVATE_KEY.to_string());
             }
         }
@@ -182,7 +182,7 @@ fn github_integration_status(
     )
 }
 
-fn slack_integration_status(state: &AppState) -> SystemIntegrationStatus {
+async fn slack_integration_status(state: &AppState) -> SystemIntegrationStatus {
     let settings = &state.server_settings().server.integrations.slack;
     let mut metadata = BTreeMap::new();
     if let Some(default_channel) = settings.default_channel.as_ref() {
@@ -203,13 +203,24 @@ fn slack_integration_status(state: &AppState) -> SystemIntegrationStatus {
         );
     }
 
-    let mut missing =
-        match resolve_slack_credentials_status_with_lookup(|name| state.vault_secret(name)) {
-            SlackCredentialResolution::Configured(_) => Vec::new(),
-            SlackCredentialResolution::Missing { env_vars } => {
-                env_vars.into_iter().map(str::to_string).collect()
-            }
-        };
+    let slack_lookup = BTreeMap::from([
+        (
+            EnvVars::FABRO_SLACK_BOT_TOKEN,
+            state.secret_value(EnvVars::FABRO_SLACK_BOT_TOKEN).await,
+        ),
+        (
+            EnvVars::FABRO_SLACK_APP_TOKEN,
+            state.secret_value(EnvVars::FABRO_SLACK_APP_TOKEN).await,
+        ),
+    ]);
+    let mut missing = match resolve_slack_credentials_status_with_lookup(|name| {
+        slack_lookup.get(name).cloned().flatten()
+    }) {
+        SlackCredentialResolution::Configured(_) => Vec::new(),
+        SlackCredentialResolution::Missing { env_vars } => {
+            env_vars.into_iter().map(str::to_string).collect()
+        }
+    };
     missing.sort();
     if !missing.is_empty() {
         return integration_status(
@@ -267,9 +278,10 @@ fn integration_status(
     }
 }
 
-fn missing_vault_secret(state: &AppState, name: &str) -> bool {
+async fn missing_secret(state: &AppState, name: &str) -> bool {
     state
-        .vault_secret(name)
+        .secret_value(name)
+        .await
         .as_deref()
         .map(str::trim)
         .is_none_or(str::is_empty)
@@ -482,7 +494,7 @@ async fn get_github_repo(
                 return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
                     .into_response();
             }
-            let creds = match state.github_credentials(github_settings) {
+            let creds = match state.github_credentials(github_settings).await {
                 Ok(Some(fabro_github::GitHubCredentials::App(creds))) => creds,
                 Ok(Some(_)) => unreachable!("app strategy should not return token credentials"),
                 Ok(None) => {
@@ -573,7 +585,7 @@ async fn get_github_repo(
             }
         }
         GithubIntegrationStrategy::Token => {
-            let token = match state.github_credentials(github_settings) {
+            let token = match state.github_credentials(github_settings).await {
                 Ok(Some(fabro_github::GitHubCredentials::Pat(token))) => token,
                 Ok(Some(fabro_github::GitHubCredentials::Installation(token))) => {
                     match token.valid_token() {

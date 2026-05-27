@@ -928,10 +928,10 @@ async fn substitute_run_variables(
     state: &AppState,
     settings: &mut WorkflowSettings,
 ) -> Result<(), ResolveEnvError> {
-    let variables = state.variables.read().await;
+    let variables = state.variables.values_map().await;
     settings
         .run
-        .substitute_variables(|name| variables.get_value(name).map(str::to_string))
+        .substitute_variables(|name| variables.get(name).cloned())
 }
 
 async fn get_run_status(

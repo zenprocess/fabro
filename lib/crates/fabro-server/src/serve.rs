@@ -41,7 +41,7 @@ use crate::server::{
     spawn_scheduler,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
-use crate::startup::{prepare_startup_vault, resolve_startup, validate_startup_configuration};
+use crate::startup::{prepare_startup_secrets, resolve_startup, validate_startup_configuration};
 use crate::static_files;
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
@@ -293,7 +293,7 @@ enum WebhookPreconditions {
     Skip(String),
 }
 
-fn resolve_webhook_preconditions(
+async fn resolve_webhook_preconditions(
     github: &GithubIntegrationSettings,
     state: &Arc<AppState>,
     webhook_secret_present: bool,
@@ -313,7 +313,7 @@ fn resolve_webhook_preconditions(
             "server.integrations.github.app_id is not set".to_string(),
         ));
     };
-    let github_app = match state.github_credentials(github) {
+    let github_app = match state.github_credentials(github).await {
         Ok(creds) => creds,
         Err(err) => {
             return Ok(WebhookPreconditions::Skip(format!(
@@ -355,7 +355,7 @@ async fn start_webhook_strategy(
     };
 
     let (app_id, private_key_pem) =
-        match resolve_webhook_preconditions(github, state, webhook_secret_present)? {
+        match resolve_webhook_preconditions(github, state, webhook_secret_present).await? {
             WebhookPreconditions::Ready {
                 app_id,
                 private_key_pem,
@@ -733,14 +733,14 @@ where
     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
     validate_startup_configuration(&resolved_server_settings)?;
     let env_entries = process_env_snapshot();
-    let startup_vault = prepare_startup_vault(&vault_path, &server_env_path, &env_entries)?;
+    let startup_secrets = prepare_startup_secrets(&vault_path, &server_env_path, &env_entries).await?;
     let (auth_mode, server_secrets) = resolve_startup(
         &server_env_path,
         env_entries,
         &resolved_server_settings,
-        &startup_vault,
+        &startup_secrets,
     )?;
-    let webhook_secret_present = startup_vault.get(WEBHOOK_SECRET_ENV).is_some();
+    let webhook_secret_present = startup_secrets.get(WEBHOOK_SECRET_ENV).await.is_some();
     let bind_request = resolve_bind_request_from_server_settings(
         &resolved_app_settings.server_settings,
         args.bind.as_deref(),
@@ -806,7 +806,7 @@ where
         artifact_store,
         vault_path,
         variables_path,
-        preloaded_vault: Some(startup_vault),
+        preloaded_secrets: Some(startup_secrets),
         server_secrets,
         env_lookup,
         github_api_base_url: None,
@@ -814,7 +814,8 @@ where
         http_client: None,
         sandbox_provider_registry: None,
         shutdown: shutdown.clone(),
-    })?;
+    })
+    .await?;
     let reconciled = reconcile_incomplete_runs_on_startup(&state).await?;
     if reconciled > 0 {
         info!(

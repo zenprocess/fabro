@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, EnvCredentialSource, SecretCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
@@ -23,9 +23,8 @@ use fabro_types::settings::run::{
 };
 use fabro_types::settings::{InterpString, ModelRegistry, ResolvedModelRef};
 use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProviderKind};
-use fabro_vault::Vault;
+use fabro_vault::SecretStore;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifact_upload::ArtifactSink;
@@ -78,7 +77,7 @@ struct RunSession {
     workflow_path:     Option<ManifestPath>,
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
-    vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    vault:             Option<Arc<SecretStore>>,
     catalog:           Arc<Catalog>,
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
@@ -103,7 +102,7 @@ pub struct StartServices {
     /// Server-resolved GitHub integration permissions to inject into the
     /// sandbox env. Empty when github integration has no permissions.
     pub github_permissions: HashMap<String, String>,
-    pub vault:              Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:              Option<Arc<SecretStore>>,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
     pub registry_override:  Option<Arc<HandlerRegistry>>,
@@ -398,11 +397,7 @@ impl RunSession {
             },
             SandboxProviderKind::Daytona => {
                 let api_key = match &services.vault {
-                    Some(v) => v
-                        .read()
-                        .await
-                        .get(EnvVars::DAYTONA_API_KEY)
-                        .map(str::to_string),
+                    Some(secrets) => secrets.get(EnvVars::DAYTONA_API_KEY).await,
                     None => None,
                 };
                 SandboxSpec::Daytona {
@@ -481,11 +476,11 @@ impl RunSession {
 }
 
 async fn configured_providers_for_start(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
+    vault: Option<&Arc<SecretStore>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
     let source: Arc<dyn CredentialSource> = match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::with_env_lookup(
+        Some(vault) => Arc::new(SecretCredentialSource::with_env_lookup(
             Arc::clone(vault),
             process_env_var,
         )),

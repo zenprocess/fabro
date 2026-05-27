@@ -14,7 +14,7 @@ use fabro_config::user::default_settings_path;
 use fabro_server::jwt_auth::auth_method_name;
 use fabro_server::serve::{DEFAULT_TCP_PORT, ServeArgs, resolve_runtime_server_settings_for_start};
 use fabro_server::{
-    load_startup_vault, process_env_snapshot, validate_startup, validate_startup_configuration,
+    load_startup_secrets, process_env_snapshot, validate_startup, validate_startup_configuration,
 };
 use fabro_static::EnvVars;
 use fabro_types::settings::{LogDestination, ServerAuthMethod};
@@ -289,12 +289,13 @@ async fn execute_daemon(
         );
     }
     validate_startup_configuration(&resolved_settings)?;
-    let startup_vault = load_startup_vault(fabro_config::Storage::new(storage_dir).secrets_path())?;
+    let startup_secrets =
+        load_startup_secrets(fabro_config::Storage::new(storage_dir).secrets_path()).await?;
     validate_startup(
         runtime_directory.env_path().as_path(),
         process_env_snapshot(),
         &resolved_settings,
-        &startup_vault,
+        &startup_secrets,
     )?;
 
     let log_path = runtime_directory.log_path();

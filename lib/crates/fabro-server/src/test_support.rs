@@ -3,6 +3,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
+use std::future::Future;
 use std::time::Duration;
 
 use axum::extract::Request;
@@ -22,7 +23,7 @@ use fabro_store::{ArtifactStore, Database};
 use fabro_types::settings::ServerAuthMethod;
 use fabro_types::{AuthMethod, IdpIdentity, ServerSettings};
 use fabro_util::error::SharedError;
-use fabro_vault::{SecretType, Vault};
+use fabro_vault::{SecretStore, SecretType};
 use fabro_workflow::handler::HandlerRegistry;
 use object_store::memory::InMemory as MemoryObjectStore;
 use tokio_util::sync::CancellationToken;
@@ -200,44 +201,75 @@ impl TestAppStateBuilder {
     pub fn build(self) -> Arc<AppState> {
         let (store, artifact_store) = self.store_bundle.unwrap_or_else(test_store_bundle);
         let vault_path = self.vault_path.unwrap_or_else(test_secret_store_path);
-        if !self.vault_entries.is_empty() {
-            let mut vault = Vault::load(vault_path.clone()).expect("test vault should load");
-            for (name, value) in &self.vault_entries {
-                vault
-                    .set(name, value, SecretType::Token, None)
-                    .expect("test vault entry should persist");
-            }
-        }
         let server_env_path = self
             .server_env_path
             .unwrap_or_else(|| vault_path.with_file_name("server.env"));
         let active_config_path = self.active_config_path.unwrap_or_else(|| {
             std::env::temp_dir().join(format!("fabro-test-settings-{}.toml", Ulid::new()))
         });
-        build_app_state(AppStateConfig {
-            resolved_settings: resolved_runtime_settings_for_tests(
-                self.server_settings,
-                self.manifest_run_defaults,
-                self.llm_catalog_settings,
-            ),
-            registry_factory_override: self.registry_factory_override,
-            max_concurrent_runs: self.max_concurrent_runs,
-            store,
-            artifact_store,
-            variables_path: vault_path.with_file_name("variables.json"),
-            vault_path,
-            preloaded_vault: None,
-            server_secrets: load_test_server_secrets(server_env_path, self.server_secret_env),
-            env_lookup: self.env_lookup,
-            github_api_base_url: None,
-            active_config_path,
-            http_client: Some(
-                fabro_http::test_http_client().expect("test HTTP client should build"),
-            ),
-            sandbox_provider_registry: self.sandbox_provider_registry,
-            shutdown: CancellationToken::new(),
+        block_on_test(async move {
+            if !self.vault_entries.is_empty() {
+                let secrets = SecretStore::load(vault_path.clone())
+                    .await
+                    .expect("test secrets should load");
+                for (name, value) in &self.vault_entries {
+                    secrets
+                        .set(name, value, SecretType::Token, None)
+                        .await
+                        .expect("test secret entry should persist");
+                }
+            }
+
+            build_app_state(AppStateConfig {
+                resolved_settings: resolved_runtime_settings_for_tests(
+                    self.server_settings,
+                    self.manifest_run_defaults,
+                    self.llm_catalog_settings,
+                ),
+                registry_factory_override: self.registry_factory_override,
+                max_concurrent_runs: self.max_concurrent_runs,
+                store,
+                artifact_store,
+                variables_path: vault_path.with_file_name("variables.json"),
+                vault_path,
+                preloaded_secrets: None,
+                server_secrets: load_test_server_secrets(server_env_path, self.server_secret_env),
+                env_lookup: self.env_lookup,
+                github_api_base_url: None,
+                active_config_path,
+                http_client: Some(
+                    fabro_http::test_http_client().expect("test HTTP client should build"),
+                ),
+                sandbox_provider_registry: self.sandbox_provider_registry,
+                shutdown: CancellationToken::new(),
+            })
+            .await
         })
         .expect("test app state should build")
+    }
+}
+
+fn block_on_test<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(future)
+        })
+        .join()
+        .expect("test runtime thread should not panic")
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build")
+            .block_on(future)
     }
 }
 

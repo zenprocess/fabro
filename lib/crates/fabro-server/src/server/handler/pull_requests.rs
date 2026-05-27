@@ -65,11 +65,14 @@ fn pull_request_record_from_link_request(
     })
 }
 
-fn load_server_github_credentials(
+async fn load_server_github_credentials(
     state: &AppState,
 ) -> Result<fabro_github::GitHubCredentials, ApiError> {
     let settings = state.server_settings();
-    match state.github_credentials(&settings.server.integrations.github) {
+    match state
+        .github_credentials(&settings.server.integrations.github)
+        .await
+    {
         Ok(Some(creds)) => Ok(creds),
         Ok(None) => {
             warn!("GitHub integration unavailable on server: credentials not configured");
@@ -156,7 +159,7 @@ async fn load_pull_request_github_context(
 ) -> Result<PullRequestGithubContext, ApiError> {
     let record = load_pull_request_record(state, id).await?;
     let (owner, repo, number) = github_coordinates_for_record(&record);
-    let creds = load_server_github_credentials(state.as_ref())?;
+    let creds = load_server_github_credentials(state.as_ref()).await?;
     Ok(PullRequestGithubContext {
         record,
         owner,
@@ -304,7 +307,7 @@ async fn create_run_pull_request(
         Ok(inputs) => inputs,
         Err(err) => return err.into_response(),
     };
-    let creds = match load_server_github_credentials(state.as_ref()) {
+    let creds = match load_server_github_credentials(state.as_ref()).await {
         Ok(creds) => creds,
         Err(err) => return err.into_response(),
     };
@@ -428,7 +431,7 @@ async fn get_run_pull_request(
         Err(err) => return err.into_response(),
     };
     let (owner, repo, number) = github_coordinates_for_record(&record);
-    let creds = match load_server_github_credentials(state.as_ref()) {
+    let creds = match load_server_github_credentials(state.as_ref()).await {
         Ok(creds) => creds,
         Err(err) => {
             warn!(error = ?err, "Returning stored pull request without live GitHub details");

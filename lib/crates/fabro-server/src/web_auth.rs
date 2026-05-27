@@ -607,7 +607,7 @@ async fn callback_github(
             );
         }
     };
-    let Some(client_secret) = state.vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET) else {
+    let Some(client_secret) = state.secret_value(EnvVars::GITHUB_APP_CLIENT_SECRET).await else {
         error!("OAuth callback failed: GITHUB_APP_CLIENT_SECRET not configured");
         return json_response(
             StatusCode::CONFLICT,

@@ -1593,7 +1593,7 @@ mod tests {
     use fabro_agent::subagent::SessionFactory;
     use fabro_agent::{AgentProfile, LocalSandbox, ToolRegistry};
     use fabro_api::types;
-    use fabro_auth::{EnvCredentialSource, VaultCredentialSource};
+    use fabro_auth::{EnvCredentialSource, SecretCredentialSource};
     use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
     use fabro_llm::{Error as LlmError, ProviderErrorDetail, ProviderErrorKind};
     use fabro_tool::FabroToolBackend;
@@ -1601,11 +1601,10 @@ mod tests {
         EventEnvelope, FailureReason, Run, RunId, RunLifecycle, RunLinks, RunOrigin,
         RunPairStatusResponse, RunProjection, RunStatus, RunTimestamps, SuccessReason, WorkflowRef,
     };
-    use fabro_vault::{SecretType, Vault};
+    use fabro_vault::{SecretStore, SecretType};
     use futures::stream;
     use httpmock::Method::POST;
     use httpmock::MockServer;
-    use tokio::sync::RwLock as AsyncRwLock;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -2617,21 +2616,24 @@ reasoning = false
     #[tokio::test]
     async fn api_backend_uses_source_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
-        vault
+        let secrets = SecretStore::load(dir.path().join("secrets.json"))
+            .await
+            .unwrap();
+        secrets
             .set(
                 "ANTHROPIC_API_KEY",
                 "anthropic-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
         let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::anthropic(),
             Vec::new(),
-            Arc::new(VaultCredentialSource::with_env_lookup(
-                Arc::new(AsyncRwLock::new(vault)),
+            Arc::new(SecretCredentialSource::with_env_lookup(
+                Arc::new(secrets),
                 |_| None,
             )),
             SteeringHub::for_tests(),
