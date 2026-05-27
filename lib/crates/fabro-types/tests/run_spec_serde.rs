@@ -4,7 +4,7 @@ use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunSpec};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::test_support::engine_run_provenance;
+use fabro_types::test_support::test_run_provenance;
 use fabro_types::{WorkflowSettings, fixtures};
 
 fn templated_settings() -> WorkflowSettings {
@@ -23,7 +23,7 @@ fn run_spec_round_trips_templated_settings() {
         workflow_slug:    Some("demo".to_string()),
         source_directory: Some("/Users/client/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance:       engine_run_provenance(),
+        provenance:       test_run_provenance(),
         manifest_blob:    None,
         definition_blob:  None,
         git:              Some(GitContext {
