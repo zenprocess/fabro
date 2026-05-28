@@ -503,7 +503,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-28T00:13:58.936868Z",
-  "last_event_at": "2026-05-28T00:14:15.430722Z",
+  "last_event_at": "2026-05-28T00:16:35.033591Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -607,9 +607,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 38,
       "checkpoint": {
-        "timestamp": "2026-05-28T00:16:31.052972Z",
+        "timestamp": "2026-05-28T00:16:35.031738Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -618,8 +618,90 @@
         ],
         "node_retries": {},
         "context_values": {
-          "thread.start.current_node": "toolchain",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
           "current_node": "preflight_compile",
+          "failure_class": "",
+          "failure_signature": "",
+          "graph.rankdir": "LR",
+          "internal.fidelity": "compact",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.toolchain": 0,
+          "internal.run_id": "01KSNYVQCKXPCSCEGWMZ1Q574Z",
+          "thread.start.current_node": "toolchain",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.goal": "---\ntitle: \"refactor: Remove IP allowlisting\"\ntype: refactor\nstatus: active\ndate: 2026-05-27\n---\n\n# refactor: Remove IP allowlisting\n\n## Overview\n\nRemove Fabro's inbound server IP allowlisting feature completely. This removes the\nserver-wide `[server.ip_allowlist]` setting, the GitHub webhook-specific\n`[server.integrations.github.webhooks.ip_allowlist]` overlay, request middleware,\nclient-IP extraction, GitHub `/meta` hook-range expansion, settings API exposure,\ngenerated API client types, and the Settings > Security UI display.\n\nExisting configs that still contain removed IP allowlist keys should fail as\nunknown fields. This is an intentional hard removal, not a compatibility\ndeprecation.\n\n## Problem Frame\n\nThe feature is being removed from Fabro rather than maintained as an in-process\nnetwork access-control layer. Network source restrictions should be handled\noutside Fabro by reverse proxies, firewalls, VPNs, Tailscale, platform ingress,\nor other deployment-layer controls.\n\n## Requirements Trace\n\n- R1. Remove all runtime enforcement of inbound source-IP allowlisting from web,\n  API, static asset, and GitHub webhook routes.\n- R2. Remove the server settings schema for global and GitHub webhook IP\n  allowlists.\n- R3. Remove `IpAllowEntry` and related API schema/client types from public\n  settings payloads.\n- R4. Keep unrelated allowlists intact: GitHub username allowlists, sandbox\n  egress CIDR allow lists, and internal policy/test allowlists.\n- R5. Preserve existing authentication, GitHub webhook HMAC verification,\n  routing, health checks, request logging, and settings hot-reload behavior.\n- R6. Treat old IP allowlist config as invalid after removal.\n- R7. Update operator-facing docs/changelog so users know to move source-IP\n  restrictions upstream.\n\n## Scope Boundaries\n\n- Do not remove `[server.auth.github].allowed_usernames`.\n- Do not remove Daytona/sandbox `cidr_allow_list` network policy support.\n- Do not remove generic uses of \"allowlist\" in policy tests, markdown rendering,\n  model controls, or other unrelated domains.\n- Do not add a migration, warning-only parser, or fallback compatibility path for\n  old IP allowlist settings.\n- Do not change GitHub webhook signature verification or webhook route strategy.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- Settings use sparse config layers in `lib/crates/fabro-config/src/layers/`\n  and dense resolved types in `lib/crates/fabro-types/src/settings/`.\n- The OpenAPI spec at `docs/public/api-reference/fabro-api.yaml` is the source\n  of truth for API wire shape; `cargo build -p fabro-api` regenerates Rust API\n  code, and `cd lib/packages/fabro-api-client && bun run generate` regenerates\n  the TypeScript client.\n- `lib/crates/fabro-server/src/server.rs` builds the router and currently wires\n  IP allowlist middleware before other route dispatch behavior.\n- `lib/crates/fabro-server/src/serve.rs` currently resolves server and webhook\n  allowlist configs at startup and creates a GitHub `/meta` resolver.\n- `apps/fabro-web/app/routes/settings-security.tsx` displays the settings API's\n  `server.ip_allowlist` state.\n\n### Main Removal Surfaces\n\n- Config/types: `fabro-types`, `fabro-config`, config tests.\n- Server runtime: `fabro-server/src/ip_allowlist.rs`, router wiring, startup\n  wiring, test helpers, routing/TCP tests.\n- API/contracts: OpenAPI schema, `fabro-api` type replacements/exports, generated\n  TypeScript API client models.\n- Frontend/docs: Settings > Security copy, settings navigation copy, changelog.\n\n## Key Technical Decisions\n\n- **Hard removal:** Removed config keys should fail through existing\n  `deny_unknown_fields` behavior. This keeps the change simple and makes stale\n  deployment config visible immediately.\n- **Delete, do not stub:** Remove `IpAllowlistConfig` and middleware parameters\n  instead of passing default empty configs through the router. Empty stubs would\n  keep the feature shape alive and make future cleanup harder.\n- **Keep webhook auth unchanged:** GitHub webhook source-IP filtering goes away,\n  but HMAC signature verification remains the security boundary for webhook\n  payload authenticity.\n- **Generated clients follow OpenAPI:** Update the OpenAPI schemas first, then\n  regenerate Rust and TypeScript API outputs rather than hand-editing generated\n  client files except as a short-term cleanup if generation leaves stale exports.\n- **Docs mention upstream controls:** The changelog and security guidance should\n  direct operators to network-layer controls, not a replacement Fabro setting.\n\n## Implementation Units\n\n- [ ] **Unit 1: Remove config schema and resolved types**\n\n**Goal:** Delete the IP allowlist settings contract from config parsing and dense\nserver settings.\n\n**Requirements:** R2, R3, R4, R6\n\n**Dependencies:** None\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/settings/server.rs`\n- Modify: `lib/crates/fabro-types/src/settings/mod.rs`\n- Modify: `lib/crates/fabro-types/Cargo.toml`\n- Modify: `lib/crates/fabro-config/src/layers/server.rs`\n- Modify: `lib/crates/fabro-config/src/layers/mod.rs`\n- Modify: `lib/crates/fabro-config/src/lib.rs`\n- Modify: `lib/crates/fabro-config/src/resolve/server.rs`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_server.rs`\n\n**Approach:**\n- Remove `ServerNamespace.ip_allowlist` and its `test_default()` population.\n- Delete `ServerIpAllowlistSettings`, `ServerIpAllowlistOverrideSettings`, and\n  `IpAllowEntry`.\n- Remove `ServerLayer.ip_allowlist`, `ServerIpAllowlistLayer`,\n  `ServerIpAllowlistOverrideLayer`, and `IntegrationWebhooksLayer.ip_allowlist`.\n- Remove resolver functions and validation for global and webhook IP allowlists,\n  including `github_meta_hooks` parsing and Unix socket trusted-proxy checks.\n- Remove `ipnet` from `fabro-types`. Keep `ipnet` in `fabro-config` because\n  `resolve/environment.rs` still validates sandbox CIDR policy.\n- Replace old positive/negative IP allowlist config tests with unknown-field\n  tests for `[server.ip_allowlist]` and\n  `[server.integrations.github.webhooks.ip_allowlist]`.\n\n**Patterns to follow:**\n- Existing unknown-field tests in `lib/crates/fabro-config/src/tests/resolve_server.rs`\n  for retired server settings.\n- Existing `ServerLayer`/`ServerNamespace` layer-to-resolved pattern for removing\n  a server subdomain cleanly.\n\n**Test scenarios:**\n- Error path: TOML with `[server.ip_allowlist]` fails parsing/resolution with an\n  unknown-field diagnostic mentioning `ip_allowlist`.\n- Error path: TOML with `[server.integrations.github.webhooks.ip_allowlist]`\n  fails with an unknown-field diagnostic mentioning `ip_allowlist`.\n- Happy path: minimal valid server settings still resolve without any\n  `ip_allowlist` field.\n- Integration: serialized `ServerSettings` JSON no longer includes\n  `server.ip_allowlist`.\n\n**Verification:**\n- `fabro-config` and `fabro-types` compile without removed IP allowlist symbols.\n- Config tests prove stale allowlist settings are rejected.\n\n- [ ] **Unit 2: Remove server middleware and startup resolution**\n\n**Goal:** Remove all runtime source-IP filtering and GitHub `/meta` range\nresolution from `fabro-server`.\n\n**Requirements:** R1, R4, R5\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Delete: `lib/crates/fabro-server/src/ip_allowlist.rs`\n- Modify: `lib/crates/fabro-server/src/lib.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/serve.rs`\n- Modify: `lib/crates/fabro-server/src/test_support.rs`\n- Modify: `lib/crates/fabro-server/Cargo.toml`\n- Modify: `lib/crates/fabro-server/src/auth/translate.rs`\n- Modify: `lib/crates/fabro-server/src/web_auth.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/support/auth_harness.rs`\n\n**Approach:**\n- Remove the public `ip_allowlist` module export.\n- Delete `IpAllowlistConfig`, `IpAllowlist`, `GitHubMetaResolver`, client-IP\n  extraction, middleware, and GitHub meta cache helpers.\n- Simplify `build_router_with_options` by removing its `Arc<IpAllowlistConfig>`\n  parameter and removing `RouterOptions.github_webhook_ip_allowlist`.\n- Remove the global allowlist middleware layer from the main app router.\n- Simplify `github_webhook_routes` so it only receives the webhook secret and no\n  route-specific allowlist config.\n- Remove startup creation of `GitHubMetaResolver`, `default_ip_allowlist`,\n  `resolve_github_webhook_ip_allowlist`, and\n  `resolve_startup_github_webhook_ip_allowlist`.\n- Replace all test/helper call sites that pass `IpAllowlistConfig::default()`\n  with the simplified router signature.\n- Remove `ipnet` and any now-unused HTTP mocking/test-only dependencies from\n  `fabro-server` if they are only used by the deleted module.\n- Consider whether `serve.rs` still needs `SocketAddr` for TCP\n  `ConnectInfo`; if it was only present for allowlisting tests, remove the\n  connect-info service wrapper and imports.\n\n**Patterns to follow:**\n- Keep router layers ordered as they are after the allowlist layer is removed:\n  auth translation, demo routing, auth extension, canonical host, security\n  headers, HTTP logging, request ID.\n- Existing webhook route HMAC tests and auth tests should remain the source of\n  truth for webhook behavior.\n\n**Test scenarios:**\n- Happy path: API requests from any TCP remote address route normally when auth\n  requirements are satisfied.\n- Happy path: `/health` remains accessible.\n- Integration: GitHub webhook route still rejects missing/invalid signatures and\n  accepts valid signatures exactly as before.\n- Cleanup: there are no references to `IpAllowlistConfig`, `ip_allowlist_middleware`,\n  `GitHubMetaResolver`, `github_meta_hooks`, or `github-meta-hooks.json`.\n\n**Verification:**\n- `fabro-server` and CLI auth harness tests compile against the simplified router\n  API.\n- Runtime startup no longer performs any GitHub `/meta` fetch for webhook IP\n  ranges.\n\n- [ ] **Unit 3: Update OpenAPI and generated API clients**\n\n**Goal:** Remove IP allowlist fields and schemas from public settings API\ncontracts and regenerated clients.\n\n**Requirements:** R3, R4\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Modify: `lib/crates/fabro-api/src/lib.rs`\n- Modify: `lib/crates/fabro-api/tests/server_settings_round_trip.rs`\n- Modify/generated: `lib/packages/fabro-api-client/src/models/*`\n\n**Approach:**\n- Remove `ip_allowlist` from `ServerNamespace.required` and\n  `ServerNamespace.properties`.\n- Remove `ServerIpAllowlistSettings`,\n  `ServerIpAllowlistOverrideSettings`, `IpAllowEntry`,\n  `LiteralIpAllowEntry`, and `GitHubMetaHooksEntry` schemas.\n- Remove `IntegrationWebhooksSettings.ip_allowlist` from required/properties.\n- Remove `with_replacement` entries and public re-exports for removed types in\n  `fabro-api`.\n- Regenerate Rust API code by building `fabro-api`.\n- Regenerate TypeScript Axios client and ensure stale allowlist model files and\n  index exports are gone.\n- Strengthen round-trip tests to assert settings JSON omits\n  `server.ip_allowlist` and webhook `ip_allowlist`.\n\n**Patterns to follow:**\n- Existing OpenAPI-first workflow in `AGENTS.md`.\n- Existing `server_settings_family_reuses_domain_types` assertions for shared\n  domain type identity.\n\n**Test scenarios:**\n- Contract: `ServerSettings` round-trips through API types without any IP\n  allowlist field.\n- Contract: OpenAPI-generated TypeScript `ServerNamespace` has no\n  `ip_allowlist` property.\n- Contract: `IntegrationWebhooksSettings` has only webhook strategy fields after\n  removal.\n\n**Verification:**\n- Generated Rust and TypeScript clients match the updated OpenAPI spec.\n- `rg \"ServerIpAllowlist|IpAllowEntry|server-ip-allowlist|literal-ip-allow-entry\"`\n  finds no remaining generated/public API references.\n\n- [ ] **Unit 4: Update web settings UI**\n\n**Goal:** Remove IP allowlist display from Settings > Security and align copy\nwith the new settings shape.\n\n**Requirements:** R3, R7\n\n**Dependencies:** Unit 3\n\n**Files:**\n- Modify: `apps/fabro-web/app/routes/settings-security.tsx`\n- Modify: `apps/fabro-web/app/routes/settings.tsx`\n\n**Approach:**\n- Change the Security page description from \"Authentication methods and network\n  allowlist\" to authentication-only wording.\n- Remove destructuring and rendering of `settings.server.ip_allowlist`.\n- Remove the unused `Count` and `plural` imports if no longer used.\n- Update the Settings nav description for Security from \"Authentication and\n  network allowlist\" to authentication-focused copy.\n\n**Patterns to follow:**\n- Existing `settings-panel` row layout for Auth methods and Allowed usernames.\n\n**Test scenarios:**\n- Typecheck: the route compiles against the regenerated API client with no\n  `server.ip_allowlist` property.\n- UI behavior: Security page still renders auth methods and allowed usernames.\n- Cleanup: no frontend references to `ip_allowlist`, `IP allowlist`, or\n  `trusted_proxy_count` remain.\n\n**Verification:**\n- `apps/fabro-web` typecheck passes against the new generated client.\n\n- [ ] **Unit 5: Update tests, docs, changelog, and dependency lockfile**\n\n**Goal:** Remove stale references and document the operator-facing behavior\nchange.\n\n**Requirements:** R4, R6, R7\n\n**Dependencies:** Units 1 through 4\n\n**Files:**\n- Modify: `lib/crates/fabro-server/tests/it/api/routing.rs`\n- Modify: `lib/crates/fabro-server/tests/it/api/tcp.rs`\n- Modify: `lib/crates/fabro-server/tests/it/api/settings.rs`\n- Modify: `docs/public/administration/security.mdx`\n- Create or modify: `docs/public/changelog/2026-05-27.mdx`\n- Modify: `Cargo.lock` if dependency graph changes\n\n**Approach:**\n- Delete route/TCP tests that only prove IP allowlist enforcement or\n  `ConnectInfo` behavior.\n- Adjust any router setup helpers after the signature simplification.\n- Add a settings API assertion that `server.ip_allowlist` is absent from\n  `/api/v1/settings`.\n- Update security docs to explicitly state that Fabro does not provide inbound\n  source-IP allowlisting and operators should use upstream network controls.\n- Add a changelog entry dated 2026-05-27 describing the hard removal and the\n  expected replacement at the deployment layer.\n- Run dependency resolution after removing direct `ipnet`/test dependencies;\n  keep transitive or unrelated `ipnet` entries needed by sandbox CIDR validation.\n\n**Patterns to follow:**\n- Existing changelog style in `docs/public/changelog/2026-05-26.mdx`.\n- Existing settings API integration test style in\n  `lib/crates/fabro-server/tests/it/api/settings.rs`.\n\n**Test scenarios:**\n- Settings API: response contains server auth, listen, storage, scheduler, and\n  integrations fields, but not `server.ip_allowlist`.\n- Config compatibility: old IP allowlist TOML fails before startup rather than\n  being silently ignored.\n- Docs validation: security docs no longer imply Fabro can restrict inbound\n  source IPs internally.\n\n**Verification:**\n- `rg -n \"ip_allowlist|trusted_proxy_count|github_meta_hooks|IP allowlist|ip allowlist\"`\n  returns only historical archived plan/brainstorm/spec references or unrelated\n  non-server allowlist text.\n\n## System-Wide Impact\n\n- **Public API:** `GET /api/v1/settings` response shape changes by removing\n  `server.ip_allowlist` and webhook `ip_allowlist`.\n- **Config compatibility:** Existing `settings.toml` files containing the removed\n  keys become invalid. This is intentional.\n- **Runtime security posture:** Fabro no longer blocks requests based on source\n  IP. Operators must enforce network source restrictions upstream.\n- **Webhook handling:** GitHub webhook HMAC verification remains unchanged; only\n  optional source-IP filtering is removed.\n- **Generated clients:** Downstream TypeScript/Rust consumers that read\n  `server.ip_allowlist` must update.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Operators accidentally expose a server that previously relied on Fabro IP allowlisting | Changelog and security docs explicitly call out the removal and direct operators to upstream controls. |\n| Generated API clients retain stale types | Update OpenAPI first, regenerate both Rust and TypeScript clients, and run search checks for stale symbols. |\n| Unrelated allowlist functionality is removed by broad search/replace | Scope searches to `IpAllow`, `ip_allowlist`, `trusted_proxy_count`, and `github_meta_hooks`; preserve sandbox CIDR and GitHub username allowlists. |\n| Router signature cleanup breaks many tests | Update shared test helpers first, then compile-driven cleanup of remaining call sites. |\n| `ipnet` is removed where still needed | Keep `fabro-config` dependency if environment CIDR validation still imports `ipnet::IpNet`. |\n\n## Test Plan\n\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cargo nextest run -p fabro-config -p fabro-types -p fabro-api -p fabro-server`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun test`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The accepted compatibility policy is hard removal: no warning-only parser, no\n  migration, and no custom compatibility error path.\n- Public API consumers can tolerate a breaking settings shape change for this\n  removed feature.\n- Historical documents in `docs/plans/`, `docs/brainstorms/`, and\n  `docs/superpowers/` are archival and do not need rewriting.\n\n## Sources & References\n\n- Previous feature requirements:\n  `docs/brainstorms/2026-04-15-ip-whitelist-requirements.md`\n- Previous implementation plan:\n  `docs/plans/2026-04-15-002-feat-ip-allowlist-plan.md`\n- API workflow guidance: `AGENTS.md`\n- OpenAPI source of truth: `docs/public/api-reference/fabro-api.yaml`\n",
+          "internal.retry_count.start": 0,
+          "outcome": "succeeded",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.thread_id": "toolchain",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "thread.toolchain.current_node": "preflight_compile"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1482,
+              "active_time_ms": 1482
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 135614,
+              "active_time_ms": 135614
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "6c1e8640c7c44c6215d136832d5dbc20212709a8",
+        "node_visits": {
+          "start": 1,
+          "preflight_compile": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-28T00:18:58.022473Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "thread.start.current_node": "toolchain",
+          "current_node": "preflight_lint",
           "failure_class": "",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "graph.goal": "---\ntitle: \"refactor: Remove IP allowlisting\"\ntype: refactor\nstatus: active\ndate: 2026-05-27\n---\n\n# refactor: Remove IP allowlisting\n\n## Overview\n\nRemove Fabro's inbound server IP allowlisting feature completely. This removes the\nserver-wide `[server.ip_allowlist]` setting, the GitHub webhook-specific\n`[server.integrations.github.webhooks.ip_allowlist]` overlay, request middleware,\nclient-IP extraction, GitHub `/meta` hook-range expansion, settings API exposure,\ngenerated API client types, and the Settings > Security UI display.\n\nExisting configs that still contain removed IP allowlist keys should fail as\nunknown fields. This is an intentional hard removal, not a compatibility\ndeprecation.\n\n## Problem Frame\n\nThe feature is being removed from Fabro rather than maintained as an in-process\nnetwork access-control layer. Network source restrictions should be handled\noutside Fabro by reverse proxies, firewalls, VPNs, Tailscale, platform ingress,\nor other deployment-layer controls.\n\n## Requirements Trace\n\n- R1. Remove all runtime enforcement of inbound source-IP allowlisting from web,\n  API, static asset, and GitHub webhook routes.\n- R2. Remove the server settings schema for global and GitHub webhook IP\n  allowlists.\n- R3. Remove `IpAllowEntry` and related API schema/client types from public\n  settings payloads.\n- R4. Keep unrelated allowlists intact: GitHub username allowlists, sandbox\n  egress CIDR allow lists, and internal policy/test allowlists.\n- R5. Preserve existing authentication, GitHub webhook HMAC verification,\n  routing, health checks, request logging, and settings hot-reload behavior.\n- R6. Treat old IP allowlist config as invalid after removal.\n- R7. Update operator-facing docs/changelog so users know to move source-IP\n  restrictions upstream.\n\n## Scope Boundaries\n\n- Do not remove `[server.auth.github].allowed_usernames`.\n- Do not remove Daytona/sandbox `cidr_allow_list` network policy support.\n- Do not remove generic uses of \"allowlist\" in policy tests, markdown rendering,\n  model controls, or other unrelated domains.\n- Do not add a migration, warning-only parser, or fallback compatibility path for\n  old IP allowlist settings.\n- Do not change GitHub webhook signature verification or webhook route strategy.\n\n## Context & Research\n\n### Relevant Code and Patterns\n\n- Settings use sparse config layers in `lib/crates/fabro-config/src/layers/`\n  and dense resolved types in `lib/crates/fabro-types/src/settings/`.\n- The OpenAPI spec at `docs/public/api-reference/fabro-api.yaml` is the source\n  of truth for API wire shape; `cargo build -p fabro-api` regenerates Rust API\n  code, and `cd lib/packages/fabro-api-client && bun run generate` regenerates\n  the TypeScript client.\n- `lib/crates/fabro-server/src/server.rs` builds the router and currently wires\n  IP allowlist middleware before other route dispatch behavior.\n- `lib/crates/fabro-server/src/serve.rs` currently resolves server and webhook\n  allowlist configs at startup and creates a GitHub `/meta` resolver.\n- `apps/fabro-web/app/routes/settings-security.tsx` displays the settings API's\n  `server.ip_allowlist` state.\n\n### Main Removal Surfaces\n\n- Config/types: `fabro-types`, `fabro-config`, config tests.\n- Server runtime: `fabro-server/src/ip_allowlist.rs`, router wiring, startup\n  wiring, test helpers, routing/TCP tests.\n- API/contracts: OpenAPI schema, `fabro-api` type replacements/exports, generated\n  TypeScript API client models.\n- Frontend/docs: Settings > Security copy, settings navigation copy, changelog.\n\n## Key Technical Decisions\n\n- **Hard removal:** Removed config keys should fail through existing\n  `deny_unknown_fields` behavior. This keeps the change simple and makes stale\n  deployment config visible immediately.\n- **Delete, do not stub:** Remove `IpAllowlistConfig` and middleware parameters\n  instead of passing default empty configs through the router. Empty stubs would\n  keep the feature shape alive and make future cleanup harder.\n- **Keep webhook auth unchanged:** GitHub webhook source-IP filtering goes away,\n  but HMAC signature verification remains the security boundary for webhook\n  payload authenticity.\n- **Generated clients follow OpenAPI:** Update the OpenAPI schemas first, then\n  regenerate Rust and TypeScript API outputs rather than hand-editing generated\n  client files except as a short-term cleanup if generation leaves stale exports.\n- **Docs mention upstream controls:** The changelog and security guidance should\n  direct operators to network-layer controls, not a replacement Fabro setting.\n\n## Implementation Units\n\n- [ ] **Unit 1: Remove config schema and resolved types**\n\n**Goal:** Delete the IP allowlist settings contract from config parsing and dense\nserver settings.\n\n**Requirements:** R2, R3, R4, R6\n\n**Dependencies:** None\n\n**Files:**\n- Modify: `lib/crates/fabro-types/src/settings/server.rs`\n- Modify: `lib/crates/fabro-types/src/settings/mod.rs`\n- Modify: `lib/crates/fabro-types/Cargo.toml`\n- Modify: `lib/crates/fabro-config/src/layers/server.rs`\n- Modify: `lib/crates/fabro-config/src/layers/mod.rs`\n- Modify: `lib/crates/fabro-config/src/lib.rs`\n- Modify: `lib/crates/fabro-config/src/resolve/server.rs`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_server.rs`\n\n**Approach:**\n- Remove `ServerNamespace.ip_allowlist` and its `test_default()` population.\n- Delete `ServerIpAllowlistSettings`, `ServerIpAllowlistOverrideSettings`, and\n  `IpAllowEntry`.\n- Remove `ServerLayer.ip_allowlist`, `ServerIpAllowlistLayer`,\n  `ServerIpAllowlistOverrideLayer`, and `IntegrationWebhooksLayer.ip_allowlist`.\n- Remove resolver functions and validation for global and webhook IP allowlists,\n  including `github_meta_hooks` parsing and Unix socket trusted-proxy checks.\n- Remove `ipnet` from `fabro-types`. Keep `ipnet` in `fabro-config` because\n  `resolve/environment.rs` still validates sandbox CIDR policy.\n- Replace old positive/negative IP allowlist config tests with unknown-field\n  tests for `[server.ip_allowlist]` and\n  `[server.integrations.github.webhooks.ip_allowlist]`.\n\n**Patterns to follow:**\n- Existing unknown-field tests in `lib/crates/fabro-config/src/tests/resolve_server.rs`\n  for retired server settings.\n- Existing `ServerLayer`/`ServerNamespace` layer-to-resolved pattern for removing\n  a server subdomain cleanly.\n\n**Test scenarios:**\n- Error path: TOML with `[server.ip_allowlist]` fails parsing/resolution with an\n  unknown-field diagnostic mentioning `ip_allowlist`.\n- Error path: TOML with `[server.integrations.github.webhooks.ip_allowlist]`\n  fails with an unknown-field diagnostic mentioning `ip_allowlist`.\n- Happy path: minimal valid server settings still resolve without any\n  `ip_allowlist` field.\n- Integration: serialized `ServerSettings` JSON no longer includes\n  `server.ip_allowlist`.\n\n**Verification:**\n- `fabro-config` and `fabro-types` compile without removed IP allowlist symbols.\n- Config tests prove stale allowlist settings are rejected.\n\n- [ ] **Unit 2: Remove server middleware and startup resolution**\n\n**Goal:** Remove all runtime source-IP filtering and GitHub `/meta` range\nresolution from `fabro-server`.\n\n**Requirements:** R1, R4, R5\n\n**Dependencies:** Unit 1\n\n**Files:**\n- Delete: `lib/crates/fabro-server/src/ip_allowlist.rs`\n- Modify: `lib/crates/fabro-server/src/lib.rs`\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/serve.rs`\n- Modify: `lib/crates/fabro-server/src/test_support.rs`\n- Modify: `lib/crates/fabro-server/Cargo.toml`\n- Modify: `lib/crates/fabro-server/src/auth/translate.rs`\n- Modify: `lib/crates/fabro-server/src/web_auth.rs`\n- Modify: `lib/crates/fabro-cli/tests/it/support/auth_harness.rs`\n\n**Approach:**\n- Remove the public `ip_allowlist` module export.\n- Delete `IpAllowlistConfig`, `IpAllowlist`, `GitHubMetaResolver`, client-IP\n  extraction, middleware, and GitHub meta cache helpers.\n- Simplify `build_router_with_options` by removing its `Arc<IpAllowlistConfig>`\n  parameter and removing `RouterOptions.github_webhook_ip_allowlist`.\n- Remove the global allowlist middleware layer from the main app router.\n- Simplify `github_webhook_routes` so it only receives the webhook secret and no\n  route-specific allowlist config.\n- Remove startup creation of `GitHubMetaResolver`, `default_ip_allowlist`,\n  `resolve_github_webhook_ip_allowlist`, and\n  `resolve_startup_github_webhook_ip_allowlist`.\n- Replace all test/helper call sites that pass `IpAllowlistConfig::default()`\n  with the simplified router signature.\n- Remove `ipnet` and any now-unused HTTP mocking/test-only dependencies from\n  `fabro-server` if they are only used by the deleted module.\n- Consider whether `serve.rs` still needs `SocketAddr` for TCP\n  `ConnectInfo`; if it was only present for allowlisting tests, remove the\n  connect-info service wrapper and imports.\n\n**Patterns to follow:**\n- Keep router layers ordered as they are after the allowlist layer is removed:\n  auth translation, demo routing, auth extension, canonical host, security\n  headers, HTTP logging, request ID.\n- Existing webhook route HMAC tests and auth tests should remain the source of\n  truth for webhook behavior.\n\n**Test scenarios:**\n- Happy path: API requests from any TCP remote address route normally when auth\n  requirements are satisfied.\n- Happy path: `/health` remains accessible.\n- Integration: GitHub webhook route still rejects missing/invalid signatures and\n  accepts valid signatures exactly as before.\n- Cleanup: there are no references to `IpAllowlistConfig`, `ip_allowlist_middleware`,\n  `GitHubMetaResolver`, `github_meta_hooks`, or `github-meta-hooks.json`.\n\n**Verification:**\n- `fabro-server` and CLI auth harness tests compile against the simplified router\n  API.\n- Runtime startup no longer performs any GitHub `/meta` fetch for webhook IP\n  ranges.\n\n- [ ] **Unit 3: Update OpenAPI and generated API clients**\n\n**Goal:** Remove IP allowlist fields and schemas from public settings API\ncontracts and regenerated clients.\n\n**Requirements:** R3, R4\n\n**Dependencies:** Units 1 and 2\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Modify: `lib/crates/fabro-api/src/lib.rs`\n- Modify: `lib/crates/fabro-api/tests/server_settings_round_trip.rs`\n- Modify/generated: `lib/packages/fabro-api-client/src/models/*`\n\n**Approach:**\n- Remove `ip_allowlist` from `ServerNamespace.required` and\n  `ServerNamespace.properties`.\n- Remove `ServerIpAllowlistSettings`,\n  `ServerIpAllowlistOverrideSettings`, `IpAllowEntry`,\n  `LiteralIpAllowEntry`, and `GitHubMetaHooksEntry` schemas.\n- Remove `IntegrationWebhooksSettings.ip_allowlist` from required/properties.\n- Remove `with_replacement` entries and public re-exports for removed types in\n  `fabro-api`.\n- Regenerate Rust API code by building `fabro-api`.\n- Regenerate TypeScript Axios client and ensure stale allowlist model files and\n  index exports are gone.\n- Strengthen round-trip tests to assert settings JSON omits\n  `server.ip_allowlist` and webhook `ip_allowlist`.\n\n**Patterns to follow:**\n- Existing OpenAPI-first workflow in `AGENTS.md`.\n- Existing `server_settings_family_reuses_domain_types` assertions for shared\n  domain type identity.\n\n**Test scenarios:**\n- Contract: `ServerSettings` round-trips through API types without any IP\n  allowlist field.\n- Contract: OpenAPI-generated TypeScript `ServerNamespace` has no\n  `ip_allowlist` property.\n- Contract: `IntegrationWebhooksSettings` has only webhook strategy fields after\n  removal.\n\n**Verification:**\n- Generated Rust and TypeScript clients match the updated OpenAPI spec.\n- `rg \"ServerIpAllowlist|IpAllowEntry|server-ip-allowlist|literal-ip-allow-entry\"`\n  finds no remaining generated/public API references.\n\n- [ ] **Unit 4: Update web settings UI**\n\n**Goal:** Remove IP allowlist display from Settings > Security and align copy\nwith the new settings shape.\n\n**Requirements:** R3, R7\n\n**Dependencies:** Unit 3\n\n**Files:**\n- Modify: `apps/fabro-web/app/routes/settings-security.tsx`\n- Modify: `apps/fabro-web/app/routes/settings.tsx`\n\n**Approach:**\n- Change the Security page description from \"Authentication methods and network\n  allowlist\" to authentication-only wording.\n- Remove destructuring and rendering of `settings.server.ip_allowlist`.\n- Remove the unused `Count` and `plural` imports if no longer used.\n- Update the Settings nav description for Security from \"Authentication and\n  network allowlist\" to authentication-focused copy.\n\n**Patterns to follow:**\n- Existing `settings-panel` row layout for Auth methods and Allowed usernames.\n\n**Test scenarios:**\n- Typecheck: the route compiles against the regenerated API client with no\n  `server.ip_allowlist` property.\n- UI behavior: Security page still renders auth methods and allowed usernames.\n- Cleanup: no frontend references to `ip_allowlist`, `IP allowlist`, or\n  `trusted_proxy_count` remain.\n\n**Verification:**\n- `apps/fabro-web` typecheck passes against the new generated client.\n\n- [ ] **Unit 5: Update tests, docs, changelog, and dependency lockfile**\n\n**Goal:** Remove stale references and document the operator-facing behavior\nchange.\n\n**Requirements:** R4, R6, R7\n\n**Dependencies:** Units 1 through 4\n\n**Files:**\n- Modify: `lib/crates/fabro-server/tests/it/api/routing.rs`\n- Modify: `lib/crates/fabro-server/tests/it/api/tcp.rs`\n- Modify: `lib/crates/fabro-server/tests/it/api/settings.rs`\n- Modify: `docs/public/administration/security.mdx`\n- Create or modify: `docs/public/changelog/2026-05-27.mdx`\n- Modify: `Cargo.lock` if dependency graph changes\n\n**Approach:**\n- Delete route/TCP tests that only prove IP allowlist enforcement or\n  `ConnectInfo` behavior.\n- Adjust any router setup helpers after the signature simplification.\n- Add a settings API assertion that `server.ip_allowlist` is absent from\n  `/api/v1/settings`.\n- Update security docs to explicitly state that Fabro does not provide inbound\n  source-IP allowlisting and operators should use upstream network controls.\n- Add a changelog entry dated 2026-05-27 describing the hard removal and the\n  expected replacement at the deployment layer.\n- Run dependency resolution after removing direct `ipnet`/test dependencies;\n  keep transitive or unrelated `ipnet` entries needed by sandbox CIDR validation.\n\n**Patterns to follow:**\n- Existing changelog style in `docs/public/changelog/2026-05-26.mdx`.\n- Existing settings API integration test style in\n  `lib/crates/fabro-server/tests/it/api/settings.rs`.\n\n**Test scenarios:**\n- Settings API: response contains server auth, listen, storage, scheduler, and\n  integrations fields, but not `server.ip_allowlist`.\n- Config compatibility: old IP allowlist TOML fails before startup rather than\n  being silently ignored.\n- Docs validation: security docs no longer imply Fabro can restrict inbound\n  source IPs internally.\n\n**Verification:**\n- `rg -n \"ip_allowlist|trusted_proxy_count|github_meta_hooks|IP allowlist|ip allowlist\"`\n  returns only historical archived plan/brainstorm/spec references or unrelated\n  non-server allowlist text.\n\n## System-Wide Impact\n\n- **Public API:** `GET /api/v1/settings` response shape changes by removing\n  `server.ip_allowlist` and webhook `ip_allowlist`.\n- **Config compatibility:** Existing `settings.toml` files containing the removed\n  keys become invalid. This is intentional.\n- **Runtime security posture:** Fabro no longer blocks requests based on source\n  IP. Operators must enforce network source restrictions upstream.\n- **Webhook handling:** GitHub webhook HMAC verification remains unchanged; only\n  optional source-IP filtering is removed.\n- **Generated clients:** Downstream TypeScript/Rust consumers that read\n  `server.ip_allowlist` must update.\n\n## Risks & Mitigations\n\n| Risk | Mitigation |\n|------|------------|\n| Operators accidentally expose a server that previously relied on Fabro IP allowlisting | Changelog and security docs explicitly call out the removal and direct operators to upstream controls. |\n| Generated API clients retain stale types | Update OpenAPI first, regenerate both Rust and TypeScript clients, and run search checks for stale symbols. |\n| Unrelated allowlist functionality is removed by broad search/replace | Scope searches to `IpAllow`, `ip_allowlist`, `trusted_proxy_count`, and `github_meta_hooks`; preserve sandbox CIDR and GitHub username allowlists. |\n| Router signature cleanup breaks many tests | Update shared test helpers first, then compile-driven cleanup of remaining call sites. |\n| `ipnet` is removed where still needed | Keep `fabro-config` dependency if environment CIDR validation still imports `ipnet::IpNet`. |\n\n## Test Plan\n\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cargo nextest run -p fabro-config -p fabro-types -p fabro-api -p fabro-server`\n- `cd apps/fabro-web && bun run typecheck`\n- `cd apps/fabro-web && bun test`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n\n## Assumptions\n\n- The accepted compatibility policy is hard removal: no warning-only parser, no\n  migration, and no custom compatibility error path.\n- Public API consumers can tolerate a breaking settings shape change for this\n  removed feature.\n- Historical documents in `docs/plans/`, `docs/brainstorms/`, and\n  `docs/superpowers/` are archival and do not need rewriting.\n\n## Sources & References\n\n- Previous feature requirements:\n  `docs/brainstorms/2026-04-15-ip-whitelist-requirements.md`\n- Previous implementation plan:\n  `docs/plans/2026-04-15-002-feat-ip-allowlist-plan.md`\n- API workflow guidance: `AGENTS.md`\n- OpenAPI source of truth: `docs/public/api-reference/fabro-api.yaml`\n",
@@ -631,13 +713,29 @@
           "internal.fidelity": "compact",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "internal.retry_count.preflight_compile": 0,
+          "internal.retry_count.preflight_lint": 0,
           "graph.rankdir": "LR",
+          "thread.preflight_compile.current_node": "preflight_lint",
           "internal.retry_count.toolchain": 0,
           "thread.toolchain.current_node": "preflight_compile",
           "outcome": "succeeded",
-          "internal.thread_id": "toolchain"
+          "internal.thread_id": "preflight_compile"
         },
         "node_outcomes": {
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 142983,
+              "active_time_ms": 142983
+            }
+          },
           "start": {
             "status": "succeeded",
             "usage": null
@@ -671,11 +769,12 @@
             }
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
-          "toolchain": 1,
           "start": 1,
-          "preflight_compile": 1
+          "toolchain": 1,
+          "preflight_compile": 1,
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -794,7 +893,12 @@
       "first_event_seq": 31,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-28T00:16:31.052309Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -802,10 +906,53 @@
         "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
         "language": "shell"
       },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 135614,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-28T00:14:15.430334Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 135621,
+        "inference_time_ms": 0,
+        "tool_time_ms": 135614,
+        "active_time_ms": 135614
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "preflight_lint@1": {
+      "first_event_seq": 41,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-28T00:14:15.430334Z",
+      "started_at": "2026-05-28T00:16:35.033240Z",
       "handler": "command",
       "usage": {
         "input_tokens": 0,
