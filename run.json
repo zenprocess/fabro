@@ -508,7 +508,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-28T04:28:33.524509Z",
-  "last_event_at": "2026-05-28T04:28:40.324740Z",
+  "last_event_at": "2026-05-28T04:30:55.468096Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -612,9 +612,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 38,
       "checkpoint": {
-        "timestamp": "2026-05-28T04:30:51.451775Z",
+        "timestamp": "2026-05-28T04:30:55.466431Z",
         "current_node": "preflight_compile",
         "completed_nodes": [
           "start",
@@ -623,9 +623,93 @@
         ],
         "node_retries": {},
         "context_values": {
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.fidelity": "compact",
+          "failure_class": "",
+          "thread.start.current_node": "toolchain",
+          "failure_signature": "",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "outcome": "succeeded",
+          "graph.goal": "# Server-Owned Environments Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Move environment definitions from layered run settings into server-owned TOML resources with CRUD API management, matching the Automation store pattern.\n\n**Architecture:** Add a concrete `EnvironmentStore` that loads one environment TOML file per id from a sibling `environments/` directory next to the active server settings file. Runs continue to select an environment by id through `[run.environment]` or `--environment`, but server-side run creation resolves the id from `EnvironmentStore`; project/workflow/user config can no longer define environment catalogs or environment field overrides. The web UI is intentionally deferred.\n\n**Tech Stack:** Rust, Axum, serde/TOML, `toml_edit`, Tokio file I/O, OpenAPI/progenitor, generated TypeScript API client, cargo-nextest.\n\n---\n\n## File Structure\n\n- Create `lib/crates/fabro-environment/`: environment ids, revisions, API/domain DTOs, TOML persistence, canonicalization, validation, and `EnvironmentStore`.\n- Modify workspace manifests: root `Cargo.toml`, `lib/crates/fabro-server/Cargo.toml`, `lib/crates/fabro-api/build.rs`, and generated API/client package files.\n- Modify `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/server/handler/mod.rs`, and a new `lib/crates/fabro-server/src/server/handler/environments.rs` to wire the store and API.\n- Modify `lib/crates/fabro-config/src/builders.rs`, `lib/crates/fabro-config/src/load.rs`, `lib/crates/fabro-config/src/migrations.rs`, and config tests to treat `[environments]` as migration-only, not runtime configuration.\n- Modify `lib/crates/fabro-manifest/src/lib.rs`, `lib/crates/fabro-server/src/run_manifest.rs`, and CLI run/preflight/graph/validate paths so environment ids are resolved only by the server.\n- Modify install/repo-init/docs/OpenAPI artifacts so new examples use server environment files and run configs only select ids.\n\n## Decisions\n\n- Environment definitions are server-owned operator policy. Project and workflow files may request an id but cannot define or override environment fields.\n- `default`, `local`, `docker`, and `daytona` are seeded if missing. Existing files are never overwritten.\n- `default` is protected from deletion. Other seeded files can be edited or deleted.\n- Environment ids use `[a-z0-9][a-z0-9-]{0,62}`.\n- Environment revisions are SHA-256 hashes of the persisted TOML bytes, returned in JSON as `revision` and in `ETag`.\n- `PUT` and `DELETE` require `If-Match`, following `AutomationStore`.\n- `image.dockerfile = { path = \"Dockerfile\" }` is accepted in persisted files and API input, resolved relative to the environment file or request context, and converted to inline content for runtime use. API writes canonical inline TOML.\n- `--preserve-sandbox` remains a CLI/server argument override. TOML `[run.environment.lifecycle]` is rejected.\n- `--docker-image` is rejected with a targeted message directing operators to create or update a server environment.\n- Existing dense `WorkflowSettings.environments` stays in the API for compatibility and is populated from the server environment catalog during run resolution.\n\n## Task 1: Add `fabro-environment` Store Crate\n\n**Files:**\n- Create: `lib/crates/fabro-environment/Cargo.toml`\n- Create: `lib/crates/fabro-environment/src/lib.rs`\n- Create: `lib/crates/fabro-environment/src/id.rs`\n- Create: `lib/crates/fabro-environment/src/model.rs`\n- Create: `lib/crates/fabro-environment/src/store.rs`\n- Create: `lib/crates/fabro-environment/src/error.rs`\n- Modify: root `Cargo.toml`\n\n- [ ] Create a workspace crate named `fabro-environment`, modeled after `fabro-automation`.\n- [ ] Define `EnvironmentId`, `EnvironmentRevision`, and parse/validation errors.\n- [ ] Define public DTOs:\n  - `Environment`: `id`, `revision`, `provider`, `image`, `resources`, `network`, `lifecycle`, `labels`, `volumes`, `env`.\n  - `EnvironmentDraft`: `id` plus environment fields.\n  - `EnvironmentReplace`: environment fields without id.\n- [ ] Use the existing environment field types from `fabro_types::settings::run` for dense API fields.\n- [ ] Use existing sparse `fabro_config::EnvironmentLayer` only for TOML input/output and conversion; do not create a second environment field vocabulary.\n- [ ] Add conversion helpers that resolve an `EnvironmentLayer` into dense `EnvironmentSettings` using the same provider/network/image validation rules as `fabro-config`.\n- [ ] Implement canonical TOML serialization for persisted files. Omit `id` and `revision`; the filename is the id and the file bytes determine revision.\n- [ ] Implement `EnvironmentStore` with `load_or_seed(dir)`, `list`, `get`, `create`, `replace`, `delete`, and `catalog_layer`.\n- [ ] Seed missing `default`, `local`, `docker`, and `daytona` files from the current built-in defaults. Do not overwrite existing files.\n- [ ] Protect `default` from deletion with a typed store error.\n- [ ] Resolve Dockerfile path references relative to the environment file directory during load and relative to the active settings directory during API create/replace. Store runtime values with inline Dockerfile content.\n- [ ] Add unit tests for loading an absent directory, seeding built-ins, sorted listing, invalid ids, invalid provider, invalid network mode, missing Dockerfile path, create conflict, replace stale revision, default delete rejection, delete success, and canonical revision changes.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-environment\n```\n\nExpected: all `fabro-environment` tests pass.\n\n## Task 2: Make Config Environments Migration-Only\n\n**Files:**\n- Modify: `lib/crates/fabro-config/src/parse.rs`\n- Modify: `lib/crates/fabro-config/src/builders.rs`\n- Modify: `lib/crates/fabro-config/src/load.rs`\n- Modify: `lib/crates/fabro-config/src/migrations.rs`\n- Create: `lib/crates/fabro-config/migrations/2026052801_settings_environments_to_server_files.rs`\n- Modify: `lib/crates/fabro-config/src/defaults.toml`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_run.rs`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_root.rs`\n\n- [ ] Keep `SettingsLayer.environments` in this pass so old files can parse and migrate, but remove environment catalog entries from `defaults.toml`.\n- [ ] Add source-aware validation that rejects `SettingsLayer.environments` for project, workflow, and direct run config layers with this message shape: `[environments.<id>] is now server-managed; move this definition to the server environments directory`.\n- [ ] Add validation that rejects TOML-provided `run.environment.image`, `resources`, `network`, `lifecycle`, `labels`, `volumes`, and `env`. Keep `run.environment.id`.\n- [ ] Ensure CLI/server argument layers can still set `run.environment.lifecycle.preserve` for `--preserve-sandbox`; the rejection applies only to parsed TOML sources.\n- [ ] Add a settings-file migration that extracts top-level `[environments.<id>]` entries from the active `settings.toml` into sibling `environments/<id>.toml` files.\n- [ ] Migration must write a backup before editing `settings.toml`, preserve `[run.environment] id`, remove the top-level `[environments]` table, and fail without changing files if any target environment file already exists.\n- [ ] Chain the existing legacy `[run.sandbox]` migration before the new extraction migration so legacy sandbox settings become a server `default` environment file.\n- [ ] Update run settings tests to assert that `RunSettingsBuilder` no longer resolves a selected environment without an injected server catalog.\n- [ ] Add tests proving project/workflow `[environments]` definitions produce targeted errors rather than silent ignores.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config\n```\n\nExpected: config tests pass, including migration coverage.\n\n## Task 3: Wire EnvironmentStore Into Server Run Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/serve.rs`\n- Modify: `lib/crates/fabro-server/src/run_manifest.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/runs.rs`\n- Modify: `lib/crates/fabro-server/src/manifest_validation.rs`\n- Modify: `lib/crates/fabro-server/src/test_support.rs`\n\n- [ ] Add `environment_store: Arc<EnvironmentStore>` to `AppState`, loaded from `active_config_path.parent().join(\"environments\")`.\n- [ ] Replace `manifest_environment_defaults` from `ServerRuntimeSettings` with `environment_store.catalog_layer()` when preparing manifests on the server.\n- [ ] Keep the dense run snapshot unchanged: `prepared.settings.run.environment` contains the resolved environment fields, and `prepared.settings.environments` contains the server catalog used for resolution.\n- [ ] Convert unknown environment ids into `400 Bad Request` during run creation/preflight/graph preparation.\n- [ ] Keep sandbox provider policy checks after environment resolution, so disabled providers still reject runs.\n- [ ] Apply `--preserve-sandbox` after selected environment resolution.\n- [ ] Remove server reliance on `[environments]` in `settings.toml`.\n- [ ] Update server test support so tests can inject environment files or use seeded defaults.\n- [ ] Add server tests for default environment run creation, custom server environment selection, unknown environment id, disabled provider policy, `--preserve-sandbox`, and rejected TOML environment field overrides.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server\n```\n\nExpected: server API and run-manifest tests pass.\n\n## Task 4: Add Environment CRUD API\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Create: `lib/crates/fabro-server/src/server/handler/environments.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/mod.rs`\n- Add tests: `lib/crates/fabro-server/tests/it/api/environments.rs`\n- Update generated Rust and TypeScript API artifacts after spec changes.\n\n- [ ] Add OpenAPI tag `Environments`.\n- [ ] Add schemas for `Environment`, `CreateEnvironmentRequest`, `ReplaceEnvironmentRequest`, and `EnvironmentListResponse`.\n- [ ] Reuse existing environment schemas for provider/image/resources/network/lifecycle/volumes/env.\n- [ ] Add endpoints:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- [ ] Return `ETag` on retrieve and replace.\n- [ ] Require `If-Match` on replace and delete.\n- [ ] Map store errors to API responses:\n  - invalid id: `400`\n  - duplicate create: `409`\n  - stale revision: `409`\n  - validation error: `422`\n  - missing resource: `404`\n  - protected default delete: `409`\n  - persistence failure: `500`\n- [ ] Add route tests for empty-seeded list, create, retrieve with ETag, replace, stale replace, missing `If-Match`, delete, protected default delete, invalid provider, invalid CIDR, and missing Dockerfile path.\n- [ ] Regenerate `fabro-api` and TypeScript client artifacts.\n\nRun:\n\n```bash\ncargo build -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ncargo nextest run -p fabro-server --test it -- api::environments\n```\n\nExpected: generated artifacts are updated and environment API tests pass.\n\n## Task 5: Adjust CLI And Manifest Behavior\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/overrides.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/preflight.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/graph.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/validate.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/repo/init.rs`\n- Modify: `lib/crates/fabro-manifest/src/lib.rs`\n- Modify CLI integration tests under `lib/crates/fabro-cli/tests/it/`\n\n- [ ] Reject `--docker-image` in run, create, preflight, graph, and validate commands with this message shape: `--docker-image is no longer supported; create or update a server environment and select it with --environment`.\n- [ ] Keep `--environment` as an id-only selector in manifest args.\n- [ ] Stop collecting Dockerfile path references from `[environments.<id>]` in project/workflow config because those definitions are invalid.\n- [ ] Keep collecting Dockerfile references for any remaining CLI-created run environment override only when it comes from allowed argument paths; with `--docker-image` rejected, no normal user path should add one.\n- [ ] Update local preflight/graph/validate flows so they either call server preflight for environment resolution or print a clear message that server-owned environment resolution requires a running server.\n- [ ] Update `fabro repo init` to write only `[run.environment] id = \"local\"` and no `[environments.local]` block.\n- [ ] Update CLI tests for manifest args, repo init output, rejected `--docker-image`, and server-owned environment selection.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli\n```\n\nExpected: CLI tests pass and no generated workflow config contains `[environments.*]`.\n\n## Task 6: Update Install, Docs, And Generated References\n\n**Files:**\n- Modify install persistence code in `lib/crates/fabro-cli/src/commands/install.rs` and server install handlers/tests.\n- Modify docs: `docs/public/execution/environments.mdx`, `docs/public/execution/run-configuration.mdx`, `docs/public/reference/user-configuration.mdx`, `docs/public/administration/server-configuration.mdx`, `docs/public/administration/sandboxing.mdx`, `docs/public/integrations/daytona.mdx`, and examples that currently define `[environments.<id>]`.\n- Modify generated settings reference if applicable.\n\n- [ ] Update install flows to write server environment files instead of `[environments.default]` into `settings.toml`.\n- [ ] Keep install-written `[run.environment] id = \"default\"` when a default run environment selection is still needed.\n- [ ] Update tests that assert `settings.toml` contains `[environments.default]` to assert the sibling environment file exists and settings no longer contains `[environments]`.\n- [ ] Rewrite public docs so environment definitions are server-owned TOML files and run configs only select ids.\n- [ ] Add a compatibility note explaining that project/workflow `[environments]` definitions now fail and must be moved to the server.\n- [ ] Keep `Settings > Environments` UI documentation out of this pass.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server --test it -- api::install\ncargo nextest run -p fabro-cli --test it\n```\n\nExpected: install tests pass and docs no longer present project/workflow environment definitions as valid.\n\n## Task 7: Workspace Verification\n\n**Files:**\n- No new files unless test snapshots require reviewed updates.\n\n- [ ] Run Rust formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] Run workspace tests:\n\n```bash\ncargo nextest run --workspace\n```\n\n- [ ] Run TypeScript checks if API client changes affect the web package:\n\n```bash\ncd apps/fabro-web && bun run typecheck\ncd apps/fabro-web && bun test\n```\n\n- [ ] Inspect generated files and snapshots before accepting any snapshot changes.\n\n## Acceptance Criteria\n\n- Server startup creates or loads `environments/default.toml`, `local.toml`, `docker.toml`, and `daytona.toml`.\n- `GET /api/v1/environments` returns seeded environments with revisions.\n- API-created environments persist as TOML files and survive server restart.\n- Runs using `[run.environment] id = \"cloud\"` resolve from server files only.\n- Project/workflow/user `[environments.<id>]` definitions no longer affect runs.\n- Existing runs keep their dense environment snapshot after environment files change.\n- `--environment` still works.\n- `--preserve-sandbox` still works.\n- `--docker-image` no longer works and produces the targeted replacement guidance.\n- Web UI changes are not included.\n",
+          "internal.retry_count.preflight_compile": 0,
           "internal.retry_count.toolchain": 0,
+          "internal.node_visit_count": 1,
           "internal.thread_id": "toolchain",
+          "graph.rankdir": "LR",
+          "thread.toolchain.current_node": "preflight_compile",
           "current_node": "preflight_compile",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.start": 0,
+          "internal.run_id": "01KSPDE8E9ATTVY1VBCS3YRBHT"
+        },
+        "node_outcomes": {
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1316,
+              "active_time_ms": 1316
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 131121,
+              "active_time_ms": 131121
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "git_commit_sha": "ff16c8aa3a076181759ec21d1cfe9e3e18ff2321",
+        "node_visits": {
+          "start": 1,
+          "preflight_compile": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-28T04:33:18.678385Z",
+        "current_node": "preflight_lint",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.retry_count.toolchain": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.thread_id": "preflight_compile",
+          "current_node": "preflight_lint",
           "graph.goal": "# Server-Owned Environments Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Move environment definitions from layered run settings into server-owned TOML resources with CRUD API management, matching the Automation store pattern.\n\n**Architecture:** Add a concrete `EnvironmentStore` that loads one environment TOML file per id from a sibling `environments/` directory next to the active server settings file. Runs continue to select an environment by id through `[run.environment]` or `--environment`, but server-side run creation resolves the id from `EnvironmentStore`; project/workflow/user config can no longer define environment catalogs or environment field overrides. The web UI is intentionally deferred.\n\n**Tech Stack:** Rust, Axum, serde/TOML, `toml_edit`, Tokio file I/O, OpenAPI/progenitor, generated TypeScript API client, cargo-nextest.\n\n---\n\n## File Structure\n\n- Create `lib/crates/fabro-environment/`: environment ids, revisions, API/domain DTOs, TOML persistence, canonicalization, validation, and `EnvironmentStore`.\n- Modify workspace manifests: root `Cargo.toml`, `lib/crates/fabro-server/Cargo.toml`, `lib/crates/fabro-api/build.rs`, and generated API/client package files.\n- Modify `lib/crates/fabro-server/src/server.rs`, `lib/crates/fabro-server/src/server/handler/mod.rs`, and a new `lib/crates/fabro-server/src/server/handler/environments.rs` to wire the store and API.\n- Modify `lib/crates/fabro-config/src/builders.rs`, `lib/crates/fabro-config/src/load.rs`, `lib/crates/fabro-config/src/migrations.rs`, and config tests to treat `[environments]` as migration-only, not runtime configuration.\n- Modify `lib/crates/fabro-manifest/src/lib.rs`, `lib/crates/fabro-server/src/run_manifest.rs`, and CLI run/preflight/graph/validate paths so environment ids are resolved only by the server.\n- Modify install/repo-init/docs/OpenAPI artifacts so new examples use server environment files and run configs only select ids.\n\n## Decisions\n\n- Environment definitions are server-owned operator policy. Project and workflow files may request an id but cannot define or override environment fields.\n- `default`, `local`, `docker`, and `daytona` are seeded if missing. Existing files are never overwritten.\n- `default` is protected from deletion. Other seeded files can be edited or deleted.\n- Environment ids use `[a-z0-9][a-z0-9-]{0,62}`.\n- Environment revisions are SHA-256 hashes of the persisted TOML bytes, returned in JSON as `revision` and in `ETag`.\n- `PUT` and `DELETE` require `If-Match`, following `AutomationStore`.\n- `image.dockerfile = { path = \"Dockerfile\" }` is accepted in persisted files and API input, resolved relative to the environment file or request context, and converted to inline content for runtime use. API writes canonical inline TOML.\n- `--preserve-sandbox` remains a CLI/server argument override. TOML `[run.environment.lifecycle]` is rejected.\n- `--docker-image` is rejected with a targeted message directing operators to create or update a server environment.\n- Existing dense `WorkflowSettings.environments` stays in the API for compatibility and is populated from the server environment catalog during run resolution.\n\n## Task 1: Add `fabro-environment` Store Crate\n\n**Files:**\n- Create: `lib/crates/fabro-environment/Cargo.toml`\n- Create: `lib/crates/fabro-environment/src/lib.rs`\n- Create: `lib/crates/fabro-environment/src/id.rs`\n- Create: `lib/crates/fabro-environment/src/model.rs`\n- Create: `lib/crates/fabro-environment/src/store.rs`\n- Create: `lib/crates/fabro-environment/src/error.rs`\n- Modify: root `Cargo.toml`\n\n- [ ] Create a workspace crate named `fabro-environment`, modeled after `fabro-automation`.\n- [ ] Define `EnvironmentId`, `EnvironmentRevision`, and parse/validation errors.\n- [ ] Define public DTOs:\n  - `Environment`: `id`, `revision`, `provider`, `image`, `resources`, `network`, `lifecycle`, `labels`, `volumes`, `env`.\n  - `EnvironmentDraft`: `id` plus environment fields.\n  - `EnvironmentReplace`: environment fields without id.\n- [ ] Use the existing environment field types from `fabro_types::settings::run` for dense API fields.\n- [ ] Use existing sparse `fabro_config::EnvironmentLayer` only for TOML input/output and conversion; do not create a second environment field vocabulary.\n- [ ] Add conversion helpers that resolve an `EnvironmentLayer` into dense `EnvironmentSettings` using the same provider/network/image validation rules as `fabro-config`.\n- [ ] Implement canonical TOML serialization for persisted files. Omit `id` and `revision`; the filename is the id and the file bytes determine revision.\n- [ ] Implement `EnvironmentStore` with `load_or_seed(dir)`, `list`, `get`, `create`, `replace`, `delete`, and `catalog_layer`.\n- [ ] Seed missing `default`, `local`, `docker`, and `daytona` files from the current built-in defaults. Do not overwrite existing files.\n- [ ] Protect `default` from deletion with a typed store error.\n- [ ] Resolve Dockerfile path references relative to the environment file directory during load and relative to the active settings directory during API create/replace. Store runtime values with inline Dockerfile content.\n- [ ] Add unit tests for loading an absent directory, seeding built-ins, sorted listing, invalid ids, invalid provider, invalid network mode, missing Dockerfile path, create conflict, replace stale revision, default delete rejection, delete success, and canonical revision changes.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-environment\n```\n\nExpected: all `fabro-environment` tests pass.\n\n## Task 2: Make Config Environments Migration-Only\n\n**Files:**\n- Modify: `lib/crates/fabro-config/src/parse.rs`\n- Modify: `lib/crates/fabro-config/src/builders.rs`\n- Modify: `lib/crates/fabro-config/src/load.rs`\n- Modify: `lib/crates/fabro-config/src/migrations.rs`\n- Create: `lib/crates/fabro-config/migrations/2026052801_settings_environments_to_server_files.rs`\n- Modify: `lib/crates/fabro-config/src/defaults.toml`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_run.rs`\n- Modify: `lib/crates/fabro-config/src/tests/resolve_root.rs`\n\n- [ ] Keep `SettingsLayer.environments` in this pass so old files can parse and migrate, but remove environment catalog entries from `defaults.toml`.\n- [ ] Add source-aware validation that rejects `SettingsLayer.environments` for project, workflow, and direct run config layers with this message shape: `[environments.<id>] is now server-managed; move this definition to the server environments directory`.\n- [ ] Add validation that rejects TOML-provided `run.environment.image`, `resources`, `network`, `lifecycle`, `labels`, `volumes`, and `env`. Keep `run.environment.id`.\n- [ ] Ensure CLI/server argument layers can still set `run.environment.lifecycle.preserve` for `--preserve-sandbox`; the rejection applies only to parsed TOML sources.\n- [ ] Add a settings-file migration that extracts top-level `[environments.<id>]` entries from the active `settings.toml` into sibling `environments/<id>.toml` files.\n- [ ] Migration must write a backup before editing `settings.toml`, preserve `[run.environment] id`, remove the top-level `[environments]` table, and fail without changing files if any target environment file already exists.\n- [ ] Chain the existing legacy `[run.sandbox]` migration before the new extraction migration so legacy sandbox settings become a server `default` environment file.\n- [ ] Update run settings tests to assert that `RunSettingsBuilder` no longer resolves a selected environment without an injected server catalog.\n- [ ] Add tests proving project/workflow `[environments]` definitions produce targeted errors rather than silent ignores.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-config\n```\n\nExpected: config tests pass, including migration coverage.\n\n## Task 3: Wire EnvironmentStore Into Server Run Resolution\n\n**Files:**\n- Modify: `lib/crates/fabro-server/src/server.rs`\n- Modify: `lib/crates/fabro-server/src/serve.rs`\n- Modify: `lib/crates/fabro-server/src/run_manifest.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/runs.rs`\n- Modify: `lib/crates/fabro-server/src/manifest_validation.rs`\n- Modify: `lib/crates/fabro-server/src/test_support.rs`\n\n- [ ] Add `environment_store: Arc<EnvironmentStore>` to `AppState`, loaded from `active_config_path.parent().join(\"environments\")`.\n- [ ] Replace `manifest_environment_defaults` from `ServerRuntimeSettings` with `environment_store.catalog_layer()` when preparing manifests on the server.\n- [ ] Keep the dense run snapshot unchanged: `prepared.settings.run.environment` contains the resolved environment fields, and `prepared.settings.environments` contains the server catalog used for resolution.\n- [ ] Convert unknown environment ids into `400 Bad Request` during run creation/preflight/graph preparation.\n- [ ] Keep sandbox provider policy checks after environment resolution, so disabled providers still reject runs.\n- [ ] Apply `--preserve-sandbox` after selected environment resolution.\n- [ ] Remove server reliance on `[environments]` in `settings.toml`.\n- [ ] Update server test support so tests can inject environment files or use seeded defaults.\n- [ ] Add server tests for default environment run creation, custom server environment selection, unknown environment id, disabled provider policy, `--preserve-sandbox`, and rejected TOML environment field overrides.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server\n```\n\nExpected: server API and run-manifest tests pass.\n\n## Task 4: Add Environment CRUD API\n\n**Files:**\n- Modify: `docs/public/api-reference/fabro-api.yaml`\n- Modify: `lib/crates/fabro-api/build.rs`\n- Create: `lib/crates/fabro-server/src/server/handler/environments.rs`\n- Modify: `lib/crates/fabro-server/src/server/handler/mod.rs`\n- Add tests: `lib/crates/fabro-server/tests/it/api/environments.rs`\n- Update generated Rust and TypeScript API artifacts after spec changes.\n\n- [ ] Add OpenAPI tag `Environments`.\n- [ ] Add schemas for `Environment`, `CreateEnvironmentRequest`, `ReplaceEnvironmentRequest`, and `EnvironmentListResponse`.\n- [ ] Reuse existing environment schemas for provider/image/resources/network/lifecycle/volumes/env.\n- [ ] Add endpoints:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- [ ] Return `ETag` on retrieve and replace.\n- [ ] Require `If-Match` on replace and delete.\n- [ ] Map store errors to API responses:\n  - invalid id: `400`\n  - duplicate create: `409`\n  - stale revision: `409`\n  - validation error: `422`\n  - missing resource: `404`\n  - protected default delete: `409`\n  - persistence failure: `500`\n- [ ] Add route tests for empty-seeded list, create, retrieve with ETag, replace, stale replace, missing `If-Match`, delete, protected default delete, invalid provider, invalid CIDR, and missing Dockerfile path.\n- [ ] Regenerate `fabro-api` and TypeScript client artifacts.\n\nRun:\n\n```bash\ncargo build -p fabro-api\ncd lib/packages/fabro-api-client && bun run generate\ncargo nextest run -p fabro-server --test it -- api::environments\n```\n\nExpected: generated artifacts are updated and environment API tests pass.\n\n## Task 5: Adjust CLI And Manifest Behavior\n\n**Files:**\n- Modify: `lib/crates/fabro-cli/src/commands/run/overrides.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/preflight.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/graph.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/validate.rs`\n- Modify: `lib/crates/fabro-cli/src/commands/repo/init.rs`\n- Modify: `lib/crates/fabro-manifest/src/lib.rs`\n- Modify CLI integration tests under `lib/crates/fabro-cli/tests/it/`\n\n- [ ] Reject `--docker-image` in run, create, preflight, graph, and validate commands with this message shape: `--docker-image is no longer supported; create or update a server environment and select it with --environment`.\n- [ ] Keep `--environment` as an id-only selector in manifest args.\n- [ ] Stop collecting Dockerfile path references from `[environments.<id>]` in project/workflow config because those definitions are invalid.\n- [ ] Keep collecting Dockerfile references for any remaining CLI-created run environment override only when it comes from allowed argument paths; with `--docker-image` rejected, no normal user path should add one.\n- [ ] Update local preflight/graph/validate flows so they either call server preflight for environment resolution or print a clear message that server-owned environment resolution requires a running server.\n- [ ] Update `fabro repo init` to write only `[run.environment] id = \"local\"` and no `[environments.local]` block.\n- [ ] Update CLI tests for manifest args, repo init output, rejected `--docker-image`, and server-owned environment selection.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-cli\n```\n\nExpected: CLI tests pass and no generated workflow config contains `[environments.*]`.\n\n## Task 6: Update Install, Docs, And Generated References\n\n**Files:**\n- Modify install persistence code in `lib/crates/fabro-cli/src/commands/install.rs` and server install handlers/tests.\n- Modify docs: `docs/public/execution/environments.mdx`, `docs/public/execution/run-configuration.mdx`, `docs/public/reference/user-configuration.mdx`, `docs/public/administration/server-configuration.mdx`, `docs/public/administration/sandboxing.mdx`, `docs/public/integrations/daytona.mdx`, and examples that currently define `[environments.<id>]`.\n- Modify generated settings reference if applicable.\n\n- [ ] Update install flows to write server environment files instead of `[environments.default]` into `settings.toml`.\n- [ ] Keep install-written `[run.environment] id = \"default\"` when a default run environment selection is still needed.\n- [ ] Update tests that assert `settings.toml` contains `[environments.default]` to assert the sibling environment file exists and settings no longer contains `[environments]`.\n- [ ] Rewrite public docs so environment definitions are server-owned TOML files and run configs only select ids.\n- [ ] Add a compatibility note explaining that project/workflow `[environments]` definitions now fail and must be moved to the server.\n- [ ] Keep `Settings > Environments` UI documentation out of this pass.\n\nRun:\n\n```bash\ncargo nextest run -p fabro-server --test it -- api::install\ncargo nextest run -p fabro-cli --test it\n```\n\nExpected: install tests pass and docs no longer present project/workflow environment definitions as valid.\n\n## Task 7: Workspace Verification\n\n**Files:**\n- No new files unless test snapshots require reviewed updates.\n\n- [ ] Run Rust formatting check:\n\n```bash\ncargo +nightly-2026-04-14 fmt --check --all\n```\n\n- [ ] Run clippy:\n\n```bash\ncargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings\n```\n\n- [ ] Run workspace tests:\n\n```bash\ncargo nextest run --workspace\n```\n\n- [ ] Run TypeScript checks if API client changes affect the web package:\n\n```bash\ncd apps/fabro-web && bun run typecheck\ncd apps/fabro-web && bun test\n```\n\n- [ ] Inspect generated files and snapshots before accepting any snapshot changes.\n\n## Acceptance Criteria\n\n- Server startup creates or loads `environments/default.toml`, `local.toml`, `docker.toml`, and `daytona.toml`.\n- `GET /api/v1/environments` returns seeded environments with revisions.\n- API-created environments persist as TOML files and survive server restart.\n- Runs using `[run.environment] id = \"cloud\"` resolve from server files only.\n- Project/workflow/user `[environments.<id>]` definitions no longer affect runs.\n- Existing runs keep their dense environment snapshot after environment files change.\n- `--environment` still works.\n- `--preserve-sandbox` still works.\n- `--docker-image` no longer works and produces the targeted replacement guidance.\n- Web UI changes are not included.\n",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
           "internal.retry_count.preflight_compile": 0,
@@ -657,6 +741,20 @@
               "active_time_ms": 131121
             }
           },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 143203,
+              "active_time_ms": 143203
+            }
+          },
           "start": {
             "status": "succeeded",
             "usage": null
@@ -676,11 +774,12 @@
             }
           }
         },
-        "next_node_id": "preflight_lint",
+        "next_node_id": "implement",
         "node_visits": {
           "start": 1,
           "toolchain": 1,
-          "preflight_compile": 1
+          "preflight_compile": 1,
+          "preflight_lint": 1
         }
       },
       "diff": {}
@@ -794,22 +893,22 @@
       },
       "state": "succeeded"
     },
-    "preflight_compile@1": {
-      "first_event_seq": 31,
+    "preflight_lint@1": {
+      "first_event_seq": 41,
       "prompt": null,
       "response": null,
       "completion": null,
       "provider_used": null,
       "diff": null,
       "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
         "language": "shell"
       },
       "script_timing": null,
       "parallel_results": null,
       "output": null,
-      "started_at": "2026-05-28T04:28:40.324442Z",
+      "started_at": "2026-05-28T04:30:55.467797Z",
       "handler": "command",
       "usage": {
         "input_tokens": 0,
@@ -820,6 +919,54 @@
         "cache_write_tokens": 0
       },
       "state": "running"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 31,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-28T04:30:51.451059Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 131121,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-28T04:28:40.324442Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 131126,
+        "inference_time_ms": 0,
+        "tool_time_ms": 131121,
+        "active_time_ms": 131121
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
     }
   }
 }
