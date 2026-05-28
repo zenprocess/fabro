@@ -1,0 +1,3650 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2ef51ead4..29c44783b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2007,6 +2007,22 @@ dependencies = [
+  "serde_json",
+ ]
+ 
++[[package]]
++name = "fabro-environment"
++version = "0.246.0-nightly.0"
++dependencies = [
++ "fabro-config",
++ "fabro-types",
++ "hex",
++ "serde",
++ "sha2",
++ "tempfile",
++ "thiserror 2.0.18",
++ "tokio",
++ "toml 0.8.23",
++ "toml_edit",
++]
++
+ [[package]]
+ name = "fabro-github"
+ version = "0.246.0-nightly.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index de3a7e4ca..94f02b492 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -84,6 +84,7 @@ percent-encoding = "2"
+ minijinja = "=2.19.0"
+ miette = { version = "7.6", features = ["fancy"] }
+ fabro-http = { path = "lib/crates/fabro-http" }
++fabro-environment = { path = "lib/crates/fabro-environment" }
+ fabro-options-metadata = { path = "lib/crates/fabro-options-metadata" }
+ fabro-redact = { path = "lib/crates/fabro-redact" }
+ fabro-static = { path = "lib/crates/fabro-static" }
+diff --git a/lib/crates/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs b/lib/crates/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs
+index d276c9891..255d9bf42 100644
+--- a/lib/crates/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs
++++ b/lib/crates/fabro-config/migrations/2026050101_legacy_sandbox_to_environments.rs
+@@ -19,7 +19,6 @@ pub(crate) const REMOVAL_NOTE: &str =
+ 
+ #[derive(Debug)]
+ pub(crate) struct LegacySandboxMigrationReport {
+-    pub(crate) layer:   SettingsLayer,
+     pub(crate) warning: String,
+     #[cfg(test)]
+     backup_path:        PathBuf,
+@@ -77,14 +76,13 @@ pub(crate) fn migrate_settings_path(
+     );
+ 
+     Ok(Some(LegacySandboxMigrationReport {
+-        layer,
+         warning,
+         #[cfg(test)]
+         backup_path,
+     }))
+ }
+ 
+-fn migrate_contents(original_contents: &str, path: &Path) -> Result<Option<String>> {
++pub(crate) fn migrate_contents(original_contents: &str, path: &Path) -> Result<Option<String>> {
+     let Ok(mut doc) = original_contents.parse::<DocumentMut>() else {
+         return Ok(None);
+     };
+diff --git a/lib/crates/fabro-config/migrations/2026052801_settings_environments_to_server_files.rs b/lib/crates/fabro-config/migrations/2026052801_settings_environments_to_server_files.rs
+new file mode 100644
+index 000000000..31d995b0f
+--- /dev/null
++++ b/lib/crates/fabro-config/migrations/2026052801_settings_environments_to_server_files.rs
+@@ -0,0 +1,334 @@
++#![expect(
++    clippy::disallowed_methods,
++    clippy::disallowed_types,
++    reason = "temporary startup config migration uses synchronous file I/O before config is loaded"
++)]
++
++use std::io::Write;
++use std::path::{Path, PathBuf};
++
++use toml_edit::{DocumentMut, Item};
++
++use crate::{Error, Result};
++
++pub(crate) const REMOVAL_NOTE: &str =
++    "This temporary compatibility migration will be removed before v1.0.";
++
++#[derive(Debug)]
++pub(crate) struct SettingsEnvironmentsMigrationReport {
++    pub(crate) contents: String,
++    pub(crate) warning:  String,
++    #[cfg(test)]
++    backup_path:         PathBuf,
++}
++
++pub(crate) fn migrate_settings_path(
++    path: &Path,
++    original_contents: &str,
++) -> Result<Option<SettingsEnvironmentsMigrationReport>> {
++    let legacy_migrated =
++        super::legacy_sandbox_to_environments::migrate_contents(original_contents, path)?;
++    let contents = legacy_migrated.as_deref().unwrap_or(original_contents);
++    let legacy_changed = legacy_migrated.is_some();
++
++    let Some((next_contents, extracted)) = extract_environments(contents, path)? else {
++        if legacy_changed {
++            return Err(Error::other(format!(
++                "Legacy [run.sandbox] settings in {} did not produce a server environment file candidate.",
++                path.display()
++            )));
++        }
++        return Ok(None);
++    };
++
++    let settings_dir = path.parent().unwrap_or_else(|| Path::new("."));
++    let environment_dir = settings_dir.join("environments");
++    let existing = extracted
++        .iter()
++        .map(|environment| environment_dir.join(format!("{}.toml", environment.id)))
++        .find(|target| target.exists());
++    if let Some(target) = existing {
++        return Err(Error::other(format!(
++            "Settings environments in {} could not be auto-migrated because target environment file {} already exists. Move or merge the file and retry.",
++            path.display(),
++            target.display()
++        )));
++    }
++
++    let backup_path = write_next_backup(path, original_contents)?;
++    std::fs::create_dir_all(&environment_dir).map_err(|source| {
++        Error::other(format!(
++            "creating server environments directory {}: {source}",
++            environment_dir.display()
++        ))
++    })?;
++    for environment in &extracted {
++        let target = environment_dir.join(format!("{}.toml", environment.id));
++        write_new_file(&target, &environment.contents)?;
++    }
++    std::fs::write(path, &next_contents).map_err(|source| {
++        Error::other(format!(
++            "writing migrated settings file {}: {source}",
++            path.display()
++        ))
++    })?;
++
++    let ids = extracted
++        .iter()
++        .map(|environment| environment.id.as_str())
++        .collect::<Vec<_>>()
++        .join(", ");
++    let warning = format!(
++        "Migrated [environments] settings in {} to server environment files under {} ({ids}). Backup written to {}. {REMOVAL_NOTE}",
++        path.display(),
++        environment_dir.display(),
++        backup_path.display()
++    );
++
++    Ok(Some(SettingsEnvironmentsMigrationReport {
++        contents: next_contents,
++        warning,
++        #[cfg(test)]
++        backup_path,
++    }))
++}
++
++#[derive(Debug)]
++struct ExtractedEnvironment {
++    id:       String,
++    contents: String,
++}
++
++fn extract_environments(
++    contents: &str,
++    path: &Path,
++) -> Result<Option<(String, Vec<ExtractedEnvironment>)>> {
++    let Ok(mut doc) = contents.parse::<DocumentMut>() else {
++        return Ok(None);
++    };
++    let Some(environments_item) = doc.get("environments") else {
++        return Ok(None);
++    };
++    let Some(environments) = environments_item.as_table() else {
++        return Err(Error::other(format!(
++            "[environments] in {} must be a table to migrate to server environment files.",
++            path.display()
++        )));
++    };
++
++    let mut extracted = Vec::new();
++    for (id, item) in environments {
++        validate_environment_id(id, path)?;
++        let contents = environment_file_contents(id, item, path)?;
++        extracted.push(ExtractedEnvironment {
++            id: id.to_string(),
++            contents,
++        });
++    }
++    if extracted.is_empty() {
++        return Ok(None);
++    }
++    extracted.sort_by(|left, right| left.id.cmp(&right.id));
++
++    doc.as_table_mut().remove("environments");
++    Ok(Some((doc.to_string(), extracted)))
++}
++
++fn environment_file_contents(id: &str, item: &Item, path: &Path) -> Result<String> {
++    let Some(table) = item.as_table() else {
++        return Err(Error::other(format!(
++            "[environments.{id}] in {} must be a table to migrate to a server environment file.",
++            path.display()
++        )));
++    };
++
++    let mut doc = DocumentMut::new();
++    for (key, value) in table {
++        doc[key] = value.clone();
++    }
++    Ok(doc.to_string())
++}
++
++fn validate_environment_id(id: &str, path: &Path) -> Result<()> {
++    if is_valid_environment_id(id) {
++        Ok(())
++    } else {
++        Err(Error::other(format!(
++            "[environments.{id}] in {} could not be migrated because environment ids must match [a-z0-9][a-z0-9-]{{0,62}}.",
++            path.display()
++        )))
++    }
++}
++
++fn is_valid_environment_id(value: &str) -> bool {
++    let mut bytes = value.bytes();
++    let Some(first) = bytes.next() else {
++        return false;
++    };
++    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
++        return false;
++    }
++    if value.len() > 63 {
++        return false;
++    }
++    bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
++}
++
++fn write_new_file(path: &Path, contents: &str) -> Result<()> {
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(path)
++        .map_err(|source| {
++            Error::other(format!(
++                "writing server environment file {}: {source}",
++                path.display()
++            ))
++        })?;
++    file.write_all(contents.as_bytes()).map_err(|source| {
++        Error::other(format!(
++            "writing server environment file {}: {source}",
++            path.display()
++        ))
++    })?;
++    file.sync_all().map_err(|source| {
++        Error::other(format!(
++            "syncing server environment file {}: {source}",
++            path.display()
++        ))
++    })?;
++    Ok(())
++}
++
++fn write_next_backup(path: &Path, contents: &str) -> Result<PathBuf> {
++    for index in 0u32.. {
++        let backup_path = backup_path_for(path, index);
++        match std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&backup_path)
++        {
++            Ok(mut file) => {
++                file.write_all(contents.as_bytes()).map_err(|source| {
++                    Error::other(format!(
++                        "writing settings environments migration backup {}: {source}",
++                        backup_path.display()
++                    ))
++                })?;
++                return Ok(backup_path);
++            }
++            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
++            Err(source) => {
++                return Err(Error::other(format!(
++                    "writing settings environments migration backup {}: {source}",
++                    backup_path.display()
++                )));
++            }
++        }
++    }
++    unreachable!("unbounded backup suffix search should return")
++}
++
++fn backup_path_for(path: &Path, index: u32) -> PathBuf {
++    let file_name = path
++        .file_name()
++        .and_then(|name| name.to_str())
++        .unwrap_or("settings.toml");
++    if index == 0 {
++        path.with_file_name(format!("{file_name}.settings-environments-migration.bak"))
++    } else {
++        path.with_file_name(format!(
++            "{file_name}.settings-environments-migration.{index}.bak"
++        ))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn extracts_environments_and_removes_catalog_from_settings() {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let path = dir.path().join("settings.toml");
++        let source = r#"
++_version = 1
++
++[run.environment]
++id = "cloud"
++
++[environments.cloud]
++provider = "docker"
++
++[environments.cloud.image]
++docker = "ubuntu:24.04"
++"#;
++        std::fs::write(&path, source).expect("write settings");
++
++        let report = migrate_settings_path(&path, source)
++            .expect("migration should succeed")
++            .expect("catalog should migrate");
++
++        let rewritten = std::fs::read_to_string(&path).expect("read settings");
++        let environment =
++            std::fs::read_to_string(dir.path().join("environments/cloud.toml")).expect("read env");
++        assert!(report.backup_path.exists());
++        assert!(!rewritten.contains("[environments"));
++        assert!(rewritten.contains("id = \"cloud\""));
++        assert!(environment.contains("provider = \"docker\""));
++        assert!(environment.contains("docker = \"ubuntu:24.04\""));
++    }
++
++    #[test]
++    fn target_conflict_fails_without_changing_settings_or_files() {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let path = dir.path().join("settings.toml");
++        let environment_dir = dir.path().join("environments");
++        std::fs::create_dir_all(&environment_dir).expect("mkdir");
++        std::fs::write(environment_dir.join("cloud.toml"), "provider = \"local\"\n")
++            .expect("write existing");
++        let source = r#"
++_version = 1
++
++[environments.cloud]
++provider = "docker"
++"#;
++        std::fs::write(&path, source).expect("write settings");
++
++        let err = migrate_settings_path(&path, source).expect_err("conflict should fail");
++
++        assert!(err.to_string().contains("already exists"));
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
++        assert_eq!(
++            std::fs::read_to_string(environment_dir.join("cloud.toml")).unwrap(),
++            "provider = \"local\"\n"
++        );
++    }
++
++    #[test]
++    fn legacy_sandbox_is_chained_into_default_environment_file() {
++        let dir = tempfile::tempdir().expect("temp dir");
++        let path = dir.path().join("settings.toml");
++        let source = r#"
++_version = 1
++
++[run.sandbox]
++provider = "docker"
++preserve = true
++"#;
++        std::fs::write(&path, source).expect("write settings");
++
++        migrate_settings_path(&path, source)
++            .expect("migration should succeed")
++            .expect("legacy sandbox should migrate");
++
++        let rewritten = std::fs::read_to_string(&path).expect("read settings");
++        let environment = std::fs::read_to_string(dir.path().join("environments/default.toml"))
++            .expect("read default env");
++        assert!(rewritten.contains("[run.environment]"));
++        assert!(rewritten.contains("id = \"default\""));
++        assert!(!rewritten.contains("[environments"));
++        assert!(environment.contains("provider = \"docker\""));
++        assert!(environment.contains("preserve = true"));
++    }
++}
+diff --git a/lib/crates/fabro-config/src/builders.rs b/lib/crates/fabro-config/src/builders.rs
+index 3562328f0..1430ae43b 100644
+--- a/lib/crates/fabro-config/src/builders.rs
++++ b/lib/crates/fabro-config/src/builders.rs
+@@ -8,7 +8,8 @@ use fabro_types::{ServerSettings, UserSettings, WorkflowSettings};
+ use fabro_util::error::SharedError;
+ 
+ use crate::defaults::DEFAULTS_LAYER;
+-use crate::load::load_settings_path;
++use crate::load::{load_settings_path, load_settings_path_with_source};
++use crate::parse::{SettingsSource, validate_settings_source};
+ use crate::resolve::{
+     ResolveError, resolve_cli, resolve_project, resolve_run, resolve_server, resolve_workflow,
+ };
+@@ -90,6 +91,7 @@ impl ServerSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::ActiveSettings)?;
+         Self::from_layer(&layer)
+     }
+ 
+@@ -119,12 +121,12 @@ impl UserSettingsBuilder {
+     }
+ 
+     pub fn load_from(path: &Path) -> Result<UserSettings> {
+-        let layer = load_settings_path(path)?;
++        let layer = load_settings_path_with_source(path, SettingsSource::User)?;
+         Self::from_layer(&layer)
+     }
+ 
+     pub fn load_from_with_cli_overrides(path: &Path, cli: &CliLayer) -> Result<UserSettings> {
+-        let layer = load_settings_path(path)?;
++        let layer = load_settings_path_with_source(path, SettingsSource::User)?;
+         Self::from_layer_with_cli_overrides(&layer, cli)
+     }
+ 
+@@ -132,6 +134,7 @@ impl UserSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::User)?;
+         Self::from_layer(&layer)
+     }
+ 
+@@ -139,6 +142,7 @@ impl UserSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::User)?;
+         Self::from_layer_with_cli_overrides(&layer, cli)
+     }
+ 
+@@ -176,7 +180,7 @@ impl RunSettingsBuilder {
+     }
+ 
+     pub fn load_from(path: &Path) -> Result<RunNamespace> {
+-        let layer = load_settings_path(path)?;
++        let layer = load_settings_path_with_source(path, SettingsSource::DirectRun)?;
+         Self::from_layer(&layer)
+     }
+ 
+@@ -184,6 +188,7 @@ impl RunSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::DirectRun)?;
+         Self::from_layer(&layer)
+     }
+ 
+@@ -244,6 +249,7 @@ pub fn server_runtime_settings_from_toml(
+     let layer = source
+         .parse::<SettingsLayer>()
+         .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++    validate_parsed_source(&layer, SettingsSource::ActiveSettings)?;
+     resolve_server_runtime_settings(layer, run_overrides, server_overrides)
+ }
+ 
+@@ -412,6 +418,11 @@ fn cost_rates_to_catalog(rates: &CostRates) -> model_catalog::CostRates {
+     }
+ }
+ 
++fn validate_parsed_source(layer: &SettingsLayer, source: SettingsSource) -> Result<()> {
++    validate_settings_source(layer, source)
++        .map_err(|err| Error::parse("Failed to parse settings file", err))
++}
++
+ #[derive(Clone, Debug, Default)]
+ pub struct WorkflowSettingsBuilder {
+     args:     SettingsLayer,
+@@ -431,6 +442,7 @@ impl WorkflowSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::Workflow)?;
+         Self::from_layer(&layer)
+             .map_err(|errors| Error::resolve("failed to resolve workflow settings", errors.into()))
+     }
+@@ -459,6 +471,7 @@ impl WorkflowSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::Workflow)?;
+         Ok(self.workflow_layer(layer))
+     }
+ 
+@@ -466,6 +479,7 @@ impl WorkflowSettingsBuilder {
+         let mut layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::Workflow)?;
+         layer.run = Some(run);
+         Ok(self.workflow_layer(layer))
+     }
+@@ -484,6 +498,7 @@ impl WorkflowSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::Project)?;
+         Ok(self.project_layer(layer))
+     }
+ 
+@@ -491,12 +506,16 @@ impl WorkflowSettingsBuilder {
+         let mut layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::Project)?;
+         layer.run = Some(run);
+         Ok(self.project_layer(layer))
+     }
+ 
+     pub fn project_file(self, path: &Path) -> Result<Self> {
+-        Ok(self.project_layer(load_settings_path(path)?))
++        Ok(self.project_layer(load_settings_path_with_source(
++            path,
++            SettingsSource::Project,
++        )?))
+     }
+ 
+     #[must_use]
+@@ -509,11 +528,15 @@ impl WorkflowSettingsBuilder {
+         let layer = source
+             .parse::<SettingsLayer>()
+             .map_err(|err| Error::parse("Failed to parse settings file", err))?;
++        validate_parsed_source(&layer, SettingsSource::User)?;
+         Ok(self.user_layer(layer))
+     }
+ 
+     pub fn user_file(self, path: &Path) -> Result<Self> {
+-        Ok(self.user_layer(load_settings_path(path)?))
++        Ok(self.user_layer(load_settings_path_with_source(
++            path,
++            SettingsSource::User,
++        )?))
+     }
+ 
+     #[must_use]
+@@ -643,11 +666,24 @@ mod tests {
+     use fabro_types::settings::run::{ApprovalMode, RunMode};
+ 
+     use super::{RunSettingsBuilder, WorkflowSettingsBuilder, server_runtime_settings_from_toml};
+-    use crate::{CliLayer, CliOutputLayer, ReplaceMap, RunExecutionLayer, RunLayer, RunModelLayer};
++    use crate::{
++        CliLayer, CliOutputLayer, ReplaceMap, RunExecutionLayer, RunLayer, RunModelLayer,
++        SettingsLayer,
++    };
++
++    fn seeded_environment_catalog() -> crate::MergeMap<crate::EnvironmentLayer> {
++        r#"
++[environments.default]
++provider = "local"
++"#
++        .parse::<SettingsLayer>()
++        .expect("seeded catalog should parse")
++        .environments
++    }
+ 
+     #[test]
+-    fn run_settings_builder_resolves_run_namespace() {
+-        let settings = RunSettingsBuilder::from_toml(
++    fn run_settings_builder_requires_injected_environment_catalog() {
++        let err = RunSettingsBuilder::from_toml(
+             r#"
+ _version = 1
+ 
+@@ -659,15 +695,19 @@ type = "stdio"
+ command = ["demo-mcp"]
+ "#,
+         )
+-        .expect("run settings should resolve");
++        .expect_err("run settings should not resolve without a server environment catalog");
+ 
+-        assert_eq!(settings.execution.mode, RunMode::DryRun);
+-        assert!(settings.agent.mcps.contains_key("demo"));
++        let message = err.to_string();
++        assert!(
++            message.contains("run.environment.id") && message.contains("unknown environment"),
++            "expected missing server environment catalog diagnostic, got: {message}"
++        );
+     }
+ 
+     #[test]
+     fn workflow_builder_preserves_run_overrides_when_cli_overrides_are_added() {
+         let settings = WorkflowSettingsBuilder::new()
++            .server_manifest_defaults(RunLayer::default(), seeded_environment_catalog())
+             .run_overrides(RunLayer {
+                 metadata: ReplaceMap::from(HashMap::from([("env".to_string(), "cli".to_string())])),
+                 model: Some(RunModelLayer {
+@@ -718,6 +758,46 @@ command = ["demo-mcp"]
+         assert_eq!(settings.run.execution.approval, ApprovalMode::Auto);
+     }
+ 
++    #[test]
++    fn workflow_environment_catalog_definition_is_rejected() {
++        let err = WorkflowSettingsBuilder::new()
++            .workflow_toml(
++                r#"
++_version = 1
++
++[environments.cloud]
++provider = "docker"
++"#,
++            )
++            .expect_err("workflow environment catalogs should be server-managed");
++
++        let message = err.to_string();
++        assert!(
++            message.contains("[environments.cloud] is now server-managed"),
++            "expected targeted server-managed environment diagnostic, got: {message}"
++        );
++    }
++
++    #[test]
++    fn project_environment_catalog_definition_is_rejected() {
++        let err = WorkflowSettingsBuilder::new()
++            .project_toml(
++                r#"
++_version = 1
++
++[environments.cloud]
++provider = "docker"
++"#,
++            )
++            .expect_err("project environment catalogs should be server-managed");
++
++        let message = err.to_string();
++        assert!(
++            message.contains("[environments.cloud] is now server-managed"),
++            "expected targeted server-managed environment diagnostic, got: {message}"
++        );
++    }
++
+     #[test]
+     fn server_runtime_settings_preserves_llm_catalog_overrides() {
+         let settings = server_runtime_settings_from_toml(
+diff --git a/lib/crates/fabro-config/src/defaults.toml b/lib/crates/fabro-config/src/defaults.toml
+index faecfdeb5..ae70776fa 100644
+--- a/lib/crates/fabro-config/src/defaults.toml
++++ b/lib/crates/fabro-config/src/defaults.toml
+@@ -26,40 +26,6 @@ push = true
+ [run.environment]
+ id = "default"
+ 
+-[environments.default]
+-provider = "docker"
+-
+-[environments.default.image]
+-docker = "buildpack-deps:noble"
+-
+-[environments.default.resources]
+-cpu = 2
+-memory = "4GB"
+-
+-[environments.default.lifecycle]
+-preserve = false
+-stop_on_terminal = true
+-
+-[environments.local]
+-provider = "local"
+-
+-[environments.docker]
+-provider = "docker"
+-
+-[environments.docker.image]
+-docker = "buildpack-deps:noble"
+-
+-[environments.docker.resources]
+-cpu = 2
+-memory = "4GB"
+-
+-[environments.docker.lifecycle]
+-preserve = false
+-stop_on_terminal = true
+-
+-[environments.daytona]
+-provider = "daytona"
+-
+ [cli.output]
+ format = "text"
+ verbosity = "normal"
+diff --git a/lib/crates/fabro-config/src/lib.rs b/lib/crates/fabro-config/src/lib.rs
+index ccabacd0f..70fae6129 100644
+--- a/lib/crates/fabro-config/src/lib.rs
++++ b/lib/crates/fabro-config/src/lib.rs
+@@ -63,7 +63,8 @@ pub use layers::{
+ pub use logging::{resolve_log_destination, resolve_log_destination_with_env};
+ pub use parse::ParseError;
+ pub use resolve::{
+-    ResolveError, resolve_cli, resolve_project, resolve_run, resolve_server, resolve_workflow,
++    ResolveError, resolve_cli, resolve_environment_layer, resolve_project, resolve_run,
++    resolve_server, resolve_workflow,
+ };
+ use serde::de::DeserializeOwned;
+ pub use storage::{RunScratch, RuntimeDirectory, Storage};
+diff --git a/lib/crates/fabro-config/src/load.rs b/lib/crates/fabro-config/src/load.rs
+index 324d7f581..701658e75 100644
+--- a/lib/crates/fabro-config/src/load.rs
++++ b/lib/crates/fabro-config/src/load.rs
+@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
+ 
+ use fabro_types::settings::InterpString;
+ 
++use crate::parse::{SettingsSource, validate_settings_source};
+ use crate::{Error, Result, RunGoalLayer, SettingsLayer, migrations};
+ 
+ #[expect(
+@@ -14,24 +15,36 @@ use crate::{Error, Result, RunGoalLayer, SettingsLayer, migrations};
+     reason = "startup config auto-migration warning must be visible before caller logging is configured"
+ )]
+ pub(crate) fn load_settings_path(path: &Path) -> Result<SettingsLayer> {
++    load_settings_path_with_source(path, SettingsSource::ActiveSettings)
++}
++
++#[expect(
++    clippy::print_stderr,
++    reason = "startup config auto-migration warning must be visible before caller logging is configured"
++)]
++pub(crate) fn load_settings_path_with_source(
++    path: &Path,
++    source: SettingsSource,
++) -> Result<SettingsLayer> {
+     let content = std::fs::read_to_string(path).map_err(|source| Error::read_file(path, source))?;
+-    let mut layer = match content.parse::<SettingsLayer>() {
+-        Ok(layer) => layer,
+-        Err(err) => match migrations::run_migrations(path, &content)? {
++    let content = if source.runs_settings_migrations() {
++        match migrations::run_migrations(path, &content)? {
+             Some(report) => {
+                 tracing::warn!("{}", report.warning);
+                 eprintln!("{}", report.warning);
+-                report.layer
+-            }
+-            None => {
+-                return Err(Error::parse_file(
+-                    "Failed to parse settings file",
+-                    path,
+-                    err,
+-                ));
++                report.contents
+             }
+-        },
++            None => content,
++        }
++    } else {
++        content
+     };
++    let mut layer = content
++        .parse::<SettingsLayer>()
++        .map_err(|err| Error::parse_file("Failed to parse settings file", path, err))?;
++    validate_settings_source(&layer, source).map_err(|err| {
++        Error::parse_file("Failed to parse settings file", path, err)
++    })?;
+     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+     resolve_goal_file_paths(&mut layer, base_dir);
+     Ok(layer)
+@@ -66,8 +79,6 @@ pub(crate) fn resolve_goal_file_path(path_str: &str, base_dir: &Path) -> PathBuf
+ 
+ #[cfg(test)]
+ mod tests {
+-    use fabro_types::settings::run::EnvironmentProvider;
+-
+     use super::*;
+ 
+     #[test]
+@@ -86,15 +97,21 @@ provider = "daytona"
+         .expect("write legacy settings");
+ 
+         let layer = load_settings_path(&path).expect("legacy settings should auto-migrate");
+-        let resolved = crate::WorkflowSettingsBuilder::from_layer(&layer)
+-            .expect("migrated settings should resolve")
+-            .run;
+ 
+-        assert_eq!(resolved.environment.provider, EnvironmentProvider::Daytona);
++        assert_eq!(
++            layer.run
++                .as_ref()
++                .and_then(|run| run.environment.as_ref())
++                .and_then(|environment| environment.id.as_deref()),
++            Some("daytona")
++        );
+         assert!(
+             std::fs::read_to_string(&path)
+                 .expect("read rewritten settings")
+                 .contains("[run.environment]")
+         );
++        let environment = std::fs::read_to_string(dir.path().join("environments/daytona.toml"))
++            .expect("read migrated environment file");
++        assert!(environment.contains("provider = \"daytona\""));
+     }
+ }
+diff --git a/lib/crates/fabro-config/src/migrations.rs b/lib/crates/fabro-config/src/migrations.rs
+index 596ca093a..865b093f2 100644
+--- a/lib/crates/fabro-config/src/migrations.rs
++++ b/lib/crates/fabro-config/src/migrations.rs
+@@ -4,12 +4,14 @@ use crate::Result;
+ 
+ #[path = "../migrations/2026050101_legacy_sandbox_to_environments.rs"]
+ mod legacy_sandbox_to_environments;
++#[path = "../migrations/2026052801_settings_environments_to_server_files.rs"]
++mod settings_environments_to_server_files;
+ 
+-pub(crate) type MigrationReport = legacy_sandbox_to_environments::LegacySandboxMigrationReport;
++pub(crate) use settings_environments_to_server_files::SettingsEnvironmentsMigrationReport as MigrationReport;
+ 
+ pub(crate) fn run_migrations(
+     path: &Path,
+     original_contents: &str,
+ ) -> Result<Option<MigrationReport>> {
+-    legacy_sandbox_to_environments::migrate_settings_path(path, original_contents)
++    settings_environments_to_server_files::migrate_settings_path(path, original_contents)
+ }
+diff --git a/lib/crates/fabro-config/src/parse.rs b/lib/crates/fabro-config/src/parse.rs
+index 66ea23680..37f0bb541 100644
+--- a/lib/crates/fabro-config/src/parse.rs
++++ b/lib/crates/fabro-config/src/parse.rs
+@@ -32,6 +32,7 @@ pub enum ParseError {
+     Toml(String),
+     Version(VersionError),
+     UnknownTopLevelKey { key: String, hint: Option<String> },
++    ServerManagedEnvironment { path: String },
+ }
+ 
+ impl fmt::Display for ParseError {
+@@ -49,6 +50,10 @@ impl fmt::Display for ParseError {
+                     )
+                 }
+             }
++            Self::ServerManagedEnvironment { path } => write!(
++                f,
++                "[{path}] is now server-managed; move this definition to the server environments directory"
++            ),
+         }
+     }
+ }
+@@ -111,6 +116,70 @@ pub(crate) fn parse_settings(input: &str) -> Result<SettingsLayer, ParseError> {
+         .map_err(|e| ParseError::Toml(e.to_string()))
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SettingsSource {
++    ActiveSettings,
++    Project,
++    Workflow,
++    DirectRun,
++    User,
++}
++
++impl SettingsSource {
++    #[must_use]
++    pub(crate) fn runs_settings_migrations(self) -> bool {
++        matches!(self, Self::ActiveSettings | Self::User)
++    }
++}
++
++pub fn validate_settings_source(
++    layer: &SettingsLayer,
++    source: SettingsSource,
++) -> Result<(), ParseError> {
++    if matches!(
++        source,
++        SettingsSource::Project | SettingsSource::Workflow | SettingsSource::DirectRun | SettingsSource::User
++    ) {
++        if let Some(id) = layer.environments.keys().min() {
++            return Err(ParseError::ServerManagedEnvironment {
++                path: format!("environments.{id}"),
++            });
++        }
++    }
++
++    if let Some(path) = toml_run_environment_override_path(layer) {
++        return Err(ParseError::ServerManagedEnvironment { path });
++    }
++
++    Ok(())
++}
++
++fn toml_run_environment_override_path(layer: &SettingsLayer) -> Option<String> {
++    let environment = layer.run.as_ref()?.environment.as_ref()?;
++    if environment.image.is_some() {
++        return Some("run.environment.image".to_string());
++    }
++    if environment.resources.is_some() {
++        return Some("run.environment.resources".to_string());
++    }
++    if environment.network.is_some() {
++        return Some("run.environment.network".to_string());
++    }
++    if environment.lifecycle.is_some() {
++        return Some("run.environment.lifecycle".to_string());
++    }
++    if !environment.labels.is_empty() {
++        return Some("run.environment.labels".to_string());
++    }
++    if environment.volumes.is_some() {
++        return Some("run.environment.volumes".to_string());
++    }
++    if !environment.env.is_empty() {
++        return Some("run.environment.env".to_string());
++    }
++    None
++}
++
+ fn validate_version(raw: &toml::Value) -> Result<(), VersionError> {
+     if let Some(table) = raw.as_table() {
+         if table.contains_key("version") {
+diff --git a/lib/crates/fabro-config/src/project.rs b/lib/crates/fabro-config/src/project.rs
+index 763bf0abe..b52663d78 100644
+--- a/lib/crates/fabro-config/src/project.rs
++++ b/lib/crates/fabro-config/src/project.rs
+@@ -402,7 +402,7 @@ directory = "custom/"
+             Some("custom/".to_string())
+         );
+ 
+-        let project = WorkflowSettingsBuilder::from_toml(
++        let project = crate::tests::workflow_settings_from_toml(
+             r#"
+ _version = 1
+ 
+diff --git a/lib/crates/fabro-config/src/resolve/environment.rs b/lib/crates/fabro-config/src/resolve/environment.rs
+index 32f1907b6..e427e02db 100644
+--- a/lib/crates/fabro-config/src/resolve/environment.rs
++++ b/lib/crates/fabro-config/src/resolve/environment.rs
+@@ -37,12 +37,26 @@ pub(crate) fn resolve_run_environment(
+         .clone()
+         .into_environment_override()
+         .combine(base.clone());
+-    let environment = resolve_environment_layer(&merged, "run.environment", errors);
++    let environment = resolve_environment_fields(&merged, "run.environment", errors);
+     validate_provider_capabilities(&environment, "run.environment", errors);
+     RunEnvironmentSettings::from_environment(id, environment)
+ }
+ 
+-fn resolve_environment_layer(
++pub fn resolve_environment_layer(
++    layer: &EnvironmentLayer,
++    path: &str,
++) -> Result<EnvironmentSettings, Vec<ResolveError>> {
++    let mut errors = Vec::new();
++    let environment = resolve_environment_fields(layer, path, &mut errors);
++    validate_provider_capabilities(&environment, path, &mut errors);
++    if errors.is_empty() {
++        Ok(environment)
++    } else {
++        Err(errors)
++    }
++}
++
++fn resolve_environment_fields(
+     layer: &EnvironmentLayer,
+     path: &str,
+     errors: &mut Vec<ResolveError>,
+diff --git a/lib/crates/fabro-config/src/resolve/mod.rs b/lib/crates/fabro-config/src/resolve/mod.rs
+index 3b654e888..6501dda1a 100644
+--- a/lib/crates/fabro-config/src/resolve/mod.rs
++++ b/lib/crates/fabro-config/src/resolve/mod.rs
+@@ -7,6 +7,7 @@ mod server;
+ mod workflow;
+ 
+ pub use cli::resolve_cli;
++pub use environment::resolve_environment_layer;
+ pub(crate) use environment::resolve_run_environment;
+ pub use error::ResolveError;
+ use fabro_types::settings::InterpString;
+@@ -56,7 +57,7 @@ mod tests {
+ 
+     use fabro_types::settings::run::{HookType, McpHttpProtocol, McpTransport, TlsMode};
+ 
+-    use crate::{SettingsLayer, WorkflowSettingsBuilder};
++    use crate::SettingsLayer;
+ 
+     #[test]
+     fn resolve_preserves_source_templates_for_mcp_and_hook_strings() {
+@@ -99,7 +100,7 @@ Authorization = "Bearer {{ env.HOOK_TOKEN }}"
+         .parse::<SettingsLayer>()
+         .expect("settings fixture should parse");
+ 
+-        let resolved = WorkflowSettingsBuilder::from_layer(&settings)
++        let resolved = crate::tests::workflow_settings_from_layer(settings)
+             .expect("run settings should resolve")
+             .run;
+         let mcps = &resolved.agent.mcps;
+diff --git a/lib/crates/fabro-config/src/run.rs b/lib/crates/fabro-config/src/run.rs
+index 7fb5ec65f..311cd3726 100644
+--- a/lib/crates/fabro-config/src/run.rs
++++ b/lib/crates/fabro-config/src/run.rs
+@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::{ResolvedGoalSource, ResolvedRunGoal, RunGoal, RunNamespace};
+ 
+-use crate::load::{load_settings_path, resolve_goal_file_path};
++use crate::load::{load_settings_path_with_source, resolve_goal_file_path};
++use crate::parse::{SettingsSource, validate_settings_source};
+ use crate::{Result, RunGoalLayer, RunLayer, SettingsLayer};
+ 
+ /// Load and parse a run config from a TOML file.
+@@ -22,7 +23,7 @@ use crate::{Result, RunGoalLayer, RunLayer, SettingsLayer};
+ /// Goes through [`load_settings_path`] so that relative `run.goal.file`
+ /// paths are anchored at the directory of `path` at load time.
+ pub(crate) fn load_run_config(path: &Path) -> Result<SettingsLayer> {
+-    load_settings_path(path)
++    load_settings_path_with_source(path, SettingsSource::Workflow)
+ }
+ 
+ /// Parse a settings TOML source string and extract its `[run]` layer.
+@@ -43,6 +44,8 @@ pub fn parse_run_layer_from_settings_toml(source: &str) -> Result<RunLayer> {
+     let layer = source
+         .parse::<SettingsLayer>()
+         .map_err(|err| crate::Error::parse("Failed to parse run config TOML", err))?;
++    validate_settings_source(&layer, SettingsSource::DirectRun)
++        .map_err(|err| crate::Error::parse("Failed to parse run config TOML", err))?;
+     Ok(layer.run.unwrap_or_default())
+ }
+ 
+diff --git a/lib/crates/fabro-config/src/tests/defaults.rs b/lib/crates/fabro-config/src/tests/defaults.rs
+index 210bf87c1..4446268bc 100644
+--- a/lib/crates/fabro-config/src/tests/defaults.rs
++++ b/lib/crates/fabro-config/src/tests/defaults.rs
+@@ -2,7 +2,7 @@ use fabro_types::settings::cli::OutputFormat;
+ use fabro_types::settings::run::{ApprovalMode, RunMode};
+ use fabro_types::settings::server::ObjectStoreProvider;
+ 
+-use crate::{Combine, ServerSettingsBuilder, SettingsLayer, WorkflowSettingsBuilder};
++use crate::{Combine, ServerSettingsBuilder, SettingsLayer};
+ 
+ fn parse(source: &str) -> SettingsLayer {
+     source
+@@ -62,13 +62,7 @@ fn apply_builtin_defaults_materializes_expected_layer() {
+             .and_then(|environment| environment.id.as_deref()),
+         Some("default")
+     );
+-    assert_eq!(
+-        layer
+-            .environments
+-            .get("default")
+-            .and_then(|environment| environment.provider.as_deref()),
+-        Some("docker")
+-    );
++    assert!(layer.environments.is_empty());
+     assert_eq!(
+         layer
+             .run
+@@ -134,8 +128,7 @@ mode = "dry_run"
+ "#,
+     );
+ 
+-    let settings =
+-        WorkflowSettingsBuilder::from_layer(&layer).expect("workflow settings should resolve");
++    let settings = super::workflow_settings_from_layer(layer).expect("workflow settings should resolve");
+ 
+     assert_eq!(settings.run.execution.mode, RunMode::DryRun);
+     assert_eq!(settings.run.execution.approval, ApprovalMode::Prompt);
+diff --git a/lib/crates/fabro-config/src/tests/mod.rs b/lib/crates/fabro-config/src/tests/mod.rs
+index 6e97859ba..074c346f6 100644
+--- a/lib/crates/fabro-config/src/tests/mod.rs
++++ b/lib/crates/fabro-config/src/tests/mod.rs
+@@ -7,3 +7,75 @@ mod resolve_root;
+ mod resolve_run;
+ mod resolve_server;
+ mod resolve_workflow;
++
++use fabro_types::WorkflowSettings;
++
++use crate::{
++    EnvironmentLayer, Error, MergeMap, ResolveErrors, RunLayer, SettingsLayer,
++    WorkflowSettingsBuilder,
++};
++
++pub(crate) fn seeded_environment_catalog() -> MergeMap<EnvironmentLayer> {
++    r#"
++[environments.default]
++provider = "docker"
++
++[environments.default.image]
++docker = "buildpack-deps:noble"
++
++[environments.default.resources]
++cpu = 2
++memory = "4GB"
++
++[environments.default.lifecycle]
++preserve = false
++stop_on_terminal = true
++
++[environments.local]
++provider = "local"
++
++[environments.docker]
++provider = "docker"
++
++[environments.docker.image]
++docker = "buildpack-deps:noble"
++
++[environments.docker.resources]
++cpu = 2
++memory = "4GB"
++
++[environments.docker.lifecycle]
++preserve = false
++stop_on_terminal = true
++
++[environments.daytona]
++provider = "daytona"
++"#
++    .parse::<SettingsLayer>()
++    .expect("seeded environment catalog should parse")
++    .environments
++}
++
++pub(crate) fn workflow_settings_from_toml(source: &str) -> crate::Result<WorkflowSettings> {
++    workflow_settings_from_toml_with_catalog(source, seeded_environment_catalog())
++}
++
++pub(crate) fn workflow_settings_from_toml_with_catalog(
++    source: &str,
++    catalog: MergeMap<EnvironmentLayer>,
++) -> crate::Result<WorkflowSettings> {
++    WorkflowSettingsBuilder::new()
++        .server_manifest_defaults(RunLayer::default(), catalog)
++        .workflow_toml(source)?
++        .build()
++        .map_err(|errors| Error::resolve("failed to resolve workflow settings", errors.into()))
++}
++
++pub(crate) fn workflow_settings_from_layer(
++    layer: SettingsLayer,
++) -> std::result::Result<WorkflowSettings, ResolveErrors> {
++    WorkflowSettingsBuilder::new()
++        .server_manifest_defaults(RunLayer::default(), seeded_environment_catalog())
++        .workflow_layer(layer)
++        .build()
++}
+diff --git a/lib/crates/fabro-config/src/tests/resolve_project.rs b/lib/crates/fabro-config/src/tests/resolve_project.rs
+index b23b0971b..71597e07a 100644
+--- a/lib/crates/fabro-config/src/tests/resolve_project.rs
++++ b/lib/crates/fabro-config/src/tests/resolve_project.rs
+@@ -1,10 +1,10 @@
+-use crate::{SettingsLayer, WorkflowSettingsBuilder};
++use crate::SettingsLayer;
+ 
+ #[test]
+ fn resolves_project_defaults_from_empty_settings() {
+     let settings = SettingsLayer::default();
+ 
+-    let project = WorkflowSettingsBuilder::from_layer(&settings)
++    let project = super::workflow_settings_from_layer(settings)
+         .expect("empty settings should resolve")
+         .project;
+ 
+@@ -20,7 +20,7 @@ fn resolves_project_defaults_from_empty_settings() {
+ 
+ #[test]
+ fn resolves_project_metadata_and_ignores_deprecated_directory() {
+-    let project = WorkflowSettingsBuilder::from_toml(
++    let project = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+diff --git a/lib/crates/fabro-config/src/tests/resolve_root.rs b/lib/crates/fabro-config/src/tests/resolve_root.rs
+index bad738301..ed2f77cb0 100644
+--- a/lib/crates/fabro-config/src/tests/resolve_root.rs
++++ b/lib/crates/fabro-config/src/tests/resolve_root.rs
+@@ -1,7 +1,7 @@
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::RunMode;
+ 
+-use crate::{ServerSettingsBuilder, SettingsLayer, WorkflowSettingsBuilder};
++use crate::{ServerSettingsBuilder, SettingsLayer};
+ 
+ #[test]
+ fn resolves_root_settings_require_explicit_server_auth_methods() {
+@@ -35,11 +35,12 @@ methods = ["github"]
+ [server.auth.github]
+ allowed_usernames = []
+ 
++"#;
++    let workflow_source = r#"
++_version = 1
++
+ [run.environment]
+ id = "bad"
+-
+-[environments.bad]
+-provider = "not-a-provider"
+ "#;
+ 
+     let mut rendered = Vec::new();
+@@ -54,7 +55,16 @@ provider = "not-a-provider"
+         .map(|error| error.to_string()),
+     );
+     rendered.extend(
+-        match fabro_config::WorkflowSettingsBuilder::from_toml(source)
++        match super::workflow_settings_from_toml_with_catalog(
++            workflow_source,
++            r#"
++[environments.bad]
++provider = "not-a-provider"
++"#
++            .parse::<SettingsLayer>()
++            .expect("bad environment catalog should parse")
++            .environments,
++        )
+             .expect_err("invalid run settings should fail")
+         {
+             fabro_config::Error::Resolve { errors, .. } => errors,
+@@ -92,7 +102,7 @@ name = "gpt-5"
+ "#;
+ 
+     let workflow_settings =
+-        WorkflowSettingsBuilder::from_toml(source).expect("workflow settings should resolve");
++        super::workflow_settings_from_toml(source).expect("workflow settings should resolve");
+     let server = ServerSettingsBuilder::from_toml(source).expect("server settings should resolve");
+ 
+     let project_json = serde_json::to_value(&workflow_settings.project)
+@@ -126,7 +136,7 @@ name = "gpt-5"
+ #[test]
+ fn workflow_settings_resolve_defaults_and_expose_fields() {
+     let settings = SettingsLayer::default();
+-    let resolved = fabro_config::WorkflowSettingsBuilder::from_layer(&settings)
++    let resolved = super::workflow_settings_from_layer(settings)
+         .expect("defaults should resolve");
+ 
+     let project_json =
+@@ -141,7 +151,7 @@ fn workflow_settings_resolve_defaults_and_expose_fields() {
+ 
+ #[test]
+ fn workflow_settings_combine_labels_with_later_namespaces_winning() {
+-    let labels = fabro_config::WorkflowSettingsBuilder::from_toml(
++    let labels = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+@@ -169,16 +179,20 @@ shared = "run"
+ 
+ #[test]
+ fn workflow_settings_report_invalid_environment_provider() {
+-    let errors = match fabro_config::WorkflowSettingsBuilder::from_toml(
++    let errors = match super::workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "bad"
+-
++"#,
++        r#"
+ [environments.bad]
+ provider = "not-a-provider"
+-"#,
++"#
++        .parse::<SettingsLayer>()
++        .expect("bad environment catalog should parse")
++        .environments,
+     )
+     .expect_err("invalid workflow settings should fail")
+     {
+@@ -196,20 +210,24 @@ provider = "not-a-provider"
+ 
+ #[test]
+ fn workflow_settings_accumulate_multiple_run_errors() {
+-    let rendered = fabro_config::WorkflowSettingsBuilder::from_toml(
++    let rendered = super::workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "bad"
+ 
+-[environments.bad]
+-provider = "not-a-provider"
+-
+ [[run.prepare.steps]]
+ script = "echo hi"
+ command = ["echo", "hi"]
+ "#,
++        r#"
++[environments.bad]
++provider = "not-a-provider"
++"#
++        .parse::<SettingsLayer>()
++        .expect("bad environment catalog should parse")
++        .environments,
+     )
+     .expect_err("invalid workflow settings should fail")
+     .to_string();
+diff --git a/lib/crates/fabro-config/src/tests/resolve_run.rs b/lib/crates/fabro-config/src/tests/resolve_run.rs
+index 930117984..f89e421e4 100644
+--- a/lib/crates/fabro-config/src/tests/resolve_run.rs
++++ b/lib/crates/fabro-config/src/tests/resolve_run.rs
+@@ -3,11 +3,35 @@ use fabro_types::settings::run::{
+     ApprovalMode, EnvironmentNetworkMode, EnvironmentProvider, RunGoal, RunMode,
+ };
+ 
+-use crate::{SettingsLayer, WorkflowSettingsBuilder};
++use crate::{MergeMap, SettingsLayer};
++
++fn catalog(source: &str) -> MergeMap<crate::EnvironmentLayer> {
++    source
++        .parse::<SettingsLayer>()
++        .expect("environment catalog should parse")
++        .environments
++}
++
++fn workflow_settings_from_toml_with_catalog(
++    source: &str,
++    catalog: &str,
++) -> crate::Result<fabro_types::WorkflowSettings> {
++    super::workflow_settings_from_toml_with_catalog(source, self::catalog(catalog))
++}
++
++fn workflow_settings_from_toml(source: &str) -> crate::Result<fabro_types::WorkflowSettings> {
++    super::workflow_settings_from_toml(source)
++}
++
++fn workflow_settings_from_layer(
++    layer: SettingsLayer,
++) -> std::result::Result<fabro_types::WorkflowSettings, crate::ResolveErrors> {
++    super::workflow_settings_from_layer(layer)
++}
+ 
+ #[test]
+ fn run_model_controls_round_trip_through_resolve() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+@@ -28,7 +52,7 @@ speed = "fast"
+ 
+ #[test]
+ fn run_model_controls_default_to_none() {
+-    let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())
++    let settings = super::workflow_settings_from_layer(SettingsLayer::default())
+         .expect("empty settings should resolve")
+         .run;
+ 
+@@ -38,7 +62,7 @@ fn run_model_controls_default_to_none() {
+ 
+ #[test]
+ fn resolves_run_defaults_from_empty_settings() {
+-    let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())
++    let settings = super::workflow_settings_from_layer(SettingsLayer::default())
+         .expect("empty settings should resolve")
+         .run;
+ 
+@@ -71,20 +95,15 @@ fn resolves_run_defaults_from_empty_settings() {
+ }
+ 
+ #[test]
+-fn resolves_named_daytona_environment_and_run_overrides() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++fn resolves_named_daytona_environment_from_injected_catalog() {
++    let settings = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "fabro-dev"
+-
+-[run.environment.resources]
+-memory = "32GB"
+-
+-[run.environment.lifecycle]
+-preserve = true
+-
++"#,
++        r#"
+ [environments.fabro-dev]
+ provider = "daytona"
+ 
+@@ -128,7 +147,7 @@ NODE_ENV = "development"
+     assert_eq!(environment.resources.cpu, Some(8));
+     assert_eq!(
+         environment.resources.memory.map(|size| size.as_bytes()),
+-        Some(32_000_000_000)
++        Some(16_000_000_000)
+     );
+     assert_eq!(
+         environment.resources.disk.map(|size| size.as_bytes()),
+@@ -139,7 +158,7 @@ NODE_ENV = "development"
+         EnvironmentNetworkMode::CidrAllowList
+     );
+     assert_eq!(environment.network.allow, vec!["10.0.0.0/8"]);
+-    assert!(environment.lifecycle.preserve);
++    assert!(!environment.lifecycle.preserve);
+     assert_eq!(
+         environment
+             .lifecycle
+@@ -167,7 +186,7 @@ NODE_ENV = "development"
+ 
+ #[test]
+ fn resolves_run_level_clone_branch_controls() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = super::workflow_settings_from_toml(
+         r"
+ _version = 1
+ 
+@@ -195,7 +214,7 @@ push = false
+ 
+ #[test]
+ fn disabling_run_branch_forces_meta_branch_off() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = super::workflow_settings_from_toml(
+         r"
+ _version = 1
+ 
+@@ -217,7 +236,7 @@ push = true
+ 
+ #[test]
+ fn pull_request_requires_pushed_run_branch() {
+-    let disabled_branch = WorkflowSettingsBuilder::from_toml(
++    let disabled_branch = super::workflow_settings_from_toml(
+         r"
+ _version = 1
+ 
+@@ -235,7 +254,7 @@ enabled = true
+         "expected run branch validation error, got: {message}"
+     );
+ 
+-    let disabled_push = WorkflowSettingsBuilder::from_toml(
++    let disabled_push = super::workflow_settings_from_toml(
+         r"
+ _version = 1
+ 
+@@ -273,7 +292,7 @@ provider = "local"
+ 
+ #[test]
+ fn resolved_run_chat_surfaces_are_slack_only() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = super::workflow_settings_from_toml(
+         r##"
+ _version = 1
+ 
+@@ -358,8 +377,8 @@ channel = "#ops"
+ }
+ 
+ #[test]
+-fn resolves_explicit_stop_on_terminal_false() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++fn toml_run_environment_lifecycle_override_is_rejected() {
++    let err = super::workflow_settings_from_toml(
+         r"
+ _version = 1
+ 
+@@ -367,21 +386,25 @@ _version = 1
+ stop_on_terminal = false
+ ",
+     )
+-    .expect("environment stop_on_terminal setting should resolve")
+-    .run;
++    .expect_err("TOML environment lifecycle overrides should be rejected");
+ 
+-    assert!(!settings.environment.lifecycle.stop_on_terminal);
++    let message = err.to_string();
++    assert!(
++        message.contains("[run.environment.lifecycle] is now server-managed"),
++        "expected server-managed environment override diagnostic, got: {message}"
++    );
+ }
+ 
+ #[test]
+ fn resolves_minimal_local_environment() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "host"
+-
++"#,
++        r#"
+ [environments.host]
+ provider = "local"
+ "#,
+@@ -396,7 +419,7 @@ provider = "local"
+ 
+ #[test]
+ fn missing_environment_slug_errors() {
+-    let err = WorkflowSettingsBuilder::from_toml(
++    let err = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+@@ -415,13 +438,14 @@ id = "missing"
+ 
+ #[test]
+ fn docker_cidr_allow_list_errors() {
+-    let err = WorkflowSettingsBuilder::from_toml(
++    let err = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "locked"
+-
++"#,
++        r#"
+ [environments.locked]
+ provider = "docker"
+ 
+@@ -441,13 +465,14 @@ allow = ["10.0.0.0/8"]
+ 
+ #[test]
+ fn local_blocked_network_errors() {
+-    let err = WorkflowSettingsBuilder::from_toml(
++    let err = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "host"
+-
++"#,
++        r#"
+ [environments.host]
+ provider = "local"
+ 
+@@ -467,13 +492,14 @@ mode = "block"
+ 
+ #[test]
+ fn daytona_dockerfile_without_image_ref_resolves() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "cloud"
+-
++"#,
++        r#"
+ [environments.cloud]
+ provider = "daytona"
+ 
+@@ -491,13 +517,14 @@ dockerfile = { path = "Dockerfile" }
+ 
+ #[test]
+ fn daytona_image_docker_errors() {
+-    let err = WorkflowSettingsBuilder::from_toml(
++    let err = workflow_settings_from_toml_with_catalog(
+         r#"
+ _version = 1
+ 
+ [run.environment]
+ id = "cloud"
+-
++"#,
++        r#"
+ [environments.cloud]
+ provider = "daytona"
+ 
+@@ -516,7 +543,7 @@ docker = "ubuntu:24.04"
+ 
+ #[test]
+ fn image_ref_is_rejected_as_unknown_field() {
+-    let err = WorkflowSettingsBuilder::from_toml(
++    let err = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+@@ -535,7 +562,7 @@ ref = "ubuntu:24.04"
+ 
+ #[test]
+ fn preserves_goal_variants_and_model_sources() {
+-    let settings = WorkflowSettingsBuilder::from_toml(
++    let settings = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+@@ -582,7 +609,7 @@ mod run_integrations_github_permissions {
+     use fabro_types::settings::InterpString;
+ 
+     use crate::layers::Combine;
+-    use crate::{SettingsLayer, WorkflowSettingsBuilder};
++    use crate::SettingsLayer;
+ 
+     fn parse_settings(source: &str) -> SettingsLayer {
+         source
+@@ -641,7 +668,7 @@ contents = "read"
+         );
+         let merged = workflow.combine(user);
+ 
+-        let resolved = WorkflowSettingsBuilder::from_layer(&merged)
++        let resolved = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+@@ -664,7 +691,7 @@ contents = "read"
+         );
+         let merged = workflow.combine(user);
+ 
+-        let resolved = WorkflowSettingsBuilder::from_layer(&merged)
++        let resolved = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+@@ -697,7 +724,7 @@ contents = "read"
+         );
+         let merged = workflow.combine(user);
+ 
+-        let resolved = WorkflowSettingsBuilder::from_layer(&merged)
++        let resolved = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+@@ -727,7 +754,7 @@ issues = "read"
+ 
+     #[test]
+     fn resolver_preserves_interp_string_in_permissions() {
+-        let resolved = WorkflowSettingsBuilder::from_toml(
++        let resolved = super::workflow_settings_from_toml(
+             r#"
+ _version = 1
+ 
+@@ -752,7 +779,7 @@ issues = "{{ env.GH_PERM_LEVEL }}"
+ 
+ mod run_agent_fabro_tools {
+     use crate::layers::Combine;
+-    use crate::{SettingsLayer, WorkflowSettingsBuilder};
++    use crate::SettingsLayer;
+ 
+     fn parse_settings(source: &str) -> SettingsLayer {
+         source
+@@ -762,7 +789,7 @@ mod run_agent_fabro_tools {
+ 
+     #[test]
+     fn defaults_to_false_when_run_agent_is_absent() {
+-        let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())
++        let settings = super::workflow_settings_from_layer(SettingsLayer::default())
+             .expect("empty settings should resolve")
+             .run;
+ 
+@@ -771,7 +798,7 @@ mod run_agent_fabro_tools {
+ 
+     #[test]
+     fn resolves_true_from_run_agent_table() {
+-        let settings = WorkflowSettingsBuilder::from_toml(
++        let settings = super::workflow_settings_from_toml(
+             r"
+ _version = 1
+ 
+@@ -786,7 +813,7 @@ fabro_tools = true
+ 
+     #[test]
+     fn resolves_explicit_false_from_run_agent_table() {
+-        let settings = WorkflowSettingsBuilder::from_toml(
++        let settings = super::workflow_settings_from_toml(
+             r"
+ _version = 1
+ 
+@@ -819,7 +846,7 @@ fabro_tools = true
+         );
+         let merged = workflow.combine(user);
+ 
+-        let settings = WorkflowSettingsBuilder::from_layer(&merged)
++        let settings = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+@@ -831,7 +858,7 @@ mod run_checkpoint_skip_git_hooks {
+     //! Layer + resolver tests for `[run.checkpoint] skip_git_hooks`.
+ 
+     use crate::layers::Combine;
+-    use crate::{SettingsLayer, WorkflowSettingsBuilder};
++    use crate::SettingsLayer;
+ 
+     fn parse_settings(source: &str) -> SettingsLayer {
+         source
+@@ -841,7 +868,7 @@ mod run_checkpoint_skip_git_hooks {
+ 
+     #[test]
+     fn resolves_skip_git_hooks_true_when_set() {
+-        let settings = WorkflowSettingsBuilder::from_toml(
++        let settings = super::workflow_settings_from_toml(
+             r"
+ _version = 1
+ 
+@@ -857,7 +884,7 @@ skip_git_hooks = true
+ 
+     #[test]
+     fn resolves_skip_git_hooks_false_when_omitted() {
+-        let settings = WorkflowSettingsBuilder::from_layer(&SettingsLayer::default())
++        let settings = super::workflow_settings_from_layer(SettingsLayer::default())
+             .expect("empty settings should resolve")
+             .run;
+ 
+@@ -884,7 +911,7 @@ skip_git_hooks = true
+         );
+         let merged = workflow.combine(user);
+ 
+-        let settings = WorkflowSettingsBuilder::from_layer(&merged)
++        let settings = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+@@ -914,7 +941,7 @@ exclude_globs = ["**/lower/**"]
+         );
+         let merged = workflow.combine(user);
+ 
+-        let settings = WorkflowSettingsBuilder::from_layer(&merged)
++        let settings = super::workflow_settings_from_layer(merged)
+             .expect("merged settings should resolve")
+             .run;
+ 
+diff --git a/lib/crates/fabro-config/src/tests/resolve_workflow.rs b/lib/crates/fabro-config/src/tests/resolve_workflow.rs
+index 3e8eb3c9f..c2d574d72 100644
+--- a/lib/crates/fabro-config/src/tests/resolve_workflow.rs
++++ b/lib/crates/fabro-config/src/tests/resolve_workflow.rs
+@@ -1,10 +1,10 @@
+-use crate::{SettingsLayer, WorkflowSettingsBuilder};
++use crate::SettingsLayer;
+ 
+ #[test]
+ fn resolves_workflow_defaults_from_empty_settings() {
+     let settings = SettingsLayer::default();
+ 
+-    let workflow = WorkflowSettingsBuilder::from_layer(&settings)
++    let workflow = super::workflow_settings_from_layer(settings)
+         .expect("empty settings should resolve")
+         .workflow;
+ 
+@@ -16,7 +16,7 @@ fn resolves_workflow_defaults_from_empty_settings() {
+ 
+ #[test]
+ fn resolves_workflow_graph_and_metadata() {
+-    let workflow = WorkflowSettingsBuilder::from_toml(
++    let workflow = super::workflow_settings_from_toml(
+         r#"
+ _version = 1
+ 
+diff --git a/lib/crates/fabro-environment/Cargo.toml b/lib/crates/fabro-environment/Cargo.toml
+new file mode 100644
+index 000000000..638538df8
+--- /dev/null
++++ b/lib/crates/fabro-environment/Cargo.toml
+@@ -0,0 +1,28 @@
++[package]
++name = "fabro-environment"
++edition.workspace = true
++version.workspace = true
++publish = false
++license.workspace = true
++description = "Server-owned environment domain and durable storage for Fabro"
++
++[lib]
++doctest = false
++
++[lints]
++workspace = true
++
++[dependencies]
++fabro-config = { path = "../fabro-config" }
++fabro-types = { path = "../fabro-types" }
++hex.workspace = true
++serde.workspace = true
++sha2.workspace = true
++thiserror.workspace = true
++tokio.workspace = true
++toml.workspace = true
++toml_edit.workspace = true
++
++[dev-dependencies]
++tempfile = "3"
++tokio = { workspace = true, features = ["macros", "test-util"] }
+diff --git a/lib/crates/fabro-environment/src/error.rs b/lib/crates/fabro-environment/src/error.rs
+new file mode 100644
+index 000000000..6557a662f
+--- /dev/null
++++ b/lib/crates/fabro-environment/src/error.rs
+@@ -0,0 +1,107 @@
++use std::path::PathBuf;
++
++use toml::de::Error as TomlDeError;
++use toml::ser::Error as TomlSerError;
++
++use crate::{EnvironmentId, EnvironmentRevision};
++
++#[derive(Debug, thiserror::Error)]
++pub enum EnvironmentValidationError {
++    #[error("environment id {value:?} must match [a-z0-9][a-z0-9-]{{0,62}}")]
++    InvalidEnvironmentId { value: String },
++    #[error("environment settings are invalid: {}", .errors.join("; "))]
++    InvalidSettings { errors: Vec<String> },
++    #[error("failed to read Dockerfile referenced by environment at {path:?}")]
++    DockerfileRead {
++        path: PathBuf,
++        #[source]
++        source: std::io::Error,
++    },
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum EnvironmentStoreError {
++    #[error("environment not found: {id}")]
++    NotFound { id: EnvironmentId },
++    #[error("environment already exists: {id}")]
++    AlreadyExists { id: EnvironmentId },
++    #[error("environment revision is missing: {id}")]
++    MissingRevision { id: EnvironmentId },
++    #[error("environment revision is stale for {id}: expected {expected}, actual {actual}")]
++    StaleRevision {
++        id:       EnvironmentId,
++        expected: EnvironmentRevision,
++        actual:   EnvironmentRevision,
++    },
++    #[error("environment is protected and cannot be deleted: {id}")]
++    Protected { id: EnvironmentId },
++    #[error("environment validation failed: {source}")]
++    Validation {
++        #[from]
++        source: EnvironmentValidationError,
++    },
++    #[error("invalid environment filename at {path:?}")]
++    InvalidFilename { path: PathBuf, reason: String },
++    #[error("failed to parse environment TOML at {path:?}")]
++    Parse {
++        path:   PathBuf,
++        #[source]
++        source: TomlDeError,
++    },
++    #[error("environment TOML at {path:?} is not UTF-8")]
++    InvalidUtf8 {
++        path:   PathBuf,
++        #[source]
++        source: std::str::Utf8Error,
++    },
++    #[error("failed to serialize environment TOML")]
++    Serialize {
++        #[from]
++        source: TomlSerError,
++    },
++    #[error("I/O error at {path:?}")]
++    Io {
++        path:   PathBuf,
++        #[source]
++        source: std::io::Error,
++    },
++}
++
++impl EnvironmentStoreError {
++    pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
++        Self::Io {
++            path: path.into(),
++            source,
++        }
++    }
++
++    pub(crate) fn parse(path: impl Into<PathBuf>, source: TomlDeError) -> Self {
++        Self::Parse {
++            path: path.into(),
++            source,
++        }
++    }
++
++    pub(crate) fn invalid_utf8(path: impl Into<PathBuf>, source: std::str::Utf8Error) -> Self {
++        Self::InvalidUtf8 {
++            path: path.into(),
++            source,
++        }
++    }
++
++    #[must_use]
++    pub fn kind(&self) -> &'static str {
++        match self {
++            Self::NotFound { .. } => "not_found",
++            Self::AlreadyExists { .. } => "already_exists",
++            Self::MissingRevision { .. } => "missing_revision",
++            Self::StaleRevision { .. } => "stale_revision",
++            Self::Protected { .. } => "protected",
++            Self::Validation { .. } => "validation",
++            Self::InvalidFilename { .. } => "invalid_filename",
++            Self::Parse { .. } | Self::InvalidUtf8 { .. } => "parse",
++            Self::Serialize { .. } => "serialize",
++            Self::Io { .. } => "io",
++        }
++    }
++}
+diff --git a/lib/crates/fabro-environment/src/id.rs b/lib/crates/fabro-environment/src/id.rs
+new file mode 100644
+index 000000000..7bca49087
+--- /dev/null
++++ b/lib/crates/fabro-environment/src/id.rs
+@@ -0,0 +1,164 @@
++use std::fmt;
++use std::str::FromStr;
++
++use serde::de::Error as _;
++use serde::{Deserialize, Deserializer, Serialize, Serializer};
++use sha2::{Digest, Sha256};
++
++use crate::EnvironmentValidationError;
++
++#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub struct EnvironmentId(String);
++
++impl EnvironmentId {
++    pub fn new(value: impl Into<String>) -> Result<Self, EnvironmentValidationError> {
++        let value = value.into();
++        if is_valid_environment_id(&value) {
++            Ok(Self(value))
++        } else {
++            Err(EnvironmentValidationError::InvalidEnvironmentId { value })
++        }
++    }
++
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for EnvironmentId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++impl FromStr for EnvironmentId {
++    type Err = EnvironmentValidationError;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        Self::new(value)
++    }
++}
++
++impl Serialize for EnvironmentId {
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        serializer.serialize_str(self.as_str())
++    }
++}
++
++impl<'de> Deserialize<'de> for EnvironmentId {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let value = String::deserialize(deserializer)?;
++        value.parse().map_err(D::Error::custom)
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
++pub struct EnvironmentRevision(String);
++
++impl EnvironmentRevision {
++    #[must_use]
++    pub fn from_bytes(bytes: &[u8]) -> Self {
++        Self(hex::encode(Sha256::digest(bytes)))
++    }
++
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for EnvironmentRevision {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++impl FromStr for EnvironmentRevision {
++    type Err = EnvironmentRevisionParseError;
++
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        if value.len() == 64
++            && value
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            Ok(Self(value.to_string()))
++        } else {
++            Err(EnvironmentRevisionParseError(value.to_string()))
++        }
++    }
++}
++
++impl Serialize for EnvironmentRevision {
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        serializer.serialize_str(self.as_str())
++    }
++}
++
++impl<'de> Deserialize<'de> for EnvironmentRevision {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let value = String::deserialize(deserializer)?;
++        value.parse().map_err(D::Error::custom)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct EnvironmentRevisionParseError(String);
++
++impl fmt::Display for EnvironmentRevisionParseError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "invalid environment revision: {:?}", self.0)
++    }
++}
++
++impl std::error::Error for EnvironmentRevisionParseError {}
++
++fn is_valid_environment_id(value: &str) -> bool {
++    let mut bytes = value.bytes();
++    let Some(first) = bytes.next() else {
++        return false;
++    };
++    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
++        return false;
++    }
++    if value.len() > 63 {
++        return false;
++    }
++    bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{EnvironmentId, EnvironmentRevision};
++
++    #[test]
++    fn environment_id_validation_matches_contract() {
++        assert!("a".parse::<EnvironmentId>().is_ok());
++        assert!("a-1".parse::<EnvironmentId>().is_ok());
++        assert!("0".parse::<EnvironmentId>().is_ok());
++        assert!("A".parse::<EnvironmentId>().is_err());
++        assert!("a_1".parse::<EnvironmentId>().is_err());
++        assert!("-a".parse::<EnvironmentId>().is_err());
++        assert!("a".repeat(64).parse::<EnvironmentId>().is_err());
++    }
++
++    #[test]
++    fn revision_requires_lowercase_sha256_hex() {
++        assert!("a".repeat(64).parse::<EnvironmentRevision>().is_ok());
++        assert!("A".repeat(64).parse::<EnvironmentRevision>().is_err());
++        assert!("a".repeat(63).parse::<EnvironmentRevision>().is_err());
++    }
++}
+diff --git a/lib/crates/fabro-environment/src/lib.rs b/lib/crates/fabro-environment/src/lib.rs
+new file mode 100644
+index 000000000..5fc53c08c
+--- /dev/null
++++ b/lib/crates/fabro-environment/src/lib.rs
+@@ -0,0 +1,9 @@
++mod error;
++mod id;
++mod model;
++mod store;
++
++pub use error::{EnvironmentStoreError, EnvironmentValidationError};
++pub use id::{EnvironmentId, EnvironmentRevision, EnvironmentRevisionParseError};
++pub use model::{Environment, EnvironmentDraft, EnvironmentReplace};
++pub use store::EnvironmentStore;
+diff --git a/lib/crates/fabro-environment/src/model.rs b/lib/crates/fabro-environment/src/model.rs
+new file mode 100644
+index 000000000..92dd1a075
+--- /dev/null
++++ b/lib/crates/fabro-environment/src/model.rs
+@@ -0,0 +1,497 @@
++use std::collections::BTreeMap;
++use std::path::{Path, PathBuf};
++
++use fabro_config::{
++    EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer,
++    EnvironmentLifecycleLayer, EnvironmentNetworkLayer, EnvironmentResourcesLayer,
++    EnvironmentVolumeLayer, StickyMap,
++};
++use fabro_types::settings::InterpString;
++use fabro_types::settings::run::{
++    DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
++    EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
++    EnvironmentResourcesSettings, EnvironmentSettings, EnvironmentVolumeSettings,
++};
++use serde::{Deserialize, Serialize};
++use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
++
++use crate::{
++    EnvironmentId, EnvironmentRevision, EnvironmentStoreError, EnvironmentValidationError,
++};
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Environment {
++    pub id:        EnvironmentId,
++    pub revision:  EnvironmentRevision,
++    pub provider:  EnvironmentProvider,
++    pub image:     EnvironmentImageSettings,
++    pub resources: EnvironmentResourcesSettings,
++    pub network:   EnvironmentNetworkSettings,
++    pub lifecycle: EnvironmentLifecycleSettings,
++    pub labels:    std::collections::HashMap<String, String>,
++    pub volumes:   Vec<EnvironmentVolumeSettings>,
++    pub env:       std::collections::HashMap<String, InterpString>,
++}
++
++impl Environment {
++    pub fn from_toml_bytes(id: EnvironmentId, bytes: &[u8]) -> Result<Self, EnvironmentStoreError> {
++        let revision = EnvironmentRevision::from_bytes(bytes);
++        let persisted = parse_persisted(bytes, None)?;
++        Self::from_persisted(id, revision, persisted, None).map_err(EnvironmentStoreError::from)
++    }
++
++    pub(crate) fn from_persisted_path(
++        id: EnvironmentId,
++        bytes: &[u8],
++        path: impl Into<PathBuf>,
++    ) -> Result<Self, EnvironmentStoreError> {
++        let path = path.into();
++        let revision = EnvironmentRevision::from_bytes(bytes);
++        let persisted = parse_persisted(bytes, Some(path.clone()))?;
++        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
++        Self::from_persisted(id, revision, persisted, Some(base_dir))
++            .map_err(EnvironmentStoreError::from)
++    }
++
++    pub(crate) fn from_replace(
++        id: EnvironmentId,
++        replacement: EnvironmentReplace,
++        dockerfile_base_dir: &Path,
++    ) -> Result<(Self, Vec<u8>), EnvironmentStoreError> {
++        let settings = replacement.into_settings();
++        let settings = inline_dense_dockerfile(settings, dockerfile_base_dir)?;
++        let persisted = environment_settings_to_layer(&settings);
++        let bytes = canonical_bytes(&persisted).into_bytes();
++        let revision = EnvironmentRevision::from_bytes(&bytes);
++        let environment = Self::from_validated_settings(id, revision, settings);
++        Ok((environment, bytes))
++    }
++
++    pub(crate) fn to_layer(&self) -> EnvironmentLayer {
++        environment_settings_to_layer(&self.settings())
++    }
++
++    #[must_use]
++    pub fn settings(&self) -> EnvironmentSettings {
++        EnvironmentSettings {
++            provider:  self.provider,
++            image:     self.image.clone(),
++            resources: self.resources.clone(),
++            network:   self.network.clone(),
++            lifecycle: self.lifecycle.clone(),
++            labels:    self.labels.clone(),
++            volumes:   self.volumes.clone(),
++            env:       self.env.clone(),
++        }
++    }
++
++    pub fn to_toml_string(&self) -> String {
++        canonical_bytes(&self.to_layer())
++    }
++
++    fn from_persisted(
++        id: EnvironmentId,
++        revision: EnvironmentRevision,
++        mut persisted: EnvironmentLayer,
++        dockerfile_base_dir: Option<&Path>,
++    ) -> Result<Self, EnvironmentValidationError> {
++        if let Some(base_dir) = dockerfile_base_dir {
++            inline_layer_dockerfile_paths(&mut persisted, base_dir)?;
++        }
++        let settings = resolve_environment(&persisted)?;
++        Ok(Self::from_validated_settings(id, revision, settings))
++    }
++
++    fn from_validated_settings(
++        id: EnvironmentId,
++        revision: EnvironmentRevision,
++        settings: EnvironmentSettings,
++    ) -> Self {
++        Self {
++            id,
++            revision,
++            provider: settings.provider,
++            image: settings.image,
++            resources: settings.resources,
++            network: settings.network,
++            lifecycle: settings.lifecycle,
++            labels: settings.labels,
++            volumes: settings.volumes,
++            env: settings.env,
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct EnvironmentDraft {
++    pub id:        EnvironmentId,
++    pub provider:  EnvironmentProvider,
++    pub image:     EnvironmentImageSettings,
++    pub resources: EnvironmentResourcesSettings,
++    pub network:   EnvironmentNetworkSettings,
++    pub lifecycle: EnvironmentLifecycleSettings,
++    pub labels:    std::collections::HashMap<String, String>,
++    pub volumes:   Vec<EnvironmentVolumeSettings>,
++    pub env:       std::collections::HashMap<String, InterpString>,
++}
++
++impl From<EnvironmentDraft> for (EnvironmentId, EnvironmentReplace) {
++    fn from(value: EnvironmentDraft) -> Self {
++        (value.id, EnvironmentReplace {
++            provider:  value.provider,
++            image:     value.image,
++            resources: value.resources,
++            network:   value.network,
++            lifecycle: value.lifecycle,
++            labels:    value.labels,
++            volumes:   value.volumes,
++            env:       value.env,
++        })
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct EnvironmentReplace {
++    pub provider:  EnvironmentProvider,
++    pub image:     EnvironmentImageSettings,
++    pub resources: EnvironmentResourcesSettings,
++    pub network:   EnvironmentNetworkSettings,
++    pub lifecycle: EnvironmentLifecycleSettings,
++    pub labels:    std::collections::HashMap<String, String>,
++    pub volumes:   Vec<EnvironmentVolumeSettings>,
++    pub env:       std::collections::HashMap<String, InterpString>,
++}
++
++impl EnvironmentReplace {
++    #[must_use]
++    pub fn from_settings(settings: EnvironmentSettings) -> Self {
++        Self {
++            provider:  settings.provider,
++            image:     settings.image,
++            resources: settings.resources,
++            network:   settings.network,
++            lifecycle: settings.lifecycle,
++            labels:    settings.labels,
++            volumes:   settings.volumes,
++            env:       settings.env,
++        }
++    }
++
++    fn into_settings(self) -> EnvironmentSettings {
++        EnvironmentSettings {
++            provider:  self.provider,
++            image:     self.image,
++            resources: self.resources,
++            network:   self.network,
++            lifecycle: self.lifecycle,
++            labels:    self.labels,
++            volumes:   self.volumes,
++            env:       self.env,
++        }
++    }
++}
++
++pub(crate) fn canonical_bytes(layer: &EnvironmentLayer) -> String {
++    let mut doc = DocumentMut::new();
++    if let Some(provider) = layer.provider.as_deref() {
++        doc["provider"] = value(provider);
++    }
++    if let Some(image) = layer.image.as_ref() {
++        append_image(doc.as_table_mut(), image);
++    }
++    if let Some(resources) = layer.resources.as_ref() {
++        append_resources(doc.as_table_mut(), resources);
++    }
++    if let Some(network) = layer.network.as_ref() {
++        append_network(doc.as_table_mut(), network);
++    }
++    if let Some(lifecycle) = layer.lifecycle.as_ref() {
++        append_lifecycle(doc.as_table_mut(), lifecycle);
++    }
++    append_string_map(doc.as_table_mut(), "labels", &layer.labels);
++    if let Some(volumes) = layer.volumes.as_deref() {
++        append_volumes(doc.as_table_mut(), volumes);
++    }
++    append_interp_map(doc.as_table_mut(), "env", &layer.env);
++    doc.to_string()
++}
++
++fn parse_persisted(
++    bytes: &[u8],
++    path: Option<PathBuf>,
++) -> Result<EnvironmentLayer, EnvironmentStoreError> {
++    let content = std::str::from_utf8(bytes).map_err(|err| match &path {
++        Some(path) => EnvironmentStoreError::invalid_utf8(path.clone(), err),
++        None => EnvironmentStoreError::invalid_utf8("<memory>", err),
++    })?;
++    toml::from_str(content).map_err(|err| match path {
++        Some(path) => EnvironmentStoreError::parse(path, err),
++        None => EnvironmentStoreError::parse("<memory>", err),
++    })
++}
++
++fn resolve_environment(
++    layer: &EnvironmentLayer,
++) -> Result<EnvironmentSettings, EnvironmentValidationError> {
++    fabro_config::resolve_environment_layer(layer, "environment").map_err(|errors| {
++        EnvironmentValidationError::InvalidSettings {
++            errors: errors.into_iter().map(|err| err.to_string()).collect(),
++        }
++    })
++}
++
++fn inline_layer_dockerfile_paths(
++    layer: &mut EnvironmentLayer,
++    base_dir: &Path,
++) -> Result<(), EnvironmentValidationError> {
++    let Some(image) = layer.image.as_mut() else {
++        return Ok(());
++    };
++    let Some(EnvironmentDockerfileLayer::Path { path }) = image.dockerfile.as_ref() else {
++        return Ok(());
++    };
++    let path = resolve_path(base_dir, path);
++    let content =
++        std::fs::read_to_string(&path).map_err(|source| EnvironmentValidationError::DockerfileRead {
++            path: path.clone(),
++            source,
++        })?;
++    image.dockerfile = Some(EnvironmentDockerfileLayer::Inline(content));
++    Ok(())
++}
++
++fn inline_dense_dockerfile(
++    mut settings: EnvironmentSettings,
++    base_dir: &Path,
++) -> Result<EnvironmentSettings, EnvironmentValidationError> {
++    let Some(DockerfileSource::Path { path }) = settings.image.dockerfile.as_ref() else {
++        return Ok(settings);
++    };
++    let path = resolve_path(base_dir, path);
++    let content =
++        std::fs::read_to_string(&path).map_err(|source| EnvironmentValidationError::DockerfileRead {
++            path: path.clone(),
++            source,
++        })?;
++    settings.image.dockerfile = Some(DockerfileSource::Inline(content));
++    Ok(settings)
++}
++
++fn resolve_path(base_dir: &Path, path: &str) -> PathBuf {
++    let path = Path::new(path);
++    if path.is_absolute() {
++        path.to_path_buf()
++    } else {
++        base_dir.join(path)
++    }
++}
++
++fn environment_settings_to_layer(settings: &EnvironmentSettings) -> EnvironmentLayer {
++    EnvironmentLayer {
++        provider:  Some(settings.provider.to_string()),
++        image:     image_settings_to_layer(&settings.image),
++        resources: resources_settings_to_layer(&settings.resources),
++        network:   network_settings_to_layer(&settings.network),
++        lifecycle: lifecycle_settings_to_layer(&settings.lifecycle),
++        labels:    StickyMap::from(settings.labels.clone()),
++        volumes:   volumes_settings_to_layer(&settings.volumes),
++        env:       StickyMap::from(settings.env.clone()),
++    }
++}
++
++fn image_settings_to_layer(
++    settings: &EnvironmentImageSettings,
++) -> Option<EnvironmentImageLayer> {
++    if settings.docker.is_none() && settings.dockerfile.is_none() {
++        return None;
++    }
++    Some(EnvironmentImageLayer {
++        docker:     settings.docker.clone(),
++        dockerfile: settings.dockerfile.as_ref().map(dockerfile_source_to_layer),
++    })
++}
++
++fn dockerfile_source_to_layer(source: &DockerfileSource) -> EnvironmentDockerfileLayer {
++    match source {
++        DockerfileSource::Inline(value) => EnvironmentDockerfileLayer::Inline(value.clone()),
++        DockerfileSource::Path { path } => EnvironmentDockerfileLayer::Path { path: path.clone() },
++    }
++}
++
++fn resources_settings_to_layer(
++    settings: &EnvironmentResourcesSettings,
++) -> Option<EnvironmentResourcesLayer> {
++    if settings.cpu.is_none() && settings.memory.is_none() && settings.disk.is_none() {
++        return None;
++    }
++    Some(EnvironmentResourcesLayer {
++        cpu:    settings.cpu,
++        memory: settings.memory,
++        disk:   settings.disk,
++    })
++}
++
++fn network_settings_to_layer(
++    settings: &EnvironmentNetworkSettings,
++) -> Option<EnvironmentNetworkLayer> {
++    if settings.mode == EnvironmentNetworkMode::AllowAll && settings.allow.is_empty() {
++        return None;
++    }
++    Some(EnvironmentNetworkLayer {
++        mode:  Some(settings.mode.to_string()),
++        allow: settings.allow.clone(),
++    })
++}
++
++fn lifecycle_settings_to_layer(
++    settings: &EnvironmentLifecycleSettings,
++) -> Option<EnvironmentLifecycleLayer> {
++    if !settings.preserve && settings.stop_on_terminal && settings.auto_stop.is_none() {
++        return None;
++    }
++    Some(EnvironmentLifecycleLayer {
++        preserve:         settings.preserve.then_some(true),
++        stop_on_terminal: (!settings.stop_on_terminal).then_some(false),
++        auto_stop:        settings.auto_stop,
++    })
++}
++
++fn volumes_settings_to_layer(
++    settings: &[EnvironmentVolumeSettings],
++) -> Option<Vec<EnvironmentVolumeLayer>> {
++    if settings.is_empty() {
++        return None;
++    }
++    Some(settings.iter().map(volume_settings_to_layer).collect())
++}
++
++fn volume_settings_to_layer(settings: &EnvironmentVolumeSettings) -> EnvironmentVolumeLayer {
++    EnvironmentVolumeLayer {
++        id:         settings.id.clone(),
++        mount_path: settings.mount_path.clone(),
++        subpath:    settings.subpath.clone(),
++    }
++}
++
++fn append_image(root: &mut Table, image: &EnvironmentImageLayer) {
++    let table = ensure_table(root, &["image"]);
++    if let Some(docker) = image.docker.as_deref() {
++        table["docker"] = value(docker);
++    }
++    if let Some(dockerfile) = image.dockerfile.as_ref() {
++        match dockerfile {
++            EnvironmentDockerfileLayer::Inline(content) => {
++                table["dockerfile"] = value(content.as_str());
++            }
++            EnvironmentDockerfileLayer::Path { path } => {
++                let dockerfile_table = ensure_table(table, &["dockerfile"]);
++                dockerfile_table["path"] = value(path.as_str());
++            }
++        }
++    }
++}
++
++fn append_resources(root: &mut Table, resources: &EnvironmentResourcesLayer) {
++    let table = ensure_table(root, &["resources"]);
++    if let Some(cpu) = resources.cpu {
++        table["cpu"] = value(i64::from(cpu));
++    }
++    if let Some(memory) = resources.memory {
++        table["memory"] = value(memory.to_string());
++    }
++    if let Some(disk) = resources.disk {
++        table["disk"] = value(disk.to_string());
++    }
++}
++
++fn append_network(root: &mut Table, network: &EnvironmentNetworkLayer) {
++    let table = ensure_table(root, &["network"]);
++    if let Some(mode) = network.mode.as_deref() {
++        table["mode"] = value(mode);
++    }
++    if !network.allow.is_empty() {
++        table["allow"] = string_array(&network.allow);
++    }
++}
++
++fn append_lifecycle(root: &mut Table, lifecycle: &EnvironmentLifecycleLayer) {
++    let table = ensure_table(root, &["lifecycle"]);
++    if let Some(preserve) = lifecycle.preserve {
++        table["preserve"] = value(preserve);
++    }
++    if let Some(stop_on_terminal) = lifecycle.stop_on_terminal {
++        table["stop_on_terminal"] = value(stop_on_terminal);
++    }
++    if let Some(auto_stop) = lifecycle.auto_stop {
++        table["auto_stop"] = value(auto_stop.to_string());
++    }
++}
++
++fn append_string_map(root: &mut Table, name: &str, map: &StickyMap<String>) {
++    if map.is_empty() {
++        return;
++    }
++    let table = ensure_table(root, &[name]);
++    for (key, value) in sorted_map(map) {
++        table[key] = self::value(value.as_str());
++    }
++}
++
++fn append_interp_map(root: &mut Table, name: &str, map: &StickyMap<InterpString>) {
++    if map.is_empty() {
++        return;
++    }
++    let table = ensure_table(root, &[name]);
++    for (key, value) in sorted_map(map) {
++        table[key] = self::value(value.as_source());
++    }
++}
++
++fn append_volumes(root: &mut Table, volumes: &[EnvironmentVolumeLayer]) {
++    if volumes.is_empty() {
++        return;
++    }
++    let mut array = ArrayOfTables::new();
++    for volume in volumes {
++        let mut table = Table::new();
++        table["id"] = value(volume.id.as_str());
++        table["mount_path"] = value(volume.mount_path.as_str());
++        if let Some(subpath) = volume.subpath.as_deref() {
++            table["subpath"] = value(subpath);
++        }
++        array.push(table);
++    }
++    root["volumes"] = Item::ArrayOfTables(array);
++}
++
++fn ensure_table<'a>(root: &'a mut Table, path: &[&str]) -> &'a mut Table {
++    let mut current = root;
++    for key in path {
++        if !current.contains_key(*key) {
++            current[*key] = Item::Table(Table::new());
++        }
++        current = current[*key]
++            .as_table_mut()
++            .expect("environment canonical table should be a table");
++    }
++    current
++}
++
++fn value(value: impl Into<Value>) -> Item {
++    Item::Value(value.into())
++}
++
++fn string_array(values: &[String]) -> Item {
++    let mut array = Array::new();
++    for value in values {
++        array.push(value.as_str());
++    }
++    Item::Value(Value::Array(array))
++}
++
++fn sorted_map<V>(map: &StickyMap<V>) -> BTreeMap<&String, &V> {
++    map.iter().collect()
++}
+diff --git a/lib/crates/fabro-environment/src/store.rs b/lib/crates/fabro-environment/src/store.rs
+new file mode 100644
+index 000000000..a2677af93
+--- /dev/null
++++ b/lib/crates/fabro-environment/src/store.rs
+@@ -0,0 +1,688 @@
++use std::collections::HashMap;
++use std::io::ErrorKind;
++use std::path::{Path, PathBuf};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use fabro_config::{EnvironmentLayer, MergeMap};
++use tokio::fs;
++use tokio::io::AsyncWriteExt as _;
++use tokio::sync::Mutex;
++
++use crate::{
++    Environment, EnvironmentDraft, EnvironmentId, EnvironmentReplace, EnvironmentRevision,
++    EnvironmentStoreError,
++};
++
++const SEEDS: &[(&str, &str)] = &[
++    ("default", DEFAULT_ENVIRONMENT_TOML),
++    ("local", LOCAL_ENVIRONMENT_TOML),
++    ("docker", DOCKER_ENVIRONMENT_TOML),
++    ("daytona", DAYTONA_ENVIRONMENT_TOML),
++];
++
++const DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "docker"
++
++[image]
++docker = "buildpack-deps:noble"
++
++[resources]
++cpu = 2
++memory = "4GB"
++
++[lifecycle]
++preserve = false
++stop_on_terminal = true
++"#;
++
++const LOCAL_ENVIRONMENT_TOML: &str = r#"provider = "local"
++"#;
++
++const DOCKER_ENVIRONMENT_TOML: &str = r#"provider = "docker"
++
++[image]
++docker = "buildpack-deps:noble"
++
++[resources]
++cpu = 2
++memory = "4GB"
++
++[lifecycle]
++preserve = false
++stop_on_terminal = true
++"#;
++
++const DAYTONA_ENVIRONMENT_TOML: &str = r#"provider = "daytona"
++"#;
++
++#[derive(Debug)]
++pub struct EnvironmentStore {
++    dir:              PathBuf,
++    request_base_dir: PathBuf,
++    mutations:        Mutex<()>,
++    environments:     std::sync::RwLock<HashMap<EnvironmentId, Environment>>,
++}
++
++impl EnvironmentStore {
++    /// Synchronously seed missing built-in environment files and load all
++    /// persisted environments. The synchronous file access runs during server
++    /// startup before request handling begins.
++    pub fn load_or_seed(dir: impl Into<PathBuf>) -> Result<Self, EnvironmentStoreError> {
++        let dir = dir.into();
++        seed_missing_environments(&dir)?;
++        let environments = load_environments(&dir)?;
++        let request_base_dir = dir
++            .parent()
++            .unwrap_or_else(|| Path::new("."))
++            .to_path_buf();
++        Ok(Self {
++            dir,
++            request_base_dir,
++            mutations: Mutex::new(()),
++            environments: std::sync::RwLock::new(environments),
++        })
++    }
++
++    pub async fn list(&self) -> Vec<Environment> {
++        let environments = self
++            .environments
++            .read()
++            .expect("environment store read lock poisoned");
++        let mut values = environments.values().cloned().collect::<Vec<_>>();
++        values.sort_by(|left, right| left.id.cmp(&right.id));
++        values
++    }
++
++    pub async fn get(&self, id: &EnvironmentId) -> Option<Environment> {
++        self.environments
++            .read()
++            .expect("environment store read lock poisoned")
++            .get(id)
++            .cloned()
++    }
++
++    pub async fn create(
++        &self,
++        draft: EnvironmentDraft,
++    ) -> Result<Environment, EnvironmentStoreError> {
++        let (id, replace) = draft.into();
++        let (environment, bytes) =
++            Environment::from_replace(id.clone(), replace, &self.request_base_dir)?;
++        let _mutation = self.mutations.lock().await;
++        if self
++            .environments
++            .read()
++            .expect("environment store read lock poisoned")
++            .contains_key(&id)
++        {
++            return Err(EnvironmentStoreError::AlreadyExists { id });
++        }
++
++        let path = environment_path(&self.dir, &id);
++        write_new(&self.dir, &path, &bytes)
++            .await
++            .map_err(|err| create_error_for(id.clone(), err))?;
++
++        let mut environments = self
++            .environments
++            .write()
++            .expect("environment store write lock poisoned");
++        environments.insert(id, environment.clone());
++        Ok(environment)
++    }
++
++    pub async fn replace(
++        &self,
++        id: &EnvironmentId,
++        expected: &EnvironmentRevision,
++        draft: EnvironmentReplace,
++    ) -> Result<Environment, EnvironmentStoreError> {
++        let (environment, bytes) =
++            Environment::from_replace(id.clone(), draft, &self.request_base_dir)?;
++        let _mutation = self.mutations.lock().await;
++        {
++            let environments = self
++                .environments
++                .read()
++                .expect("environment store read lock poisoned");
++            let current = environments
++                .get(id)
++                .ok_or_else(|| EnvironmentStoreError::NotFound { id: id.clone() })?;
++            if &current.revision != expected {
++                return Err(EnvironmentStoreError::StaleRevision {
++                    id:       id.clone(),
++                    expected: expected.clone(),
++                    actual:   current.revision.clone(),
++                });
++            }
++        }
++
++        write_atomic(&self.dir, &environment_path(&self.dir, id), &bytes).await?;
++        let mut environments = self
++            .environments
++            .write()
++            .expect("environment store write lock poisoned");
++        environments.insert(id.clone(), environment.clone());
++        Ok(environment)
++    }
++
++    pub async fn delete(
++        &self,
++        id: &EnvironmentId,
++        expected: &EnvironmentRevision,
++    ) -> Result<(), EnvironmentStoreError> {
++        if id.as_str() == "default" {
++            return Err(EnvironmentStoreError::Protected { id: id.clone() });
++        }
++
++        let _mutation = self.mutations.lock().await;
++        {
++            let environments = self
++                .environments
++                .read()
++                .expect("environment store read lock poisoned");
++            let current = environments
++                .get(id)
++                .ok_or_else(|| EnvironmentStoreError::NotFound { id: id.clone() })?;
++            if &current.revision != expected {
++                return Err(EnvironmentStoreError::StaleRevision {
++                    id:       id.clone(),
++                    expected: expected.clone(),
++                    actual:   current.revision.clone(),
++                });
++            }
++        }
++
++        let path = environment_path(&self.dir, id);
++        fs::remove_file(&path)
++            .await
++            .map_err(|err| EnvironmentStoreError::io(path, err))?;
++        let mut environments = self
++            .environments
++            .write()
++            .expect("environment store write lock poisoned");
++        environments.remove(id);
++        Ok(())
++    }
++
++    pub fn catalog_layer(&self) -> MergeMap<EnvironmentLayer> {
++        let environments = self
++            .environments
++            .read()
++            .expect("environment store read lock poisoned");
++        let catalog: HashMap<String, EnvironmentLayer> = environments
++            .iter()
++            .map(|(id, environment)| (id.to_string(), environment.to_layer()))
++            .collect();
++        MergeMap::from(catalog)
++    }
++}
++
++#[expect(
++    clippy::disallowed_methods,
++    reason = "Environment directory seeding runs synchronously during startup before request handling."
++)]
++fn seed_missing_environments(dir: &Path) -> Result<(), EnvironmentStoreError> {
++    std::fs::create_dir_all(dir).map_err(|err| EnvironmentStoreError::io(dir, err))?;
++    for (id, content) in SEEDS {
++        let path = dir.join(format!("{id}.toml"));
++        match std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&path)
++        {
++            Ok(mut file) => {
++                use std::io::Write as _;
++                file.write_all(content.as_bytes())
++                    .map_err(|err| EnvironmentStoreError::io(&path, err))?;
++                file.sync_all()
++                    .map_err(|err| EnvironmentStoreError::io(&path, err))?;
++            }
++            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
++            Err(err) => return Err(EnvironmentStoreError::io(path, err)),
++        }
++    }
++    Ok(())
++}
++
++#[expect(
++    clippy::disallowed_methods,
++    reason = "Environment directory scan runs once at startup; std::fs avoids requiring a Tokio runtime for callers."
++)]
++fn load_environments(
++    dir: &Path,
++) -> Result<HashMap<EnvironmentId, Environment>, EnvironmentStoreError> {
++    let entries = match std::fs::read_dir(dir) {
++        Ok(entries) => entries,
++        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
++        Err(err) => return Err(EnvironmentStoreError::io(dir, err)),
++    };
++
++    let mut environments = HashMap::new();
++    for entry in entries {
++        let entry = entry.map_err(|err| EnvironmentStoreError::io(dir, err))?;
++        let path = entry.path();
++        let file_type = entry
++            .file_type()
++            .map_err(|err| EnvironmentStoreError::io(&path, err))?;
++        if !file_type.is_file() || !is_toml_file(&path) {
++            continue;
++        }
++        let environment = load_environment_file(&path)?;
++        environments.insert(environment.id.clone(), environment);
++    }
++    Ok(environments)
++}
++
++#[expect(
++    clippy::disallowed_methods,
++    reason = "Sync sibling of `load_environments`; only invoked from the synchronous startup load path."
++)]
++fn load_environment_file(path: &Path) -> Result<Environment, EnvironmentStoreError> {
++    let id = id_from_path(path)?;
++    let bytes = std::fs::read(path).map_err(|err| EnvironmentStoreError::io(path, err))?;
++    Environment::from_persisted_path(id, &bytes, path)
++}
++
++fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
++    let stem = path
++        .file_stem()
++        .and_then(|stem| stem.to_str())
++        .ok_or_else(|| EnvironmentStoreError::InvalidFilename {
++            path:   path.to_path_buf(),
++            reason: "filename is not valid UTF-8".to_string(),
++        })?;
++    EnvironmentId::new(stem).map_err(|source| EnvironmentStoreError::InvalidFilename {
++        path:   path.to_path_buf(),
++        reason: source.to_string(),
++    })
++}
++
++fn is_toml_file(path: &Path) -> bool {
++    path.extension()
++        .and_then(|extension| extension.to_str())
++        .is_some_and(|extension| extension == "toml")
++}
++
++async fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), EnvironmentStoreError> {
++    fs::create_dir_all(dir)
++        .await
++        .map_err(|err| EnvironmentStoreError::io(dir, err))?;
++    let temp_path = temp_path_for(path);
++    let mut file = fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temp_path)
++        .await
++        .map_err(|err| EnvironmentStoreError::io(&temp_path, err))?;
++
++    if let Err(err) = file.write_all(bytes).await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(&temp_path, err));
++    }
++    if let Err(err) = file.sync_all().await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(&temp_path, err));
++    }
++    drop(file);
++
++    if let Err(err) = fs::rename(&temp_path, path).await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(path, err));
++    }
++
++    Ok(())
++}
++
++async fn write_new(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), EnvironmentStoreError> {
++    fs::create_dir_all(dir)
++        .await
++        .map_err(|err| EnvironmentStoreError::io(dir, err))?;
++    let temp_path = temp_path_for(path);
++    let mut file = fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temp_path)
++        .await
++        .map_err(|err| EnvironmentStoreError::io(&temp_path, err))?;
++
++    if let Err(err) = file.write_all(bytes).await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(&temp_path, err));
++    }
++    if let Err(err) = file.sync_all().await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(&temp_path, err));
++    }
++    drop(file);
++
++    if let Err(err) = fs::hard_link(&temp_path, path).await {
++        cleanup_temp(&temp_path).await;
++        return Err(EnvironmentStoreError::io(path, err));
++    }
++    cleanup_temp(&temp_path).await;
++    Ok(())
++}
++
++async fn cleanup_temp(path: &Path) {
++    let _ = fs::remove_file(path).await;
++}
++
++fn create_error_for(id: EnvironmentId, err: EnvironmentStoreError) -> EnvironmentStoreError {
++    match err {
++        EnvironmentStoreError::Io { source, .. } if source.kind() == ErrorKind::AlreadyExists => {
++            EnvironmentStoreError::AlreadyExists { id }
++        }
++        err => err,
++    }
++}
++
++fn temp_path_for(path: &Path) -> PathBuf {
++    let parent = path.parent().unwrap_or_else(|| Path::new("."));
++    let file_name = path
++        .file_name()
++        .and_then(|name| name.to_str())
++        .unwrap_or("environment.toml");
++    let now = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_or(0, |duration| duration.as_nanos());
++    parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), now))
++}
++
++fn environment_path(dir: &Path, id: &EnvironmentId) -> PathBuf {
++    dir.join(format!("{id}.toml"))
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::HashMap;
++
++    use fabro_types::settings::InterpString;
++    use fabro_types::settings::run::{
++        DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
++        EnvironmentNetworkSettings, EnvironmentProvider, EnvironmentResourcesSettings,
++        EnvironmentSettings,
++    };
++    use tokio::fs;
++
++    use crate::{
++        EnvironmentDraft, EnvironmentId, EnvironmentReplace, EnvironmentRevision,
++        EnvironmentStore, EnvironmentStoreError,
++    };
++
++    fn settings(provider: EnvironmentProvider) -> EnvironmentSettings {
++        EnvironmentSettings {
++            provider,
++            image: EnvironmentImageSettings::default(),
++            resources: EnvironmentResourcesSettings::default(),
++            network: EnvironmentNetworkSettings::default(),
++            lifecycle: EnvironmentLifecycleSettings::default(),
++            labels: HashMap::new(),
++            volumes: Vec::new(),
++            env: HashMap::new(),
++        }
++    }
++
++    fn replacement(provider: EnvironmentProvider) -> EnvironmentReplace {
++        EnvironmentReplace::from_settings(settings(provider))
++    }
++
++    fn draft(id: &str, provider: EnvironmentProvider) -> EnvironmentDraft {
++        let settings = settings(provider);
++        EnvironmentDraft {
++            id:        EnvironmentId::new(id).unwrap(),
++            provider:  settings.provider,
++            image:     settings.image,
++            resources: settings.resources,
++            network:   settings.network,
++            lifecycle: settings.lifecycle,
++            labels:    settings.labels,
++            volumes:   settings.volumes,
++            env:       settings.env,
++        }
++    }
++
++    #[tokio::test]
++    async fn absent_directory_loads_and_seeds_built_ins() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++
++        let store = EnvironmentStore::load_or_seed(&environment_dir).unwrap();
++        let environments = store.list().await;
++
++        assert_eq!(
++            environments
++                .iter()
++                .map(|environment| environment.id.as_str())
++                .collect::<Vec<_>>(),
++            vec!["daytona", "default", "docker", "local"]
++        );
++        for id in ["default", "local", "docker", "daytona"] {
++            assert!(environment_dir.join(format!("{id}.toml")).exists());
++        }
++    }
++
++    #[tokio::test]
++    async fn listing_is_sorted() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        fs::create_dir_all(&environment_dir).await.unwrap();
++        fs::write(environment_dir.join("z.toml"), r#"provider = "local""#)
++            .await
++            .unwrap();
++        fs::write(environment_dir.join("a.toml"), r#"provider = "local""#)
++            .await
++            .unwrap();
++
++        let store = EnvironmentStore::load_or_seed(&environment_dir).unwrap();
++
++        assert_eq!(
++            store
++                .list()
++                .await
++                .iter()
++                .map(|environment| environment.id.as_str())
++                .collect::<Vec<_>>(),
++            vec!["a", "daytona", "default", "docker", "local", "z"]
++        );
++    }
++
++    #[test]
++    fn invalid_id_file_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        std::fs::create_dir_all(&environment_dir).unwrap();
++        std::fs::write(environment_dir.join("Bad.toml"), r#"provider = "local""#).unwrap();
++
++        let err = EnvironmentStore::load_or_seed(&environment_dir).unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::InvalidFilename { .. }));
++    }
++
++    #[test]
++    fn invalid_provider_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        std::fs::create_dir_all(&environment_dir).unwrap();
++        std::fs::write(environment_dir.join("bad.toml"), r#"provider = "bogus""#).unwrap();
++
++        let err = EnvironmentStore::load_or_seed(&environment_dir).unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::Validation { .. }));
++        assert!(err.to_string().contains("unknown environment provider"));
++    }
++
++    #[test]
++    fn invalid_network_mode_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        std::fs::create_dir_all(&environment_dir).unwrap();
++        std::fs::write(
++            environment_dir.join("bad.toml"),
++            r#"
++provider = "docker"
++
++[network]
++mode = "cidr_allow_list"
++"#,
++        )
++        .unwrap();
++
++        let err = EnvironmentStore::load_or_seed(&environment_dir).unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::Validation { .. }));
++        assert!(err.to_string().contains("docker environments cannot enforce"));
++    }
++
++    #[test]
++    fn missing_dockerfile_path_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        std::fs::create_dir_all(&environment_dir).unwrap();
++        std::fs::write(
++            environment_dir.join("bad.toml"),
++            r#"
++provider = "docker"
++
++[image.dockerfile]
++path = "Dockerfile"
++"#,
++        )
++        .unwrap();
++
++        let err = EnvironmentStore::load_or_seed(&environment_dir).unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::Validation { .. }));
++        assert!(err.to_string().contains("Dockerfile"));
++    }
++
++    #[tokio::test]
++    async fn create_conflict_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = EnvironmentStore::load_or_seed(dir.path().join("environments")).unwrap();
++
++        let err = store
++            .create(draft("local", EnvironmentProvider::Local))
++            .await
++            .unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::AlreadyExists { .. }));
++    }
++
++    #[tokio::test]
++    async fn replace_stale_revision_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = EnvironmentStore::load_or_seed(dir.path().join("environments")).unwrap();
++        let current = store
++            .get(&EnvironmentId::new("local").unwrap())
++            .await
++            .unwrap();
++        let stale = EnvironmentRevision::from_bytes(b"stale");
++
++        let err = store
++            .replace(
++                &current.id,
++                &stale,
++                replacement(EnvironmentProvider::Docker),
++            )
++            .await
++            .unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::StaleRevision { .. }));
++    }
++
++    #[tokio::test]
++    async fn default_delete_is_rejected() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = EnvironmentStore::load_or_seed(dir.path().join("environments")).unwrap();
++        let default = store
++            .get(&EnvironmentId::new("default").unwrap())
++            .await
++            .unwrap();
++
++        let err = store.delete(&default.id, &default.revision).await.unwrap_err();
++
++        assert!(matches!(err, EnvironmentStoreError::Protected { .. }));
++    }
++
++    #[tokio::test]
++    async fn delete_success_removes_file_and_memory_entry() {
++        let dir = tempfile::tempdir().unwrap();
++        let environment_dir = dir.path().join("environments");
++        let store = EnvironmentStore::load_or_seed(&environment_dir).unwrap();
++        let created = store
++            .create(draft("tmp", EnvironmentProvider::Local))
++            .await
++            .unwrap();
++
++        store.delete(&created.id, &created.revision).await.unwrap();
++
++        assert!(store.get(&created.id).await.is_none());
++        assert!(!environment_dir.join("tmp.toml").exists());
++    }
++
++    #[tokio::test]
++    async fn canonical_revision_changes_when_persisted_bytes_change() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = EnvironmentStore::load_or_seed(dir.path().join("environments")).unwrap();
++        let created = store
++            .create(draft("rev", EnvironmentProvider::Local))
++            .await
++            .unwrap();
++        let mut next = settings(EnvironmentProvider::Local);
++        next.env.insert(
++            "TOKEN".to_string(),
++            InterpString::parse("{{ env.TEST_TOKEN }}"),
++        );
++
++        let replaced = store
++            .replace(
++                &created.id,
++                &created.revision,
++                EnvironmentReplace::from_settings(next),
++            )
++            .await
++            .unwrap();
++
++        assert_ne!(created.revision, replaced.revision);
++    }
++
++    #[tokio::test]
++    async fn api_dockerfile_path_is_resolved_relative_to_settings_dir_and_persisted_inline() {
++        let dir = tempfile::tempdir().unwrap();
++        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n")
++            .await
++            .unwrap();
++        let store = EnvironmentStore::load_or_seed(dir.path().join("environments")).unwrap();
++        let mut settings = settings(EnvironmentProvider::Docker);
++        settings.image.dockerfile = Some(DockerfileSource::Path {
++            path: "Dockerfile".to_string(),
++        });
++        let draft = EnvironmentDraft {
++            id:        EnvironmentId::new("with-dockerfile").unwrap(),
++            provider:  settings.provider,
++            image:     settings.image,
++            resources: settings.resources,
++            network:   settings.network,
++            lifecycle: settings.lifecycle,
++            labels:    settings.labels,
++            volumes:   settings.volumes,
++            env:       settings.env,
++        };
++
++        let created = store.create(draft).await.unwrap();
++        let persisted = fs::read_to_string(
++            dir.path()
++                .join("environments")
++                .join("with-dockerfile.toml"),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(
++            created.image.dockerfile,
++            Some(DockerfileSource::Inline("FROM alpine\n".to_string()))
++        );
++        assert!(persisted.contains("FROM alpine"));
++        assert!(!persisted.contains("path ="));
++    }
++}
+diff --git a/lib/crates/fabro-server/Cargo.toml b/lib/crates/fabro-server/Cargo.toml
+index dfde73f66..184154cb0 100644
+--- a/lib/crates/fabro-server/Cargo.toml
++++ b/lib/crates/fabro-server/Cargo.toml
+@@ -26,6 +26,7 @@ fabro-auth = { path = "../fabro-auth" }
+ fabro-install = { path = "../fabro-install" }
+ fabro-spa = { path = "../fabro-spa" }
+ fabro-config = { path = "../fabro-config" }
++fabro-environment.workspace = true
+ fabro-graphviz = { path = "../fabro-graphviz" }
+ fabro-hooks = { path = "../fabro-hooks" }
+ fabro-interview = { path = "../fabro-interview" }
+diff --git a/lib/crates/fabro-server/src/run_manifest.rs b/lib/crates/fabro-server/src/run_manifest.rs
+index c60d03817..864f3ee57 100644
+--- a/lib/crates/fabro-server/src/run_manifest.rs
++++ b/lib/crates/fabro-server/src/run_manifest.rs
+@@ -12,6 +12,7 @@ use fabro_config::{
+     MergeMap, RunLayer, SettingsLayer, WorkflowSettingsBuilder, parse_input_overrides,
+     parse_labels,
+ };
++use fabro_config::parse::{self, SettingsSource};
+ use fabro_graphviz::graph::{Graph, is_llm_handler_type};
+ use fabro_graphviz::render::apply_direction;
+ use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
+@@ -116,6 +117,7 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
+             &config.source,
+             &config.path,
+             &workflow_input.files,
++            SettingsSource::Workflow,
+         )?;
+         workflow_settings_builder = workflow_settings_builder.workflow_layer(layer);
+     }
+@@ -130,6 +132,7 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
+                 source,
+                 &config_path,
+                 &workflow_input.files,
++                SettingsSource::Project,
+             )?;
+             workflow_settings_builder = workflow_settings_builder.project_layer(layer);
+         }
+@@ -331,6 +334,7 @@ fn settings_layer_with_resolved_dockerfiles(
+     source: &str,
+     config_path: &ManifestPath,
+     files: &HashMap<ManifestPath, String>,
++    settings_source: SettingsSource,
+ ) -> Result<SettingsLayer> {
+     // Parse via `SettingsLayer` so unknown nested keys (like a stale
+     // `[server.integrations.github.permissions]` after the move to
+@@ -338,6 +342,8 @@ fn settings_layer_with_resolved_dockerfiles(
+     let mut layer = source
+         .parse::<SettingsLayer>()
+         .context("Failed to parse run config TOML")?;
++    parse::validate_settings_source(&layer, settings_source)
++        .context("Failed to parse run config TOML")?;
+     resolve_manifest_dockerfiles(&mut layer, config_path, files)?;
+     Ok(layer)
+ }
+@@ -417,11 +423,6 @@ fn resolve_manifest_dockerfiles(
+     {
+         resolve_manifest_dockerfile(image, config_path, files)?;
+     }
+-    for environment in layer.environments.values_mut() {
+-        if let Some(image) = environment.image.as_mut() {
+-            resolve_manifest_dockerfile(image, config_path, files)?;
+-        }
+-    }
+     Ok(())
+ }
+ 
+diff --git a/lib/crates/fabro-server/src/serve.rs b/lib/crates/fabro-server/src/serve.rs
+index 2b71e6d4a..240b13b1d 100644
+--- a/lib/crates/fabro-server/src/serve.rs
++++ b/lib/crates/fabro-server/src/serve.rs
+@@ -688,11 +688,10 @@ where
+         effective_log_destination,
+     );
+     let resolved_app_settings = ResolvedAppStateSettings {
+-        server_settings:               runtime_settings.server_settings,
+-        manifest_run_defaults:         runtime_settings.manifest_run_defaults,
+-        manifest_environment_defaults: runtime_settings.manifest_environment_defaults,
+-        manifest_run_settings:         runtime_settings.manifest_run_settings,
+-        llm_catalog_settings:          runtime_settings.llm_catalog_settings,
++        server_settings:       runtime_settings.server_settings,
++        manifest_run_defaults: runtime_settings.manifest_run_defaults,
++        manifest_run_settings: runtime_settings.manifest_run_settings,
++        llm_catalog_settings:  runtime_settings.llm_catalog_settings,
+     };
+     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
+     validate_startup_configuration(&resolved_server_settings)?;
+@@ -850,12 +849,10 @@ where
+                                 .server_settings
+                                 .with_storage_override(&data_dir_for_poll);
+                             ResolvedAppStateSettings {
+-                                server_settings:               resolved.server_settings,
+-                                manifest_run_defaults:         resolved.manifest_run_defaults,
+-                                manifest_environment_defaults: resolved
+-                                    .manifest_environment_defaults,
+-                                manifest_run_settings:         resolved.manifest_run_settings,
+-                                llm_catalog_settings:          resolved.llm_catalog_settings,
++                                server_settings:       resolved.server_settings,
++                                manifest_run_defaults: resolved.manifest_run_defaults,
++                                manifest_run_settings: resolved.manifest_run_settings,
++                                llm_catalog_settings:  resolved.llm_catalog_settings,
+                             }
+                         });
+                         match resolved {
+@@ -1246,7 +1243,6 @@ mod tests {
+             manifest_run_settings: RunSettingsBuilder::from_run_layer(&manifest_run_defaults)
+                 .map_err(|err| fabro_util::error::SharedError::new(anyhow::Error::new(err))),
+             manifest_run_defaults,
+-            manifest_environment_defaults: fabro_config::MergeMap::default(),
+             server_settings: server_settings(source),
+             llm_catalog_settings: fabro_model::catalog::LlmCatalogSettings::default(),
+         }
+diff --git a/lib/crates/fabro-server/src/server.rs b/lib/crates/fabro-server/src/server.rs
+index 11963ba1c..7709d2c34 100644
+--- a/lib/crates/fabro-server/src/server.rs
++++ b/lib/crates/fabro-server/src/server.rs
+@@ -54,7 +54,8 @@ use fabro_automation::AutomationStore;
+ #[cfg(test)]
+ use fabro_config::RunSettingsBuilder;
+ use fabro_config::daemon::ServerDaemon;
+-use fabro_config::{EnvironmentLayer, MergeMap, RunLayer, Storage};
++use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
++use fabro_environment::EnvironmentStore;
+ use fabro_interview::{
+     Answer, AnswerSubmission, ControlInterviewer, Interviewer, Question, WorkerControlEnvelope,
+ };
+@@ -1063,6 +1064,7 @@ pub struct AppState {
+     session_runtimes: SessionRuntimeManager,
+     artifact_store: ArtifactStore,
+     automation_store: Arc<AutomationStore>,
++    environment_store: Arc<EnvironmentStore>,
+     #[cfg(any(test, feature = "test-support"))]
+     automation_materializer_override: Option<Arc<dyn AutomationRunMaterializer>>,
+     worker_tokens: WorkerTokenKeys,
+@@ -1085,7 +1087,6 @@ pub struct AppState {
+     pub(super) server_secrets: ServerSecrets,
+     pub(crate) llm_source: Arc<dyn CredentialSource>,
+     manifest_run_defaults: RwLock<Arc<RunLayer>>,
+-    manifest_environment_defaults: RwLock<Arc<MergeMap<EnvironmentLayer>>>,
+     manifest_run_settings: RwLock<std::result::Result<RunNamespace, SharedError>>,
+     pub(crate) server_settings: RwLock<Arc<ServerSettings>>,
+     catalog: RwLock<Arc<Catalog>>,
+@@ -1108,6 +1109,10 @@ impl AppState {
+         &self.automation_store
+     }
+ 
++    pub(crate) fn environment_store(&self) -> &EnvironmentStore {
++        &self.environment_store
++    }
++
+     pub(crate) async fn materialize_automation_run(
+         &self,
+         input: AutomationRunMaterializeInput,
+@@ -1238,7 +1243,6 @@ pub(crate) struct AppStateConfig {
+ pub(crate) struct ResolvedAppStateSettings {
+     pub(crate) server_settings:               ServerSettings,
+     pub(crate) manifest_run_defaults:         RunLayer,
+-    pub(crate) manifest_environment_defaults: MergeMap<EnvironmentLayer>,
+     pub(crate) manifest_run_settings:         std::result::Result<RunNamespace, SharedError>,
+     pub(crate) llm_catalog_settings:          LlmCatalogSettings,
+ }
+@@ -1289,15 +1293,6 @@ impl AppState {
+         )
+     }
+ 
+-    pub(crate) fn manifest_environment_defaults(&self) -> Arc<MergeMap<EnvironmentLayer>> {
+-        Arc::clone(
+-            &self
+-                .manifest_environment_defaults
+-                .read()
+-                .expect("manifest environment defaults lock poisoned"),
+-        )
+-    }
+-
+     pub(crate) fn server_settings(&self) -> Arc<ServerSettings> {
+         Arc::clone(
+             &self
+@@ -1540,13 +1535,15 @@ impl AppState {
+         let ResolvedAppStateSettings {
+             server_settings,
+             manifest_run_defaults,
+-            manifest_environment_defaults,
+-            manifest_run_settings,
++            manifest_run_settings: _,
+             llm_catalog_settings,
+         } = resolved_settings;
+         let server_settings = Arc::new(server_settings);
+         let manifest_run_defaults = Arc::new(manifest_run_defaults);
+-        let manifest_environment_defaults = Arc::new(manifest_environment_defaults);
++        let manifest_run_settings = resolve_manifest_run_settings_with_catalog(
++            manifest_run_defaults.as_ref(),
++            &self.environment_store,
++        );
+         let catalog = Arc::new(
+             Catalog::from_builtin_with_overrides(&llm_catalog_settings)
+                 .context("building LLM model catalog")?,
+@@ -1558,10 +1555,6 @@ impl AppState {
+             .manifest_run_defaults
+             .write()
+             .expect("manifest run defaults lock poisoned") = manifest_run_defaults;
+-        *self
+-            .manifest_environment_defaults
+-            .write()
+-            .expect("manifest environment defaults lock poisoned") = manifest_environment_defaults;
+         *self
+             .manifest_run_settings
+             .write()
+@@ -2157,6 +2150,20 @@ fn resolve_manifest_run_settings(
+         .map_err(|err| SharedError::new(anyhow::Error::new(err)))
+ }
+ 
++fn resolve_manifest_run_settings_with_catalog(
++    manifest_run_defaults: &RunLayer,
++    environment_store: &EnvironmentStore,
++) -> std::result::Result<RunNamespace, SharedError> {
++    WorkflowSettingsBuilder::new()
++        .server_manifest_defaults(
++            manifest_run_defaults.clone(),
++            environment_store.catalog_layer(),
++        )
++        .build()
++        .map(|settings| settings.run)
++        .map_err(|err| SharedError::new(anyhow::Error::msg(err.to_string())))
++}
++
+ fn system_sandbox_provider(
+     manifest_run_settings: &std::result::Result<RunNamespace, SharedError>,
+ ) -> String {
+@@ -2248,6 +2255,13 @@ fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> Pat
+         .join("automations")
+ }
+ 
++fn environment_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
++    active_config_path
++        .parent()
++        .unwrap_or_else(|| std::path::Path::new("."))
++        .join("environments")
++}
++
+ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppState>> {
+     let AppStateConfig {
+         resolved_settings,
+@@ -2279,6 +2293,12 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+             .map_err(anyhow::Error::new)
+             .context("load automations")?,
+     );
++    let environment_dir = environment_dir_for_active_config(&active_config_path);
++    let environment_store = Arc::new(
++        EnvironmentStore::load_or_seed(environment_dir)
++            .map_err(anyhow::Error::new)
++            .context("load environments")?,
++    );
+     let variables = VariableStore::load(variables_path).context("load variables")?;
+     let variables = Arc::new(AsyncRwLock::new(variables));
+     let vault = match preloaded_vault {
+@@ -2294,9 +2314,10 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+     let (global_event_tx, _) = broadcast::channel(4096);
+     let current_server_settings = Arc::new(resolved_settings.server_settings);
+     let current_manifest_run_defaults = Arc::new(resolved_settings.manifest_run_defaults);
+-    let current_manifest_environment_defaults =
+-        Arc::new(resolved_settings.manifest_environment_defaults);
+-    let current_manifest_run_settings = resolved_settings.manifest_run_settings;
++    let current_manifest_run_settings = resolve_manifest_run_settings_with_catalog(
++        current_manifest_run_defaults.as_ref(),
++        &environment_store,
++    );
+     let current_catalog = Arc::new(
+         Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
+             .context("building LLM model catalog")?,
+@@ -2381,6 +2402,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+         session_runtimes: SessionRuntimeManager::new(),
+         artifact_store,
+         automation_store,
++        environment_store,
+         #[cfg(any(test, feature = "test-support"))]
+         automation_materializer_override,
+         worker_tokens,
+@@ -2399,7 +2421,6 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
+         server_secrets,
+         llm_source,
+         manifest_run_defaults: RwLock::new(current_manifest_run_defaults),
+-        manifest_environment_defaults: RwLock::new(current_manifest_environment_defaults),
+         manifest_run_settings: RwLock::new(current_manifest_run_settings),
+         server_settings: RwLock::new(current_server_settings),
+         catalog: RwLock::new(current_catalog),
+diff --git a/lib/crates/fabro-server/src/server/handler/graph.rs b/lib/crates/fabro-server/src/server/handler/graph.rs
+index 1ed691b2f..579ada98a 100644
+--- a/lib/crates/fabro-server/src/server/handler/graph.rs
++++ b/lib/crates/fabro-server/src/server/handler/graph.rs
+@@ -41,10 +41,10 @@ async fn render_graph_from_manifest(
+     Json(req): Json<RenderWorkflowGraphRequest>,
+ ) -> Response {
+     let manifest_run_defaults = state.manifest_run_defaults();
+-    let manifest_environment_defaults = state.manifest_environment_defaults();
++    let manifest_environment_defaults = state.environment_store().catalog_layer();
+     let prepared = match run_manifest::prepare_manifest_with_environment_defaults(
+         manifest_run_defaults.as_ref(),
+-        manifest_environment_defaults.as_ref(),
++        &manifest_environment_defaults,
+         &req.manifest,
+     ) {
+         Ok(prepared) => prepared,
+diff --git a/lib/crates/fabro-server/src/server/handler/runs.rs b/lib/crates/fabro-server/src/server/handler/runs.rs
+index 3e83bddbb..ba0c19b3f 100644
+--- a/lib/crates/fabro-server/src/server/handler/runs.rs
++++ b/lib/crates/fabro-server/src/server/handler/runs.rs
+@@ -638,10 +638,10 @@ pub(crate) async fn create_run_from_manifest(
+         automation,
+     } = request;
+     let manifest_run_defaults = state.manifest_run_defaults();
+-    let manifest_environment_defaults = state.manifest_environment_defaults();
++    let manifest_environment_defaults = state.environment_store().catalog_layer();
+     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
+         manifest_run_defaults.as_ref(),
+-        manifest_environment_defaults.as_ref(),
++        &manifest_environment_defaults,
+         &manifest,
+     ) {
+         Ok(prepared) => prepared,
+@@ -902,10 +902,10 @@ async fn run_preflight(
+     Json(req): Json<RunManifest>,
+ ) -> Response {
+     let manifest_run_defaults = state.manifest_run_defaults();
+-    let manifest_environment_defaults = state.manifest_environment_defaults();
++    let manifest_environment_defaults = state.environment_store().catalog_layer();
+     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
+         manifest_run_defaults.as_ref(),
+-        manifest_environment_defaults.as_ref(),
++        &manifest_environment_defaults,
+         &req,
+     ) {
+         Ok(prepared) => prepared,
+@@ -939,10 +939,10 @@ async fn validate_run_manifest(
+     Json(req): Json<RunManifest>,
+ ) -> Response {
+     let manifest_run_defaults = state.manifest_run_defaults();
+-    let manifest_environment_defaults = state.manifest_environment_defaults();
++    let manifest_environment_defaults = state.environment_store().catalog_layer();
+     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
+         manifest_run_defaults.as_ref(),
+-        manifest_environment_defaults.as_ref(),
++        &manifest_environment_defaults,
+         &req,
+     ) {
+         Ok(prepared) => prepared,
+diff --git a/lib/crates/fabro-server/src/test_support.rs b/lib/crates/fabro-server/src/test_support.rs
+index de5003629..06f4df0bd 100644
+--- a/lib/crates/fabro-server/src/test_support.rs
++++ b/lib/crates/fabro-server/src/test_support.rs
+@@ -335,12 +335,10 @@ pub(crate) fn resolved_runtime_settings_for_tests(
+     manifest_run_defaults: RunLayer,
+     llm_catalog_settings: LlmCatalogSettings,
+ ) -> ResolvedAppStateSettings {
+-    let manifest_environment_defaults = fabro_config::MergeMap::default();
+     ResolvedAppStateSettings {
+         manifest_run_settings: RunSettingsBuilder::from_run_layer(&manifest_run_defaults)
+             .map_err(|err| SharedError::new(anyhow::Error::new(err))),
+         manifest_run_defaults,
+-        manifest_environment_defaults,
+         server_settings,
+         llm_catalog_settings,
+     }
