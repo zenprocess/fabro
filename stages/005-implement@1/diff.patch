@@ -1,0 +1,491 @@
+diff --git a/lib/crates/fabro-server/src/principal_middleware.rs b/lib/crates/fabro-server/src/principal_middleware.rs
+index acc9eb250..912f36d43 100644
+--- a/lib/crates/fabro-server/src/principal_middleware.rs
++++ b/lib/crates/fabro-server/src/principal_middleware.rs
+@@ -57,6 +57,7 @@ pub(crate) struct RequestAuth(pub(crate) AuthContextSlot);
+ 
+ pub(crate) struct RequiredUser(pub(crate) UserPrincipal);
+ pub(crate) struct RequiredRunManagementActor(pub(crate) Principal);
++pub(crate) struct RequiredRunToolActor(pub(crate) Principal);
+ pub(crate) struct RequireRunScoped(pub(crate) RunId);
+ pub(crate) struct RequireRunManagementTarget(pub(crate) RunId, pub(crate) Principal);
+ pub(crate) struct RequireRunBlob(pub(crate) RunId, pub(crate) RunBlobId);
+@@ -228,6 +229,19 @@ impl<S: Send + Sync> FromRequestParts<S> for RequiredRunManagementActor {
+     }
+ }
+ 
++impl<S: Send + Sync> FromRequestParts<S> for RequiredRunToolActor {
++    type Rejection = ApiError;
++
++    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
++        let slot = parts
++            .extensions
++            .get::<AuthContextSlot>()
++            .cloned()
++            .unwrap_or_else(AuthContextSlot::initial);
++        require_run_tool_actor(&slot).map(Self)
++    }
++}
++
+ impl FromRequestParts<Arc<AppState>> for RequireRunScoped {
+     type Rejection = Response;
+ 
+@@ -405,6 +419,10 @@ pub(crate) fn require_run_management_actor(slot: &AuthContextSlot) -> Result<Pri
+     }
+ }
+ 
++pub(crate) fn require_run_tool_actor(slot: &AuthContextSlot) -> Result<Principal, ApiError> {
++    require_run_management_actor(slot)
++}
++
+ fn require_worker_or_user_for_run(
+     slot: &AuthContextSlot,
+     route_run_id: &RunId,
+diff --git a/lib/crates/fabro-server/src/server/handler/automations.rs b/lib/crates/fabro-server/src/server/handler/automations.rs
+index 0c3ea067a..94b873fc4 100644
+--- a/lib/crates/fabro-server/src/server/handler/automations.rs
++++ b/lib/crates/fabro-server/src/server/handler/automations.rs
+@@ -1,16 +1,26 @@
+ use std::sync::Arc;
+ 
+ use axum::http::{HeaderMap, HeaderValue, header};
++use axum_extra::extract::Query as ExtraQuery;
+ use fabro_automation::{
+-    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationRevision,
+-    AutomationStoreError,
++    ApiTrigger, Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationRevision,
++    AutomationStoreError, AutomationTrigger,
+ };
++use fabro_config::Storage;
++use fabro_types::{AutomationRef, RunId};
+ use serde::Serialize;
+ 
+ use super::super::{
+-    ApiError, AppState, IntoResponse, Json, Path, RequiredUser, Response, Router, State,
+-    StatusCode, get,
++    ApiError, AppState, IntoResponse, Json, PaginationParams, Path, RequiredUser, Response, Router,
++    State, StatusCode, get, paginate_items,
+ };
++use super::runs;
++use crate::automation_materializer::{
++    AutomationRunMaterializeError, AutomationRunMaterializeInput,
++};
++use crate::principal_middleware::RequiredRunToolActor;
++
++const AUTOMATION_API_TRIGGER_DISABLED_CODE: &str = "automation_api_trigger_disabled";
+ 
+ #[derive(Serialize)]
+ struct AutomationListResponse {
+@@ -29,6 +39,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
+             "/automations",
+             get(list_automations).post(create_automation),
+         )
++        .route(
++            "/automations/{id}/runs",
++            get(list_automation_runs).post(create_automation_run),
++        )
+         .route(
+             "/automations/{id}",
+             get(get_automation)
+@@ -50,6 +64,116 @@ async fn list_automations(_auth: RequiredUser, State(state): State<Arc<AppState>
+         .into_response()
+ }
+ 
++async fn list_automation_runs(
++    _auth: RequiredUser,
++    State(state): State<Arc<AppState>>,
++    Path(id): Path<String>,
++    ExtraQuery(pagination): ExtraQuery<PaginationParams>,
++) -> Response {
++    let id = match parse_path_id(id) {
++        Ok(id) => id,
++        Err(err) => return err.into_response(),
++    };
++    if state.automation_store().get(&id).await.is_none() {
++        return ApiError::not_found(format!("automation not found: {id}")).into_response();
++    }
++
++    let entries = match state
++        .store
++        .list_cached_runs(&fabro_store::ListRunsQuery::default(), chrono::Utc::now())
++        .await
++    {
++        Ok(entries) => entries,
++        Err(err) => {
++            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
++                .into_response();
++        }
++    };
++
++    let mut runs: Vec<fabro_types::Run> = entries
++        .into_iter()
++        .map(|entry| entry.summary)
++        .filter(|run| {
++            run.automation
++                .as_ref()
++                .is_some_and(|automation| automation.id == id.as_str())
++        })
++        .collect();
++    runs.sort_by(|a, b| {
++        b.timestamps
++            .created_at
++            .cmp(&a.timestamps.created_at)
++            .then_with(|| b.id.cmp(&a.id))
++    });
++
++    let total = runs.len() as u64;
++    let decorated = state.decorate_run_summaries(runs).await;
++    let (data, has_more) = paginate_items(decorated, &pagination);
++
++    (
++        StatusCode::OK,
++        Json(serde_json::json!({
++            "data": data,
++            "meta": { "has_more": has_more, "total": total }
++        })),
++    )
++        .into_response()
++}
++
++async fn create_automation_run(
++    RequiredRunToolActor(actor): RequiredRunToolActor,
++    State(state): State<Arc<AppState>>,
++    headers: HeaderMap,
++    Path(id): Path<String>,
++) -> Response {
++    let id = match parse_path_id(id) {
++        Ok(id) => id,
++        Err(err) => return err.into_response(),
++    };
++    let Some(automation) = state.automation_store().get(&id).await else {
++        return ApiError::not_found(format!("automation not found: {id}")).into_response();
++    };
++    let Some(api_trigger) = enabled_api_trigger(&automation) else {
++        return automation_api_trigger_disabled_error().into_response();
++    };
++    let api_trigger_id = api_trigger.id.to_string();
++
++    let run_id = RunId::new();
++    let materialized = match state
++        .materialize_automation_run(AutomationRunMaterializeInput {
++            automation_id: automation.id.clone(),
++            target: automation.target.clone(),
++            run_id,
++            user_settings_path: state.active_config_path().to_path_buf(),
++            temp_root: automation_materialization_temp_root(state.as_ref()),
++        })
++        .await
++    {
++        Ok(materialized) => materialized,
++        Err(err) => return automation_materialize_error(&err).into_response(),
++    };
++    let explicit_title_supplied = materialized.manifest.title.is_some();
++    let automation_ref = AutomationRef {
++        id:         automation.id.to_string(),
++        name:       Some(automation.name.clone()),
++        trigger_id: Some(api_trigger_id),
++    };
++
++    Box::pin(runs::create_run_from_manifest(
++        state,
++        runs::CreateRunFromManifestRequest {
++            manifest: materialized.manifest,
++            submitted_manifest_bytes: materialized.submitted_manifest_bytes,
++            explicit_run_id: Some(run_id),
++            explicit_title_supplied,
++            actor,
++            headers,
++            automation: Some(automation_ref),
++        },
++    ))
++    .await
++}
++
+ async fn create_automation(
+     _auth: RequiredUser,
+     State(state): State<Arc<AppState>>,
+@@ -130,6 +254,37 @@ fn unquote_etag(value: &str) -> &str {
+         .unwrap_or(value)
+ }
+ 
++fn enabled_api_trigger(automation: &Automation) -> Option<&ApiTrigger> {
++    if !automation.enabled {
++        return None;
++    }
++    automation
++        .triggers
++        .iter()
++        .find_map(|trigger| match trigger {
++            AutomationTrigger::Api(trigger) if trigger.enabled => Some(trigger),
++            _ => None,
++        })
++}
++
++fn automation_api_trigger_disabled_error() -> ApiError {
++    ApiError::with_code(
++        StatusCode::CONFLICT,
++        "automation is disabled or has no enabled API trigger",
++        AUTOMATION_API_TRIGGER_DISABLED_CODE,
++    )
++}
++
++fn automation_materialization_temp_root(state: &AppState) -> std::path::PathBuf {
++    Storage::new(state.server_storage_dir())
++        .scratch_dir()
++        .join("automations")
++}
++
++fn automation_materialize_error(err: &AutomationRunMaterializeError) -> ApiError {
++    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
++}
++
+ fn automation_with_etag_response(status: StatusCode, automation: Automation) -> Response {
+     let etag = HeaderValue::from_str(&format!("\"{}\"", automation.revision))
+         .expect("automation revisions are valid ETag header values");
+diff --git a/lib/crates/fabro-server/tests/it/api/automations.rs b/lib/crates/fabro-server/tests/it/api/automations.rs
+index 37189c750..36ba160d1 100644
+--- a/lib/crates/fabro-server/tests/it/api/automations.rs
++++ b/lib/crates/fabro-server/tests/it/api/automations.rs
+@@ -3,11 +3,16 @@ use std::path::PathBuf;
+ use axum::body::Body;
+ use axum::http::{Method, Request, StatusCode, header};
+ use fabro_server::server::build_router;
+-use fabro_server::test_support::{TestAppStateBuilder, build_test_router, test_auth_mode};
++use fabro_server::test_support::{
++    TestAppStateBuilder, TestAutomationRunMaterializer, build_test_router, test_auth_mode,
++};
+ use serde_json::{Value, json};
+ use tower::ServiceExt;
+ 
+-use crate::helpers::{api, checked_response, response_json, response_status};
++use crate::helpers::{
++    MINIMAL_DOT, api, checked_response, minimal_manifest_json, response_json, response_status,
++    run_json,
++};
+ 
+ fn automation_body(id: &str, name: &str) -> Value {
+     json!({
+@@ -66,6 +71,25 @@ fn automation_app() -> (axum::Router, tempfile::TempDir, PathBuf) {
+     (build_test_router(state), temp_dir, automation_dir)
+ }
+ 
++fn automation_app_with_fake_materializer() -> (axum::Router, tempfile::TempDir, PathBuf) {
++    let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
++    let active_config_path = temp_dir.path().join("settings.toml");
++    let automation_dir = temp_dir.path().join("automations");
++    let materialized_manifest: fabro_api::types::RunManifest =
++        serde_json::from_value(minimal_manifest_json(MINIMAL_DOT))
++            .expect("minimal run manifest fixture should deserialize");
++    let submitted_manifest_bytes =
++        serde_json::to_vec(&materialized_manifest).expect("minimal run manifest should serialize");
++    let state = TestAppStateBuilder::new()
++        .active_config_path(active_config_path)
++        .automation_materializer(TestAutomationRunMaterializer::succeed(
++            materialized_manifest,
++            submitted_manifest_bytes,
++        ))
++        .build();
++    (build_test_router(state), temp_dir, automation_dir)
++}
++
+ fn json_request(method: Method, path: &str, body: &Value) -> Request<Body> {
+     Request::builder()
+         .method(method)
+@@ -108,18 +132,48 @@ fn request_with_if_match(
+ }
+ 
+ async fn create_automation(app: &axum::Router, id: &str, name: &str) -> Value {
++    create_automation_with_body(app, &automation_body(id, name)).await
++}
++
++async fn create_automation_with_body(app: &axum::Router, body: &Value) -> Value {
+     let response = app
+         .clone()
+-        .oneshot(json_request(
+-            Method::POST,
+-            "/automations",
+-            &automation_body(id, name),
+-        ))
++        .oneshot(json_request(Method::POST, "/automations", body))
+         .await
+         .expect("create automation should respond");
+     response_json(response, StatusCode::CREATED, "POST /api/v1/automations").await
+ }
+ 
++async fn create_automation_run(
++    app: &axum::Router,
++    automation_id: &str,
++    expected: StatusCode,
++) -> Value {
++    let response = app
++        .clone()
++        .oneshot(empty_request(
++            Method::POST,
++            &format!("/automations/{automation_id}/runs"),
++        ))
++        .await
++        .expect("create automation run should respond");
++    response_json(
++        response,
++        expected,
++        format!("POST /api/v1/automations/{automation_id}/runs"),
++    )
++    .await
++}
++
++async fn list_automation_runs(app: &axum::Router, path: &str) -> Value {
++    let response = app
++        .clone()
++        .oneshot(empty_request(Method::GET, path))
++        .await
++        .expect("list automation runs should respond");
++    response_json(response, StatusCode::OK, format!("GET /api/v1{path}")).await
++}
++
+ fn revision_from(body: &Value) -> &str {
+     body["revision"]
+         .as_str()
+@@ -499,3 +553,143 @@ async fn automations_routes_require_authenticated_user() {
+     )
+     .await;
+ }
++
++#[tokio::test]
++async fn disabled_automation_run_endpoint_returns_conflict_code() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    let mut body = automation_body("nightly", "Nightly");
++    body["enabled"] = json!(false);
++    create_automation_with_body(&app, &body).await;
++
++    let error = create_automation_run(&app, "nightly", StatusCode::CONFLICT).await;
++
++    assert_eq!(
++        error["errors"][0]["code"],
++        "automation_api_trigger_disabled"
++    );
++}
++
++#[tokio::test]
++async fn missing_automation_run_endpoint_returns_not_found() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++
++    create_automation_run(&app, "missing", StatusCode::NOT_FOUND).await;
++}
++
++#[tokio::test]
++async fn disabled_api_trigger_run_endpoint_returns_conflict_code() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    let mut body = automation_body("nightly", "Nightly");
++    body["triggers"][0]["enabled"] = json!(false);
++    create_automation_with_body(&app, &body).await;
++
++    let error = create_automation_run(&app, "nightly", StatusCode::CONFLICT).await;
++
++    assert_eq!(
++        error["errors"][0]["code"],
++        "automation_api_trigger_disabled"
++    );
++}
++
++#[tokio::test]
++async fn missing_api_trigger_run_endpoint_returns_conflict_code() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    let mut body = automation_body("nightly", "Nightly");
++    body["triggers"] = json!([
++        {
++            "type": "schedule",
++            "id": "nightly",
++            "enabled": true,
++            "expression": "0 3 * * *"
++        }
++    ]);
++    create_automation_with_body(&app, &body).await;
++
++    let error = create_automation_run(&app, "nightly", StatusCode::CONFLICT).await;
++
++    assert_eq!(
++        error["errors"][0]["code"],
++        "automation_api_trigger_disabled"
++    );
++}
++
++#[tokio::test]
++async fn successful_api_triggered_automation_run_persists_automation_metadata() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    create_automation(&app, "nightly", "Nightly").await;
++
++    let created = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
++
++    assert_eq!(created["automation"]["id"], "nightly");
++    assert_eq!(created["automation"]["name"], "Nightly");
++    assert_eq!(created["automation"]["trigger_id"], "manual");
++
++    let run_id = created["id"]
++        .as_str()
++        .expect("created automation run should include id");
++    let retrieved = run_json(&app, run_id).await;
++    assert_eq!(retrieved["id"], run_id);
++    assert_eq!(retrieved["automation"], created["automation"]);
++}
++
++#[tokio::test]
++async fn automation_run_listing_includes_only_runs_for_that_automation() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    create_automation(&app, "nightly", "Nightly").await;
++    create_automation(&app, "weekly", "Weekly").await;
++    let nightly = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
++    let weekly = create_automation_run(&app, "weekly", StatusCode::CREATED).await;
++
++    let body = list_automation_runs(&app, "/automations/nightly/runs").await;
++
++    assert_eq!(body["meta"]["total"], 1);
++    assert_eq!(body["meta"]["has_more"], false);
++    assert_eq!(
++        body["data"].as_array().expect("data should be array").len(),
++        1
++    );
++    assert_eq!(body["data"][0]["id"], nightly["id"]);
++    assert_ne!(body["data"][0]["id"], weekly["id"]);
++    assert_eq!(body["data"][0]["automation"]["id"], "nightly");
++}
++
++#[tokio::test]
++async fn missing_automation_run_listing_returns_not_found() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++
++    let response = app
++        .oneshot(empty_request(Method::GET, "/automations/missing/runs"))
++        .await
++        .expect("missing automation run listing should respond");
++
++    response_status(
++        response,
++        StatusCode::NOT_FOUND,
++        "GET /api/v1/automations/missing/runs",
++    )
++    .await;
++}
++
++#[tokio::test]
++async fn automation_run_listing_is_newest_first_and_paginates() {
++    let (app, _temp_dir, _automation_dir) = automation_app_with_fake_materializer();
++    create_automation(&app, "nightly", "Nightly").await;
++    let oldest = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
++    let middle = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
++    let newest = create_automation_run(&app, "nightly", StatusCode::CREATED).await;
++
++    let first_page = list_automation_runs(&app, "/automations/nightly/runs?page[limit]=2").await;
++    assert_eq!(first_page["meta"]["total"], 3);
++    assert_eq!(first_page["meta"]["has_more"], true);
++    assert_eq!(first_page["data"][0]["id"], newest["id"]);
++    assert_eq!(first_page["data"][1]["id"], middle["id"]);
++
++    let second_page = list_automation_runs(
++        &app,
++        "/automations/nightly/runs?page[limit]=2&page[offset]=2",
++    )
++    .await;
++    assert_eq!(second_page["meta"]["total"], 3);
++    assert_eq!(second_page["meta"]["has_more"], false);
++    assert_eq!(second_page["data"][0]["id"], oldest["id"]);
++}
