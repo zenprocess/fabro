@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-29T17:59:12.457328Z",
-  "last_event_at": "2026-05-29T17:59:14.730623Z",
+  "last_event_at": "2026-05-29T17:59:20.637832Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -546,9 +546,9 @@
       "diff": {}
     },
     {
-      "seq": 0,
+      "seq": 28,
       "checkpoint": {
-        "timestamp": "2026-05-29T17:59:16.148086Z",
+        "timestamp": "2026-05-29T17:59:20.634751Z",
         "current_node": "toolchain",
         "completed_nodes": [
           "start",
@@ -556,22 +556,22 @@
         ],
         "node_retries": {},
         "context_values": {
+          "failure_class": "",
+          "internal.run_id": "01KSTE7AK905MJ5YJR2Z2X5MJS",
+          "failure_signature": "",
+          "internal.fidelity": "compact",
+          "outcome": "succeeded",
           "internal.work_dir": "/home/daytona/workspace/fabro",
-          "internal.retry_count.start": 0,
           "internal.thread_id": "start",
+          "graph.rankdir": "LR",
+          "internal.retry_count.toolchain": 0,
+          "graph.goal": "---\ntitle: \"feat: Add Environment REST CRUD API\"\ntype: feat\nstatus: active\ndate: 2026-05-28\n---\n\n# feat: Add Environment REST CRUD API\n\n## Summary\n\nAdd server-owned Environment CRUD under `/api/v1/environments`, modeled after\nAutomations and backed by the existing `EnvironmentStore`. The API manages only\nthe server-side environment catalog in `environments/*.toml`; client-side\nenvironment definitions in `workflow.toml`, `.fabro/project.toml`, or run inputs\ncontinue to work and are not managed by this API.\n\n## API Contract\n\n- Add OpenAPI paths:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- Mirror Automations semantics:\n  - List returns `{ data: Environment[], meta: { total } }`, sorted by id.\n  - Create body includes `id`; replace body omits `id`; path id is authoritative.\n  - `GET` and `PUT` return `ETag: \"<revision>\"`.\n  - `PUT` and `DELETE` require `If-Match`.\n  - Use existing Automation-style statuses: `400`, `404`, `409`, `422`, `428`, `500`.\n  - Stale revisions return `409` to match Automations.\n- Add API-specific Environment request/response schemas so REST `image.dockerfile`\n  accepts only inline content or `null`.\n  - Existing workflow/settings schemas keep supporting Dockerfile `path`.\n  - REST requests with Dockerfile `path` return `422` and must not read\n    server-local files.\n- Do not add `PATCH` in v1.\n\n## Implementation Changes\n\n- OpenAPI and generated clients:\n  - Update `docs/public/api-reference/fabro-api.yaml` with an `Environments` tag,\n    an `EnvironmentId` parameter, CRUD paths, list envelope, and inline-only API\n    image schema.\n  - Regenerate Rust API types and the TypeScript Axios client.\n  - Keep the existing `EnvironmentSettings` schema intact for workflow settings.\n- Server:\n  - Add `lib/crates/fabro-server/src/server/handler/environments.rs`, following\n    `automations.rs` for routes, auth, ETag parsing, and error mapping.\n  - Merge the routes into real API routes; do not add demo routes unless an\n    existing convention requires it.\n  - Convert API request DTOs into `EnvironmentDraft` / `EnvironmentSettings` only\n    after rejecting Dockerfile path sources.\n  - Map `EnvironmentStoreError` similarly to Automations: duplicate, protected,\n    and stale as `409`; missing as `404`; validation as `422`; internal\n    storage/parse/io as curated `500`.\n  - After successful create, replace, or delete, refresh cached manifest run\n    settings from the current `EnvironmentStore` catalog so `/system/info` and\n    default run settings reflect the updated catalog.\n- Domain and API types:\n  - Use a meaningful API DTO boundary rather than treating REST and TOML as\n    identical Dockerfile-source surfaces.\n  - Reuse `fabro-environment::Environment` for persisted domain behavior where\n    the wire shape matches; keep API-only request schemas distinct where\n    inline-only Dockerfile behavior differs.\n\n## Implementation Units\n\n- [ ] **Unit 1: Define the OpenAPI contract**\n  - Add the environment CRUD paths, schemas, and path parameter.\n  - Ensure the spec distinguishes REST-safe inline Dockerfile sources from the\n    existing workflow/settings Dockerfile source schema.\n  - Verification: OpenAPI route conformance can see the new paths and generated\n    clients expose an `EnvironmentsApi`.\n\n- [ ] **Unit 2: Add server environment handlers**\n  - Implement a new handler module mirroring the Automation CRUD handler shape.\n  - Enforce authentication, id parsing, ETag/If-Match behavior, and error mapping.\n  - Reject REST Dockerfile path sources before calling `EnvironmentStore`.\n  - Verification: server API tests prove CRUD behavior and failure responses.\n\n- [ ] **Unit 3: Refresh derived server state after mutations**\n  - Ensure successful environment create, replace, and delete refresh any cached\n    manifest run settings derived from `EnvironmentStore::catalog_layer()`.\n  - Preserve existing client-side environment precedence and behavior.\n  - Verification: a test proves newly created server environments affect the\n    resolved server default run environment where applicable.\n\n- [ ] **Unit 4: Regenerate clients and add contract tests**\n  - Regenerate `fabro-api` and `lib/packages/fabro-api-client`.\n  - Add Rust server integration tests and keep OpenAPI conformance passing.\n  - Verification: generated Rust and TypeScript surfaces compile and expose the\n    new environment operations.\n\n## Test Plan\n\n- Add server API tests in\n  `lib/crates/fabro-server/tests/it/api/environments.rs` and register the module.\n- Cover:\n  - List returns seeded environments and correct total.\n  - Create persists `environments/{id}.toml`, returns `201`, and is visible via\n    list/get.\n  - Get returns current `ETag` matching `revision`.\n  - Replace with valid `If-Match` updates the file, returns a new revision, and\n    updates the `ETag`.\n  - Replace/delete without `If-Match` return `428`.\n  - Stale replace/delete return `409`.\n  - Duplicate create returns `409`.\n  - Invalid id/header returns `400`.\n  - Domain validation failures return `422`.\n  - Dockerfile `path` over REST returns `422` and does not persist or expose file\n    contents.\n  - Delete removes a non-default environment; deleting `default` returns a\n    protected conflict.\n  - Unauthenticated environment routes return `401`.\n  - Creating an environment referenced by server default run settings refreshes\n    cached manifest run settings.\n\n## Assumptions\n\n- This API manages server-owned environments only; client-defined catalogs remain\n  file/request scoped.\n- Built-in seed behavior follows the current store: seeded environments are\n  listed, create conflicts with existing ids, and `default` is protected from\n  delete.\n- Create responses match Automations and do not need an `ETag`; clients can use\n  the returned `revision` or call `GET`.\n- Inline-only Dockerfile policy applies only to REST CRUD, not local TOML\n  configuration.\n\n## Sources\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-server/src/server/handler/automations.rs`\n- `lib/crates/fabro-environment/src/store.rs`\n- `lib/crates/fabro-environment/src/model.rs`\n- `docs/public/execution/environments.mdx`\n",
           "current_node": "toolchain",
           "thread.start.current_node": "toolchain",
           "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
-          "graph.goal": "---\ntitle: \"feat: Add Environment REST CRUD API\"\ntype: feat\nstatus: active\ndate: 2026-05-28\n---\n\n# feat: Add Environment REST CRUD API\n\n## Summary\n\nAdd server-owned Environment CRUD under `/api/v1/environments`, modeled after\nAutomations and backed by the existing `EnvironmentStore`. The API manages only\nthe server-side environment catalog in `environments/*.toml`; client-side\nenvironment definitions in `workflow.toml`, `.fabro/project.toml`, or run inputs\ncontinue to work and are not managed by this API.\n\n## API Contract\n\n- Add OpenAPI paths:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- Mirror Automations semantics:\n  - List returns `{ data: Environment[], meta: { total } }`, sorted by id.\n  - Create body includes `id`; replace body omits `id`; path id is authoritative.\n  - `GET` and `PUT` return `ETag: \"<revision>\"`.\n  - `PUT` and `DELETE` require `If-Match`.\n  - Use existing Automation-style statuses: `400`, `404`, `409`, `422`, `428`, `500`.\n  - Stale revisions return `409` to match Automations.\n- Add API-specific Environment request/response schemas so REST `image.dockerfile`\n  accepts only inline content or `null`.\n  - Existing workflow/settings schemas keep supporting Dockerfile `path`.\n  - REST requests with Dockerfile `path` return `422` and must not read\n    server-local files.\n- Do not add `PATCH` in v1.\n\n## Implementation Changes\n\n- OpenAPI and generated clients:\n  - Update `docs/public/api-reference/fabro-api.yaml` with an `Environments` tag,\n    an `EnvironmentId` parameter, CRUD paths, list envelope, and inline-only API\n    image schema.\n  - Regenerate Rust API types and the TypeScript Axios client.\n  - Keep the existing `EnvironmentSettings` schema intact for workflow settings.\n- Server:\n  - Add `lib/crates/fabro-server/src/server/handler/environments.rs`, following\n    `automations.rs` for routes, auth, ETag parsing, and error mapping.\n  - Merge the routes into real API routes; do not add demo routes unless an\n    existing convention requires it.\n  - Convert API request DTOs into `EnvironmentDraft` / `EnvironmentSettings` only\n    after rejecting Dockerfile path sources.\n  - Map `EnvironmentStoreError` similarly to Automations: duplicate, protected,\n    and stale as `409`; missing as `404`; validation as `422`; internal\n    storage/parse/io as curated `500`.\n  - After successful create, replace, or delete, refresh cached manifest run\n    settings from the current `EnvironmentStore` catalog so `/system/info` and\n    default run settings reflect the updated catalog.\n- Domain and API types:\n  - Use a meaningful API DTO boundary rather than treating REST and TOML as\n    identical Dockerfile-source surfaces.\n  - Reuse `fabro-environment::Environment` for persisted domain behavior where\n    the wire shape matches; keep API-only request schemas distinct where\n    inline-only Dockerfile behavior differs.\n\n## Implementation Units\n\n- [ ] **Unit 1: Define the OpenAPI contract**\n  - Add the environment CRUD paths, schemas, and path parameter.\n  - Ensure the spec distinguishes REST-safe inline Dockerfile sources from the\n    existing workflow/settings Dockerfile source schema.\n  - Verification: OpenAPI route conformance can see the new paths and generated\n    clients expose an `EnvironmentsApi`.\n\n- [ ] **Unit 2: Add server environment handlers**\n  - Implement a new handler module mirroring the Automation CRUD handler shape.\n  - Enforce authentication, id parsing, ETag/If-Match behavior, and error mapping.\n  - Reject REST Dockerfile path sources before calling `EnvironmentStore`.\n  - Verification: server API tests prove CRUD behavior and failure responses.\n\n- [ ] **Unit 3: Refresh derived server state after mutations**\n  - Ensure successful environment create, replace, and delete refresh any cached\n    manifest run settings derived from `EnvironmentStore::catalog_layer()`.\n  - Preserve existing client-side environment precedence and behavior.\n  - Verification: a test proves newly created server environments affect the\n    resolved server default run environment where applicable.\n\n- [ ] **Unit 4: Regenerate clients and add contract tests**\n  - Regenerate `fabro-api` and `lib/packages/fabro-api-client`.\n  - Add Rust server integration tests and keep OpenAPI conformance passing.\n  - Verification: generated Rust and TypeScript surfaces compile and expose the\n    new environment operations.\n\n## Test Plan\n\n- Add server API tests in\n  `lib/crates/fabro-server/tests/it/api/environments.rs` and register the module.\n- Cover:\n  - List returns seeded environments and correct total.\n  - Create persists `environments/{id}.toml`, returns `201`, and is visible via\n    list/get.\n  - Get returns current `ETag` matching `revision`.\n  - Replace with valid `If-Match` updates the file, returns a new revision, and\n    updates the `ETag`.\n  - Replace/delete without `If-Match` return `428`.\n  - Stale replace/delete return `409`.\n  - Duplicate create returns `409`.\n  - Invalid id/header returns `400`.\n  - Domain validation failures return `422`.\n  - Dockerfile `path` over REST returns `422` and does not persist or expose file\n    contents.\n  - Delete removes a non-default environment; deleting `default` returns a\n    protected conflict.\n  - Unauthenticated environment routes return `401`.\n  - Creating an environment referenced by server default run settings refreshes\n    cached manifest run settings.\n\n## Assumptions\n\n- This API manages server-owned environments only; client-defined catalogs remain\n  file/request scoped.\n- Built-in seed behavior follows the current store: seeded environments are\n  listed, create conflicts with existing ids, and `default` is protected from\n  delete.\n- Create responses match Automations and do not need an `ETag`; clients can use\n  the returned `revision` or call `GET`.\n- Inline-only Dockerfile policy applies only to REST CRUD, not local TOML\n  configuration.\n\n## Sources\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-server/src/server/handler/automations.rs`\n- `lib/crates/fabro-environment/src/store.rs`\n- `lib/crates/fabro-environment/src/model.rs`\n- `docs/public/execution/environments.mdx`\n",
-          "failure_class": "",
-          "failure_signature": "",
-          "graph.rankdir": "LR",
-          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
-          "outcome": "succeeded",
           "internal.node_visit_count": 1,
-          "internal.retry_count.toolchain": 0,
-          "internal.run_id": "01KSTE7AK905MJ5YJR2Z2X5MJS",
-          "internal.fidelity": "compact"
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "internal.retry_count.start": 0
         },
         "node_outcomes": {
           "start": {
@@ -594,8 +594,89 @@
           }
         },
         "next_node_id": "preflight_compile",
+        "git_commit_sha": "05201a98f07cd29eb815afe8cae9b2e1ebe9f4ab",
         "node_visits": {
           "toolchain": 1,
+          "start": 1
+        }
+      },
+      "diff": {
+        "summary": {
+          "files_changed": 0,
+          "additions": 0,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-29T18:01:30.616113Z",
+        "current_node": "preflight_compile",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.retry_count.start": 0,
+          "internal.thread_id": "toolchain",
+          "current_node": "preflight_compile",
+          "thread.start.current_node": "toolchain",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.goal": "---\ntitle: \"feat: Add Environment REST CRUD API\"\ntype: feat\nstatus: active\ndate: 2026-05-28\n---\n\n# feat: Add Environment REST CRUD API\n\n## Summary\n\nAdd server-owned Environment CRUD under `/api/v1/environments`, modeled after\nAutomations and backed by the existing `EnvironmentStore`. The API manages only\nthe server-side environment catalog in `environments/*.toml`; client-side\nenvironment definitions in `workflow.toml`, `.fabro/project.toml`, or run inputs\ncontinue to work and are not managed by this API.\n\n## API Contract\n\n- Add OpenAPI paths:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- Mirror Automations semantics:\n  - List returns `{ data: Environment[], meta: { total } }`, sorted by id.\n  - Create body includes `id`; replace body omits `id`; path id is authoritative.\n  - `GET` and `PUT` return `ETag: \"<revision>\"`.\n  - `PUT` and `DELETE` require `If-Match`.\n  - Use existing Automation-style statuses: `400`, `404`, `409`, `422`, `428`, `500`.\n  - Stale revisions return `409` to match Automations.\n- Add API-specific Environment request/response schemas so REST `image.dockerfile`\n  accepts only inline content or `null`.\n  - Existing workflow/settings schemas keep supporting Dockerfile `path`.\n  - REST requests with Dockerfile `path` return `422` and must not read\n    server-local files.\n- Do not add `PATCH` in v1.\n\n## Implementation Changes\n\n- OpenAPI and generated clients:\n  - Update `docs/public/api-reference/fabro-api.yaml` with an `Environments` tag,\n    an `EnvironmentId` parameter, CRUD paths, list envelope, and inline-only API\n    image schema.\n  - Regenerate Rust API types and the TypeScript Axios client.\n  - Keep the existing `EnvironmentSettings` schema intact for workflow settings.\n- Server:\n  - Add `lib/crates/fabro-server/src/server/handler/environments.rs`, following\n    `automations.rs` for routes, auth, ETag parsing, and error mapping.\n  - Merge the routes into real API routes; do not add demo routes unless an\n    existing convention requires it.\n  - Convert API request DTOs into `EnvironmentDraft` / `EnvironmentSettings` only\n    after rejecting Dockerfile path sources.\n  - Map `EnvironmentStoreError` similarly to Automations: duplicate, protected,\n    and stale as `409`; missing as `404`; validation as `422`; internal\n    storage/parse/io as curated `500`.\n  - After successful create, replace, or delete, refresh cached manifest run\n    settings from the current `EnvironmentStore` catalog so `/system/info` and\n    default run settings reflect the updated catalog.\n- Domain and API types:\n  - Use a meaningful API DTO boundary rather than treating REST and TOML as\n    identical Dockerfile-source surfaces.\n  - Reuse `fabro-environment::Environment` for persisted domain behavior where\n    the wire shape matches; keep API-only request schemas distinct where\n    inline-only Dockerfile behavior differs.\n\n## Implementation Units\n\n- [ ] **Unit 1: Define the OpenAPI contract**\n  - Add the environment CRUD paths, schemas, and path parameter.\n  - Ensure the spec distinguishes REST-safe inline Dockerfile sources from the\n    existing workflow/settings Dockerfile source schema.\n  - Verification: OpenAPI route conformance can see the new paths and generated\n    clients expose an `EnvironmentsApi`.\n\n- [ ] **Unit 2: Add server environment handlers**\n  - Implement a new handler module mirroring the Automation CRUD handler shape.\n  - Enforce authentication, id parsing, ETag/If-Match behavior, and error mapping.\n  - Reject REST Dockerfile path sources before calling `EnvironmentStore`.\n  - Verification: server API tests prove CRUD behavior and failure responses.\n\n- [ ] **Unit 3: Refresh derived server state after mutations**\n  - Ensure successful environment create, replace, and delete refresh any cached\n    manifest run settings derived from `EnvironmentStore::catalog_layer()`.\n  - Preserve existing client-side environment precedence and behavior.\n  - Verification: a test proves newly created server environments affect the\n    resolved server default run environment where applicable.\n\n- [ ] **Unit 4: Regenerate clients and add contract tests**\n  - Regenerate `fabro-api` and `lib/packages/fabro-api-client`.\n  - Add Rust server integration tests and keep OpenAPI conformance passing.\n  - Verification: generated Rust and TypeScript surfaces compile and expose the\n    new environment operations.\n\n## Test Plan\n\n- Add server API tests in\n  `lib/crates/fabro-server/tests/it/api/environments.rs` and register the module.\n- Cover:\n  - List returns seeded environments and correct total.\n  - Create persists `environments/{id}.toml`, returns `201`, and is visible via\n    list/get.\n  - Get returns current `ETag` matching `revision`.\n  - Replace with valid `If-Match` updates the file, returns a new revision, and\n    updates the `ETag`.\n  - Replace/delete without `If-Match` return `428`.\n  - Stale replace/delete return `409`.\n  - Duplicate create returns `409`.\n  - Invalid id/header returns `400`.\n  - Domain validation failures return `422`.\n  - Dockerfile `path` over REST returns `422` and does not persist or expose file\n    contents.\n  - Delete removes a non-default environment; deleting `default` returns a\n    protected conflict.\n  - Unauthenticated environment routes return `401`.\n  - Creating an environment referenced by server default run settings refreshes\n    cached manifest run settings.\n\n## Assumptions\n\n- This API manages server-owned environments only; client-defined catalogs remain\n  file/request scoped.\n- Built-in seed behavior follows the current store: seeded environments are\n  listed, create conflicts with existing ids, and `default` is protected from\n  delete.\n- Create responses match Automations and do not need an `ETag`; clients can use\n  the returned `revision` or call `GET`.\n- Inline-only Dockerfile policy applies only to REST CRUD, not local TOML\n  configuration.\n\n## Sources\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-server/src/server/handler/automations.rs`\n- `lib/crates/fabro-environment/src/store.rs`\n- `lib/crates/fabro-environment/src/model.rs`\n- `docs/public/execution/environments.mdx`\n",
+          "failure_class": "",
+          "failure_signature": "",
+          "graph.rankdir": "LR",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "outcome": "succeeded",
+          "internal.node_visit_count": 1,
+          "internal.retry_count.toolchain": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.run_id": "01KSTE7AK905MJ5YJR2Z2X5MJS",
+          "internal.fidelity": "compact",
+          "internal.retry_count.preflight_compile": 0
+        },
+        "node_outcomes": {
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1407,
+              "active_time_ms": 1407
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 129969,
+              "active_time_ms": 129969
+            }
+          }
+        },
+        "next_node_id": "preflight_lint",
+        "node_visits": {
+          "toolchain": 1,
+          "preflight_compile": 1,
           "start": 1
         }
       },
@@ -633,7 +714,12 @@
       "first_event_seq": 21,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-29T17:59:16.146681Z"
+      },
       "provider_used": null,
       "diff": null,
       "script_invocation": {
@@ -641,11 +727,27 @@
         "command": "exec 2>&1\ncommand -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
         "language": "shell"
       },
-      "script_timing": null,
+      "script_timing": {
+        "output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c",
+        "exit_code": 0,
+        "duration_ms": 1407,
+        "termination": "exited",
+        "output_bytes": 36,
+        "live_streaming": true
+      },
       "parallel_results": null,
       "output": null,
+      "output_bytes": 36,
+      "live_streaming": true,
+      "termination": "exited",
       "started_at": "2026-05-29T17:59:14.730582Z",
       "handler": "command",
+      "timing": {
+        "wall_time_ms": 1415,
+        "inference_time_ms": 0,
+        "tool_time_ms": 1407,
+        "active_time_ms": 1407
+      },
       "usage": {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -654,7 +756,7 @@
         "cache_read_tokens": 0,
         "cache_write_tokens": 0
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "start@1": {
       "first_event_seq": 17,
@@ -689,6 +791,33 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 31,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-29T17:59:20.637190Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
     }
   }
 }
