@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-05-29T17:59:12.457328Z",
-  "last_event_at": "2026-05-29T18:49:12.640649Z",
+  "last_event_at": "2026-05-29T18:49:16.961821Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -1121,9 +1121,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1225,
       "checkpoint": {
-        "timestamp": "2026-05-29T18:49:12.698411Z",
+        "timestamp": "2026-05-29T18:49:16.959249Z",
         "current_node": "simplify_gpt",
         "completed_nodes": [
           "start",
@@ -1136,13 +1136,246 @@
         ],
         "node_retries": {},
         "context_values": {
-          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.fidelity": "compact",
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.preflight_lint.current_node": "implement",
+          "internal.retry_count.toolchain": 0,
+          "thread.toolchain.current_node": "preflight_compile",
+          "outcome": "succeeded",
+          "graph.rankdir": "LR",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.implement": 0,
+          "response.simplify_gpt": "Reviewed the branch diff and applied one cleanup:\n\n- Deduplicated shared `If-Match` parsing, ETag quoting, and JSON-with-ETag response construction between Automations and Environments.\n- Added shared helpers in `lib/crates/fabro-server/src/server/handler/mod.rs`.\n- Updated:\n  - `lib/crates/fabro-server/src/server/handler/automations.rs`\n  - `lib/crates/fabro-server/src/server/handler/environments.rs`\n\nValidation run:\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo check -q -p fabro-server -p fabro-api`\n- `cargo nextest run -p fabro-server --features test-support --test it api::environments`\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --features test-support --test it -- -D warnings`\n\nAll passed.",
+          "response.simplify_opus": "## Summary\n\nReviewed the Environment REST CRUD API diff (2,574 lines) with three parallel agents covering code reuse, code quality, and efficiency.\n\n### Fixed\n\n**Collapsed API DTO duplication in `lib/crates/fabro-server/src/server/handler/environments.rs`** (-27 net lines):\n- Removed the redundant `ApiEnvironmentSettings` middleman struct (an exact field-by-field clone of `CreateEnvironmentRequest`/`ReplaceEnvironmentRequest`).\n- Removed both `into_settings`/`into_draft` trampoline impls that constructed `ApiEnvironmentSettings` only to shell out to a shared converter.\n- `CreateEnvironmentRequest::into_draft` and `ReplaceEnvironmentRequest::into_settings` now build `EnvironmentSettings` directly.\n- Replaced `ApiDockerfileSource::Path { _path: String }` with `_path: IgnoredAny`, removing the per-request `String` allocation for a payload that's parsed and discarded.\n\n### Verified\n\n- `cargo +nightly clippy --workspace --all-targets -- -D warnings` ✅\n- 13/13 `api::environments` tests pass\n- 4/4 `openapi_conformance` tests pass\n- 170/170 `fabro-api` tests pass (including round-trip)\n- 16/16 `fabro-environment` tests pass\n\n### Reviewed but not fixed (with rationale)\n\n- **Shared etag/parse helpers across automations.rs and environments.rs** (High priority from reuse review): The five helpers (`parse_path_id`, `parse_required_if_match`, `unquote_etag`, `*_with_etag_response`, `From<*StoreError> for ApiError`) are byte-twins with the automations versions. Extracting them requires changes to both modules and adds trait machinery; better tackled when a third resource lands.\n- **Catalog deep clone in `resolve_manifest_run_settings_with_catalog`** (Medium efficiency): Would require restructuring `SettingsLayer.environments` from owned `MergeMap` to `Arc<MergeMap>` across fabro-config. Environment writes are admin-only on small catalogs; deferred.\n- **`Environment::from_settings` extra resolve round-trip** (Medium efficiency): The added `resolve_environment(&persisted)` call is intentional — it's the validation step that powers the new `create_invalid_settings_is_rejected` test. Correct as-is.\n- **List pagination** (Medium efficiency): Out of scope; would require an OpenAPI spec change.\n- **`EnvironmentListResponse`/`EnvironmentListMeta` generalization** (Medium reuse): Same pattern as `AutomationListResponse`; cross-cutting refactor worth doing later.\n- **OpenAPI YAML repeats every 4xx/5xx response body** (Low quality): Pre-existing pattern across automations and other paths; systemic, not introduced by this PR.",
+          "thread.implement.current_node": "simplify_opus",
           "internal.thread_id": "simplify_opus",
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "failure_signature": "",
+          "internal.node_visit_count": 1,
+          "internal.run_id": "01KSTE7AK905MJ5YJR2Z2X5MJS",
+          "last_response": "Reviewed the branch diff and applied one cleanup:\n\n- Deduplicated shared `If-Match` parsing, ETag quoting, and JSON-with-ETag response construction between Automations and Environments.\n- Added shared",
+          "internal.retry_count.simplify_opus": 0,
+          "internal.retry_count.preflight_compile": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
+          "current_node": "simplify_gpt",
+          "internal.retry_count.start": 0,
+          "last_stage": "simplify_gpt",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "response.implement": "Implemented Environment REST CRUD API end-to-end.\n\nSummary:\n- Added OpenAPI `Environments` tag, `/api/v1/environments` CRUD paths, `EnvironmentId` parameter, list envelope, and REST-safe inline-only Dockerfile schemas.\n- Added server handler module: `lib/crates/fabro-server/src/server/handler/environments.rs`.\n- Mounted real API routes only; no demo routes added.\n- Added API DTO boundary that rejects REST Dockerfile `path` sources with `422` before calling `EnvironmentStore`.\n- Added ETag / `If-Match` behavior matching Automations.\n- Added `EnvironmentStoreError` → `ApiError` mapping with stale/duplicate/protected as `409`.\n- Refreshes cached manifest run settings after create/replace/delete so `/system/info` reflects catalog mutations.\n- Tightened `fabro-environment` create/replace behavior to validate dense settings before persistence.\n- Regenerated Rust API types and TypeScript Axios client; TS now exposes `EnvironmentsApi`.\n- Added server integration tests, OpenAPI/SDK conformance test, and Rust API JSON/type-boundary tests.\n\nValidation run:\n- Red TDD check: new environment API tests initially failed with `404` before routes existed.\n- `cargo nextest run -p fabro-server --features test-support --test it api::environments`\n- `cargo nextest run -p fabro-server --features test-support --test it openapi_conformance`\n- `cargo test -p fabro-api --test environment_round_trip`\n- `cargo nextest run -p fabro-environment`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n\nNote: I installed `openjdk-21-jre-headless` in the container because `openapi-generator-cli` requires `java` for TypeScript client generation.",
+          "failure_class": "",
+          "graph.goal": "---\ntitle: \"feat: Add Environment REST CRUD API\"\ntype: feat\nstatus: active\ndate: 2026-05-28\n---\n\n# feat: Add Environment REST CRUD API\n\n## Summary\n\nAdd server-owned Environment CRUD under `/api/v1/environments`, modeled after\nAutomations and backed by the existing `EnvironmentStore`. The API manages only\nthe server-side environment catalog in `environments/*.toml`; client-side\nenvironment definitions in `workflow.toml`, `.fabro/project.toml`, or run inputs\ncontinue to work and are not managed by this API.\n\n## API Contract\n\n- Add OpenAPI paths:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- Mirror Automations semantics:\n  - List returns `{ data: Environment[], meta: { total } }`, sorted by id.\n  - Create body includes `id`; replace body omits `id`; path id is authoritative.\n  - `GET` and `PUT` return `ETag: \"<revision>\"`.\n  - `PUT` and `DELETE` require `If-Match`.\n  - Use existing Automation-style statuses: `400`, `404`, `409`, `422`, `428`, `500`.\n  - Stale revisions return `409` to match Automations.\n- Add API-specific Environment request/response schemas so REST `image.dockerfile`\n  accepts only inline content or `null`.\n  - Existing workflow/settings schemas keep supporting Dockerfile `path`.\n  - REST requests with Dockerfile `path` return `422` and must not read\n    server-local files.\n- Do not add `PATCH` in v1.\n\n## Implementation Changes\n\n- OpenAPI and generated clients:\n  - Update `docs/public/api-reference/fabro-api.yaml` with an `Environments` tag,\n    an `EnvironmentId` parameter, CRUD paths, list envelope, and inline-only API\n    image schema.\n  - Regenerate Rust API types and the TypeScript Axios client.\n  - Keep the existing `EnvironmentSettings` schema intact for workflow settings.\n- Server:\n  - Add `lib/crates/fabro-server/src/server/handler/environments.rs`, following\n    `automations.rs` for routes, auth, ETag parsing, and error mapping.\n  - Merge the routes into real API routes; do not add demo routes unless an\n    existing convention requires it.\n  - Convert API request DTOs into `EnvironmentDraft` / `EnvironmentSettings` only\n    after rejecting Dockerfile path sources.\n  - Map `EnvironmentStoreError` similarly to Automations: duplicate, protected,\n    and stale as `409`; missing as `404`; validation as `422`; internal\n    storage/parse/io as curated `500`.\n  - After successful create, replace, or delete, refresh cached manifest run\n    settings from the current `EnvironmentStore` catalog so `/system/info` and\n    default run settings reflect the updated catalog.\n- Domain and API types:\n  - Use a meaningful API DTO boundary rather than treating REST and TOML as\n    identical Dockerfile-source surfaces.\n  - Reuse `fabro-environment::Environment` for persisted domain behavior where\n    the wire shape matches; keep API-only request schemas distinct where\n    inline-only Dockerfile behavior differs.\n\n## Implementation Units\n\n- [ ] **Unit 1: Define the OpenAPI contract**\n  - Add the environment CRUD paths, schemas, and path parameter.\n  - Ensure the spec distinguishes REST-safe inline Dockerfile sources from the\n    existing workflow/settings Dockerfile source schema.\n  - Verification: OpenAPI route conformance can see the new paths and generated\n    clients expose an `EnvironmentsApi`.\n\n- [ ] **Unit 2: Add server environment handlers**\n  - Implement a new handler module mirroring the Automation CRUD handler shape.\n  - Enforce authentication, id parsing, ETag/If-Match behavior, and error mapping.\n  - Reject REST Dockerfile path sources before calling `EnvironmentStore`.\n  - Verification: server API tests prove CRUD behavior and failure responses.\n\n- [ ] **Unit 3: Refresh derived server state after mutations**\n  - Ensure successful environment create, replace, and delete refresh any cached\n    manifest run settings derived from `EnvironmentStore::catalog_layer()`.\n  - Preserve existing client-side environment precedence and behavior.\n  - Verification: a test proves newly created server environments affect the\n    resolved server default run environment where applicable.\n\n- [ ] **Unit 4: Regenerate clients and add contract tests**\n  - Regenerate `fabro-api` and `lib/packages/fabro-api-client`.\n  - Add Rust server integration tests and keep OpenAPI conformance passing.\n  - Verification: generated Rust and TypeScript surfaces compile and expose the\n    new environment operations.\n\n## Test Plan\n\n- Add server API tests in\n  `lib/crates/fabro-server/tests/it/api/environments.rs` and register the module.\n- Cover:\n  - List returns seeded environments and correct total.\n  - Create persists `environments/{id}.toml`, returns `201`, and is visible via\n    list/get.\n  - Get returns current `ETag` matching `revision`.\n  - Replace with valid `If-Match` updates the file, returns a new revision, and\n    updates the `ETag`.\n  - Replace/delete without `If-Match` return `428`.\n  - Stale replace/delete return `409`.\n  - Duplicate create returns `409`.\n  - Invalid id/header returns `400`.\n  - Domain validation failures return `422`.\n  - Dockerfile `path` over REST returns `422` and does not persist or expose file\n    contents.\n  - Delete removes a non-default environment; deleting `default` returns a\n    protected conflict.\n  - Unauthenticated environment routes return `401`.\n  - Creating an environment referenced by server default run settings refreshes\n    cached manifest run settings.\n\n## Assumptions\n\n- This API manages server-owned environments only; client-defined catalogs remain\n  file/request scoped.\n- Built-in seed behavior follows the current store: seeded environments are\n  listed, create conflicts with existing ids, and `default` is protected from\n  delete.\n- Create responses match Automations and do not need an `ETag`; clients can use\n  the returned `revision` or call `GET`.\n- Inline-only Dockerfile policy applies only to REST CRUD, not local TOML\n  configuration.\n\n## Sources\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-server/src/server/handler/automations.rs`\n- `lib/crates/fabro-environment/src/store.rs`\n- `lib/crates/fabro-environment/src/model.rs`\n- `docs/public/execution/environments.mdx`\n",
+          "thread.start.current_node": "toolchain",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "node_outcomes": {
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.simplify_opus": "## Summary\n\nReviewed the Environment REST CRUD API diff (2,574 lines) with three parallel agents covering code reuse, code quality, and efficiency.\n\n### Fixed\n\n**Collapsed API DTO duplication in `lib/crates/fabro-server/src/server/handler/environments.rs`** (-27 net lines):\n- Removed the redundant `ApiEnvironmentSettings` middleman struct (an exact field-by-field clone of `CreateEnvironmentRequest`/`ReplaceEnvironmentRequest`).\n- Removed both `into_settings`/`into_draft` trampoline impls that constructed `ApiEnvironmentSettings` only to shell out to a shared converter.\n- `CreateEnvironmentRequest::into_draft` and `ReplaceEnvironmentRequest::into_settings` now build `EnvironmentSettings` directly.\n- Replaced `ApiDockerfileSource::Path { _path: String }` with `_path: IgnoredAny`, removing the per-request `String` allocation for a payload that's parsed and discarded.\n\n### Verified\n\n- `cargo +nightly clippy --workspace --all-targets -- -D warnings` ✅\n- 13/13 `api::environments` tests pass\n- 4/4 `openapi_conformance` tests pass\n- 170/170 `fabro-api` tests pass (including round-trip)\n- 16/16 `fabro-environment` tests pass\n\n### Reviewed but not fixed (with rationale)\n\n- **Shared etag/parse helpers across automations.rs and environments.rs** (High priority from reuse review): The five helpers (`parse_path_id`, `parse_required_if_match`, `unquote_etag`, `*_with_etag_response`, `From<*StoreError> for ApiError`) are byte-twins with the automations versions. Extracting them requires changes to both modules and adds trait machinery; better tackled when a third resource lands.\n- **Catalog deep clone in `resolve_manifest_run_settings_with_catalog`** (Medium efficiency): Would require restructuring `SettingsLayer.environments` from owned `MergeMap` to `Arc<MergeMap>` across fabro-config. Environment writes are admin-only on small catalogs; deferred.\n- **`Environment::from_settings` extra resolve round-trip** (Medium efficiency): The added `resolve_environment(&persisted)` call is intentional — it's the validation step that powers the new `create_invalid_settings_is_rejected` test. Correct as-is.\n- **List pagination** (Medium efficiency): Out of scope; would require an OpenAPI spec change.\n- **`EnvironmentListResponse`/`EnvironmentListMeta` generalization** (Medium reuse): Same pattern as `AutomationListResponse`; cross-cutting refactor worth doing later.\n- **OpenAPI YAML repeats every 4xx/5xx response body** (Low quality): Pre-existing pattern across automations and other paths; systemic, not introduced by this PR.",
+              "last_stage": "simplify_opus",
+              "last_response": "## Summary\n\nReviewed the Environment REST CRUD API diff (2,574 lines) with three parallel agents covering code reuse, code quality, and efficiency.\n\n### Fixed\n\n**Collapsed API DTO duplication in `lib/"
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 116453,
+                    "output_tokens": 32987,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 5421839,
+                    "cache_write_tokens": 458669
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 458669,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 6984540
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-server/src/server/handler/environments.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 466515,
+              "tool_time_ms": 402062,
+              "active_time_ms": 868577
+            }
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 1407,
+              "active_time_ms": 1407
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Reviewed the branch diff and applied one cleanup:\n\n- Deduplicated shared `If-Match` parsing, ETag quoting, and JSON-with-ETag response construction between Automations and Environments.\n- Added shared",
+              "response.simplify_gpt": "Reviewed the branch diff and applied one cleanup:\n\n- Deduplicated shared `If-Match` parsing, ETag quoting, and JSON-with-ETag response construction between Automations and Environments.\n- Added shared helpers in `lib/crates/fabro-server/src/server/handler/mod.rs`.\n- Updated:\n  - `lib/crates/fabro-server/src/server/handler/automations.rs`\n  - `lib/crates/fabro-server/src/server/handler/environments.rs`\n\nValidation run:\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo check -q -p fabro-server -p fabro-api`\n- `cargo nextest run -p fabro-server --features test-support --test it api::environments`\n- `cargo +nightly-2026-04-14 clippy -q -p fabro-server --features test-support --test it -- -D warnings`\n\nAll passed.",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 564240,
+                    "output_tokens": 5406,
+                    "reasoning_tokens": 1417,
+                    "cache_read_tokens": 1221632,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 3636706
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 216190,
+              "tool_time_ms": 62347,
+              "active_time_ms": 278537
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_stage": "implement",
+              "response.implement": "Implemented Environment REST CRUD API end-to-end.\n\nSummary:\n- Added OpenAPI `Environments` tag, `/api/v1/environments` CRUD paths, `EnvironmentId` parameter, list envelope, and REST-safe inline-only Dockerfile schemas.\n- Added server handler module: `lib/crates/fabro-server/src/server/handler/environments.rs`.\n- Mounted real API routes only; no demo routes added.\n- Added API DTO boundary that rejects REST Dockerfile `path` sources with `422` before calling `EnvironmentStore`.\n- Added ETag / `If-Match` behavior matching Automations.\n- Added `EnvironmentStoreError` → `ApiError` mapping with stale/duplicate/protected as `409`.\n- Refreshes cached manifest run settings after create/replace/delete so `/system/info` reflects catalog mutations.\n- Tightened `fabro-environment` create/replace behavior to validate dense settings before persistence.\n- Regenerated Rust API types and TypeScript Axios client; TS now exposes `EnvironmentsApi`.\n- Added server integration tests, OpenAPI/SDK conformance test, and Rust API JSON/type-boundary tests.\n\nValidation run:\n- Red TDD check: new environment API tests initially failed with `404` before routes existed.\n- `cargo nextest run -p fabro-server --features test-support --test it api::environments`\n- `cargo nextest run -p fabro-server --features test-support --test it openapi_conformance`\n- `cargo test -p fabro-api --test environment_round_trip`\n- `cargo nextest run -p fabro-environment`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n\nNote: I installed `openjdk-21-jre-headless` in the container because `openapi-generator-cli` requires `java` for TypeScript client generation.",
+              "last_response": "Implemented Environment REST CRUD API end-to-end.\n\nSummary:\n- Added OpenAPI `Environments` tag, `/api/v1/environments` CRUD paths, `EnvironmentId` parameter, list envelope, and REST-safe inline-only D"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 2226903,
+                    "output_tokens": 23362,
+                    "reasoning_tokens": 14691,
+                    "cache_read_tokens": 15023104,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 19787657
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 1030880,
+              "tool_time_ms": 509884,
+              "active_time_ms": 1540764
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 129969,
+              "active_time_ms": 129969
+            }
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 145385,
+              "active_time_ms": 145385
+            }
+          }
+        },
+        "next_node_id": "verify",
+        "git_commit_sha": "8ffb2715743041548a74b43990951ee17dfd4649",
+        "node_visits": {
+          "start": 1,
+          "toolchain": 1,
+          "implement": 1,
+          "preflight_compile": 1,
+          "simplify_gpt": 1,
+          "preflight_lint": 1,
+          "simplify_opus": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/lib/crates/fabro-server/src/server/handler/automations.rs b/lib/crates/fabro-server/src/server/handler/automations.rs\nindex c29920d1d..51e09a980 100644\n--- a/lib/crates/fabro-server/src/server/handler/automations.rs\n+++ b/lib/crates/fabro-server/src/server/handler/automations.rs\n@@ -1,11 +1,10 @@\n use std::sync::Arc;\n \n-use axum::http::{HeaderMap, HeaderValue, header};\n+use axum::http::HeaderMap;\n use axum_extra::extract::Query as ExtraQuery;\n use chrono::Utc;\n use fabro_automation::{\n-    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationRevision,\n-    AutomationStoreError,\n+    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationStoreError,\n };\n use fabro_config::Storage;\n use fabro_types::{AutomationRef, RunId};\n@@ -15,7 +14,7 @@ use super::super::{\n     ApiError, AppState, IntoResponse, Json, PaginationParams, Path, RequiredUser, Response, Router,\n     State, StatusCode, get, paginate_items,\n };\n-use super::{lifecycle, runs};\n+use super::{json_with_etag_response, lifecycle, parse_required_if_match, runs};\n use crate::automation_materializer::AutomationRunMaterializeInput;\n use crate::principal_middleware::RequiredRunToolActor;\n \n@@ -227,7 +226,7 @@ async fn replace_automation(\n     Json(replacement): Json<AutomationReplace>,\n ) -> Result<Response, ApiError> {\n     let id = parse_path_id(id)?;\n-    let expected = parse_required_if_match(&headers, &id)?;\n+    let expected = parse_required_if_match(&headers, \"automation\", &id)?;\n     let automation = state\n         .automation_store()\n         .replace(&id, &expected, replacement)\n@@ -242,7 +241,7 @@ async fn delete_automation(\n     Path(id): Path<String>,\n ) -> Result<Response, ApiError> {\n     let id = parse_path_id(id)?;\n-    let expected = parse_required_if_match(&headers, &id)?;\n+    let expected = parse_required_if_match(&headers, \"automation\", &id)?;\n     state.automation_store().delete(&id, &expected).await?;\n     Ok(StatusCode::NO_CONTENT.into_response())\n }\n@@ -252,38 +251,9 @@ fn parse_path_id(id: String) -> Result<AutomationId, ApiError> {\n         .map_err(|err| ApiError::bad_request(format!(\"invalid automation id: {err}\")))\n }\n \n-fn parse_required_if_match(\n-    headers: &HeaderMap,\n-    id: &AutomationId,\n-) -> Result<AutomationRevision, ApiError> {\n-    let Some(value) = headers.get(header::IF_MATCH) else {\n-        return Err(ApiError::new(\n-            StatusCode::PRECONDITION_REQUIRED,\n-            format!(\"If-Match header is required for automation: {id}\"),\n-        ));\n-    };\n-    let value = value\n-        .to_str()\n-        .map_err(|_| ApiError::bad_request(\"If-Match header must be visible ASCII\"))?;\n-    let value = unquote_etag(value.trim());\n-    value.parse::<AutomationRevision>().map_err(|err| {\n-        ApiError::bad_request(format!(\"invalid If-Match automation revision: {err}\"))\n-    })\n-}\n-\n-fn unquote_etag(value: &str) -> &str {\n-    value\n-        .strip_prefix('\"')\n-        .and_then(|unquoted| unquoted.strip_suffix('\"'))\n-        .unwrap_or(value)\n-}\n-\n fn automation_with_etag_response(status: StatusCode, automation: Automation) -> Response {\n-    let etag = HeaderValue::from_str(&format!(\"\\\"{}\\\"\", automation.revision))\n-        .expect(\"automation revisions are valid ETag header values\");\n-    let mut response = (status, Json(automation)).into_response();\n-    response.headers_mut().insert(header::ETAG, etag);\n-    response\n+    let revision = automation.revision.clone();\n+    json_with_etag_response(status, \"automation\", &revision, automation)\n }\n \n impl From<AutomationStoreError> for ApiError {\ndiff --git a/lib/crates/fabro-server/src/server/handler/environments.rs b/lib/crates/fabro-server/src/server/handler/environments.rs\nindex d0bf0bf55..686bd089f 100644\n--- a/lib/crates/fabro-server/src/server/handler/environments.rs\n+++ b/lib/crates/fabro-server/src/server/handler/environments.rs\n@@ -1,10 +1,8 @@\n use std::collections::HashMap;\n use std::sync::Arc;\n \n-use axum::http::{HeaderMap, HeaderValue, header};\n-use fabro_environment::{\n-    Environment, EnvironmentDraft, EnvironmentId, EnvironmentRevision, EnvironmentStoreError,\n-};\n+use axum::http::HeaderMap;\n+use fabro_environment::{Environment, EnvironmentDraft, EnvironmentId, EnvironmentStoreError};\n use fabro_types::settings::InterpString;\n use fabro_types::settings::run::{\n     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,\n@@ -18,6 +16,7 @@ use super::super::{\n     ApiError, AppState, IntoResponse, Json, Path, RequiredUser, Response, Router, State,\n     StatusCode, get,\n };\n+use super::{json_with_etag_response, parse_required_if_match};\n \n #[derive(Serialize)]\n struct EnvironmentListResponse {\n@@ -67,7 +66,9 @@ struct ApiEnvironmentImageSettings {\n #[derive(Deserialize)]\n #[serde(tag = \"type\", rename_all = \"snake_case\", deny_unknown_fields)]\n enum ApiDockerfileSource {\n-    Inline { value: String },\n+    Inline {\n+        value: String,\n+    },\n     // Recognized so the handler can return a 422 with bespoke guidance.\n     // The `path` payload is parsed and discarded — never read from disk.\n     Path {\n@@ -193,7 +194,7 @@ async fn replace_environment(\n     Json(request): Json<ReplaceEnvironmentRequest>,\n ) -> Result<Response, ApiError> {\n     let id = parse_path_id(id)?;\n-    let expected = parse_required_if_match(&headers, &id)?;\n+    let expected = parse_required_if_match(&headers, \"environment\", &id)?;\n     let environment = state\n         .environment_store()\n         .replace(&id, &expected, request.into_settings()?)\n@@ -209,7 +210,7 @@ async fn delete_environment(\n     Path(id): Path<String>,\n ) -> Result<Response, ApiError> {\n     let id = parse_path_id(id)?;\n-    let expected = parse_required_if_match(&headers, &id)?;\n+    let expected = parse_required_if_match(&headers, \"environment\", &id)?;\n     state.environment_store().delete(&id, &expected).await?;\n     state.refresh_manifest_run_settings_from_environment_catalog();\n     Ok(StatusCode::NO_CONTENT.into_response())\n@@ -220,38 +221,9 @@ fn parse_path_id(id: String) -> Result<EnvironmentId, ApiError> {\n         .map_err(|err| ApiError::bad_request(format!(\"invalid environment id: {err}\")))\n }\n \n-fn parse_required_if_match(\n-    headers: &HeaderMap,\n-    id: &EnvironmentId,\n-) -> Result<EnvironmentRevision, ApiError> {\n-    let Some(value) = headers.get(header::IF_MATCH) else {\n-        return Err(ApiError::new(\n-            StatusCode::PRECONDITION_REQUIRED,\n-            format!(\"If-Match header is required for environment: {id}\"),\n-        ));\n-    };\n-    let value = value\n-        .to_str()\n-        .map_err(|_| ApiError::bad_request(\"If-Match header must be visible ASCII\"))?;\n-    let value = unquote_etag(value.trim());\n-    value.parse::<EnvironmentRevision>().map_err(|err| {\n-        ApiError::bad_request(format!(\"invalid If-Match environment revision: {err}\"))\n-    })\n-}\n-\n-fn unquote_etag(value: &str) -> &str {\n-    value\n-        .strip_prefix('\"')\n-        .and_then(|unquoted| unquoted.strip_suffix('\"'))\n-        .unwrap_or(value)\n-}\n-\n fn environment_with_etag_response(status: StatusCode, environment: Environment) -> Response {\n-    let etag = HeaderValue::from_str(&format!(\"\\\"{}\\\"\", environment.revision))\n-        .expect(\"environment revisions are valid ETag header values\");\n-    let mut response = (status, Json(environment)).into_response();\n-    response.headers_mut().insert(header::ETAG, etag);\n-    response\n+    let revision = environment.revision.clone();\n+    json_with_etag_response(status, \"environment\", &revision, environment)\n }\n \n impl From<EnvironmentStoreError> for ApiError {\ndiff --git a/lib/crates/fabro-server/src/server/handler/mod.rs b/lib/crates/fabro-server/src/server/handler/mod.rs\nindex ff3c3648a..5b931f76f 100644\n--- a/lib/crates/fabro-server/src/server/handler/mod.rs\n+++ b/lib/crates/fabro-server/src/server/handler/mod.rs\n@@ -1,9 +1,11 @@\n use std::sync::Arc;\n \n use axum::Router;\n+use axum::http::{HeaderMap, HeaderValue, header};\n use axum::routing::{get, post};\n+use serde::Serialize;\n \n-use super::{ApiError, AppState, IntoResponse, Response, StatusCode, demo};\n+use super::{ApiError, AppState, IntoResponse, Json, Response, StatusCode, demo};\n \n mod artifacts;\n mod automations;\n@@ -32,6 +34,53 @@ async fn not_implemented() -> Response {\n     ApiError::new(StatusCode::NOT_IMPLEMENTED, \"Not implemented.\").into_response()\n }\n \n+fn parse_required_if_match<R>(\n+    headers: &HeaderMap,\n+    resource: &str,\n+    id: &impl std::fmt::Display,\n+) -> Result<R, ApiError>\n+where\n+    R: std::str::FromStr,\n+    R::Err: std::fmt::Display,\n+{\n+    let Some(value) = headers.get(header::IF_MATCH) else {\n+        return Err(ApiError::new(\n+            StatusCode::PRECONDITION_REQUIRED,\n+            format!(\"If-Match header is required for {resource}: {id}\"),\n+        ));\n+    };\n+    let value = value\n+        .to_str()\n+        .map_err(|_| ApiError::bad_request(\"If-Match header must be visible ASCII\"))?;\n+    let value = unquote_etag(value.trim());\n+    value.parse::<R>().map_err(|err| {\n+        ApiError::bad_request(format!(\"invalid If-Match {resource} revision: {err}\"))\n+    })\n+}\n+\n+fn unquote_etag(value: &str) -> &str {\n+    value\n+        .strip_prefix('\"')\n+        .and_then(|unquoted| unquoted.strip_suffix('\"'))\n+        .unwrap_or(value)\n+}\n+\n+fn json_with_etag_response<T>(\n+    status: StatusCode,\n+    resource: &str,\n+    revision: &impl std::fmt::Display,\n+    body: T,\n+) -> Response\n+where\n+    T: Serialize,\n+{\n+    let etag = HeaderValue::from_str(&format!(\"\\\"{revision}\\\"\"))\n+        .unwrap_or_else(|_| panic!(\"{resource} revisions are valid ETag header values\"));\n+    let mut response = (status, Json(body)).into_response();\n+    response.headers_mut().insert(header::ETAG, etag);\n+    response\n+}\n+\n pub(super) fn demo_routes() -> Router<Arc<AppState>> {\n     Router::new()\n         .route(\"/runs\", get(demo::list_runs).post(demo::create_run_stub))\n",
+        "summary": {
+          "files_changed": 26,
+          "additions": 2274,
+          "deletions": 40
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-05-29T18:58:31.190007Z",
+        "current_node": "verify",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt",
+          "verify"
+        ],
+        "node_retries": {},
+        "context_values": {
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "internal.thread_id": "simplify_gpt",
+          "command.output": "blob://sha256/9bdf2577ab76f5d8185ec5dd54430e6e6f900cb61ca1ba94066894cbe6ff9a60",
+          "thread.simplify_gpt.current_node": "verify",
           "graph.goal": "---\ntitle: \"feat: Add Environment REST CRUD API\"\ntype: feat\nstatus: active\ndate: 2026-05-28\n---\n\n# feat: Add Environment REST CRUD API\n\n## Summary\n\nAdd server-owned Environment CRUD under `/api/v1/environments`, modeled after\nAutomations and backed by the existing `EnvironmentStore`. The API manages only\nthe server-side environment catalog in `environments/*.toml`; client-side\nenvironment definitions in `workflow.toml`, `.fabro/project.toml`, or run inputs\ncontinue to work and are not managed by this API.\n\n## API Contract\n\n- Add OpenAPI paths:\n  - `GET /api/v1/environments`\n  - `POST /api/v1/environments`\n  - `GET /api/v1/environments/{id}`\n  - `PUT /api/v1/environments/{id}`\n  - `DELETE /api/v1/environments/{id}`\n- Mirror Automations semantics:\n  - List returns `{ data: Environment[], meta: { total } }`, sorted by id.\n  - Create body includes `id`; replace body omits `id`; path id is authoritative.\n  - `GET` and `PUT` return `ETag: \"<revision>\"`.\n  - `PUT` and `DELETE` require `If-Match`.\n  - Use existing Automation-style statuses: `400`, `404`, `409`, `422`, `428`, `500`.\n  - Stale revisions return `409` to match Automations.\n- Add API-specific Environment request/response schemas so REST `image.dockerfile`\n  accepts only inline content or `null`.\n  - Existing workflow/settings schemas keep supporting Dockerfile `path`.\n  - REST requests with Dockerfile `path` return `422` and must not read\n    server-local files.\n- Do not add `PATCH` in v1.\n\n## Implementation Changes\n\n- OpenAPI and generated clients:\n  - Update `docs/public/api-reference/fabro-api.yaml` with an `Environments` tag,\n    an `EnvironmentId` parameter, CRUD paths, list envelope, and inline-only API\n    image schema.\n  - Regenerate Rust API types and the TypeScript Axios client.\n  - Keep the existing `EnvironmentSettings` schema intact for workflow settings.\n- Server:\n  - Add `lib/crates/fabro-server/src/server/handler/environments.rs`, following\n    `automations.rs` for routes, auth, ETag parsing, and error mapping.\n  - Merge the routes into real API routes; do not add demo routes unless an\n    existing convention requires it.\n  - Convert API request DTOs into `EnvironmentDraft` / `EnvironmentSettings` only\n    after rejecting Dockerfile path sources.\n  - Map `EnvironmentStoreError` similarly to Automations: duplicate, protected,\n    and stale as `409`; missing as `404`; validation as `422`; internal\n    storage/parse/io as curated `500`.\n  - After successful create, replace, or delete, refresh cached manifest run\n    settings from the current `EnvironmentStore` catalog so `/system/info` and\n    default run settings reflect the updated catalog.\n- Domain and API types:\n  - Use a meaningful API DTO boundary rather than treating REST and TOML as\n    identical Dockerfile-source surfaces.\n  - Reuse `fabro-environment::Environment` for persisted domain behavior where\n    the wire shape matches; keep API-only request schemas distinct where\n    inline-only Dockerfile behavior differs.\n\n## Implementation Units\n\n- [ ] **Unit 1: Define the OpenAPI contract**\n  - Add the environment CRUD paths, schemas, and path parameter.\n  - Ensure the spec distinguishes REST-safe inline Dockerfile sources from the\n    existing workflow/settings Dockerfile source schema.\n  - Verification: OpenAPI route conformance can see the new paths and generated\n    clients expose an `EnvironmentsApi`.\n\n- [ ] **Unit 2: Add server environment handlers**\n  - Implement a new handler module mirroring the Automation CRUD handler shape.\n  - Enforce authentication, id parsing, ETag/If-Match behavior, and error mapping.\n  - Reject REST Dockerfile path sources before calling `EnvironmentStore`.\n  - Verification: server API tests prove CRUD behavior and failure responses.\n\n- [ ] **Unit 3: Refresh derived server state after mutations**\n  - Ensure successful environment create, replace, and delete refresh any cached\n    manifest run settings derived from `EnvironmentStore::catalog_layer()`.\n  - Preserve existing client-side environment precedence and behavior.\n  - Verification: a test proves newly created server environments affect the\n    resolved server default run environment where applicable.\n\n- [ ] **Unit 4: Regenerate clients and add contract tests**\n  - Regenerate `fabro-api` and `lib/packages/fabro-api-client`.\n  - Add Rust server integration tests and keep OpenAPI conformance passing.\n  - Verification: generated Rust and TypeScript surfaces compile and expose the\n    new environment operations.\n\n## Test Plan\n\n- Add server API tests in\n  `lib/crates/fabro-server/tests/it/api/environments.rs` and register the module.\n- Cover:\n  - List returns seeded environments and correct total.\n  - Create persists `environments/{id}.toml`, returns `201`, and is visible via\n    list/get.\n  - Get returns current `ETag` matching `revision`.\n  - Replace with valid `If-Match` updates the file, returns a new revision, and\n    updates the `ETag`.\n  - Replace/delete without `If-Match` return `428`.\n  - Stale replace/delete return `409`.\n  - Duplicate create returns `409`.\n  - Invalid id/header returns `400`.\n  - Domain validation failures return `422`.\n  - Dockerfile `path` over REST returns `422` and does not persist or expose file\n    contents.\n  - Delete removes a non-default environment; deleting `default` returns a\n    protected conflict.\n  - Unauthenticated environment routes return `401`.\n  - Creating an environment referenced by server default run settings refreshes\n    cached manifest run settings.\n\n## Assumptions\n\n- This API manages server-owned environments only; client-defined catalogs remain\n  file/request scoped.\n- Built-in seed behavior follows the current store: seeded environments are\n  listed, create conflicts with existing ids, and `default` is protected from\n  delete.\n- Create responses match Automations and do not need an `ETag`; clients can use\n  the returned `revision` or call `GET`.\n- Inline-only Dockerfile policy applies only to REST CRUD, not local TOML\n  configuration.\n\n## Sources\n\n- `docs/public/api-reference/fabro-api.yaml`\n- `lib/crates/fabro-server/src/server/handler/automations.rs`\n- `lib/crates/fabro-environment/src/store.rs`\n- `lib/crates/fabro-environment/src/model.rs`\n- `docs/public/execution/environments.mdx`\n",
           "failure_class": "",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
           "last_stage": "simplify_gpt",
+          "internal.retry_count.verify": 0,
           "internal.retry_count.toolchain": 0,
           "response.implement": "Implemented Environment REST CRUD API end-to-end.\n\nSummary:\n- Added OpenAPI `Environments` tag, `/api/v1/environments` CRUD paths, `EnvironmentId` parameter, list envelope, and REST-safe inline-only Dockerfile schemas.\n- Added server handler module: `lib/crates/fabro-server/src/server/handler/environments.rs`.\n- Mounted real API routes only; no demo routes added.\n- Added API DTO boundary that rejects REST Dockerfile `path` sources with `422` before calling `EnvironmentStore`.\n- Added ETag / `If-Match` behavior matching Automations.\n- Added `EnvironmentStoreError` → `ApiError` mapping with stale/duplicate/protected as `409`.\n- Refreshes cached manifest run settings after create/replace/delete so `/system/info` reflects catalog mutations.\n- Tightened `fabro-environment` create/replace behavior to validate dense settings before persistence.\n- Regenerated Rust API types and TypeScript Axios client; TS now exposes `EnvironmentsApi`.\n- Added server integration tests, OpenAPI/SDK conformance test, and Rust API JSON/type-boundary tests.\n\nValidation run:\n- Red TDD check: new environment API tests initially failed with `404` before routes existed.\n- `cargo nextest run -p fabro-server --features test-support --test it api::environments`\n- `cargo nextest run -p fabro-server --features test-support --test it openapi_conformance`\n- `cargo test -p fabro-api --test environment_round_trip`\n- `cargo nextest run -p fabro-environment`\n- `cargo check -q --workspace`\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings`\n- `cd lib/packages/fabro-api-client && bun run generate`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n\nNote: I installed `openjdk-21-jre-headless` in the container because `openapi-generator-cli` requires `java` for TypeScript client generation.",
           "internal.retry_count.implement": 0,
@@ -1154,7 +1387,7 @@
           "internal.retry_count.preflight_compile": 0,
           "internal.retry_count.start": 0,
           "thread.start.current_node": "toolchain",
-          "current_node": "simplify_gpt",
+          "current_node": "verify",
           "thread.implement.current_node": "simplify_opus",
           "internal.retry_count.simplify_opus": 0,
           "failure_signature": "",
@@ -1240,6 +1473,20 @@
               "inference_time_ms": 0,
               "tool_time_ms": 145385,
               "active_time_ms": 145385
+            }
+          },
+          "verify": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/9bdf2577ab76f5d8185ec5dd54430e6e6f900cb61ca1ba94066894cbe6ff9a60"
+            },
+            "notes": "Script completed: git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 554202,
+              "active_time_ms": 554202
             }
           },
           "implement": {
@@ -1329,14 +1576,15 @@
             }
           }
         },
-        "next_node_id": "verify",
+        "next_node_id": "exit",
         "node_visits": {
-          "simplify_gpt": 1,
           "simplify_opus": 1,
+          "verify": 1,
+          "simplify_gpt": 1,
+          "preflight_lint": 1,
           "start": 1,
           "toolchain": 1,
           "preflight_compile": 1,
-          "preflight_lint": 1,
           "implement": 1
         }
       },
@@ -1910,11 +2158,173 @@
       },
       "state": "succeeded"
     },
+    "preflight_lint@1": {
+      "first_event_seq": 41,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-29T18:04:00.685163Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 145385,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-29T18:01:35.287610Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 145396,
+        "inference_time_ms": 0,
+        "tool_time_ms": 145385,
+        "active_time_ms": 145385
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "verify@1": {
+      "first_event_seq": 1228,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "command": "exec 2>&1\ngit fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1",
+        "language": "shell"
+      },
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-29T18:49:16.961494Z",
+      "handler": "command",
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "running"
+    },
+    "start@1": {
+      "first_event_seq": 17,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": null,
+        "failure_reason": null,
+        "timestamp": "2026-05-29T17:59:14.730252Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-05-29T17:59:14.730071Z",
+      "handler": "start",
+      "timing": {
+        "wall_time_ms": 0,
+        "inference_time_ms": 0,
+        "tool_time_ms": 0,
+        "active_time_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
+    "preflight_compile@1": {
+      "first_event_seq": 31,
+      "prompt": null,
+      "response": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Script completed: cargo check -q --workspace 2>&1",
+        "failure_reason": null,
+        "timestamp": "2026-05-29T18:01:30.615373Z"
+      },
+      "provider_used": null,
+      "diff": null,
+      "script_invocation": {
+        "script": "cargo check -q --workspace 2>&1",
+        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
+        "language": "shell"
+      },
+      "script_timing": {
+        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+        "exit_code": 0,
+        "duration_ms": 129969,
+        "termination": "exited",
+        "output_bytes": 0,
+        "live_streaming": false
+      },
+      "parallel_results": null,
+      "output": null,
+      "output_bytes": 0,
+      "live_streaming": false,
+      "termination": "exited",
+      "started_at": "2026-05-29T17:59:20.637190Z",
+      "handler": "command",
+      "timing": {
+        "wall_time_ms": 129977,
+        "inference_time_ms": 0,
+        "tool_time_ms": 129969,
+        "active_time_ms": 129969
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0
+      },
+      "state": "succeeded"
+    },
     "simplify_gpt@1": {
       "first_event_seq": 976,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_gpt",
+        "failure_reason": null,
+        "timestamp": "2026-05-29T18:49:12.697915Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "openai",
@@ -1927,6 +2337,12 @@
       "output": null,
       "started_at": "2026-05-29T18:44:33.468029Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 279228,
+        "inference_time_ms": 216190,
+        "tool_time_ms": 62347,
+        "active_time_ms": 278537
+      },
       "usage": {
         "input_tokens": 564240,
         "output_tokens": 5406,
@@ -2170,54 +2586,6 @@
         ],
         "warnings": []
       },
-      "state": "running"
-    },
-    "preflight_lint@1": {
-      "first_event_seq": 41,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-29T18:04:00.685163Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "command": "exec 2>&1\ncargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 145385,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-29T18:01:35.287610Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 145396,
-        "inference_time_ms": 0,
-        "tool_time_ms": 145385,
-        "active_time_ms": 145385
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
       "state": "succeeded"
     },
     "toolchain@1": {
@@ -2257,88 +2625,6 @@
         "inference_time_ms": 0,
         "tool_time_ms": 1407,
         "active_time_ms": 1407
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "start@1": {
-      "first_event_seq": 17,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": null,
-        "failure_reason": null,
-        "timestamp": "2026-05-29T17:59:14.730252Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": null,
-      "script_timing": null,
-      "parallel_results": null,
-      "output": null,
-      "started_at": "2026-05-29T17:59:14.730071Z",
-      "handler": "start",
-      "timing": {
-        "wall_time_ms": 0,
-        "inference_time_ms": 0,
-        "tool_time_ms": 0,
-        "active_time_ms": 0
-      },
-      "usage": {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0
-      },
-      "state": "succeeded"
-    },
-    "preflight_compile@1": {
-      "first_event_seq": 31,
-      "prompt": null,
-      "response": null,
-      "completion": {
-        "outcome": "succeeded",
-        "notes": "Script completed: cargo check -q --workspace 2>&1",
-        "failure_reason": null,
-        "timestamp": "2026-05-29T18:01:30.615373Z"
-      },
-      "provider_used": null,
-      "diff": null,
-      "script_invocation": {
-        "script": "cargo check -q --workspace 2>&1",
-        "command": "exec 2>&1\ncargo check -q --workspace 2>&1",
-        "language": "shell"
-      },
-      "script_timing": {
-        "output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-        "exit_code": 0,
-        "duration_ms": 129969,
-        "termination": "exited",
-        "output_bytes": 0,
-        "live_streaming": false
-      },
-      "parallel_results": null,
-      "output": null,
-      "output_bytes": 0,
-      "live_streaming": false,
-      "termination": "exited",
-      "started_at": "2026-05-29T17:59:20.637190Z",
-      "handler": "command",
-      "timing": {
-        "wall_time_ms": 129977,
-        "inference_time_ms": 0,
-        "tool_time_ms": 129969,
-        "active_time_ms": 129969
       },
       "usage": {
         "input_tokens": 0,

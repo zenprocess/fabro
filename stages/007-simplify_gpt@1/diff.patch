@@ -1,0 +1,252 @@
+diff --git a/lib/crates/fabro-server/src/server/handler/automations.rs b/lib/crates/fabro-server/src/server/handler/automations.rs
+index c29920d1d..51e09a980 100644
+--- a/lib/crates/fabro-server/src/server/handler/automations.rs
++++ b/lib/crates/fabro-server/src/server/handler/automations.rs
+@@ -1,11 +1,10 @@
+ use std::sync::Arc;
+ 
+-use axum::http::{HeaderMap, HeaderValue, header};
++use axum::http::HeaderMap;
+ use axum_extra::extract::Query as ExtraQuery;
+ use chrono::Utc;
+ use fabro_automation::{
+-    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationRevision,
+-    AutomationStoreError,
++    Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationStoreError,
+ };
+ use fabro_config::Storage;
+ use fabro_types::{AutomationRef, RunId};
+@@ -15,7 +14,7 @@ use super::super::{
+     ApiError, AppState, IntoResponse, Json, PaginationParams, Path, RequiredUser, Response, Router,
+     State, StatusCode, get, paginate_items,
+ };
+-use super::{lifecycle, runs};
++use super::{json_with_etag_response, lifecycle, parse_required_if_match, runs};
+ use crate::automation_materializer::AutomationRunMaterializeInput;
+ use crate::principal_middleware::RequiredRunToolActor;
+ 
+@@ -227,7 +226,7 @@ async fn replace_automation(
+     Json(replacement): Json<AutomationReplace>,
+ ) -> Result<Response, ApiError> {
+     let id = parse_path_id(id)?;
+-    let expected = parse_required_if_match(&headers, &id)?;
++    let expected = parse_required_if_match(&headers, "automation", &id)?;
+     let automation = state
+         .automation_store()
+         .replace(&id, &expected, replacement)
+@@ -242,7 +241,7 @@ async fn delete_automation(
+     Path(id): Path<String>,
+ ) -> Result<Response, ApiError> {
+     let id = parse_path_id(id)?;
+-    let expected = parse_required_if_match(&headers, &id)?;
++    let expected = parse_required_if_match(&headers, "automation", &id)?;
+     state.automation_store().delete(&id, &expected).await?;
+     Ok(StatusCode::NO_CONTENT.into_response())
+ }
+@@ -252,38 +251,9 @@ fn parse_path_id(id: String) -> Result<AutomationId, ApiError> {
+         .map_err(|err| ApiError::bad_request(format!("invalid automation id: {err}")))
+ }
+ 
+-fn parse_required_if_match(
+-    headers: &HeaderMap,
+-    id: &AutomationId,
+-) -> Result<AutomationRevision, ApiError> {
+-    let Some(value) = headers.get(header::IF_MATCH) else {
+-        return Err(ApiError::new(
+-            StatusCode::PRECONDITION_REQUIRED,
+-            format!("If-Match header is required for automation: {id}"),
+-        ));
+-    };
+-    let value = value
+-        .to_str()
+-        .map_err(|_| ApiError::bad_request("If-Match header must be visible ASCII"))?;
+-    let value = unquote_etag(value.trim());
+-    value.parse::<AutomationRevision>().map_err(|err| {
+-        ApiError::bad_request(format!("invalid If-Match automation revision: {err}"))
+-    })
+-}
+-
+-fn unquote_etag(value: &str) -> &str {
+-    value
+-        .strip_prefix('"')
+-        .and_then(|unquoted| unquoted.strip_suffix('"'))
+-        .unwrap_or(value)
+-}
+-
+ fn automation_with_etag_response(status: StatusCode, automation: Automation) -> Response {
+-    let etag = HeaderValue::from_str(&format!("\"{}\"", automation.revision))
+-        .expect("automation revisions are valid ETag header values");
+-    let mut response = (status, Json(automation)).into_response();
+-    response.headers_mut().insert(header::ETAG, etag);
+-    response
++    let revision = automation.revision.clone();
++    json_with_etag_response(status, "automation", &revision, automation)
+ }
+ 
+ impl From<AutomationStoreError> for ApiError {
+diff --git a/lib/crates/fabro-server/src/server/handler/environments.rs b/lib/crates/fabro-server/src/server/handler/environments.rs
+index d0bf0bf55..686bd089f 100644
+--- a/lib/crates/fabro-server/src/server/handler/environments.rs
++++ b/lib/crates/fabro-server/src/server/handler/environments.rs
+@@ -1,10 +1,8 @@
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+-use axum::http::{HeaderMap, HeaderValue, header};
+-use fabro_environment::{
+-    Environment, EnvironmentDraft, EnvironmentId, EnvironmentRevision, EnvironmentStoreError,
+-};
++use axum::http::HeaderMap;
++use fabro_environment::{Environment, EnvironmentDraft, EnvironmentId, EnvironmentStoreError};
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::{
+     DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
+@@ -18,6 +16,7 @@ use super::super::{
+     ApiError, AppState, IntoResponse, Json, Path, RequiredUser, Response, Router, State,
+     StatusCode, get,
+ };
++use super::{json_with_etag_response, parse_required_if_match};
+ 
+ #[derive(Serialize)]
+ struct EnvironmentListResponse {
+@@ -67,7 +66,9 @@ struct ApiEnvironmentImageSettings {
+ #[derive(Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+ enum ApiDockerfileSource {
+-    Inline { value: String },
++    Inline {
++        value: String,
++    },
+     // Recognized so the handler can return a 422 with bespoke guidance.
+     // The `path` payload is parsed and discarded — never read from disk.
+     Path {
+@@ -193,7 +194,7 @@ async fn replace_environment(
+     Json(request): Json<ReplaceEnvironmentRequest>,
+ ) -> Result<Response, ApiError> {
+     let id = parse_path_id(id)?;
+-    let expected = parse_required_if_match(&headers, &id)?;
++    let expected = parse_required_if_match(&headers, "environment", &id)?;
+     let environment = state
+         .environment_store()
+         .replace(&id, &expected, request.into_settings()?)
+@@ -209,7 +210,7 @@ async fn delete_environment(
+     Path(id): Path<String>,
+ ) -> Result<Response, ApiError> {
+     let id = parse_path_id(id)?;
+-    let expected = parse_required_if_match(&headers, &id)?;
++    let expected = parse_required_if_match(&headers, "environment", &id)?;
+     state.environment_store().delete(&id, &expected).await?;
+     state.refresh_manifest_run_settings_from_environment_catalog();
+     Ok(StatusCode::NO_CONTENT.into_response())
+@@ -220,38 +221,9 @@ fn parse_path_id(id: String) -> Result<EnvironmentId, ApiError> {
+         .map_err(|err| ApiError::bad_request(format!("invalid environment id: {err}")))
+ }
+ 
+-fn parse_required_if_match(
+-    headers: &HeaderMap,
+-    id: &EnvironmentId,
+-) -> Result<EnvironmentRevision, ApiError> {
+-    let Some(value) = headers.get(header::IF_MATCH) else {
+-        return Err(ApiError::new(
+-            StatusCode::PRECONDITION_REQUIRED,
+-            format!("If-Match header is required for environment: {id}"),
+-        ));
+-    };
+-    let value = value
+-        .to_str()
+-        .map_err(|_| ApiError::bad_request("If-Match header must be visible ASCII"))?;
+-    let value = unquote_etag(value.trim());
+-    value.parse::<EnvironmentRevision>().map_err(|err| {
+-        ApiError::bad_request(format!("invalid If-Match environment revision: {err}"))
+-    })
+-}
+-
+-fn unquote_etag(value: &str) -> &str {
+-    value
+-        .strip_prefix('"')
+-        .and_then(|unquoted| unquoted.strip_suffix('"'))
+-        .unwrap_or(value)
+-}
+-
+ fn environment_with_etag_response(status: StatusCode, environment: Environment) -> Response {
+-    let etag = HeaderValue::from_str(&format!("\"{}\"", environment.revision))
+-        .expect("environment revisions are valid ETag header values");
+-    let mut response = (status, Json(environment)).into_response();
+-    response.headers_mut().insert(header::ETAG, etag);
+-    response
++    let revision = environment.revision.clone();
++    json_with_etag_response(status, "environment", &revision, environment)
+ }
+ 
+ impl From<EnvironmentStoreError> for ApiError {
+diff --git a/lib/crates/fabro-server/src/server/handler/mod.rs b/lib/crates/fabro-server/src/server/handler/mod.rs
+index ff3c3648a..5b931f76f 100644
+--- a/lib/crates/fabro-server/src/server/handler/mod.rs
++++ b/lib/crates/fabro-server/src/server/handler/mod.rs
+@@ -1,9 +1,11 @@
+ use std::sync::Arc;
+ 
+ use axum::Router;
++use axum::http::{HeaderMap, HeaderValue, header};
+ use axum::routing::{get, post};
++use serde::Serialize;
+ 
+-use super::{ApiError, AppState, IntoResponse, Response, StatusCode, demo};
++use super::{ApiError, AppState, IntoResponse, Json, Response, StatusCode, demo};
+ 
+ mod artifacts;
+ mod automations;
+@@ -32,6 +34,53 @@ async fn not_implemented() -> Response {
+     ApiError::new(StatusCode::NOT_IMPLEMENTED, "Not implemented.").into_response()
+ }
+ 
++fn parse_required_if_match<R>(
++    headers: &HeaderMap,
++    resource: &str,
++    id: &impl std::fmt::Display,
++) -> Result<R, ApiError>
++where
++    R: std::str::FromStr,
++    R::Err: std::fmt::Display,
++{
++    let Some(value) = headers.get(header::IF_MATCH) else {
++        return Err(ApiError::new(
++            StatusCode::PRECONDITION_REQUIRED,
++            format!("If-Match header is required for {resource}: {id}"),
++        ));
++    };
++    let value = value
++        .to_str()
++        .map_err(|_| ApiError::bad_request("If-Match header must be visible ASCII"))?;
++    let value = unquote_etag(value.trim());
++    value.parse::<R>().map_err(|err| {
++        ApiError::bad_request(format!("invalid If-Match {resource} revision: {err}"))
++    })
++}
++
++fn unquote_etag(value: &str) -> &str {
++    value
++        .strip_prefix('"')
++        .and_then(|unquoted| unquoted.strip_suffix('"'))
++        .unwrap_or(value)
++}
++
++fn json_with_etag_response<T>(
++    status: StatusCode,
++    resource: &str,
++    revision: &impl std::fmt::Display,
++    body: T,
++) -> Response
++where
++    T: Serialize,
++{
++    let etag = HeaderValue::from_str(&format!("\"{revision}\""))
++        .unwrap_or_else(|_| panic!("{resource} revisions are valid ETag header values"));
++    let mut response = (status, Json(body)).into_response();
++    response.headers_mut().insert(header::ETAG, etag);
++    response
++}
++
+ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
+     Router::new()
+         .route("/runs", get(demo::list_runs).post(demo::create_run_stub))
