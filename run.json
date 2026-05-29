@@ -1,0 +1,386 @@
+{
+  "title": "Verify the sandbox can lint and test the project",
+  "spec": {
+    "run_id": "01KST6AQV9EKTCFT20RDZ8XEWQ",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "Verify the sandbox can lint and test the project"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "Smoke",
+      "nodes": {
+        "test_typescript": {
+          "id": "test_typescript",
+          "attrs": {
+            "goal_gate": {
+              "Boolean": true
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "cd apps/fabro-web && bun test 2>&1"
+            },
+            "label": {
+              "String": "Test TypeScript"
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Toolchain"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "rustc --version && cargo --version && bun --version 2>&1"
+            }
+          }
+        },
+        "compile_rust": {
+          "id": "compile_rust",
+          "attrs": {
+            "label": {
+              "String": "Compile Rust"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "label": {
+              "String": "Exit"
+            }
+          }
+        },
+        "lint_rust": {
+          "id": "lint_rust",
+          "attrs": {
+            "script": {
+              "String": "cargo +nightly-2026-04-14 fmt --check --all 2>&1 && cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Lint Rust"
+            }
+          }
+        },
+        "test_rust": {
+          "id": "test_rust",
+          "attrs": {
+            "script": {
+              "String": "ulimit -n 4096 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1"
+            },
+            "label": {
+              "String": "Test Rust"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            }
+          }
+        },
+        "compile_typescript": {
+          "id": "compile_typescript",
+          "attrs": {
+            "shape": {
+              "String": "parallelogram"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Compile TypeScript"
+            },
+            "script": {
+              "String": "cd apps/fabro-web && bun install && bun run typecheck 2>&1"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "label": {
+              "String": "Start"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "compile_rust",
+          "attrs": {}
+        },
+        {
+          "from": "compile_rust",
+          "to": "compile_typescript",
+          "attrs": {}
+        },
+        {
+          "from": "compile_typescript",
+          "to": "lint_rust",
+          "attrs": {}
+        },
+        {
+          "from": "lint_rust",
+          "to": "test_rust",
+          "attrs": {}
+        },
+        {
+          "from": "test_rust",
+          "to": "test_typescript",
+          "attrs": {}
+        },
+        {
+          "from": "test_typescript",
+          "to": "exit",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "retry_target": {
+          "String": "exit"
+        },
+        "rankdir": {
+          "String": "LR"
+        },
+        "goal": {
+          "String": "Verify the sandbox can lint and test the project"
+        }
+      }
+    },
+    "graph_source": "digraph Smoke {\n    graph [goal=\"Verify the sandbox can lint and test the project\", retry_target=exit]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain          [label=\"Toolchain\", shape=parallelogram, script=\"rustc --version && cargo --version && bun --version 2>&1\", goal_gate=true]\n    compile_rust       [label=\"Compile Rust\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", goal_gate=true]\n    compile_typescript [label=\"Compile TypeScript\", shape=parallelogram, script=\"cd apps/fabro-web && bun install && bun run typecheck 2>&1\", goal_gate=true]\n    lint_rust          [label=\"Lint Rust\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 fmt --check --all 2>&1 && cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", goal_gate=true]\n    test_rust          [label=\"Test Rust\", shape=parallelogram, script=\"ulimit -n 4096 && cargo nextest run --cargo-quiet --workspace --status-level fail 2>&1\", goal_gate=true]\n    test_typescript    [label=\"Test TypeScript\", shape=parallelogram, script=\"cd apps/fabro-web && bun test 2>&1\", goal_gate=true]\n\n    start -> toolchain\n    toolchain -> compile_rust\n    compile_rust -> compile_typescript\n    compile_typescript -> lint_rust\n    lint_rust -> test_rust\n    test_rust -> test_typescript\n    test_typescript -> exit\n}\n",
+    "workflow_slug": "smoke",
+    "automation": {
+      "id": "adfsdfssdfa",
+      "name": "smoke",
+      "trigger_id": "manual"
+    },
+    "source_directory": "/Users/bhelmkamp/.fabro/storage/scratch/automations/automation-adfsdfssdfa-01KST6AQV9EKTCFT20RDZ8XEWQ-Qdz2wW/repo",
+    "provenance": {
+      "server": {
+        "version": "0.247.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "7fa2e8be353c4ec72cf6be3eb2c54ca25855f601e72340c2f383caaf9da19353",
+    "definition_blob": "aa85443de6bdc73c32a1390d5dc063ef2856cc4bc279abbdfa104830518a163e",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "7c73f7ac023f0d35054369b43f776d05496946a7",
+      "dirty": "clean",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KST6AQV9EKTCFT20RDZ8XEWQ",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-29T15:41:03.271198Z",
+  "last_event_at": "2026-05-29T15:41:17.812774Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "kind": "ready",
+    "plan": {
+      "provider": "daytona"
+    },
+    "instance": {
+      "provider": "daytona",
+      "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+      "runtime": {
+        "id": "fabro-01KST6AQV9EKTCFT20RDZ8XEWQ",
+        "working_directory": "/home/daytona/workspace/fabro",
+        "repo_cloned": true,
+        "clone_origin_url": "https://github.com/fabro-sh/fabro",
+        "clone_branch": "main",
+        "workspace_root": "/home/daytona/workspace",
+        "repos_root": "/home/daytona/repos",
+        "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+        "primary_repo_link": "/home/daytona/workspace/fabro"
+      }
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
