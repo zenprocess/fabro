@@ -1,0 +1,533 @@
+{
+  "title": "Create Automation From Run Prefill Implementation Plan",
+  "spec": {
+    "run_id": "01KSTG15CJNFARS9XGNYZTHZP6",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "# Create Automation From Run Prefill Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add a frontend-only flow that lets users start a new automation form from an existing run.\n\n**Architecture:** Reuse the existing `/automations/new` route with an optional `from_run` search parameter. The route derives initial form values from existing run and run-settings queries, then mounts a keyed form child so source data initializes local form state without direct React effects. The run actions menu links to the prefill route for ordinary runs and to the existing automation detail page for automation-created runs.\n\n**Tech Stack:** React 19, React Router, SWR, TypeScript, existing Fabro web API clients, Bun tests.\n\n---\n\n## Decisions\n\n- Add only frontend behavior. Do not change backend routes, OpenAPI, generated clients, or automation persistence.\n- Use `/automations/new?from_run=<run_id>` as the public UI interface.\n- Treat `from_run` as a draft initializer only. Submitting still calls the existing `automationsApi.createAutomation`.\n- If a run already has `run.automation.id`, show `View automation` instead of `Create automation from run`.\n- Do not infer schedules from runs. Prefilled automations use manual/API trigger enabled and schedule disabled.\n- Do not use direct `useEffect` in route/component code; follow `docs/internal/react-effects-policy.md`.\n\n## Files\n\n- Modify `apps/fabro-web/app/routes/run-detail.tsx` for the actions menu navigation.\n- Modify `apps/fabro-web/app/routes/run-detail.test.ts` for run-action coverage.\n- Modify `apps/fabro-web/app/routes/automations-new.tsx` for query-param parsing, data loading, and keyed form initialization.\n- Modify `apps/fabro-web/app/components/automation-form.tsx` for a pure prefill helper built on existing `AutomationFormValues`, `kebabify`, `snakeify`, and `EMPTY_AUTOMATION_FORM`.\n- Create `apps/fabro-web/app/routes/automations-new.test.tsx` for route-level prefill behavior.\n\n## Implementation Tasks\n\n### Task 1: Add A Pure Prefill Helper\n\n- [ ] In `apps/fabro-web/app/components/automation-form.tsx`, add an exported helper named `automationFormValuesFromRun(run, settings)`.\n- [ ] The helper should return a complete `AutomationFormValues` object:\n  - `name`: run title if present, otherwise workflow name, graph name, slug, or `\"New automation\"`.\n  - `id`: `kebabify(name)`.\n  - `description`: empty string.\n  - `enabled`: `true`.\n  - `repository`: prefer `settings.run.scm.owner` plus `settings.run.scm.repository`; otherwise use a GitHub-looking `run.repository.name`; otherwise parse GitHub `origin_url`; otherwise empty string.\n  - `ref`: prefer `sandboxRuntime(run.sandbox)?.clone_branch`; otherwise `\"main\"`.\n  - `workflow`: prefer `run.workflow.slug`; otherwise `snakeify(workflow name, graph name, or name)`.\n  - `manualEnabled`: `true`.\n  - `scheduleEnabled`: `false`.\n  - `cron`: preserve `EMPTY_AUTOMATION_FORM.cron`.\n- [ ] Keep repository parsing intentionally narrow: only produce `owner/repo` for GitHub-style values. Leave non-GitHub or unknown repositories blank so users can edit them.\n\n### Task 2: Wire `/automations/new?from_run=...`\n\n- [ ] In `apps/fabro-web/app/routes/automations-new.tsx`, import `useSearchParams`, `useRun`, and `useRunSettings`.\n- [ ] Split the route into a wrapper and a keyed form child:\n  - Wrapper reads `from_run`.\n  - Wrapper calls `useRun(fromRunId)` and `useRunSettings(fromRunId)` only when `from_run` is present.\n  - Wrapper derives initial values during render.\n  - Form child owns `useState(initialValues)` exactly as the current route does.\n- [ ] For the blank path, preserve current behavior and render immediately with `EMPTY_AUTOMATION_FORM`.\n- [ ] For `from_run`, render a small loading placeholder until the run query resolves.\n- [ ] If the source run cannot be loaded, render the normal empty form with a non-blocking `ErrorMessage` explaining that the source run could not be loaded and the automation can be filled manually.\n- [ ] On cancel, continue navigating to `/automations`.\n- [ ] On submit success, keep the current toast and navigation to `/automations`.\n\n### Task 3: Add Run Detail Actions\n\n- [ ] In `apps/fabro-web/app/routes/run-detail.tsx`, add an operations action after `Preview` and before interrupt/steering actions.\n- [ ] If `summary.automation?.id` is present:\n  - key: `view-automation`\n  - label: `View automation`\n  - onSelect: navigate to `/automations/${encodeURIComponent(summary.automation.id)}`\n- [ ] Otherwise:\n  - key: `create-automation`\n  - label: `Create automation from run`\n  - onSelect: navigate to `/automations/new?from_run=${encodeURIComponent(params.id)}`\n- [ ] Do not disable the action for terminal, active, archived, or demo runs. It is only navigation.\n\n### Task 4: Add Focused Tests\n\n- [ ] Add `apps/fabro-web/app/routes/automations-new.test.tsx`.\n- [ ] Mock `../lib/queries` so `useRun` and `useRunSettings` can return controlled data.\n- [ ] Test `/automations/new` still renders empty form values.\n- [ ] Test `/automations/new?from_run=run_1` pre-populates name, slug, repository, branch, workflow, manual trigger, and disabled schedule from mocked run/settings data.\n- [ ] Test missing source-run data renders the form with an error message and empty editable fields.\n- [ ] Extend `apps/fabro-web/app/routes/run-detail.test.ts`:\n  - Unlinked run shows `Create automation from run`; selecting it navigates to `/automations/new?from_run=run_1`.\n  - Linked run shows `View automation`; selecting it navigates to `/automations/<automation_id>`.\n\n## Verification\n\n- [ ] Run the focused tests:\n\n```bash\ncd apps/fabro-web && bun test app/routes/automations-new.test.tsx app/routes/run-detail.test.ts\n```\n\n- [ ] Run type checking:\n\n```bash\ncd apps/fabro-web && bun run typecheck\n```\n\n- [ ] If focused tests expose shared test setup issues, run the full web test suite before finishing:\n\n```bash\ncd apps/fabro-web && bun test\n```\n\n## Acceptance Criteria\n\n- From an ordinary run detail page, the actions menu includes `Create automation from run`.\n- Selecting it opens `/automations/new?from_run=<run_id>` with editable prefilled automation fields.\n- From a run that already has automation metadata, the actions menu includes `View automation` and does not offer a duplicate-create action.\n- Creating the automation still uses the existing create automation API and persists the same automation shape as manual creation.\n- No backend, OpenAPI, generated client, or scheduler files are changed.\n"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "anthropic",
+          "name": "claude-sonnet-4-6",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "ImplementPlan",
+      "nodes": {
+        "simplify_gpt": {
+          "id": "simplify_gpt",
+          "attrs": {
+            "provider": {
+              "String": "openai"
+            },
+            "label": {
+              "String": "Simplify (GPT-55)"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            }
+          }
+        },
+        "verify": {
+          "id": "verify",
+          "attrs": {
+            "retry_target": {
+              "String": "fixup"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "script": {
+              "String": "git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\"disabled\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1"
+            },
+            "label": {
+              "String": "Verify"
+            }
+          }
+        },
+        "implement": {
+          "id": "implement",
+          "attrs": {
+            "reasoning_effort": {
+              "String": "xhigh"
+            },
+            "label": {
+              "String": "Implement"
+            },
+            "model": {
+              "String": "gpt-5.5"
+            },
+            "prompt": {
+              "String": "Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD."
+            },
+            "provider": {
+              "String": "openai"
+            }
+          }
+        },
+        "fix_lints": {
+          "id": "fix_lints",
+          "attrs": {
+            "prompt": {
+              "String": "The preflight lint step failed. Read the build output from context and fix all clippy lint warnings."
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Fix Lints"
+            },
+            "max_visits": {
+              "Integer": 3
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "preflight_lint": {
+          "id": "preflight_lint",
+          "attrs": {
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "script": {
+              "String": "cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1"
+            },
+            "label": {
+              "String": "Preflight Lint"
+            }
+          }
+        },
+        "preflight_compile": {
+          "id": "preflight_compile",
+          "attrs": {
+            "label": {
+              "String": "Preflight Compile"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "script": {
+              "String": "cargo check -q --workspace 2>&1"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_retries": {
+              "Integer": 0
+            }
+          }
+        },
+        "toolchain": {
+          "id": "toolchain",
+          "attrs": {
+            "script": {
+              "String": "command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1"
+            },
+            "max_retries": {
+              "Integer": 0
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "shape": {
+              "String": "parallelogram"
+            },
+            "label": {
+              "String": "Toolchain"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "shape": {
+              "String": "Msquare"
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Exit"
+            }
+          }
+        },
+        "simplify_opus": {
+          "id": "simplify_opus",
+          "attrs": {
+            "prompt": {
+              "String": "# Simplify: Code Review and Cleanup\n\nReview changes vs. origin for reuse, quality, and efficiency. Fix any issues found.\n\n## Phase 1: Identify Changes\n\nRun git diff (or git diff HEAD if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.\n\n## Phase 2: Launch Three Review Agents in Parallel\n\nUse the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.\n\n### Agent 1: Code Reuse Review\n\nFor each change:\n\n1. Search for existing utilities and helpers that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.\n2. Flag any new function that duplicates existing functionality. Suggest the existing function to use instead.\n3. Flag any inline logic that could use an existing utility — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.\n\nNote: This is a greenfield app, so focus on maximizing simplicity and don't worry about changing things to achieve it.\n\n### Agent 2: Code Quality Review\n\nReview the same changes for hacky patterns:\n\n1. Redundant state: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls\n2. Parameter sprawl: adding new parameters to a function instead of generalizing or restructuring existing ones\n3. Copy-paste with slight variation: near-duplicate code blocks that should be unified with a shared abstraction\n4. Leaky abstractions: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries\n5. Stringly-typed code: using raw strings where constants, enums (string unions), or branded types already exist in the codebase\n\nNote: This is a greenfield app, so be aggressive in optimizing quality.\n\n### Agent 3: Efficiency Review\n\nReview the same changes for efficiency:\n\n1. Unnecessary work: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns\n2. Missed concurrency: independent operations run sequentially when they could run in parallel\n3. Hot-path bloat: new blocking work added to startup or per-request/per-render hot paths\n4. Unnecessary existence checks: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error\n5. Memory: unbounded data structures, missing cleanup, event listener leaks\n6. Overly broad operations: reading entire files when only a portion is needed, loading all items when filtering for one\n\n## Phase 3: Fix Issues\n\nWait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.\n\nWhen done, briefly summarize what was fixed (or confirm the code was already clean)."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "label": {
+              "String": "Simplify (Opus)"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "label": {
+              "String": "Start"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "provider": {
+              "String": "anthropic"
+            }
+          }
+        },
+        "fixup": {
+          "id": "fixup",
+          "attrs": {
+            "prompt": {
+              "String": "The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures."
+            },
+            "provider": {
+              "String": "anthropic"
+            },
+            "label": {
+              "String": "Fixup"
+            },
+            "model": {
+              "String": "claude-opus-4-7"
+            },
+            "max_visits": {
+              "Integer": 3
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "toolchain",
+          "attrs": {}
+        },
+        {
+          "from": "toolchain",
+          "to": "preflight_compile",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "toolchain",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_compile",
+          "to": "preflight_lint",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_compile",
+          "to": "exit",
+          "attrs": {}
+        },
+        {
+          "from": "preflight_lint",
+          "to": "implement",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "preflight_lint",
+          "to": "fix_lints",
+          "attrs": {}
+        },
+        {
+          "from": "fix_lints",
+          "to": "preflight_lint",
+          "attrs": {}
+        },
+        {
+          "from": "implement",
+          "to": "simplify_opus",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_opus",
+          "to": "simplify_gpt",
+          "attrs": {}
+        },
+        {
+          "from": "simplify_gpt",
+          "to": "verify",
+          "attrs": {}
+        },
+        {
+          "from": "verify",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify",
+          "to": "fixup",
+          "attrs": {}
+        },
+        {
+          "from": "fixup",
+          "to": "verify",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "rankdir": {
+          "String": "LR"
+        },
+        "model_stylesheet": {
+          "String": "\n            * { model: claude-opus-4-7; }\n        "
+        },
+        "goal": {
+          "String": "# Create Automation From Run Prefill Implementation Plan\n\n> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.\n\n**Goal:** Add a frontend-only flow that lets users start a new automation form from an existing run.\n\n**Architecture:** Reuse the existing `/automations/new` route with an optional `from_run` search parameter. The route derives initial form values from existing run and run-settings queries, then mounts a keyed form child so source data initializes local form state without direct React effects. The run actions menu links to the prefill route for ordinary runs and to the existing automation detail page for automation-created runs.\n\n**Tech Stack:** React 19, React Router, SWR, TypeScript, existing Fabro web API clients, Bun tests.\n\n---\n\n## Decisions\n\n- Add only frontend behavior. Do not change backend routes, OpenAPI, generated clients, or automation persistence.\n- Use `/automations/new?from_run=<run_id>` as the public UI interface.\n- Treat `from_run` as a draft initializer only. Submitting still calls the existing `automationsApi.createAutomation`.\n- If a run already has `run.automation.id`, show `View automation` instead of `Create automation from run`.\n- Do not infer schedules from runs. Prefilled automations use manual/API trigger enabled and schedule disabled.\n- Do not use direct `useEffect` in route/component code; follow `docs/internal/react-effects-policy.md`.\n\n## Files\n\n- Modify `apps/fabro-web/app/routes/run-detail.tsx` for the actions menu navigation.\n- Modify `apps/fabro-web/app/routes/run-detail.test.ts` for run-action coverage.\n- Modify `apps/fabro-web/app/routes/automations-new.tsx` for query-param parsing, data loading, and keyed form initialization.\n- Modify `apps/fabro-web/app/components/automation-form.tsx` for a pure prefill helper built on existing `AutomationFormValues`, `kebabify`, `snakeify`, and `EMPTY_AUTOMATION_FORM`.\n- Create `apps/fabro-web/app/routes/automations-new.test.tsx` for route-level prefill behavior.\n\n## Implementation Tasks\n\n### Task 1: Add A Pure Prefill Helper\n\n- [ ] In `apps/fabro-web/app/components/automation-form.tsx`, add an exported helper named `automationFormValuesFromRun(run, settings)`.\n- [ ] The helper should return a complete `AutomationFormValues` object:\n  - `name`: run title if present, otherwise workflow name, graph name, slug, or `\"New automation\"`.\n  - `id`: `kebabify(name)`.\n  - `description`: empty string.\n  - `enabled`: `true`.\n  - `repository`: prefer `settings.run.scm.owner` plus `settings.run.scm.repository`; otherwise use a GitHub-looking `run.repository.name`; otherwise parse GitHub `origin_url`; otherwise empty string.\n  - `ref`: prefer `sandboxRuntime(run.sandbox)?.clone_branch`; otherwise `\"main\"`.\n  - `workflow`: prefer `run.workflow.slug`; otherwise `snakeify(workflow name, graph name, or name)`.\n  - `manualEnabled`: `true`.\n  - `scheduleEnabled`: `false`.\n  - `cron`: preserve `EMPTY_AUTOMATION_FORM.cron`.\n- [ ] Keep repository parsing intentionally narrow: only produce `owner/repo` for GitHub-style values. Leave non-GitHub or unknown repositories blank so users can edit them.\n\n### Task 2: Wire `/automations/new?from_run=...`\n\n- [ ] In `apps/fabro-web/app/routes/automations-new.tsx`, import `useSearchParams`, `useRun`, and `useRunSettings`.\n- [ ] Split the route into a wrapper and a keyed form child:\n  - Wrapper reads `from_run`.\n  - Wrapper calls `useRun(fromRunId)` and `useRunSettings(fromRunId)` only when `from_run` is present.\n  - Wrapper derives initial values during render.\n  - Form child owns `useState(initialValues)` exactly as the current route does.\n- [ ] For the blank path, preserve current behavior and render immediately with `EMPTY_AUTOMATION_FORM`.\n- [ ] For `from_run`, render a small loading placeholder until the run query resolves.\n- [ ] If the source run cannot be loaded, render the normal empty form with a non-blocking `ErrorMessage` explaining that the source run could not be loaded and the automation can be filled manually.\n- [ ] On cancel, continue navigating to `/automations`.\n- [ ] On submit success, keep the current toast and navigation to `/automations`.\n\n### Task 3: Add Run Detail Actions\n\n- [ ] In `apps/fabro-web/app/routes/run-detail.tsx`, add an operations action after `Preview` and before interrupt/steering actions.\n- [ ] If `summary.automation?.id` is present:\n  - key: `view-automation`\n  - label: `View automation`\n  - onSelect: navigate to `/automations/${encodeURIComponent(summary.automation.id)}`\n- [ ] Otherwise:\n  - key: `create-automation`\n  - label: `Create automation from run`\n  - onSelect: navigate to `/automations/new?from_run=${encodeURIComponent(params.id)}`\n- [ ] Do not disable the action for terminal, active, archived, or demo runs. It is only navigation.\n\n### Task 4: Add Focused Tests\n\n- [ ] Add `apps/fabro-web/app/routes/automations-new.test.tsx`.\n- [ ] Mock `../lib/queries` so `useRun` and `useRunSettings` can return controlled data.\n- [ ] Test `/automations/new` still renders empty form values.\n- [ ] Test `/automations/new?from_run=run_1` pre-populates name, slug, repository, branch, workflow, manual trigger, and disabled schedule from mocked run/settings data.\n- [ ] Test missing source-run data renders the form with an error message and empty editable fields.\n- [ ] Extend `apps/fabro-web/app/routes/run-detail.test.ts`:\n  - Unlinked run shows `Create automation from run`; selecting it navigates to `/automations/new?from_run=run_1`.\n  - Linked run shows `View automation`; selecting it navigates to `/automations/<automation_id>`.\n\n## Verification\n\n- [ ] Run the focused tests:\n\n```bash\ncd apps/fabro-web && bun test app/routes/automations-new.test.tsx app/routes/run-detail.test.ts\n```\n\n- [ ] Run type checking:\n\n```bash\ncd apps/fabro-web && bun run typecheck\n```\n\n- [ ] If focused tests expose shared test setup issues, run the full web test suite before finishing:\n\n```bash\ncd apps/fabro-web && bun test\n```\n\n## Acceptance Criteria\n\n- From an ordinary run detail page, the actions menu includes `Create automation from run`.\n- Selecting it opens `/automations/new?from_run=<run_id>` with editable prefilled automation fields.\n- From a run that already has automation metadata, the actions menu includes `View automation` and does not offer a duplicate-create action.\n- Creating the automation still uses the existing create automation API and persists the same automation shape as manual creation.\n- No backend, OpenAPI, generated client, or scheduler files are changed.\n"
+        }
+      }
+    },
+    "graph_source": "digraph ImplementPlan {\n    graph [\n        goal=\"Implement and simplify\",\n        model_stylesheet=\"\n            * { model: claude-opus-4-7; }\n        \"\n    ]\n    rankdir=LR\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    toolchain         [label=\"Toolchain\", shape=parallelogram, script=\"command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1\", max_retries=0]\n    preflight_compile [label=\"Preflight Compile\", shape=parallelogram, script=\"cargo check -q --workspace 2>&1\", max_retries=0]\n    preflight_lint    [label=\"Preflight Lint\", shape=parallelogram, script=\"cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1\", max_retries=0]\n    fix_lints         [label=\"Fix Lints\", prompt=\"The preflight lint step failed. Read the build output from context and fix all clippy lint warnings.\", max_visits=3]\n    implement         [label=\"Implement\", prompt=\"Read the plan file referenced in the goal and implement every step. Make all the code changes described in the plan. Use red/green TDD.\", model=\"gpt-55\", reasoning_effort=\"xhigh\"]\n    simplify_opus     [label=\"Simplify (Opus)\", prompt=\"@prompts/simplify.md\"]\n    simplify_gpt      [label=\"Simplify (GPT-55)\", prompt=\"@prompts/simplify.md\", model=\"gpt-55\"]\n    verify            [label=\"Verify\", shape=parallelogram, script=\"git fetch origin main 2>&1 && git merge --no-edit --no-stat origin/main 2>&1 && cargo +nightly-2026-04-14 fmt --all 2>&1 && cargo dev docs refresh 2>&1 && cargo +nightly-2026-04-14 fmt --check --all 2>&1 && { command -v rg >/dev/null 2>&1 || { echo 'rg is required for verify'; exit 127; }; } && ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\\bActorRef\\b|\\bActorKind\\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\\s*==\\s*\\\"disabled\\\"' lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml 2>&1 && cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings 2>&1 && cargo nextest run --workspace --status-level slow --profile ci 2>&1 && cargo dev docs check 2>&1 && bun install --frozen-lockfile 2>&1 && (cd apps/fabro-web && bun run typecheck) 2>&1 && (cd apps/fabro-web && bun run test) 2>&1 && (cd lib/packages/fabro-api-client && bun run typecheck) 2>&1 && cargo dev build -- -p fabro-cli --release 2>&1\", goal_gate=true, retry_target=\"fixup\"]\n    fixup             [label=\"Fixup\", prompt=\"The verify step failed. Read the build output from context and fix all format, clippy, Rust test, docs, TypeScript typecheck/test, and build failures.\", max_visits=3]\n\n    start -> toolchain\n    toolchain -> preflight_compile [condition=\"outcome=succeeded\"]\n    toolchain -> exit\n    preflight_compile -> preflight_lint [condition=\"outcome=succeeded\"]\n    preflight_compile -> exit\n    preflight_lint -> implement [condition=\"outcome=succeeded\"]\n    preflight_lint -> fix_lints\n    fix_lints -> preflight_lint\n    implement -> simplify_opus -> simplify_gpt -> verify\n    verify -> exit  [condition=\"outcome=succeeded\"]\n    verify -> fixup\n    fixup -> verify\n}\n",
+    "workflow_slug": "implement-plan",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.247.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.247.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.247.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "7302523c42fc531b5b4c44a9d4dd545e3707cc1e6695b809c061cf4f7d7d9a60",
+    "definition_blob": "303626c83b308220ef99468ae5d93ca4e254084c746b7c13fb24072fe5b0bfb2",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "0e224aa70598433ce2dccb0a669b8b4e497978dc",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KSTG15CJNFARS9XGNYZTHZP6",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-05-29T18:30:33.153947Z",
+  "last_event_at": "2026-05-29T18:30:48.338893Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "kind": "ready",
+    "plan": {
+      "provider": "daytona"
+    },
+    "instance": {
+      "provider": "daytona",
+      "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+      "runtime": {
+        "id": "fabro-01KSTG15CJNFARS9XGNYZTHZP6",
+        "working_directory": "/home/daytona/workspace/fabro",
+        "repo_cloned": true,
+        "clone_origin_url": "https://github.com/fabro-sh/fabro",
+        "clone_branch": "main",
+        "workspace_root": "/home/daytona/workspace",
+        "repos_root": "/home/daytona/repos",
+        "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+        "primary_repo_link": "/home/daytona/workspace/fabro"
+      }
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
