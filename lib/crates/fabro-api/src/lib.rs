@@ -27,11 +27,11 @@ pub mod types {
     pub use fabro_types::settings::server::{
         GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
         LogDestination, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,
-        ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
-        ServerListenSettings, ServerLoggingSettings, ServerSandboxProviderSettings,
-        ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
-        ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
-        WebhookStrategy,
+        ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerDockerWorkerSettings,
+        ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings,
+        ServerSandboxProviderSettings, ServerSandboxProvidersSettings, ServerSandboxSettings,
+        ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
+        ServerWorkerRuntime, ServerWorkerSettings, SlackIntegrationSettings, WebhookStrategy,
     };
     pub use fabro_types::status::{
         BlockedReason, FailureReason, PendingReason, RunControlAction, RunStatus, SuccessReason,
@@ -65,7 +65,8 @@ pub mod types {
         StageModelUsage, StageOutcome, StageProjection, StageState, SubAgentProjection,
         SubAgentStatus, SystemActorKind, SystemIntegrationStatus, SystemIntegrationsResponse,
         TodoListProjection, TurnId, UpdateVariableRequest, UserPrincipal, Variable,
-        VariableListResponse, WorkflowSettings,
+        VariableListResponse, WorkerBootstrapGithubIntegration, WorkerBootstrapResponse,
+        WorkerBootstrapSecret, WorkflowSettings,
     };
 
     pub use crate::generated::types::*;

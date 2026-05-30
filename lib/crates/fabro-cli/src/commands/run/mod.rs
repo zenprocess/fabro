@@ -87,6 +87,7 @@ pub(crate) async fn dispatch(
             run_dir,
             run_id,
             mode,
+            bootstrap,
         }) => {
             let worker_token = worker_token
                 .filter(|token| !token.trim().is_empty())
@@ -95,8 +96,16 @@ pub(crate) async fn dispatch(
                 })?;
             let run_span = tracing::info_span!("run", id = %run_id);
             Box::pin(
-                runner::execute(run_id, server, storage_dir, run_dir, mode, &worker_token)
-                    .instrument(run_span),
+                runner::execute(
+                    run_id,
+                    server,
+                    storage_dir,
+                    run_dir,
+                    mode,
+                    bootstrap,
+                    &worker_token,
+                )
+                .instrument(run_span),
             )
             .await
         }

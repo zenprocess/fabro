@@ -260,6 +260,36 @@ fn main() {
             &[],
         ),
         (
+            "ServerWorkerSettings",
+            "fabro_types::settings::server::ServerWorkerSettings",
+            &[],
+        ),
+        (
+            "ServerWorkerRuntime",
+            "fabro_types::settings::server::ServerWorkerRuntime",
+            &[],
+        ),
+        (
+            "ServerDockerWorkerSettings",
+            "fabro_types::settings::server::ServerDockerWorkerSettings",
+            &[],
+        ),
+        (
+            "WorkerBootstrapResponse",
+            "fabro_types::WorkerBootstrapResponse",
+            &[],
+        ),
+        (
+            "WorkerBootstrapSecret",
+            "fabro_types::WorkerBootstrapSecret",
+            &[],
+        ),
+        (
+            "WorkerBootstrapGithubIntegration",
+            "fabro_types::WorkerBootstrapGithubIntegration",
+            &[],
+        ),
+        (
             "ServerStorageSettings",
             "fabro_types::settings::server::ServerStorageSettings",
             &[],

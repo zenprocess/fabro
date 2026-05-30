@@ -8,7 +8,7 @@ use fabro_types::settings::run::{
 };
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreProvider, ServerAuthMethod,
-    WebhookStrategy,
+    ServerWorkerRuntime, WebhookStrategy,
 };
 use fabro_types::settings::{Duration, InterpString, Size};
 
@@ -89,6 +89,7 @@ impl_combine_or_option!(
     LogDestination,
     ObjectStoreProvider,
     ServerAuthMethod,
+    ServerWorkerRuntime,
     WebhookStrategy,
     LogFilter,
     AgentProfileKind,

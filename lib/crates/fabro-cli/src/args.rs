@@ -1028,6 +1028,13 @@ pub(crate) enum RunWorkerMode {
     Resume,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RunWorkerBootstrap {
+    #[default]
+    Local,
+    Api,
+}
+
 #[derive(Args)]
 pub(crate) struct RunWorkerArgs {
     /// Fabro server target: http(s) URL or absolute Unix socket path
@@ -1049,6 +1056,10 @@ pub(crate) struct RunWorkerArgs {
     /// Worker mode
     #[arg(long, value_enum)]
     pub(crate) mode: RunWorkerMode,
+
+    /// Worker bootstrap source
+    #[arg(long, default_value = "local", value_enum, hide = true)]
+    pub(crate) bootstrap: RunWorkerBootstrap,
 }
 
 #[derive(Args, Debug, Clone, Default)]

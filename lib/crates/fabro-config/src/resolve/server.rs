@@ -2,11 +2,11 @@ use fabro_types::settings::InterpString;
 use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
     ObjectStoreProvider, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,
-    ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
-    ServerListenSettings, ServerLoggingSettings, ServerNamespace, ServerSandboxProviderSettings,
-    ServerSandboxProvidersSettings, ServerSandboxSettings, ServerSchedulerSettings,
-    ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
-    WebhookStrategy,
+    ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerDockerWorkerSettings,
+    ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings, ServerNamespace,
+    ServerSandboxProviderSettings, ServerSandboxProvidersSettings, ServerSandboxSettings,
+    ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
+    ServerWorkerRuntime, ServerWorkerSettings, SlackIntegrationSettings, WebhookStrategy,
 };
 use fabro_util::Home;
 
@@ -16,7 +16,7 @@ use crate::{
     IntegrationWebhooksLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, ServerApiLayer,
     ServerArtifactsLayer, ServerAuthLayer, ServerIntegrationsLayer, ServerLayer, ServerListenLayer,
     ServerSandboxLayer, ServerSandboxProviderLayer, ServerSlateDbLayer, ServerStorageLayer,
-    ServerWebLayer,
+    ServerWebLayer, ServerWorkerLayer,
 };
 
 pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> ServerNamespace {
@@ -35,6 +35,7 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
         web,
         auth,
         sandbox: resolve_sandbox(layer.sandbox.as_ref()),
+        worker: resolve_worker(layer.worker.as_ref(), errors),
         storage: storage.clone(),
         artifacts: resolve_artifacts(layer.artifacts.as_ref(), &storage.root, errors),
         slatedb: resolve_slatedb(layer.slatedb.as_ref(), &storage.root, errors),
@@ -58,6 +59,59 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
                 .unwrap_or_default(),
         },
         integrations,
+    }
+}
+
+fn resolve_worker(
+    layer: Option<&ServerWorkerLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> ServerWorkerSettings {
+    let runtime = layer
+        .and_then(|worker| worker.runtime)
+        .unwrap_or(ServerWorkerRuntime::Local);
+    let docker = layer.and_then(|worker| worker.docker.as_ref());
+
+    if runtime == ServerWorkerRuntime::Docker {
+        require_non_empty_interp(
+            docker.and_then(|docker| docker.image.as_ref()),
+            "server.worker.docker.image",
+            errors,
+        );
+        require_non_empty_interp(
+            docker.and_then(|docker| docker.server_url.as_ref()),
+            "server.worker.docker.server_url",
+            errors,
+        );
+    }
+
+    ServerWorkerSettings {
+        runtime,
+        docker: ServerDockerWorkerSettings {
+            image:          docker.and_then(|docker| docker.image.clone()),
+            server_url:     docker.and_then(|docker| docker.server_url.clone()),
+            network:        docker.and_then(|docker| docker.network.clone()),
+            docker_socket:  docker.and_then(|docker| docker.docker_socket.clone()),
+            remove_on_exit: docker
+                .and_then(|docker| docker.remove_on_exit)
+                .unwrap_or(true),
+        },
+    }
+}
+
+fn require_non_empty_interp(
+    value: Option<&InterpString>,
+    path: &str,
+    errors: &mut Vec<ResolveError>,
+) {
+    match value {
+        Some(value) if !value.as_source().trim().is_empty() => {}
+        Some(_) => errors.push(ResolveError::Invalid {
+            path:   path.to_string(),
+            reason: "must not be empty".to_string(),
+        }),
+        None => errors.push(ResolveError::Missing {
+            path: path.to_string(),
+        }),
     }
 }
 

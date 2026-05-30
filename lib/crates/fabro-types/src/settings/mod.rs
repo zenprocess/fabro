@@ -47,9 +47,10 @@ pub use run::{
 pub use server::{
     GithubIntegrationSettings, IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings,
     ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod,
-    ServerAuthSettings, ServerIntegrationsSettings, ServerListenSettings, ServerLoggingSettings,
-    ServerNamespace, ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings,
-    ServerWebSettings, SlackIntegrationSettings,
+    ServerAuthSettings, ServerDockerWorkerSettings, ServerIntegrationsSettings,
+    ServerListenSettings, ServerLoggingSettings, ServerNamespace, ServerSchedulerSettings,
+    ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, ServerWorkerRuntime,
+    ServerWorkerSettings, SlackIntegrationSettings,
 };
 pub use size::{ParseSizeError, Size};
 pub use workflow::WorkflowNamespace;

@@ -1353,6 +1353,22 @@ impl Client {
         convert_type(response.into_inner())
     }
 
+    pub async fn get_run_worker_bootstrap(
+        &self,
+        run_id: &RunId,
+    ) -> Result<types::WorkerBootstrapResponse> {
+        let response = self
+            .send_api(|client| async move {
+                client
+                    .retrieve_run_worker_bootstrap()
+                    .id(run_id.to_string())
+                    .send()
+                    .await
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
     pub async fn get_run_logs(&self, run_id: &RunId) -> Result<Option<Vec<u8>>> {
         let response = self
             .current_state()

@@ -26,7 +26,7 @@ struct BuiltinCatalogToml;
 /// `fabro-config::LlmLayer`: `fabro-config` depends on `fabro-types`, and
 /// `fabro-types` depends on `fabro-model`, so the catalog cannot depend on
 /// `fabro-config` without creating a crate cycle.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmCatalogSettings {
     #[serde(default)]
@@ -35,7 +35,7 @@ pub struct LlmCatalogSettings {
     pub models:    HashMap<String, ModelCatalogSettings>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCatalogSettings {
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct ProviderCatalogSettings {
     pub aliases:        Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCatalogSettings {
     #[serde(default)]
@@ -101,7 +101,7 @@ pub struct ModelCatalogSettings {
     pub costs:                Option<SettingsModelCostTable>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsModelLimits {
     #[serde(default)]
@@ -110,7 +110,7 @@ pub struct SettingsModelLimits {
     pub max_output:     Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsModelFeatures {
     #[serde(default)]
@@ -125,7 +125,7 @@ pub struct SettingsModelFeatures {
     pub prompt_cache:     Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsModelControls {
     #[serde(default)]
@@ -134,7 +134,7 @@ pub struct SettingsModelControls {
     pub speed:            Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsModelCostTable {
     #[serde(flatten)]
@@ -143,7 +143,7 @@ pub struct SettingsModelCostTable {
     pub speed: Option<BTreeMap<String, CostRates>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostRates {
     #[serde(default)]

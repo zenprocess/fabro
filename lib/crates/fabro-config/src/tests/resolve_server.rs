@@ -6,7 +6,7 @@
 use fabro_types::settings::InterpString;
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreSettings, ServerAuthMethod,
-    ServerListenSettings, ServerNamespace,
+    ServerListenSettings, ServerNamespace, ServerWorkerRuntime,
 };
 use fabro_util::Home;
 use temp_env::with_var;
@@ -68,6 +68,8 @@ fn resolves_server_defaults_from_empty_settings() {
     assert_eq!(settings.web.url.as_source(), "http://localhost:3000");
     assert_eq!(settings.scheduler.max_concurrent_runs, 5);
     assert_eq!(settings.logging.destination, LogDestination::File);
+    assert_eq!(settings.worker.runtime, ServerWorkerRuntime::Local);
+    assert!(settings.worker.docker.remove_on_exit);
 
     match settings.listen {
         ServerListenSettings::Unix { path } => {
@@ -107,6 +109,112 @@ fn resolves_server_defaults_from_empty_settings() {
     }
 
     assert!(!settings.slatedb.disk_cache);
+}
+
+#[test]
+fn resolves_docker_worker_settings() {
+    let file = parse(
+        r#"
+_version = 1
+
+[server.worker]
+runtime = "docker"
+
+[server.worker.docker]
+image = "ghcr.io/fabro-sh/fabro-worker:test"
+server_url = "{{ env.FABRO_SERVER_URL }}"
+network = "fabro-net"
+docker_socket = "/var/run/docker.sock"
+remove_on_exit = false
+"#,
+    );
+
+    let settings = resolve_server(&file);
+
+    assert_eq!(settings.worker.runtime, ServerWorkerRuntime::Docker);
+    assert_eq!(
+        settings.worker.docker.image,
+        Some(InterpString::parse("ghcr.io/fabro-sh/fabro-worker:test"))
+    );
+    assert_eq!(
+        settings.worker.docker.server_url,
+        Some(InterpString::parse("{{ env.FABRO_SERVER_URL }}"))
+    );
+    assert_eq!(
+        settings.worker.docker.network,
+        Some(InterpString::parse("fabro-net"))
+    );
+    assert_eq!(
+        settings.worker.docker.docker_socket,
+        Some(InterpString::parse("/var/run/docker.sock"))
+    );
+    assert!(!settings.worker.docker.remove_on_exit);
+}
+
+#[test]
+fn rejects_docker_worker_runtime_without_image() {
+    let file = parse(
+        r#"
+_version = 1
+
+[server.worker]
+runtime = "docker"
+
+[server.worker.docker]
+server_url = "http://fabro-server:3000"
+"#,
+    );
+
+    let rendered = render_resolve_error_lines(
+        ServerSettingsBuilder::from_layer(&file)
+            .expect_err("docker worker runtime should require an image"),
+    );
+
+    assert!(rendered.contains("server.worker.docker.image"));
+}
+
+#[test]
+fn rejects_docker_worker_runtime_without_server_url() {
+    let file = parse(
+        r#"
+_version = 1
+
+[server.worker]
+runtime = "docker"
+
+[server.worker.docker]
+image = "ghcr.io/fabro-sh/fabro-worker:test"
+"#,
+    );
+
+    let rendered = render_resolve_error_lines(
+        ServerSettingsBuilder::from_layer(&file)
+            .expect_err("docker worker runtime should require a server URL"),
+    );
+
+    assert!(rendered.contains("server.worker.docker.server_url"));
+}
+
+#[test]
+fn parsing_rejects_unknown_server_worker_fields() {
+    let err = ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.worker]
+runtime = "local"
+command = "fabro worker"
+"#,
+    )
+    .expect_err("unknown worker field should be rejected");
+
+    assert!(
+        err.to_string().contains("unknown field `command`"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

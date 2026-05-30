@@ -22,8 +22,8 @@ use std::fmt::{self, Debug, Display};
 
 use anyhow::Result;
 use args::{
-    Cli, Commands, RunCommands, ServerCommand, ServerNamespace, global_args_cli_layer,
-    require_no_json_override,
+    Cli, Commands, RunCommands, RunWorkerBootstrap, ServerCommand, ServerNamespace,
+    global_args_cli_layer, require_no_json_override,
 };
 use clap::CommandFactory;
 use fabro_static::EnvVars;
@@ -496,7 +496,7 @@ async fn pre_tracing_bootstrap(command: &Commands) -> Result<PreTracingBootstrap
             .await
         }
         Commands::RunCmd(RunCommands::RunWorker(args)) => {
-            prepare_run_worker_bootstrap(args.storage_dir.as_deref(), &args.run_dir)
+            prepare_run_worker_bootstrap(args.bootstrap, args.storage_dir.as_deref(), &args.run_dir)
         }
         _ => Ok(PreTracingBootstrap::cli()),
     }
@@ -541,9 +541,21 @@ async fn prepare_server_bootstrap(
 }
 
 fn prepare_run_worker_bootstrap(
+    bootstrap: RunWorkerBootstrap,
     storage_dir: Option<&std::path::Path>,
     run_dir: &std::path::Path,
 ) -> Result<PreTracingBootstrap> {
+    if bootstrap == RunWorkerBootstrap::Api {
+        return Ok(PreTracingBootstrap {
+            sink: logging::InternalLogSink::Worker {
+                server_log:       logging::LogSink::Stdout,
+                per_run_log_path: run_dir.join("runtime").join("server.log"),
+            },
+            config_log_level: None,
+            foreground_server_log_bootstrap: None,
+        });
+    }
+
     let local_config = local_server::LocalServerConfig::load_with_storage_dir(storage_dir)?;
     let runtime_directory = fabro_config::RuntimeDirectory::new(local_config.storage_dir());
     let log_destination = fabro_config::resolve_log_destination(
@@ -1124,7 +1136,41 @@ destination = "{destination}"
                 server_log:       logging::LogSink::Stdout,
                 per_run_log_path: run_dir.path().join("runtime").join("server.log"),
             });
+            assert!(bootstrap.config_log_level.is_none());
+            assert!(bootstrap.foreground_server_log_bootstrap.is_none());
         });
+    }
+
+    #[test]
+    fn pre_tracing_bootstrap_api_worker_skips_local_storage_config() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "fabro",
+            "__run-worker",
+            "--server",
+            "http://127.0.0.1:32276",
+            "--run-dir",
+            run_dir.path().to_str().unwrap(),
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--mode",
+            "start",
+            "--bootstrap",
+            "api",
+        ])
+        .expect("should parse");
+        let command = cli.command.as_deref().unwrap();
+
+        let bootstrap = runtime()
+            .block_on(pre_tracing_bootstrap(command))
+            .expect("API bootstrap should not read local storage config");
+
+        assert_eq!(bootstrap.sink, logging::InternalLogSink::Worker {
+            server_log:       logging::LogSink::Stdout,
+            per_run_log_path: run_dir.path().join("runtime").join("server.log"),
+        });
+        assert!(bootstrap.config_log_level.is_none());
+        assert!(bootstrap.foreground_server_log_bootstrap.is_none());
     }
 
     #[test]
@@ -1529,6 +1575,7 @@ destination = "{destination}"
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Start));
+                assert!(matches!(args.bootstrap, args::RunWorkerBootstrap::Local));
             }
             _ => panic!("unexpected command variant"),
         }
@@ -1555,6 +1602,32 @@ destination = "{destination}"
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Resume));
+                assert!(matches!(args.bootstrap, args::RunWorkerBootstrap::Local));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_run_worker_with_api_bootstrap() {
+        let cli = Cli::try_parse_from([
+            "fabro",
+            "__run-worker",
+            "--server",
+            "http://127.0.0.1:3000",
+            "--run-dir",
+            "/tmp/run",
+            "--run-id",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--mode",
+            "start",
+            "--bootstrap",
+            "api",
+        ])
+        .expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::RunCmd(RunCommands::RunWorker(args)) => {
+                assert!(matches!(args.bootstrap, args::RunWorkerBootstrap::Api));
             }
             _ => panic!("unexpected command variant"),
         }

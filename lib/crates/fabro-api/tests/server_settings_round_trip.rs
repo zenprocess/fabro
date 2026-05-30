@@ -2,17 +2,20 @@ use std::any::{TypeId, type_name};
 
 use fabro_api::types::{
     LogDestination as ApiLogDestination, ObjectStoreSettings as ApiObjectStoreSettings,
+    ServerDockerWorkerSettings as ApiServerDockerWorkerSettings,
     ServerNamespace as ApiServerNamespace,
     ServerSandboxProviderSettings as ApiServerSandboxProviderSettings,
     ServerSandboxProvidersSettings as ApiServerSandboxProvidersSettings,
     ServerSandboxSettings as ApiServerSandboxSettings, ServerSettings as ApiServerSettings,
+    ServerWorkerRuntime as ApiServerWorkerRuntime, ServerWorkerSettings as ApiServerWorkerSettings,
 };
 use fabro_config::ServerSettingsBuilder;
 use fabro_types::ServerSettings;
 use fabro_types::settings::ServerNamespace;
 use fabro_types::settings::server::{
-    LogDestination, ObjectStoreSettings, ServerSandboxProviderSettings,
-    ServerSandboxProvidersSettings, ServerSandboxSettings,
+    LogDestination, ObjectStoreSettings, ServerDockerWorkerSettings, ServerSandboxProviderSettings,
+    ServerSandboxProvidersSettings, ServerSandboxSettings, ServerWorkerRuntime,
+    ServerWorkerSettings,
 };
 
 #[test]
@@ -24,6 +27,9 @@ fn server_settings_family_reuses_domain_types() {
     assert_same_type::<ApiServerSandboxSettings, ServerSandboxSettings>();
     assert_same_type::<ApiServerSandboxProvidersSettings, ServerSandboxProvidersSettings>();
     assert_same_type::<ApiServerSandboxProviderSettings, ServerSandboxProviderSettings>();
+    assert_same_type::<ApiServerWorkerSettings, ServerWorkerSettings>();
+    assert_same_type::<ApiServerWorkerRuntime, ServerWorkerRuntime>();
+    assert_same_type::<ApiServerDockerWorkerSettings, ServerDockerWorkerSettings>();
 }
 
 #[test]

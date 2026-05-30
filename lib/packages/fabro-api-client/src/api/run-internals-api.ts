@@ -46,6 +46,8 @@ import type { RunProjection } from '../models';
 // @ts-ignore
 import type { StageContextWindow } from '../models';
 // @ts-ignore
+import type { WorkerBootstrapResponse } from '../models';
+// @ts-ignore
 import type { WorkflowSettings } from '../models';
 // @ts-ignore
 import type { WriteBlobResponse } from '../models';
@@ -855,6 +857,46 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
             };
         },
         /**
+         *
+         * @summary Retrieve worker bootstrap payload
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        retrieveRunWorkerBootstrap: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('retrieveRunWorkerBootstrap', 'id', id)
+            const localVarPath = `/api/v1/runs/{id}/worker/bootstrap`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
          * Writes an opaque binary blob and returns its content-addressed blob identifier.
          * @summary Write Run Blob
          * @param {string} id Unique run identifier (ULID).
@@ -1154,6 +1196,19 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
+         *
+         * @summary Retrieve worker bootstrap payload
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async retrieveRunWorkerBootstrap(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<WorkerBootstrapResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.retrieveRunWorkerBootstrap(id, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.retrieveRunWorkerBootstrap']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
          * Writes an opaque binary blob and returns its content-addressed blob identifier.
          * @summary Write Run Blob
          * @param {string} id Unique run identifier (ULID).
@@ -1369,6 +1424,16 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
          */
         retrieveRunSettings(id: string, options?: RawAxiosRequestConfig): AxiosPromise<WorkflowSettings> {
             return localVarFp.retrieveRunSettings(id, options).then((request) => request(axios, basePath));
+        },
+        /**
+         *
+         * @summary Retrieve worker bootstrap payload
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        retrieveRunWorkerBootstrap(id: string, options?: RawAxiosRequestConfig): AxiosPromise<WorkerBootstrapResponse> {
+            return localVarFp.retrieveRunWorkerBootstrap(id, options).then((request) => request(axios, basePath));
         },
         /**
          * Writes an opaque binary blob and returns its content-addressed blob identifier.
@@ -1597,6 +1662,17 @@ export class RunInternalsApi extends BaseAPI {
      */
     public retrieveRunSettings(id: string, options?: RawAxiosRequestConfig) {
         return RunInternalsApiFp(this.configuration).retrieveRunSettings(id, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     *
+     * @summary Retrieve worker bootstrap payload
+     * @param {string} id Unique run identifier (ULID).
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public retrieveRunWorkerBootstrap(id: string, options?: RawAxiosRequestConfig) {
+        return RunInternalsApiFp(this.configuration).retrieveRunWorkerBootstrap(id, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

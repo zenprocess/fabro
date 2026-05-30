@@ -1,11 +1,19 @@
 use std::collections::{HashSet, VecDeque};
+use std::fs;
+#[expect(
+    clippy::disallowed_types,
+    reason = "Worker bootstrap writes small local files synchronously before workflow execution starts."
+)]
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use fabro_api::types::RunManifest;
+use fabro_api::types::{RunManifest, WorkerBootstrapResponse};
 use fabro_client::ServerTarget;
 use fabro_config::user::active_settings_path;
 use fabro_config::{ServerSettingsBuilder, Storage, load_llm_catalog_settings};
@@ -21,6 +29,7 @@ use fabro_store::{EventEnvelope, RunProjection, RunProjectionReducer};
 use fabro_tool::fabro_client::ClientBackend;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{RunMode, RunNamespace};
+use fabro_types::settings::server::GithubIntegrationStrategy;
 use fabro_types::{
     ArtifactUpload, EventBody, FailureReason, Principal, RunBlobId, RunEvent, RunId,
     WorkflowSettings,
@@ -51,9 +60,30 @@ use tokio_tungstenite::tungstenite::protocol::{self, Message as WebSocketMessage
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite};
 use tokio_util::sync::CancellationToken;
 
-use crate::args::RunWorkerMode;
+use crate::args::{RunWorkerBootstrap, RunWorkerMode};
 use crate::server_client;
-use crate::shared::github::build_github_credentials;
+use crate::shared::github::{GitHubCredentialLookup, build_github_credentials};
+
+const API_BOOTSTRAP_STORAGE_DIR: &str = "/tmp/fabro-worker/storage";
+const API_BOOTSTRAP_RUN_DIR: &str = "/tmp/fabro-worker/run";
+const API_BOOTSTRAP_CONFIG_PATH: &str = "/tmp/fabro-worker/settings.toml";
+
+#[derive(Debug, Clone)]
+struct WorkerBootstrapFiles {
+    storage_dir: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    run_dir:     PathBuf,
+}
+
+impl WorkerBootstrapFiles {
+    fn api() -> Self {
+        Self {
+            storage_dir: Some(PathBuf::from(API_BOOTSTRAP_STORAGE_DIR)),
+            config_path: Some(PathBuf::from(API_BOOTSTRAP_CONFIG_PATH)),
+            run_dir:     PathBuf::from(API_BOOTSTRAP_RUN_DIR),
+        }
+    }
+}
 
 const RUN_STORE_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(50),
@@ -80,6 +110,7 @@ pub(crate) async fn execute(
     storage_dir: Option<PathBuf>,
     run_dir: PathBuf,
     mode: RunWorkerMode,
+    bootstrap: RunWorkerBootstrap,
     worker_token: &str,
 ) -> Result<()> {
     let _ = fabro_proc::title_init();
@@ -93,8 +124,25 @@ pub(crate) async fn execute(
         .await
         .with_context(|| format!("failed to load run state for {run_id}"))?;
     let run_spec = &run_state.spec;
-    let llm_catalog_settings =
-        load_llm_catalog_settings(None).context("failed to load worker LLM catalog settings")?;
+    let bootstrap_files = match bootstrap {
+        RunWorkerBootstrap::Local => WorkerBootstrapFiles {
+            storage_dir,
+            config_path: None,
+            run_dir,
+        },
+        RunWorkerBootstrap::Api => {
+            let bootstrap_payload = client
+                .get_run_worker_bootstrap(&run_id)
+                .await
+                .context("failed to retrieve worker bootstrap payload")?;
+            let files = WorkerBootstrapFiles::api();
+            write_api_bootstrap_files(&bootstrap_payload, &files)
+                .context("failed to write worker bootstrap files")?;
+            files
+        }
+    };
+    let llm_catalog_settings = load_llm_catalog_settings(bootstrap_files.config_path.as_deref())
+        .context("failed to load worker LLM catalog settings")?;
     let catalog = Arc::new(
         Catalog::from_builtin_with_overrides(&llm_catalog_settings)
             .context("failed to build worker LLM catalog")?,
@@ -110,7 +158,11 @@ pub(crate) async fn execute(
             client.clone_for_reuse(),
             run_id,
             run_spec.source_directory.as_deref(),
-            &run_dir,
+            &bootstrap_files.run_dir,
+            bootstrap_files
+                .config_path
+                .clone()
+                .unwrap_or_else(|| active_settings_path(None)),
             Arc::clone(&catalog),
         )
     } else {
@@ -138,13 +190,22 @@ pub(crate) async fn execute(
     if let Some(control_manager) = &mut control_manager {
         control_manager.wait_for_first_connection().await?;
     }
-    let vault = load_worker_vault(storage_dir.as_deref())?;
+    let vault = load_worker_vault(bootstrap_files.storage_dir.as_deref())?;
     let github_app = {
         let vault_guard = match &vault {
             Some(arc) => Some(arc.read().await),
             None => None,
         };
-        maybe_build_github_credentials(&run_spec.settings, vault_guard.as_deref())?
+        let lookup = match bootstrap {
+            RunWorkerBootstrap::Local => GitHubCredentialLookup::Local,
+            RunWorkerBootstrap::Api => GitHubCredentialLookup::ApiBootstrapVault,
+        };
+        maybe_build_github_credentials(
+            &run_spec.settings,
+            vault_guard.as_deref(),
+            bootstrap_files.config_path.as_deref(),
+            lookup,
+        )?
     };
     let services = StartServices {
         run_id,
@@ -181,8 +242,8 @@ pub(crate) async fn execute(
 
     let execution = async {
         match mode {
-            RunWorkerMode::Start => operations::start(&run_dir, services).await,
-            RunWorkerMode::Resume => operations::resume(&run_dir, services).await,
+            RunWorkerMode::Start => operations::start(&bootstrap_files.run_dir, services).await,
+            RunWorkerMode::Resume => operations::resume(&bootstrap_files.run_dir, services).await,
         }
     };
 
@@ -238,6 +299,7 @@ fn build_fabro_run_tool_services(
     current_run_id: RunId,
     source_directory: Option<&str>,
     run_dir: &Path,
+    user_settings_path: PathBuf,
     catalog: Arc<Catalog>,
 ) -> Option<FabroRunToolServices> {
     if worker_token.trim().is_empty() {
@@ -249,7 +311,7 @@ fn build_fabro_run_tool_services(
         backend: Arc::new(backend),
         current_run_id,
         base_cwd: source_directory.map_or_else(|| run_dir.to_path_buf(), PathBuf::from),
-        user_settings_path: active_settings_path(None),
+        user_settings_path,
     })
 }
 
@@ -286,6 +348,107 @@ fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLoc
         )
     })?;
     Ok(Some(Arc::new(AsyncRwLock::new(vault))))
+}
+
+fn write_api_bootstrap_files(
+    payload: &WorkerBootstrapResponse,
+    files: &WorkerBootstrapFiles,
+) -> Result<()> {
+    let storage_dir = files
+        .storage_dir
+        .as_deref()
+        .context("API bootstrap storage directory missing")?;
+    let config_path = files
+        .config_path
+        .as_deref()
+        .context("API bootstrap config path missing")?;
+    let root_dir = config_path
+        .parent()
+        .context("API bootstrap config path has no parent directory")?;
+
+    create_private_dir(root_dir)?;
+    create_private_dir(storage_dir)?;
+    create_private_dir(&files.run_dir)?;
+    write_private_file(config_path, payload.config_toml.as_bytes())?;
+
+    let storage = Storage::new(storage_dir);
+    let secrets_path = storage.secrets_path();
+    match fs::remove_file(&secrets_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow!(err)).with_context(|| {
+                format!(
+                    "failed to remove stale worker bootstrap vault {}",
+                    secrets_path.display()
+                )
+            });
+        }
+    }
+    let mut vault = Vault::load(secrets_path).context("failed to create worker bootstrap vault")?;
+    for secret in &payload.secrets {
+        vault
+            .set(
+                &secret.name,
+                &secret.value,
+                secret.secret_type,
+                secret.description.as_deref(),
+            )
+            .with_context(|| format!("failed to write bootstrap secret {}", secret.name))?;
+    }
+
+    Ok(())
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    set_private_dir_permissions(path)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Worker bootstrap must set private file mode during small synchronous startup writes."
+)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    set_private_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 const WORKER_CONTROL_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -1111,38 +1274,115 @@ fn stamp_system_worker(mut event: RunEvent) -> RunEvent {
 fn maybe_build_github_credentials(
     settings: &WorkflowSettings,
     vault: Option<&fabro_vault::Vault>,
+    config_path: Option<&Path>,
+    lookup: GitHubCredentialLookup,
 ) -> Result<Option<fabro_github::GitHubCredentials>> {
     let resolved_run = &settings.run;
-    let resolved_server = ServerSettingsBuilder::load_default().ok();
-    let server_ns = resolved_server.as_ref().map(|s| &s.server);
-    let strategy = server_ns
-        .map(|server| server.integrations.github.strategy)
-        .unwrap_or_default();
-    let app_id = server_ns
-        .and_then(|server| server.integrations.github.app_id.as_ref())
-        .map(InterpString::as_source);
-    let app_slug = server_ns
-        .and_then(|server| server.integrations.github.slug.as_ref())
-        .map(InterpString::as_source);
+    let github_settings = match config_path {
+        Some(path) => github_credential_settings_from_bootstrap_config(path)?,
+        None => ServerSettingsBuilder::load_default()
+            .ok()
+            .map(|settings| GitHubCredentialSettings {
+                strategy: settings.server.integrations.github.strategy,
+                app_id:   settings
+                    .server
+                    .integrations
+                    .github
+                    .app_id
+                    .as_ref()
+                    .map(InterpString::as_source),
+                app_slug: settings
+                    .server
+                    .integrations
+                    .github
+                    .slug
+                    .as_ref()
+                    .map(InterpString::as_source),
+            })
+            .unwrap_or_default(),
+    };
 
     if requires_github_credentials(resolved_run) {
-        return build_github_credentials(strategy, app_id.as_deref(), app_slug.as_deref(), vault);
+        return build_github_credentials(
+            github_settings.strategy,
+            github_settings.app_id.as_deref(),
+            github_settings.app_slug.as_deref(),
+            vault,
+            lookup,
+        );
     }
 
     let pull_request_enabled =
         resolved_run.execution.mode != RunMode::DryRun && resolved_run.pull_request.is_some();
     if pull_request_enabled {
         return Ok(build_github_credentials(
-            strategy,
-            app_id.as_deref(),
-            app_slug.as_deref(),
+            github_settings.strategy,
+            github_settings.app_id.as_deref(),
+            github_settings.app_slug.as_deref(),
             vault,
+            lookup,
         )
         .ok()
         .flatten());
     }
 
     Ok(None)
+}
+
+#[derive(Default)]
+struct GitHubCredentialSettings {
+    strategy: GithubIntegrationStrategy,
+    app_id:   Option<String>,
+    app_slug: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerBootstrapSettingsFile {
+    server: Option<WorkerBootstrapServerSettings>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerBootstrapServerSettings {
+    integrations: Option<WorkerBootstrapIntegrationsSettings>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerBootstrapIntegrationsSettings {
+    github: Option<WorkerBootstrapGithubSettings>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkerBootstrapGithubSettings {
+    #[serde(default)]
+    strategy: GithubIntegrationStrategy,
+    app_id:   Option<InterpString>,
+    slug:     Option<InterpString>,
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Worker bootstrap reads one small generated settings file during startup."
+)]
+fn github_credential_settings_from_bootstrap_config(
+    path: &Path,
+) -> Result<GitHubCredentialSettings> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("failed to read worker settings from {}", path.display()))?;
+    let settings = toml::from_str::<WorkerBootstrapSettingsFile>(&source)
+        .with_context(|| format!("failed to parse worker settings from {}", path.display()))?;
+    let Some(github) = settings
+        .server
+        .and_then(|server| server.integrations)
+        .and_then(|integrations| integrations.github)
+    else {
+        return Ok(GitHubCredentialSettings::default());
+    };
+
+    Ok(GitHubCredentialSettings {
+        strategy: github.strategy,
+        app_id:   github.app_id.as_ref().map(InterpString::as_source),
+        app_slug: github.slug.as_ref().map(InterpString::as_source),
+    })
 }
 
 #[expect(
@@ -1214,18 +1454,25 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
+    use fabro_api::types::{
+        WorkerBootstrapGithubIntegration, WorkerBootstrapResponse, WorkerBootstrapSecret,
+    };
     use fabro_client::ServerTarget;
     use fabro_config::Storage;
     use fabro_interview::{
         AnswerValue, ControlInterviewer, Interviewer, Question, WorkerControlEnvelope,
     };
+    use fabro_static::EnvVars;
     use fabro_types::run_event::{
         InterviewCompletedProps, InterviewStartedProps, RunCompletedProps, RunControlEffectProps,
         RunFailedProps, RunStatusTransitionProps,
     };
+    use fabro_types::settings::InterpString;
+    use fabro_types::settings::server::GithubIntegrationStrategy;
     use fabro_types::{
         AuthMethod, EventBody, FailureCategory, FailureDetail, FailureReason, IdpIdentity,
-        Principal, QuestionType, RunFailure, SuccessReason, fixtures,
+        Principal, QuestionType, RunFailure, SecretType as ApiSecretType, SuccessReason,
+        WorkflowSettings, fixtures,
     };
     use fabro_vault::{SecretType, Vault};
     use fabro_workflow::event::RunEventSink;
@@ -1235,14 +1482,15 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AppliedWorkerControlDeliveryIds, WorkerControlConnectError, WorkerControlSocket,
-        WorkerTitlePhase, apply_worker_control_delivery_frame, apply_worker_control_message,
-        build_worker_control_stream_request, connect_worker_control_stream,
-        handle_worker_control_socket, initial_worker_title_phase, load_worker_vault,
-        next_worker_control_reconnect_backoff, stamp_system_worker, worker_title,
-        worker_title_phase_for_event,
+        AppliedWorkerControlDeliveryIds, WorkerBootstrapFiles, WorkerControlConnectError,
+        WorkerControlSocket, WorkerTitlePhase, apply_worker_control_delivery_frame,
+        apply_worker_control_message, build_worker_control_stream_request,
+        connect_worker_control_stream, handle_worker_control_socket, initial_worker_title_phase,
+        load_worker_vault, maybe_build_github_credentials, next_worker_control_reconnect_backoff,
+        stamp_system_worker, worker_title, worker_title_phase_for_event, write_api_bootstrap_files,
     };
     use crate::args::RunWorkerMode;
+    use crate::shared::github::GitHubCredentialLookup;
 
     fn test_steering_hub() -> Arc<fabro_workflow::SteeringHub> {
         let emitter = Arc::new(fabro_workflow::event::Emitter::new(fixtures::RUN_1));
@@ -1754,6 +2002,182 @@ mod tests {
         let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
 
         assert!(credential.contains("vault-key"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Test verifies the bootstrap file written by synchronous startup code."
+    )]
+    fn api_bootstrap_writes_config_and_private_vault_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = WorkerBootstrapFiles {
+            storage_dir: Some(temp.path().join("storage")),
+            config_path: Some(temp.path().join("settings.toml")),
+            run_dir:     temp.path().join("run"),
+        };
+        let payload = WorkerBootstrapResponse {
+            config_toml: "_version = 1\n".to_string(),
+            secrets:     vec![WorkerBootstrapSecret {
+                name:        EnvVars::OPENAI_API_KEY.to_string(),
+                value:       "sk-test".to_string(),
+                secret_type: ApiSecretType::Token,
+                description: Some("OpenAI".to_string()),
+            }],
+            github:      WorkerBootstrapGithubIntegration {
+                enabled:  false,
+                strategy: GithubIntegrationStrategy::Token,
+                app_id:   None,
+                slug:     None,
+            },
+        };
+
+        write_api_bootstrap_files(&payload, &files).unwrap();
+
+        let config_path = files.config_path.as_ref().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(config_path).unwrap(),
+            "_version = 1\n"
+        );
+        let storage_dir = files.storage_dir.as_ref().unwrap();
+        let vault = Vault::load(Storage::new(storage_dir).secrets_path()).unwrap();
+        let entry = vault.get_entry(EnvVars::OPENAI_API_KEY).unwrap();
+        assert_eq!(entry.value, "sk-test");
+        assert_eq!(entry.secret_type, SecretType::Token);
+        assert_eq!(entry.description.as_deref(), Some("OpenAI"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fn mode(path: &std::path::Path) -> u32 {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            }
+
+            assert_eq!(mode(temp.path()), 0o700);
+            assert_eq!(mode(storage_dir), 0o700);
+            assert_eq!(mode(&files.run_dir), 0o700);
+            assert_eq!(mode(config_path), 0o600);
+            assert_eq!(mode(&Storage::new(storage_dir).secrets_path()), 0o600);
+        }
+    }
+
+    fn workflow_settings_requesting_github_credentials() -> WorkflowSettings {
+        let mut settings = WorkflowSettings::default();
+        settings
+            .run
+            .integrations
+            .github
+            .permissions
+            .insert("contents".to_string(), InterpString::parse("read"));
+        settings
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Test helper writes a tiny bootstrap settings fixture."
+    )]
+    fn write_worker_github_config(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"
+_version = 1
+
+[server.integrations.github]
+enabled = true
+strategy = "app"
+app_id = "12345"
+slug = "fabro-dev"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn api_bootstrap_github_app_credentials_load_from_worker_vault() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.toml");
+        write_worker_github_config(&config_path);
+        let vault_path = temp.path().join("secrets.json");
+        let mut vault = Vault::load(vault_path).unwrap();
+        vault
+            .set(
+                EnvVars::GITHUB_APP_PRIVATE_KEY,
+                "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----",
+                SecretType::File,
+                None,
+            )
+            .unwrap();
+        let settings = workflow_settings_requesting_github_credentials();
+
+        let credentials = maybe_build_github_credentials(
+            &settings,
+            Some(&vault),
+            Some(&config_path),
+            GitHubCredentialLookup::ApiBootstrapVault,
+        )
+        .unwrap()
+        .unwrap();
+
+        match credentials {
+            fabro_github::GitHubCredentials::App(app) => {
+                assert_eq!(app.app_id, "12345");
+                assert_eq!(app.slug.as_deref(), Some("fabro-dev"));
+                assert!(
+                    app.private_key_pem
+                        .starts_with("-----BEGIN PRIVATE KEY-----")
+                );
+            }
+            other => panic!("expected GitHub App credentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_bootstrap_github_app_credentials_fail_when_vault_secret_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.toml");
+        write_worker_github_config(&config_path);
+        let vault = Vault::load(temp.path().join("secrets.json")).unwrap();
+        let settings = workflow_settings_requesting_github_credentials();
+
+        let err = maybe_build_github_credentials(
+            &settings,
+            Some(&vault),
+            Some(&config_path),
+            GitHubCredentialLookup::ApiBootstrapVault,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("GITHUB_APP_PRIVATE_KEY"));
+        assert!(err.to_string().contains("worker bootstrap vault"));
+    }
+
+    #[test]
+    fn api_bootstrap_github_app_credentials_fail_for_invalid_pem() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("settings.toml");
+        write_worker_github_config(&config_path);
+        let vault_path = temp.path().join("secrets.json");
+        let mut vault = Vault::load(vault_path).unwrap();
+        vault
+            .set(
+                EnvVars::GITHUB_APP_PRIVATE_KEY,
+                "%%%not-base64%%%",
+                SecretType::File,
+                None,
+            )
+            .unwrap();
+        let settings = workflow_settings_requesting_github_credentials();
+
+        let err = maybe_build_github_credentials(
+            &settings,
+            Some(&vault),
+            Some(&config_path),
+            GitHubCredentialLookup::ApiBootstrapVault,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not valid PEM or base64"));
     }
 
     mod requires_github_credentials_truth_table {

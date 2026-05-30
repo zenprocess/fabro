@@ -46,6 +46,9 @@ import type { ServerStorageSettings } from './server-storage-settings';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { ServerWebSettings } from './server-web-settings';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ServerWorkerSettings } from './server-worker-settings';
 
 export interface ServerNamespace {
     'listen': ServerListenSettings;
@@ -53,6 +56,7 @@ export interface ServerNamespace {
     'web': ServerWebSettings;
     'auth': ServerAuthSettings;
     'sandbox': ServerSandboxSettings;
+    'worker': ServerWorkerSettings;
     'storage': ServerStorageSettings;
     'artifacts': ServerArtifactsSettings;
     'slatedb': ServerSlateDbSettings;

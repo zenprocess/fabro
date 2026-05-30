@@ -84,10 +84,11 @@ struct RunSession {
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
 
-struct ResolvedStartLlm {
-    model:          String,
-    provider_id:    ProviderId,
-    fallback_chain: Vec<FallbackTarget>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartLlmResolution {
+    pub model:          String,
+    pub provider_id:    ProviderId,
+    pub fallback_chain: Vec<FallbackTarget>,
 }
 
 pub struct StartServices {
@@ -481,7 +482,7 @@ impl RunSession {
     }
 }
 
-async fn configured_providers_for_start(
+pub async fn configured_providers_for_start(
     vault: Option<&Arc<AsyncRwLock<Vault>>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
@@ -560,11 +561,11 @@ fn resolve_docker_config(settings: &ResolvedRunSettings) -> DockerSandboxOptions
     docker_config_from_environment(&settings.environment, !settings.clone.enabled)
 }
 
-fn resolve_start_llm(
+pub fn resolve_start_llm(
     catalog: &Catalog,
     configured: &[ProviderId],
     settings: &ResolvedRunSettings,
-) -> Result<ResolvedStartLlm, Error> {
+) -> Result<StartLlmResolution, Error> {
     let model = settings.model.name.as_ref().map_or_else(
         || catalog.default_for_configured_ids(configured).id.clone(),
         InterpString::as_source,
@@ -589,7 +590,7 @@ fn resolve_start_llm(
     let provider_id = provider_context.provider_id;
     let fallback_chain = resolve_fallback_chain(catalog, &provider_id, &model, &settings.model);
 
-    Ok(ResolvedStartLlm {
+    Ok(StartLlmResolution {
         model,
         provider_id,
         fallback_chain,

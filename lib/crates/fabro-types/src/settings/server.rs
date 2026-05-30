@@ -28,6 +28,7 @@ pub struct ServerNamespace {
     pub web:          ServerWebSettings,
     pub auth:         ServerAuthSettings,
     pub sandbox:      ServerSandboxSettings,
+    pub worker:       ServerWorkerSettings,
     pub storage:      ServerStorageSettings,
     pub artifacts:    ServerArtifactsSettings,
     pub slatedb:      ServerSlateDbSettings,
@@ -49,6 +50,7 @@ impl ServerNamespace {
             web:          ServerWebSettings::default(),
             auth:         ServerAuthSettings::default(),
             sandbox:      ServerSandboxSettings::default(),
+            worker:       ServerWorkerSettings::default(),
             storage:      ServerStorageSettings::default(),
             artifacts:    ServerArtifactsSettings::default(),
             slatedb:      ServerSlateDbSettings::default(),
@@ -157,6 +159,50 @@ impl Default for ServerSandboxProviderSettings {
     // aligned with that so callers that bypass the resolver behave identically.
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerWorkerSettings {
+    pub runtime: ServerWorkerRuntime,
+    pub docker:  ServerDockerWorkerSettings,
+}
+
+impl Default for ServerWorkerSettings {
+    fn default() -> Self {
+        Self {
+            runtime: ServerWorkerRuntime::Local,
+            docker:  ServerDockerWorkerSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerWorkerRuntime {
+    #[default]
+    Local,
+    Docker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerDockerWorkerSettings {
+    pub image:          Option<InterpString>,
+    pub server_url:     Option<InterpString>,
+    pub network:        Option<InterpString>,
+    pub docker_socket:  Option<InterpString>,
+    pub remove_on_exit: bool,
+}
+
+impl Default for ServerDockerWorkerSettings {
+    fn default() -> Self {
+        Self {
+            image:          None,
+            server_url:     None,
+            network:        None,
+            docker_socket:  None,
+            remove_on_exit: true,
+        }
     }
 }
 

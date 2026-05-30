@@ -42,6 +42,20 @@ Open http://localhost:8080.
 Use `SPLIT_WEB_PORT` to expose a different local port, or `FABRO_IMAGE` to use
 a different API image.
 
+## Docker Workers
+
+The API service mounts `/var/run/docker.sock` so it can create sibling worker
+containers on the host Docker daemon. Those workers join the stable
+`fabro-split-web` network and call the API at `http://fabro-api:32276`.
+
+Worker containers receive their config and scoped secrets from the API bootstrap
+endpoint. They do not mount the server storage volume or `/config/settings.toml`.
+
+This PoC sets `remove_on_exit = false` so QA can inspect a stopped worker
+container after a run. Production examples should omit that setting and keep the
+default `true`, because retained worker files include the worker-local bootstrap
+config and vault.
+
 ## Validate
 
 ```sh
@@ -65,3 +79,20 @@ Expected results:
   container through the same browser origin.
 - Dev-token login sets a same-origin session cookie, and
   `/api/v1/auth/me` accepts it.
+
+After starting a workflow run through the UI or CLI, verify that the API created
+a sibling worker container:
+
+```sh
+docker ps -a \
+  --filter label=sh.fabro.managed=true \
+  --filter label=sh.fabro.role=worker \
+  --format 'table {{.Names}}\t{{.Status}}\t{{.Labels}}'
+```
+
+Expected evidence:
+
+- A `fabro-worker-<run-id>-<suffix>` container exists.
+- The container has `sh.fabro.role=worker` and `sh.fabro.run_id=<run-id>`
+  labels.
+- With `remove_on_exit = false`, exited workers remain visible for inspection.

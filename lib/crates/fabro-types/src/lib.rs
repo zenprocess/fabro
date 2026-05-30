@@ -48,6 +48,7 @@ pub mod timing;
 pub mod todo;
 pub mod transcript;
 pub mod variable;
+pub mod worker_bootstrap;
 
 pub use artifact::ArtifactUpload;
 pub use auth::{IdpIdentity, IdpIdentityError};
@@ -163,4 +164,7 @@ pub use transcript::{
 };
 pub use variable::{
     CreateVariableRequest, UpdateVariableRequest, Variable, VariableListResponse, is_env_style_name,
+};
+pub use worker_bootstrap::{
+    WorkerBootstrapGithubIntegration, WorkerBootstrapResponse, WorkerBootstrapSecret,
 };

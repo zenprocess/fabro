@@ -2,7 +2,7 @@
 
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreProvider, ServerAuthMethod,
-    WebhookStrategy,
+    ServerWorkerRuntime, WebhookStrategy,
 };
 use fabro_types::settings::{Duration, InterpString};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ pub struct ServerLayer {
     pub auth:         Option<ServerAuthLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox:      Option<ServerSandboxLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker:       Option<ServerWorkerLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage:      Option<ServerStorageLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,30 @@ pub struct ServerSandboxProvidersLayer {
 pub struct ServerSandboxProviderLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+#[serde(deny_unknown_fields)]
+pub struct ServerWorkerLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ServerWorkerRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker:  Option<ServerDockerWorkerLayer>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+#[serde(deny_unknown_fields)]
+pub struct ServerDockerWorkerLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image:          Option<InterpString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_url:     Option<InterpString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network:        Option<InterpString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_socket:  Option<InterpString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_on_exit: Option<bool>,
 }
 
 /// `[server.storage]` — single managed local disk root.

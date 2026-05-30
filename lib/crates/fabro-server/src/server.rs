@@ -91,7 +91,7 @@ use fabro_store::{
 use fabro_types::BlockedReason;
 use fabro_types::settings::run::{NotificationRouteSettings, RunMode};
 use fabro_types::settings::server::{
-    GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
+    GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination, ServerWorkerRuntime,
 };
 use fabro_types::settings::{InterpString, RunNamespace};
 use fabro_types::{
@@ -119,10 +119,11 @@ use fabro_workflow::run_lookup::{
 use fabro_workflow::run_status::{FailureReason, RunStatus, SuccessReason};
 use fabro_workflow::{Error as WorkflowError, operations, pull_request};
 use futures_util::future::join_all;
+use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{
@@ -161,7 +162,9 @@ use crate::spawn_env::apply_render_graph_env;
 use crate::startup::load_startup_vault;
 use crate::worker_control::{LocalWorkerControlBus, WorkerControlBus, WorkerControlBusError};
 use crate::worker_runtime::{
-    LocalWorkerRuntime, WorkerExit, WorkerLaunchSpec, WorkerRef, WorkerRuntime,
+    DockerWorkerLaunchSpec, DockerWorkerRuntime, LocalWorkerLaunchSpec, LocalWorkerRuntime,
+    WorkerExit, WorkerLaunchCommon, WorkerLaunchSpec, WorkerOutputLine, WorkerOutputStreamKind,
+    WorkerRef, WorkerRuntime,
 };
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
@@ -1088,6 +1091,7 @@ pub struct AppState {
     manifest_run_defaults: RwLock<Arc<RunLayer>>,
     manifest_run_settings: RwLock<std::result::Result<RunNamespace, SharedError>>,
     pub(crate) server_settings: RwLock<Arc<ServerSettings>>,
+    llm_catalog_settings: RwLock<Arc<LlmCatalogSettings>>,
     catalog: RwLock<Arc<Catalog>>,
     pub(crate) env_lookup: EnvLookup,
     pub(crate) github_api_base_url: String,
@@ -1304,6 +1308,15 @@ impl AppState {
 
     pub(crate) fn catalog(&self) -> Arc<Catalog> {
         Arc::clone(&self.catalog.read().expect("catalog lock poisoned"))
+    }
+
+    pub(crate) fn llm_catalog_settings(&self) -> Arc<LlmCatalogSettings> {
+        Arc::clone(
+            &self
+                .llm_catalog_settings
+                .read()
+                .expect("LLM catalog settings lock poisoned"),
+        )
     }
 
     pub(crate) fn active_config_path(&self) -> &std::path::Path {
@@ -2309,8 +2322,9 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         current_manifest_run_defaults.as_ref(),
         &environment_store,
     );
+    let current_llm_catalog_settings = Arc::new(resolved_settings.llm_catalog_settings);
     let current_catalog = Arc::new(
-        Catalog::from_builtin_with_overrides(&resolved_settings.llm_catalog_settings)
+        Catalog::from_builtin_with_overrides(current_llm_catalog_settings.as_ref())
             .context("building LLM model catalog")?,
     );
     let sandbox_provider_registry = sandbox_provider_registry.unwrap_or_else(|| {
@@ -2388,11 +2402,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     let worker_runtime: Arc<dyn WorkerRuntime> = {
         #[cfg(test)]
         {
-            worker_runtime.unwrap_or_else(|| Arc::new(LocalWorkerRuntime::new()))
+            if let Some(worker_runtime) = worker_runtime {
+                worker_runtime
+            } else {
+                worker_runtime_from_settings(&current_server_settings)?
+            }
         }
         #[cfg(not(test))]
         {
-            Arc::new(LocalWorkerRuntime::new())
+            worker_runtime_from_settings(&current_server_settings)?
         }
     };
     Ok(Arc::new(AppState {
@@ -2424,6 +2442,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         manifest_run_defaults: RwLock::new(current_manifest_run_defaults),
         manifest_run_settings: RwLock::new(current_manifest_run_settings),
         server_settings: RwLock::new(current_server_settings),
+        llm_catalog_settings: RwLock::new(current_llm_catalog_settings),
         catalog: RwLock::new(current_catalog),
         env_lookup: Arc::clone(&env_lookup),
         github_api_base_url,
@@ -2436,6 +2455,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         slack_service,
         slack_started: AtomicBool::new(false),
     }))
+}
+
+fn worker_runtime_from_settings(
+    settings: &ServerSettings,
+) -> anyhow::Result<Arc<dyn WorkerRuntime>> {
+    match settings.server.worker.runtime {
+        ServerWorkerRuntime::Local => Ok(Arc::new(LocalWorkerRuntime::new())),
+        ServerWorkerRuntime::Docker => Ok(Arc::new(DockerWorkerRuntime::new()?)),
+    }
 }
 
 const MAX_PAGE_OFFSET: u32 = 1_000_000;
@@ -3405,14 +3433,20 @@ fn update_live_run_from_event(state: &AppState, run_id: RunId, event: &RunEvent)
     }
 }
 
-async fn drain_worker_stderr(
+async fn drain_worker_output(
     run_id: RunId,
-    stderr: std::pin::Pin<Box<dyn AsyncRead + Send + 'static>>,
+    mut output: BoxStream<'static, anyhow::Result<WorkerOutputLine>>,
 ) -> anyhow::Result<()> {
-    let mut lines = BufReader::new(stderr).lines();
-
-    while let Some(line) = lines.next_line().await? {
-        tracing::warn!(run_id = %run_id, "Worker stderr: {line}");
+    while let Some(line) = output.next().await {
+        let line = line?;
+        match line.stream {
+            WorkerOutputStreamKind::Stdout => {
+                tracing::info!(run_id = %run_id, stream = "stdout", "Worker output: {}", line.line);
+            }
+            WorkerOutputStreamKind::Stderr => {
+                tracing::warn!(run_id = %run_id, stream = "stderr", "Worker stderr: {}", line.line);
+            }
+        }
     }
 
     Ok(())
@@ -3491,17 +3525,6 @@ fn worker_launch_spec(
     run_dir: &std::path::Path,
     agent_fabro_tools_enabled: bool,
 ) -> anyhow::Result<WorkerLaunchSpec> {
-    let current_exe = std::env::current_exe().context("reading current executable path")?;
-    let executable =
-        std::env::var_os(EnvVars::CARGO_BIN_EXE_FABRO).map_or(current_exe, PathBuf::from);
-    let storage_dir = state.server_storage_dir();
-    let runtime_directory = Storage::new(&storage_dir).runtime_directory();
-    let daemon = ServerDaemon::read(&runtime_directory)?.with_context(|| {
-        format!(
-            "server record {} is missing",
-            runtime_directory.record_path().display()
-        )
-    })?;
     let scopes = if agent_fabro_tools_enabled {
         WorkerScopeSet::run_worker_with_agent_run_tools()
     } else {
@@ -3515,20 +3538,82 @@ fn worker_launch_spec(
     } else {
         None
     };
-
-    Ok(WorkerLaunchSpec {
-        executable,
-        server_target: daemon.bind.to_target(),
-        storage_dir,
-        run_dir: run_dir.to_path_buf(),
+    let common = WorkerLaunchCommon {
         run_id,
         mode: worker_mode_arg(mode),
         worker_token,
         log_destination,
         fabro_log,
-        active_config_path: state.active_config_path().to_path_buf(),
-        github_app_private_key: state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY),
-    })
+    };
+
+    match state.server_settings().server.worker.runtime {
+        ServerWorkerRuntime::Local => {
+            let current_exe = std::env::current_exe().context("reading current executable path")?;
+            let executable =
+                std::env::var_os(EnvVars::CARGO_BIN_EXE_FABRO).map_or(current_exe, PathBuf::from);
+            let storage_dir = state.server_storage_dir();
+            let runtime_directory = Storage::new(&storage_dir).runtime_directory();
+            let daemon = ServerDaemon::read(&runtime_directory)?.with_context(|| {
+                format!(
+                    "server record {} is missing",
+                    runtime_directory.record_path().display()
+                )
+            })?;
+
+            Ok(WorkerLaunchSpec::Local(LocalWorkerLaunchSpec {
+                common,
+                executable,
+                server_target: daemon.bind.to_target(),
+                storage_dir,
+                run_dir: run_dir.to_path_buf(),
+                active_config_path: state.active_config_path().to_path_buf(),
+                github_app_private_key: state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY),
+            }))
+        }
+        ServerWorkerRuntime::Docker => {
+            let docker = &state.server_settings().server.worker.docker;
+            Ok(WorkerLaunchSpec::Docker(DockerWorkerLaunchSpec {
+                common,
+                image: resolve_required_worker_docker_setting(
+                    docker.image.as_ref(),
+                    "server.worker.docker.image",
+                )?,
+                server_url: resolve_required_worker_docker_setting(
+                    docker.server_url.as_ref(),
+                    "server.worker.docker.server_url",
+                )?,
+                network: resolve_optional_worker_docker_setting(docker.network.as_ref())?,
+                docker_socket: resolve_optional_worker_docker_setting(
+                    docker.docker_socket.as_ref(),
+                )?
+                .map(PathBuf::from),
+                remove_on_exit: docker.remove_on_exit,
+            }))
+        }
+    }
+}
+
+fn resolve_required_worker_docker_setting(
+    value: Option<&InterpString>,
+    path: &str,
+) -> anyhow::Result<String> {
+    let resolved = resolve_interp_string(
+        value.with_context(|| format!("{path} is required when server.worker.runtime = docker"))?,
+    )
+    .with_context(|| format!("resolve {path}"))?;
+    if resolved.trim().is_empty() {
+        anyhow::bail!("{path} must not be empty when server.worker.runtime = docker");
+    }
+    Ok(resolved)
+}
+
+fn resolve_optional_worker_docker_setting(
+    value: Option<&InterpString>,
+) -> anyhow::Result<Option<String>> {
+    value
+        .map(resolve_interp_string)
+        .transpose()
+        .map(|value| value.filter(|resolved| !resolved.trim().is_empty()))
 }
 
 fn resolved_log_destination(state: &AppState) -> anyhow::Result<LogDestination> {
@@ -4159,7 +4244,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
         }
     }
 
-    let stderr_task = tokio::spawn(drain_worker_stderr(run_id, started_worker.stderr));
+    let output_task = tokio::spawn(drain_worker_output(run_id, started_worker.output));
 
     let worker_exit = match started_worker.wait.await {
         Ok(exit) => exit,
@@ -4183,13 +4268,13 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
         }
     };
 
-    match stderr_task.await {
+    match output_task.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
-            tracing::warn!(run_id = %run_id, error = %err, "Worker stderr drain failed");
+            tracing::warn!(run_id = %run_id, error = %err, "Worker output drain failed");
         }
         Err(err) => {
-            tracing::warn!(run_id = %run_id, error = %err, "Worker stderr task panicked");
+            tracing::warn!(run_id = %run_id, error = %err, "Worker output task panicked");
         }
     }
 

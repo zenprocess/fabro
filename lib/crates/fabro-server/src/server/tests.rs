@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -56,6 +56,7 @@ use crate::worker_control::{
 };
 use crate::worker_runtime::{
     LocalWorkerRuntime, StartedWorker, WorkerLaunchSpec, WorkerRef, WorkerRuntime,
+    WorkerRuntimeKind,
 };
 
 const MINIMAL_DOT: &str = r#"digraph Test {
@@ -980,6 +981,290 @@ fn json_request(method: Method, path: &str, body: &serde_json::Value) -> Request
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
+}
+
+async fn create_run_with_manifest_bearer(
+    app: &Router,
+    bearer: &str,
+    manifest: serde_json::Value,
+) -> RunId {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/runs"))
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::CREATED).await;
+    body["id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn get_worker_bootstrap(
+    app: &Router,
+    run_id: RunId,
+    bearer: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(bearer_request(
+            Method::GET,
+            &format!("/runs/{run_id}/worker/bootstrap"),
+            bearer,
+            Body::empty(),
+        ))
+        .await
+        .unwrap()
+}
+
+fn worker_bootstrap_secret_names(body: &serde_json::Value) -> BTreeSet<String> {
+    body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|secret| secret["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn worker_bootstrap_secret_value<'a>(body: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|secret| {
+            (secret["name"].as_str() == Some(name)).then(|| secret["value"].as_str().unwrap())
+        })
+}
+
+#[tokio::test]
+async fn worker_bootstrap_requires_same_run_worker_token_and_disables_caching() {
+    let (_state, app) = jwt_auth_app();
+    let user_jwt = issue_test_user_jwt();
+    let run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let worker_token = issue_test_worker_token(&run_id);
+    let other_run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let other_worker_token = issue_test_worker_token(&other_run_id);
+
+    let response = get_worker_bootstrap(&app, run_id, &worker_token).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let body = body_json(response.into_body()).await;
+    assert!(
+        body["config_toml"]
+            .as_str()
+            .unwrap()
+            .contains("_version = 1")
+    );
+    assert!(body["secrets"].as_array().unwrap().is_empty());
+
+    let user_response = get_worker_bootstrap(&app, run_id, &user_jwt).await;
+    assert_eq!(user_response.status(), StatusCode::FORBIDDEN);
+
+    let cross_run_response = get_worker_bootstrap(&app, run_id, &other_worker_token).await;
+    assert_eq!(cross_run_response.status(), StatusCode::FORBIDDEN);
+
+    let missing_run_id = fixtures::RUN_64;
+    let missing_worker_token = issue_test_worker_token(&missing_run_id);
+    let missing_response = get_worker_bootstrap(&app, missing_run_id, &missing_worker_token).await;
+    assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn worker_bootstrap_includes_default_provider_secret_and_excludes_unrelated_vault_entries() {
+    let state = TestAppStateBuilder::new()
+        .vault_entries([
+            (EnvVars::OPENAI_API_KEY, "sk-openai"),
+            (EnvVars::SESSION_SECRET, "server-secret"),
+            (EnvVars::FABRO_DEV_TOKEN, TEST_DEV_TOKEN),
+            (EnvVars::AWS_ACCESS_KEY_ID, "aws-access"),
+            (EnvVars::AWS_SECRET_ACCESS_KEY, "aws-secret"),
+            (EnvVars::FABRO_SLACK_BOT_TOKEN, "xoxb-slack"),
+            (EnvVars::GITHUB_APP_PRIVATE_KEY, "private-key"),
+        ])
+        .build();
+    let app = build_router(state, jwt_auth_mode());
+    let user_jwt = issue_test_user_jwt();
+    let run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let worker_token = issue_test_worker_token(&run_id);
+
+    let response = get_worker_bootstrap(&app, run_id, &worker_token).await;
+    let body = response_json!(response, StatusCode::OK).await;
+    let names = worker_bootstrap_secret_names(&body);
+
+    assert_eq!(
+        worker_bootstrap_secret_value(&body, EnvVars::OPENAI_API_KEY),
+        Some("sk-openai")
+    );
+    for excluded in [
+        EnvVars::SESSION_SECRET,
+        EnvVars::FABRO_DEV_TOKEN,
+        EnvVars::AWS_ACCESS_KEY_ID,
+        EnvVars::AWS_SECRET_ACCESS_KEY,
+        EnvVars::FABRO_SLACK_BOT_TOKEN,
+        EnvVars::GITHUB_APP_PRIVATE_KEY,
+    ] {
+        assert!(
+            !names.contains(excluded),
+            "{excluded} should not be bootstrapped"
+        );
+    }
+    let config_toml = body["config_toml"].as_str().unwrap();
+    assert!(config_toml.contains("[server.integrations.github]"));
+    assert!(!config_toml.contains("[server.storage]"));
+    assert!(!config_toml.contains(EnvVars::SESSION_SECRET));
+}
+
+#[tokio::test]
+async fn worker_bootstrap_excludes_openai_secret_for_no_auth_model_provider() {
+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(
+        r#"
+[providers.none]
+display_name = "No Auth"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "https://api.none.test/v1"
+billing_policy = "none"
+
+[models."free-model"]
+provider = "none"
+display_name = "Free Model"
+family = "free"
+default = true
+
+[models."free-model".limits]
+context_window = 128000
+
+[models."free-model".features]
+tools = true
+vision = false
+reasoning = false
+"#,
+    )
+    .expect("catalog fixture should parse");
+    let state = TestAppStateBuilder::new()
+        .llm_catalog_settings(llm_catalog_settings)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "sk-openai")])
+        .build();
+    let app = build_router(state, jwt_auth_mode());
+    let user_jwt = issue_test_user_jwt();
+    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+    manifest["args"] = json!({
+        "model": "free-model",
+        "provider": "none",
+    });
+    let run_id = create_run_with_manifest_bearer(&app, &user_jwt, manifest).await;
+    let worker_token = issue_test_worker_token(&run_id);
+
+    let response = get_worker_bootstrap(&app, run_id, &worker_token).await;
+    let body = response_json!(response, StatusCode::OK).await;
+    let names = worker_bootstrap_secret_names(&body);
+
+    assert!(!names.contains(EnvVars::OPENAI_API_KEY));
+}
+
+#[tokio::test]
+async fn worker_bootstrap_includes_provider_secret_for_node_level_override() {
+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(
+        r#"
+[providers.none]
+display_name = "No Auth"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "https://api.none.test/v1"
+billing_policy = "none"
+
+[models."free-model"]
+provider = "none"
+display_name = "Free Model"
+family = "free"
+default = true
+
+[models."free-model".limits]
+context_window = 128000
+
+[models."free-model".features]
+tools = true
+vision = false
+reasoning = false
+"#,
+    )
+    .expect("catalog fixture should parse");
+    let state = TestAppStateBuilder::new()
+        .llm_catalog_settings(llm_catalog_settings)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "sk-openai")])
+        .build();
+    let app = build_router(state, jwt_auth_mode());
+    let user_jwt = issue_test_user_jwt();
+    let dot = r#"digraph Test {
+        graph [goal="Test"]
+        start [shape=Mdiamond]
+        work [model="gpt-5.5", provider="openai", prompt="Do it"]
+        exit  [shape=Msquare]
+        start -> work -> exit
+    }"#;
+    let mut manifest = minimal_manifest_json(dot);
+    manifest["args"] = json!({
+        "model": "free-model",
+        "provider": "none",
+    });
+    let run_id = create_run_with_manifest_bearer(&app, &user_jwt, manifest).await;
+    let worker_token = issue_test_worker_token(&run_id);
+
+    let response = get_worker_bootstrap(&app, run_id, &worker_token).await;
+    let body = response_json!(response, StatusCode::OK).await;
+
+    assert_eq!(
+        worker_bootstrap_secret_value(&body, EnvVars::OPENAI_API_KEY),
+        Some("sk-openai")
+    );
+}
+
+#[tokio::test]
+async fn worker_bootstrap_includes_github_app_secret_only_when_needed() {
+    let server_settings = server_settings_from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.integrations.github]
+enabled = true
+strategy = "app"
+app_id = "12345"
+slug = "fabro-dev"
+"#,
+    );
+    let run_defaults = manifest_run_defaults_from_toml(
+        r#"
+[run.integrations.github.permissions]
+contents = "read"
+"#,
+    );
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(server_settings, run_defaults)
+        .vault_entries([(EnvVars::GITHUB_APP_PRIVATE_KEY, "pem-private-key")])
+        .build();
+    let app = build_router(state, jwt_auth_mode());
+    let user_jwt = issue_test_user_jwt();
+    let run_id = create_run_with_bearer(&app, &user_jwt).await;
+    let worker_token = issue_test_worker_token(&run_id);
+
+    let response = get_worker_bootstrap(&app, run_id, &worker_token).await;
+    let body = response_json!(response, StatusCode::OK).await;
+
+    assert_eq!(body["github"]["enabled"], true);
+    assert_eq!(body["github"]["strategy"], "app");
+    assert_eq!(body["github"]["app_id"], "12345");
+    assert_eq!(body["github"]["slug"], "fabro-dev");
+    assert_eq!(
+        worker_bootstrap_secret_value(&body, EnvVars::GITHUB_APP_PRIVATE_KEY),
+        Some("pem-private-key")
+    );
 }
 
 fn canonical_origin_settings(url: &str) -> ServerSettings {
@@ -2388,6 +2673,131 @@ destination = "file"
 }
 
 #[test]
+fn worker_launch_spec_uses_docker_worker_settings() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let state = worker_command_test_state_with_extra_config(
+        storage_dir.path(),
+        &["dev-token"],
+        Some(TEST_DEV_TOKEN),
+        r#"
+[server.worker]
+runtime = "docker"
+
+[server.worker.docker]
+image = "ghcr.io/fabro-sh/fabro-worker:test"
+server_url = "http://fabro-server:3333"
+network = "fabro-net"
+docker_socket = "/var/run/docker.sock"
+remove_on_exit = false
+"#,
+    );
+    state
+        .vault
+        .try_write()
+        .expect("test vault should not be locked")
+        .set(
+            EnvVars::GITHUB_APP_PRIVATE_KEY,
+            "test-private-key",
+            SecretType::File,
+            None,
+        )
+        .unwrap();
+    let run_id = RunId::new();
+    let run_dir = tempfile::tempdir().unwrap();
+
+    let spec = worker_launch_spec(
+        state.as_ref(),
+        run_id,
+        RunExecutionMode::Resume,
+        run_dir.path(),
+        true,
+    )
+    .unwrap();
+    let WorkerLaunchSpec::Docker(spec) = spec else {
+        panic!("docker worker settings should build a Docker launch spec");
+    };
+
+    assert_eq!(spec.common.run_id, run_id);
+    assert_eq!(spec.common.mode, "resume");
+    assert_eq!(spec.image, "ghcr.io/fabro-sh/fabro-worker:test");
+    assert_eq!(spec.server_url, "http://fabro-server:3333");
+    assert_eq!(spec.network.as_deref(), Some("fabro-net"));
+    assert_eq!(
+        spec.docker_socket.as_deref(),
+        Some(std::path::Path::new("/var/run/docker.sock"))
+    );
+    assert!(!spec.remove_on_exit);
+
+    let claims = jsonwebtoken::decode::<crate::worker_token::WorkerTokenClaims>(
+        &spec.common.worker_token,
+        state.worker_token_keys().decoding_key(),
+        state.worker_token_keys().validation(),
+    )
+    .expect("worker token should decode")
+    .claims;
+    assert_eq!(claims.run_id, run_id.to_string());
+    assert_eq!(claims.scope.split_whitespace().collect::<Vec<_>>(), vec![
+        "run:worker",
+        "agent:run_tools"
+    ]);
+}
+
+fn docker_worker_server_settings() -> ServerSettings {
+    server_settings_from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.worker]
+runtime = "docker"
+
+[server.worker.docker]
+image = "ghcr.io/fabro-sh/fabro-worker:test"
+server_url = "http://fabro-server:3333"
+"#,
+    )
+}
+
+#[test]
+fn build_app_state_explicit_worker_runtime_override_wins() {
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(docker_worker_server_settings(), RunLayer::default())
+        .worker_runtime(runtime)
+        .build();
+
+    assert_eq!(
+        state.worker_runtime.runtime_kind(),
+        WorkerRuntimeKind::Custom
+    );
+}
+
+#[test]
+fn build_app_state_local_settings_select_local_worker_runtime() {
+    let state = TestAppStateBuilder::new().build();
+
+    assert_eq!(
+        state.worker_runtime.runtime_kind(),
+        WorkerRuntimeKind::Local
+    );
+}
+
+#[test]
+fn build_app_state_docker_settings_select_docker_worker_runtime() {
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(docker_worker_server_settings(), RunLayer::default())
+        .build();
+
+    assert_eq!(
+        state.worker_runtime.runtime_kind(),
+        WorkerRuntimeKind::Docker
+    );
+}
+
+#[test]
 fn build_app_state_requires_session_secret_for_worker_tokens() {
     let server_settings = server_settings_from_toml(
         r#"
@@ -2569,6 +2979,9 @@ fn worker_command(
     agent_fabro_tools_enabled: bool,
 ) -> anyhow::Result<Command> {
     let spec = worker_launch_spec(state, run_id, mode, run_dir, agent_fabro_tools_enabled)?;
+    let WorkerLaunchSpec::Local(spec) = spec else {
+        anyhow::bail!("worker command test expected local launch spec");
+    };
     Ok(LocalWorkerRuntime::command_for_spec(&spec))
 }
 

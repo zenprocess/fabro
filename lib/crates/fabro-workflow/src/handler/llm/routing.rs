@@ -38,12 +38,12 @@ pub(crate) fn node_needs_api_backend(node: &Node) -> bool {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProviderContext {
-    pub(crate) provider_id:  ProviderId,
-    pub(crate) profile_kind: AgentProfileKind,
+pub struct ProviderContext {
+    pub provider_id:  ProviderId,
+    pub profile_kind: AgentProfileKind,
 }
 
-pub(crate) fn resolve_provider_context(
+pub fn resolve_provider_context(
     catalog: &Catalog,
     default_provider_id: &ProviderId,
     model: &str,
@@ -76,7 +76,7 @@ pub(crate) fn resolve_provider_context(
     })
 }
 
-pub(crate) fn resolve_node_provider_context(
+pub fn resolve_node_provider_context(
     catalog: &Catalog,
     default_provider_id: &ProviderId,
     default_model: &str,
