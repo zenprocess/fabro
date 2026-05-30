@@ -1,0 +1,229 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 19852f701..187bd3181 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2609,6 +2609,7 @@ dependencies = [
+  "clap",
+  "dirs",
+  "fabro-model",
++ "fabro-types",
+  "fabro-util",
+  "hex",
+  "serde",
+diff --git a/lib/crates/fabro-cli/tests/it/cmd/support.rs b/lib/crates/fabro-cli/tests/it/cmd/support.rs
+index 93ad4d6a9..7d462eb1c 100644
+--- a/lib/crates/fabro-cli/tests/it/cmd/support.rs
++++ b/lib/crates/fabro-cli/tests/it/cmd/support.rs
+@@ -21,6 +21,7 @@ use fabro_config::daemon::ServerDaemon;
+ use fabro_config::{Storage, envfile};
+ use fabro_store::EventEnvelope;
+ use fabro_test::{TestContext, expect_reqwest_status};
++use fabro_types::test_support::test_principal;
+ use fabro_types::{RunId, StageId};
+ use httpmock::{Mock, MockServer};
+ use serde_json::Value;
+@@ -177,15 +178,8 @@ pub(crate) fn remote_run_summary_json(
+             "origin_url": null,
+             "provider": "unknown"
+         },
+-        "created_by": {
+-            "kind": "user",
+-            "identity": {
+-                "issuer": "fabro:test",
+-                "subject": "test-user"
+-            },
+-            "login": "test",
+-            "auth_method": "dev_token"
+-        },
++        "created_by": serde_json::to_value(test_principal())
++            .expect("test principal should serialize"),
+         "origin": {
+             "kind": "api"
+         },
+diff --git a/lib/crates/fabro-server/src/principal_middleware.rs b/lib/crates/fabro-server/src/principal_middleware.rs
+index a50d6d3bf..2559b07bf 100644
+--- a/lib/crates/fabro-server/src/principal_middleware.rs
++++ b/lib/crates/fabro-server/src/principal_middleware.rs
+@@ -172,26 +172,13 @@ impl AuthContextSlot {
+     pub(crate) fn log_snapshot(&self) -> RequestAuthLogContext {
+         let context = self.0.lock().expect("auth context lock poisoned");
+         RequestAuthLogContext {
+-            principal:       principal_without_log_unused_fields(context.principal.as_ref()),
++            principal:       context.principal.clone(),
+             auth_status:     context.auth_status,
+             auth_error_code: context.auth_error_code,
+         }
+     }
+ }
+ 
+-fn principal_without_log_unused_fields(principal: Option<&Principal>) -> Option<Principal> {
+-    match principal {
+-        Some(Principal::User(user)) => Some(Principal::User(UserPrincipal {
+-            identity:    user.identity.clone(),
+-            login:       user.login.clone(),
+-            auth_method: user.auth_method,
+-            avatar_url:  None,
+-        })),
+-        Some(principal) => Some(principal.clone()),
+-        None => None,
+-    }
+-}
+-
+ impl<S: Send + Sync> FromRequestParts<S> for RequestAuth {
+     type Rejection = Infallible;
+ 
+diff --git a/lib/crates/fabro-types/Cargo.toml b/lib/crates/fabro-types/Cargo.toml
+index 03631959a..b7246024b 100644
+--- a/lib/crates/fabro-types/Cargo.toml
++++ b/lib/crates/fabro-types/Cargo.toml
+@@ -33,4 +33,5 @@ ulid.workspace = true
+ url.workspace = true
+ 
+ [dev-dependencies]
++fabro-types = { path = ".", features = ["test-support"] }
+ tempfile = "3"
+diff --git a/lib/crates/fabro-types/src/principal.rs b/lib/crates/fabro-types/src/principal.rs
+index 4f1962ea2..6432f41a4 100644
+--- a/lib/crates/fabro-types/src/principal.rs
++++ b/lib/crates/fabro-types/src/principal.rs
+@@ -12,8 +12,9 @@ pub struct UserPrincipal {
+     pub avatar_url:  Option<String>,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
+ #[serde(tag = "kind", rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
+ pub enum Principal {
+     User(UserPrincipal),
+     Worker {
+@@ -89,14 +90,7 @@ impl Principal {
+ 
+     #[must_use]
+     pub fn kind(&self) -> &'static str {
+-        match self {
+-            Self::User(_) => "user",
+-            Self::Worker { .. } => "worker",
+-            Self::Webhook { .. } => "webhook",
+-            Self::Slack { .. } => "slack",
+-            Self::Agent { .. } => "agent",
+-            Self::System { .. } => "system",
+-        }
++        self.into()
+     }
+ 
+     #[must_use]
+diff --git a/lib/crates/fabro-types/tests/run_event_serde.rs b/lib/crates/fabro-types/tests/run_event_serde.rs
+index 65dfb6b0b..5d25d0869 100644
+--- a/lib/crates/fabro-types/tests/run_event_serde.rs
++++ b/lib/crates/fabro-types/tests/run_event_serde.rs
+@@ -6,22 +6,8 @@ use fabro_types::run_event::run::{RunCreatedProps, RunParentLinkedProps, RunPare
+ use fabro_types::run_event::{RunSessionTurnFailedCode, RunSessionTurnFailedProps};
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::RunGoal;
+-use fabro_types::{
+-    AuthMethod, AutomationRef, EventBody, IdpIdentity, Principal, RunProvenance, TurnId,
+-    WorkflowSettings, fixtures,
+-};
+-
+-fn test_run_provenance() -> RunProvenance {
+-    RunProvenance {
+-        server:  None,
+-        client:  None,
+-        subject: Principal::user(
+-            IdpIdentity::new("fabro:test", "test-user").expect("test identity should be valid"),
+-            "test".to_string(),
+-            AuthMethod::DevToken,
+-        ),
+-    }
+-}
++use fabro_types::test_support::test_run_provenance;
++use fabro_types::{AutomationRef, EventBody, TurnId, WorkflowSettings, fixtures};
+ 
+ fn templated_settings() -> WorkflowSettings {
+     let mut settings = WorkflowSettings::default();
+diff --git a/lib/crates/fabro-types/tests/run_spec_methods.rs b/lib/crates/fabro-types/tests/run_spec_methods.rs
+index 722026ad2..638073322 100644
+--- a/lib/crates/fabro-types/tests/run_spec_methods.rs
++++ b/lib/crates/fabro-types/tests/run_spec_methods.rs
+@@ -3,19 +3,8 @@ use std::collections::HashMap;
+ use fabro_types::graph::Graph;
+ use fabro_types::run::{DirtyStatus, GitContext, PreRunPushOutcome, RunSpec};
+ use fabro_types::settings::{ProjectNamespace, WorkflowNamespace};
+-use fabro_types::{AuthMethod, IdpIdentity, Principal, RunProvenance, WorkflowSettings, fixtures};
+-
+-fn test_run_provenance() -> RunProvenance {
+-    RunProvenance {
+-        server:  None,
+-        client:  None,
+-        subject: Principal::user(
+-            IdpIdentity::new("fabro:test", "test-user").expect("test identity should be valid"),
+-            "test".to_string(),
+-            AuthMethod::DevToken,
+-        ),
+-    }
+-}
++use fabro_types::test_support::test_run_provenance;
++use fabro_types::{WorkflowSettings, fixtures};
+ 
+ fn sample_run_spec() -> RunSpec {
+     let settings = WorkflowSettings {
+diff --git a/lib/crates/fabro-types/tests/run_spec_serde.rs b/lib/crates/fabro-types/tests/run_spec_serde.rs
+index d6ddaea94..1dac9e4ce 100644
+--- a/lib/crates/fabro-types/tests/run_spec_serde.rs
++++ b/lib/crates/fabro-types/tests/run_spec_serde.rs
+@@ -4,21 +4,8 @@ use fabro_types::graph::Graph;
+ use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunSpec};
+ use fabro_types::settings::InterpString;
+ use fabro_types::settings::run::RunGoal;
+-use fabro_types::{
+-    AuthMethod, AutomationRef, IdpIdentity, Principal, RunProvenance, WorkflowSettings, fixtures,
+-};
+-
+-fn test_run_provenance() -> RunProvenance {
+-    RunProvenance {
+-        server:  None,
+-        client:  None,
+-        subject: Principal::user(
+-            IdpIdentity::new("fabro:test", "test-user").expect("test identity should be valid"),
+-            "test".to_string(),
+-            AuthMethod::DevToken,
+-        ),
+-    }
+-}
++use fabro_types::test_support::test_run_provenance;
++use fabro_types::{AutomationRef, WorkflowSettings, fixtures};
+ 
+ fn templated_settings() -> WorkflowSettings {
+     let mut settings = WorkflowSettings::default();
+diff --git a/lib/crates/fabro-workflow/src/operations/retry.rs b/lib/crates/fabro-workflow/src/operations/retry.rs
+index 6d3cbdc3c..18d0690e1 100644
+--- a/lib/crates/fabro-workflow/src/operations/retry.rs
++++ b/lib/crates/fabro-workflow/src/operations/retry.rs
+@@ -122,7 +122,7 @@ mod tests {
+     use fabro_types::{
+         AuthMethod, DirtyStatus, FailureReason, ForkSourceRef, GitContext, Graph, IdpIdentity,
+         PreRunPushOutcome, Principal, PullRequestLink, RunBlobId, RunRunnableSource,
+-        RunServerProvenance, RunTiming, UserPrincipal, WorkflowSettings, fixtures,
++        RunServerProvenance, RunTiming, WorkflowSettings, fixtures,
+     };
+     use object_store::memory::InMemory;
+ 
+@@ -138,12 +138,11 @@ mod tests {
+     }
+ 
+     fn actor(login: &str) -> Principal {
+-        Principal::User(UserPrincipal {
+-            identity:    IdpIdentity::new("github", format!("user:{login}")).unwrap(),
+-            login:       login.to_string(),
+-            auth_method: AuthMethod::DevToken,
+-            avatar_url:  None,
+-        })
++        Principal::user(
++            IdpIdentity::new("github", format!("user:{login}")).unwrap(),
++            login.to_string(),
++            AuthMethod::DevToken,
++        )
+     }
+ 
+     fn provenance(login: &str) -> RunProvenance {
