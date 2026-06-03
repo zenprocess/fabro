@@ -12,6 +12,17 @@ import { RowActionsMenu } from "./row-actions-menu";
 import { SelectionCheckbox } from "./selection-checkbox";
 import type { ToggleableColumn } from "./toggleable-column";
 
+function CreatedByCell({ run }: { run: Pick<RunWithStatus, "createdBy"> }) {
+  const creatorDisplay = principalDisplay(run.createdBy);
+  return (
+    <td className="relative z-10 w-8 whitespace-nowrap px-3 py-2.5">
+      <Tooltip label={creatorDisplay.label}>
+        <span aria-label={`Created by ${creatorDisplay.label}`}>{creatorDisplay.glyph}</span>
+      </Tooltip>
+    </td>
+  );
+}
+
 function listLifecycleStatusLabel(
   run: Pick<RunWithStatus, "status" | "statusLabel" | "lifecycleStatusLabel">,
 ): string | null {
@@ -52,16 +63,7 @@ export function RunTableRow({
           <span className={`font-mono text-xs ${statusDisplay.text}`}>{run.statusLabel}</span>
         </span>
       </td>
-      {show("created_by") && (() => {
-        const creatorDisplay = principalDisplay(run.createdBy);
-        return (
-          <td className="relative z-10 w-8 whitespace-nowrap px-3 py-2.5">
-            <Tooltip label={creatorDisplay.label}>
-              <span aria-label={`Created by ${creatorDisplay.label}`}>{creatorDisplay.glyph}</span>
-            </Tooltip>
-          </td>
-        );
-      })()}
+      {show("created_by") && <CreatedByCell run={run} />}
       {show("repo") && (
         <td className="whitespace-nowrap px-3 py-2.5 font-mono text-xs font-medium text-teal-500">
           {run.repo}

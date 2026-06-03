@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type {
+  Principal,
   Run,
   SandboxResources,
   SandboxState,
@@ -46,6 +47,16 @@ function Cell({ label, children }: { label: string; children: ReactNode }) {
     <div>
       <div className={LABEL_CLASS}>{label}</div>
       <div className={VALUE_WRAPPER_CLASS}>{children}</div>
+    </div>
+  );
+}
+
+function PrincipalValue({ principal }: { principal: Principal }) {
+  const display = principalDisplay(principal);
+  return (
+    <div className="flex items-center gap-2">
+      {display.glyph}
+      <span className={VALUE_CLASS}>{display.label}</span>
     </div>
   );
 }
@@ -126,15 +137,9 @@ export function RunSummaryPanelView({
         <Cell label="Created by">
           {runLoading || !run ? (
             <Skeleton widthClass="w-20" />
-          ) : (() => {
-            const created = principalDisplay(run.created_by);
-            return (
-              <div className="flex items-center gap-2">
-                {created.glyph}
-                <span className={VALUE_CLASS}>{created.label}</span>
-              </div>
-            );
-          })()}
+          ) : (
+            <PrincipalValue principal={run.created_by} />
+          )}
         </Cell>
 
         <Cell label="Changes">
