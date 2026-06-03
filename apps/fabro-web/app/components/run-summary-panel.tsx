@@ -116,7 +116,6 @@ export function RunSummaryPanelView({
   artifactsCount,
   artifactsLoading,
 }: RunSummaryPanelViewProps) {
-  const created = run ? principalDisplay(run.created_by) : null;
   const diff = run?.diff ?? null;
   const cost = formatUsdMicros(run?.billing?.total_usd_micros);
   const sandboxKind = sandboxLifecycleKind(run?.sandbox);
@@ -125,16 +124,17 @@ export function RunSummaryPanelView({
     <div className="rounded-md border border-line bg-panel/60 px-6 py-4">
       <div className="flex flex-wrap items-baseline gap-x-14 gap-y-3">
         <Cell label="Created by">
-          {runLoading ? (
+          {runLoading || !run ? (
             <Skeleton widthClass="w-20" />
-          ) : created ? (
-            <div className="flex items-center gap-2">
-              {created.glyph}
-              <span className={VALUE_CLASS}>{created.label}</span>
-            </div>
-          ) : (
-            <EmptyValue />
-          )}
+          ) : (() => {
+            const created = principalDisplay(run.created_by);
+            return (
+              <div className="flex items-center gap-2">
+                {created.glyph}
+                <span className={VALUE_CLASS}>{created.label}</span>
+              </div>
+            );
+          })()}
         </Cell>
 
         <Cell label="Changes">

@@ -74,9 +74,13 @@ describe("RunSummaryPanelView", () => {
 
   test("shows unavailable copy for missing run fields after load", () => {
     const tree = render({ run: makeRun() });
-    expect(instanceText(cellAfterLabel(tree, "Created by"))).toBe("Ttest");
     expect(instanceText(cellAfterLabel(tree, "Changes"))).toBe(EMPTY_VALUE);
     expect(instanceText(cellAfterLabel(tree, "Cost"))).toBe(EMPTY_VALUE);
+  });
+
+  test("renders creator from run.created_by", () => {
+    const tree = render({ run: makeRun() });
+    expect(instanceText(cellAfterLabel(tree, "Created by"))).toBe("Ttest");
   });
 
   test("shows unavailable copy when sandbox is absent", () => {

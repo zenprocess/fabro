@@ -6,20 +6,8 @@ use fabro_types::run_event::run::{RunCreatedProps, RunParentLinkedProps, RunPare
 use fabro_types::run_event::{RunSessionTurnFailedCode, RunSessionTurnFailedProps};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::{
-    AutomationRef, EventBody, Principal, RunProvenance, SystemActorKind, TurnId, WorkflowSettings,
-    fixtures,
-};
-
-fn test_run_provenance() -> RunProvenance {
-    RunProvenance {
-        server:  None,
-        client:  None,
-        subject: Principal::System {
-            system_kind: SystemActorKind::Engine,
-        },
-    }
-}
+use fabro_types::test_support::test_run_provenance;
+use fabro_types::{AutomationRef, EventBody, TurnId, WorkflowSettings, fixtures};
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
