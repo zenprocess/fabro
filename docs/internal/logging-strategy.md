@@ -118,7 +118,7 @@ Fields are key-value pairs that make events queryable. Include enough context th
 | `error` | Error value on failure |
 | `path` | File system path |
 | `duration_ms` | Elapsed time in milliseconds |
-| `principal_kind` | HTTP caller category (`user`, `worker`, `webhook`, `anonymous`, etc.) |
+| `principal_kind` | HTTP caller category (`user`, `worker`, `webhook`, `none`, etc.) |
 | `auth_status` | HTTP authentication result (`missing`, `invalid`, `expired`, `authenticated`) |
 | `idp_issuer`, `idp_subject` | Canonical user identity for authenticated user requests |
 
