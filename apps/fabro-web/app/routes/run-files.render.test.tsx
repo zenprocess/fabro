@@ -52,11 +52,11 @@ mock.module("../lib/queries", () => ({
       automation:       null,
       repository:       { name: "fabro", origin_url: null, provider: "unknown" },
       created_by:       {
-      kind:        "user",
-      identity:    { issuer: "fabro:test", subject: "test-user" },
-      login:       "test",
-      auth_method: "dev_token",
-    },
+        kind:        "user",
+        identity:    { issuer: "fabro:test", subject: "test-user" },
+        login:       "test",
+        auth_method: "dev_token",
+      },
       origin:           { kind: "api" },
       labels:           {},
       lifecycle:        {

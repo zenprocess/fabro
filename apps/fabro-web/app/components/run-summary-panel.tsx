@@ -163,7 +163,7 @@ export function RunSummaryPanelView({
           ) : sandboxKind ? (
             <SandboxLifecycleValue kind={sandboxKind} />
           ) : (
-          <EmptyValue />
+            <EmptyValue />
           )}
         </Cell>
 
@@ -173,7 +173,7 @@ export function RunSummaryPanelView({
           ) : cost != null ? (
             <span className={VALUE_MONO_CLASS}>{cost}</span>
           ) : (
-          <EmptyValue />
+            <EmptyValue />
           )}
         </Cell>
 
@@ -183,7 +183,7 @@ export function RunSummaryPanelView({
           ) : artifactsCount != null && artifactsCount > 0 ? (
             <span className={VALUE_MONO_CLASS}>{artifactsCount}</span>
           ) : (
-          <EmptyValue />
+            <EmptyValue />
           )}
         </Cell>
 
