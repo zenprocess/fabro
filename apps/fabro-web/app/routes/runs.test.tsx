@@ -34,7 +34,12 @@ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
     workflow:         { slug: "test", name: "Test", graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "repo", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       {
+      kind:        "user",
+      identity:    { issuer: "fabro:test", subject: "test-user" },
+      login:       "test",
+      auth_method: "dev_token",
+    },
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

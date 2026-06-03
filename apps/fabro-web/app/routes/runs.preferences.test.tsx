@@ -35,7 +35,12 @@ function run(id: string, repo = "qlty/fabro", workflow = "release"): Run {
     workflow:         { slug: workflow, name: workflow, graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: repo, origin_url: null, provider: "github" },
-    created_by:       null,
+    created_by:       {
+      kind:        "user",
+      identity:    { issuer: "fabro:test", subject: "test-user" },
+      login:       "test",
+      auth_method: "dev_token",
+    },
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -17,7 +17,12 @@ function makeRun(overrides: Partial<Run> = {}): Run {
     workflow:         { slug: "fix_build", name: "Fix Build", graph_name: "FixBuild", node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "myrepo", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       {
+      kind:        "user",
+      identity:    { issuer: "fabro:test", subject: "test-user" },
+      login:       "test",
+      auth_method: "dev_token",
+    },
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

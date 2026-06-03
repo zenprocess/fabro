@@ -6,7 +6,7 @@ use fabro_types::run_event::run::{RunCreatedProps, RunParentLinkedProps, RunPare
 use fabro_types::run_event::{RunSessionTurnFailedCode, RunSessionTurnFailedProps};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::{AutomationRef, EventBody, TurnId, WorkflowSettings, fixtures};
+use fabro_types::{AutomationRef, EventBody, TurnId, WorkflowSettings, fixtures, test_support};
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
@@ -32,7 +32,7 @@ fn run_created_props_round_trip_templated_settings() {
             trigger_id: Some("schedule_1".to_string()),
         }),
         db_prefix:        Some("run_".to_string()),
-        provenance:       None,
+        provenance:       test_support::test_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
             origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
@@ -97,7 +97,7 @@ fn run_created_props_omits_web_url_when_absent() {
         workflow_slug:    None,
         automation:       None,
         db_prefix:        None,
-        provenance:       None,
+        provenance:       test_support::test_run_provenance(),
         manifest_blob:    None,
         git:              None,
         fork_source_ref:  None,
@@ -128,17 +128,17 @@ fn run_created_props_omits_web_url_when_absent() {
 }
 
 #[test]
-fn run_created_props_defaults_additive_fields_for_legacy_events() {
+fn run_created_props_defaults_optional_additive_fields_when_absent() {
     let json = serde_json::json!({
         "title": null,
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
+        "provenance": test_support::test_run_provenance(),
         "labels": {},
         "run_dir": "/tmp/run"
     });
 
-    let props: RunCreatedProps =
-        serde_json::from_value(json).expect("legacy props should deserialize");
+    let props: RunCreatedProps = serde_json::from_value(json).expect("props should deserialize");
     assert_eq!(props.retried_from, None);
     assert_eq!(props.automation, None);
 }

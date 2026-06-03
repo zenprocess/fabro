@@ -221,7 +221,12 @@ function makeRunSummary({
     workflow:         { slug: "default", name: "Default", graph_name: null, node_count: 0, edge_count: 0 },
     automation,
     repository:       { name: "fabro", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       {
+      kind:        "user",
+      identity:    { issuer: "fabro:test", subject: "test-user" },
+      login:       "test",
+      auth_method: "dev_token",
+    },
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

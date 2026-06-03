@@ -667,7 +667,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use fabro_types::{Graph, RunId, SessionId, StageId, WorkflowSettings};
+    use fabro_types::{Graph, RunId, SessionId, StageId, WorkflowSettings, test_support};
     use object_store::memory::InMemory;
     use serde_json::json;
 
@@ -722,6 +722,7 @@ mod tests {
                 "properties": {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
+                    "provenance": test_support::test_run_provenance(),
                     "run_dir": "/tmp/test",
                 },
             }),

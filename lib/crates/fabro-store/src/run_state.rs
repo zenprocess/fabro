@@ -922,11 +922,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
         })
         .map(|(_, record)| record.question.clone());
     let models = run_models(state);
-    let created_by = state
-        .spec
-        .provenance
-        .as_ref()
-        .and_then(|provenance| provenance.subject.clone());
+    let created_by = state.spec.provenance.subject.clone();
     let source_directory = state.spec.source_directory.clone();
     let repo_origin_url = state.spec.git.as_ref().map(|git| git.origin_url.clone());
     let start_time = state.start.as_ref().map(|start| start.start_time);
@@ -1276,7 +1272,7 @@ mod tests {
         StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
         StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowWarning,
         StageModelUsage, StageOutcome, StageState, SubAgentStatus, SuccessReason, WorkflowSettings,
-        first_event_seq, fixtures,
+        first_event_seq, fixtures, test_support,
     };
     use serde_json::json;
 
@@ -1358,7 +1354,7 @@ mod tests {
             automation:       None,
             source_directory: None,
             labels:           HashMap::new(),
-            provenance:       None,
+            provenance:       test_support::test_run_provenance(),
             manifest_blob:    None,
             definition_blob:  None,
             git:              None,
@@ -1446,6 +1442,7 @@ mod tests {
             &json!({
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run"
             }),
@@ -1474,6 +1471,7 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
                 "automation": automation,
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run"
             }),
@@ -1497,6 +1495,7 @@ mod tests {
             &json!({
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run"
             }),
@@ -1519,6 +1518,7 @@ mod tests {
             &json!({
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run"
             }),
@@ -1596,6 +1596,7 @@ mod tests {
                 &json!({
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
+                    "provenance": test_support::test_run_provenance(),
                     "labels": {},
                     "run_dir": "/tmp/run"
                 }),
@@ -1822,7 +1823,7 @@ mod tests {
                 "repo_origin_url": null,
                 "base_branch": null,
                 "labels": {},
-                "provenance": null,
+                "provenance": test_support::test_run_provenance(),
                 "manifest_blob": null,
                 "definition_blob": null,
                 "git": null,
@@ -2851,7 +2852,7 @@ mod tests {
             source_directory: Some("/tmp/repo".to_string()),
             git:              None,
             labels:           HashMap::new(),
-            provenance:       None,
+            provenance:       test_support::test_run_provenance(),
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
@@ -2877,7 +2878,7 @@ mod tests {
             source_directory: Some("/tmp/repo".to_string()),
             git:              None,
             labels:           HashMap::new(),
-            provenance:       None,
+            provenance:       test_support::test_run_provenance(),
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
@@ -2909,6 +2910,7 @@ mod tests {
             &json!({
                 "title": "Explicit title",
                 "settings": WorkflowSettings::default(),
+                "provenance": test_support::test_run_provenance(),
                 "graph": {
                     "name": "test",
                     "nodes": {},
@@ -2936,6 +2938,7 @@ mod tests {
             "run.created",
             &json!({
                 "settings": WorkflowSettings::default(),
+                "provenance": test_support::test_run_provenance(),
                 "graph": {
                     "name": "test",
                     "nodes": {},
@@ -2965,6 +2968,7 @@ mod tests {
                 &json!({
                     "title": "Original title",
                     "settings": WorkflowSettings::default(),
+                    "provenance": test_support::test_run_provenance(),
                     "graph": {
                         "name": "test",
                         "nodes": {},
@@ -3007,6 +3011,7 @@ mod tests {
                     "event": "run.created",
                     "properties": {
                         "settings": WorkflowSettings::default(),
+                        "provenance": test_support::test_run_provenance(),
                         "graph": {
                             "name": "test",
                             "nodes": {},

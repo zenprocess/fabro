@@ -120,7 +120,12 @@ function makeRun(overrides: Record<string, unknown> = {}) {
       origin_url: "https://github.com/fallback/repo.git",
       provider:   "github",
     },
-    created_by:       null,
+    created_by:       {
+      kind:        "user",
+      identity:    { issuer: "fabro:test", subject: "test-user" },
+      login:       "test",
+      auth_method: "dev_token",
+    },
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

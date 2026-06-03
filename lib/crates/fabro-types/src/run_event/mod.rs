@@ -933,7 +933,7 @@ mod tests {
     use super::*;
     use crate::{
         AuthMethod, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId, WorkflowSettings,
-        fixtures,
+        fixtures, test_support,
     };
 
     fn user_principal(login: &str) -> Principal {
@@ -1015,6 +1015,7 @@ mod tests {
             "properties": {
                 "settings": settings,
                 "graph": graph,
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run",
                 "source_directory": "/tmp/run"
@@ -1035,6 +1036,7 @@ mod tests {
             "properties": {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
+                "provenance": test_support::test_run_provenance(),
                 "labels": {},
                 "run_dir": "/tmp/run",
                 "source_directory": "/tmp/run",

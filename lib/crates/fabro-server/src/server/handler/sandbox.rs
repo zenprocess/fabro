@@ -1299,7 +1299,7 @@ FABRO_PROC_NET_TCP /proc/net/tcp6
 mod retrieve_sandbox_tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use fabro_types::{Graph, RunId, WorkflowSettings};
+    use fabro_types::{Graph, RunId, WorkflowSettings, test_support};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -1338,6 +1338,7 @@ mod retrieve_sandbox_tests {
                 "properties": {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
+                    "provenance": test_support::test_run_provenance(),
                     "run_dir": "/tmp/test",
                 },
             }),

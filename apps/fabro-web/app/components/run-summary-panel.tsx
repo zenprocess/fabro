@@ -116,7 +116,7 @@ export function RunSummaryPanelView({
   artifactsCount,
   artifactsLoading,
 }: RunSummaryPanelViewProps) {
-  const created = run?.created_by ? principalDisplay(run.created_by) : null;
+  const created = run ? principalDisplay(run.created_by) : null;
   const diff = run?.diff ?? null;
   const cost = formatUsdMicros(run?.billing?.total_usd_micros);
   const sandboxKind = sandboxLifecycleKind(run?.sandbox);
@@ -133,7 +133,7 @@ export function RunSummaryPanelView({
               <span className={VALUE_CLASS}>{created.label}</span>
             </div>
           ) : (
-          <EmptyValue />
+            <EmptyValue />
           )}
         </Cell>
 
@@ -151,7 +151,7 @@ export function RunSummaryPanelView({
               </span>
             </div>
           ) : (
-          <EmptyValue />
+            <EmptyValue />
           )}
         </Cell>
 

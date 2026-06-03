@@ -21,7 +21,7 @@ use fabro_config::daemon::ServerDaemon;
 use fabro_config::{Storage, envfile};
 use fabro_store::EventEnvelope;
 use fabro_test::{TestContext, expect_reqwest_status};
-use fabro_types::{RunId, StageId};
+use fabro_types::{RunId, StageId, test_support};
 use httpmock::{Mock, MockServer};
 use serde_json::Value;
 use shlex::try_quote;
@@ -177,6 +177,7 @@ pub(crate) fn remote_run_summary_json(
             "origin_url": null,
             "provider": "unknown"
         },
+        "created_by": test_support::test_principal(),
         "origin": {
             "kind": "api"
         },
