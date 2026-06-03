@@ -4,7 +4,19 @@ use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunSpec};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::{AutomationRef, WorkflowSettings, fixtures};
+use fabro_types::{
+    AutomationRef, Principal, RunProvenance, SystemActorKind, WorkflowSettings, fixtures,
+};
+
+fn test_run_provenance() -> RunProvenance {
+    RunProvenance {
+        server:  None,
+        client:  None,
+        subject: Principal::System {
+            system_kind: SystemActorKind::Engine,
+        },
+    }
+}
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
@@ -27,7 +39,7 @@ fn run_spec_round_trips_templated_settings() {
         }),
         source_directory: Some("/Users/client/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance:       None,
+        provenance:       test_run_provenance(),
         manifest_blob:    None,
         definition_blob:  None,
         git:              Some(GitContext {
@@ -80,7 +92,8 @@ fn run_spec_defaults_automation_for_legacy_specs() {
         "run_id": fixtures::RUN_1,
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
-        "labels": {}
+        "labels": {},
+        "provenance": test_run_provenance()
     });
 
     let record: RunSpec = serde_json::from_value(json).expect("legacy spec should deserialize");

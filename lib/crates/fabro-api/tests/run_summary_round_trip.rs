@@ -12,7 +12,7 @@ use fabro_types::{
     AskFabro, AskFabroUnavailableReason, AutomationRef, DiffSummary, PullRequestLink,
     RepositoryProvider, RepositoryRef, Run, RunApproval, RunApprovalState, RunBillingSummary,
     RunId, RunLifecycle, RunLinks, RunOrigin, RunRunnableSource, RunSize, RunTimestamps, RunTiming,
-    WorkflowRef, fixtures,
+    WorkflowRef, fixtures, test_support as types_test_support,
 };
 use serde_json::json;
 
@@ -88,7 +88,7 @@ fn run_summary_json_matches_openapi_shape() {
             origin_url: None,
             provider:   RepositoryProvider::Unknown,
         }),
-        created_by:       None,
+        created_by:       types_test_support::test_principal(),
         origin:           RunOrigin::default(),
         labels:           HashMap::from([("team".to_string(), "core".to_string())]),
         lifecycle:        RunLifecycle {
@@ -161,7 +161,7 @@ fn run_summary_json_matches_openapi_shape() {
                 "origin_url": null,
                 "provider": "unknown"
             },
-            "created_by": null,
+            "created_by": types_test_support::test_principal(),
             "origin": {
                 "kind": "api"
             },
@@ -253,6 +253,7 @@ fn run_summary_deserializes_when_optional_fields_are_absent() {
             "origin_url": null,
             "provider": "unknown"
         },
+        "created_by": types_test_support::test_principal(),
         "models": [],
         "timestamps": {
             "created_at": "2026-04-20T12:00:00Z",

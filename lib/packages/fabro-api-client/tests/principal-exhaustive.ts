@@ -1,4 +1,4 @@
-import type { AutomationRef, Principal, PrincipalSystem, RunSpec } from "../src";
+import type { AutomationRef, Principal, PrincipalSystem, Run, RunSpec } from "../src";
 
 type AssertFalse<T extends false> = T;
 type AssertExtends<T extends U, U> = true;
@@ -40,12 +40,16 @@ export function systemKind(principal: PrincipalSystem): string {
   }
 }
 
-type Provenance = NonNullable<RunSpec["provenance"]>;
-type Subject = NonNullable<Provenance["subject"]>;
+type Provenance = RunSpec["provenance"];
+type Subject = Provenance["subject"];
+type Creator = Run["created_by"];
 
 type SubjectIsNotAny = AssertFalse<IsAny<Subject>>;
 type SubjectExtendsPrincipal = AssertExtends<Subject, Principal>;
 type PrincipalExtendsSubject = AssertExtends<Principal, Subject>;
+type CreatorIsNotAny = AssertFalse<IsAny<Creator>>;
+type CreatorExtendsPrincipal = AssertExtends<Creator, Principal>;
+type PrincipalExtendsCreator = AssertExtends<Principal, Creator>;
 
 type Automation = NonNullable<RunSpec["automation"]>;
 type AutomationExtendsRef = AssertExtends<Automation, AutomationRef>;
@@ -67,6 +71,9 @@ const _automationTriggerId: AutomationTriggerId = "schedule_1";
 void (null as unknown as SubjectIsNotAny);
 void (null as unknown as SubjectExtendsPrincipal);
 void (null as unknown as PrincipalExtendsSubject);
+void (null as unknown as CreatorIsNotAny);
+void (null as unknown as CreatorExtendsPrincipal);
+void (null as unknown as PrincipalExtendsCreator);
 void (null as unknown as AutomationExtendsRef);
 void _principalSubject;
 void _automation;

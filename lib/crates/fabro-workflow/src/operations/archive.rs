@@ -136,7 +136,10 @@ mod tests {
     use std::time::Duration;
 
     use fabro_store::Database;
-    use fabro_types::{FailureReason, RunId, SuccessReason, TerminalStatus, fixtures};
+    use fabro_types::{
+        FailureReason, RunId, SuccessReason, TerminalStatus, fixtures,
+        test_support as types_test_support,
+    };
     use object_store::memory::InMemory;
 
     use super::*;
@@ -226,7 +229,7 @@ mod tests {
             workflow_slug:    None,
             automation:       None,
             db_prefix:        None,
-            provenance:       None,
+            provenance:       types_test_support::test_run_provenance(),
             manifest_blob:    None,
             git:              None,
             fork_source_ref:  None,

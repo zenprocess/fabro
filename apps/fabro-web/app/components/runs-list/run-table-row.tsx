@@ -36,6 +36,7 @@ export function RunTableRow({
   const lifecycleLabel = listLifecycleStatusLabel(run);
   const statusDisplay = columnStatusDisplay[run.status];
   const show = (col: ToggleableColumn) => !hiddenColumns.has(col);
+  const creatorDisplay = principalDisplay(run.createdBy);
 
   return (
     <tr className={`group relative border-b border-line transition-colors last:border-b-0 ${selected ? "bg-overlay/30" : "hover:bg-overlay/40"}`}>
@@ -54,14 +55,9 @@ export function RunTableRow({
       </td>
       {show("created_by") && (
         <td className="relative z-10 w-8 whitespace-nowrap px-3 py-2.5">
-          {run.createdBy && (() => {
-            const display = principalDisplay(run.createdBy);
-            return (
-              <Tooltip label={display.label}>
-                <span aria-label={`Created by ${display.label}`}>{display.glyph}</span>
-              </Tooltip>
-            );
-          })()}
+          <Tooltip label={creatorDisplay.label}>
+            <span aria-label={`Created by ${creatorDisplay.label}`}>{creatorDisplay.glyph}</span>
+          </Tooltip>
         </td>
       )}
       {show("repo") && (

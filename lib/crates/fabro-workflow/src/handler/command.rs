@@ -228,7 +228,10 @@ mod tests {
     use bytes::Bytes;
     use fabro_graphviz::graph::AttrValue;
     use fabro_store::{Database, RunDatabase, StageId};
-    use fabro_types::{Graph, RunProjection, RunSpec, WorkflowSettings, fixtures};
+    use fabro_types::{
+        Graph, RunProjection, RunSpec, WorkflowSettings, fixtures,
+        test_support as types_test_support,
+    };
     use object_store::memory::InMemory;
     use tokio::sync::Mutex;
 
@@ -256,7 +259,7 @@ mod tests {
                     automation:       None,
                     source_directory: None,
                     labels:           std::collections::HashMap::default(),
-                    provenance:       None,
+                    provenance:       types_test_support::test_run_provenance(),
                     manifest_blob:    None,
                     definition_blob:  None,
                     git:              None,
@@ -357,7 +360,7 @@ mod tests {
                 workflow_slug:    None,
                 automation:       None,
                 db_prefix:        None,
-                provenance:       None,
+                provenance:       types_test_support::test_run_provenance(),
                 manifest_blob:    None,
                 git:              None,
                 fork_source_ref:  None,
