@@ -1,0 +1,1000 @@
+diff --git a/card-game-app/README.md b/card-game-app/README.md
+new file mode 100644
+index 000000000..c7e3693b8
+--- /dev/null
++++ b/card-game-app/README.md
+@@ -0,0 +1,55 @@
++# Terminal-Based Spider Solitaire Game
++
++A terminal-based Spider Solitaire game written in Python using the `curses` standard library.
++
++## Features
++
++- **Standard Spider Solitaire Rules**: Play with 104 cards, 10 tableau columns, and 5 stock deals.
++- **Multiple Difficulties**:
++  - **1 Suit (Easy)**: All cards are Spades (♠).
++  - **2 Suits (Medium)**: Spades (♠) and Hearts (♥).
++  - **4 Suits (Hard)**: Spades (♠), Hearts (♥), Diamonds (♦), and Clubs (♣).
++- **Smooth Cursor Navigation**: Move around the tableau and select cards seamlessly with arrow keys or WASD.
++- **Color Coding**: Suit-colored rendering (Red for Hearts/Diamonds, White/Default for Spades/Clubs) and distinct highlight styles for selection and active cursors.
++- **Full Undo/Redo**: Revert moves with `U`.
++- **Responsive Layout**: Adapts gracefully to different terminal heights and widths.
++- **Smoke Test Mode**: Run programmatic assertions and verify game correctness in a completely non-interactive terminal environment with `--smoke`.
++
++## Installation & Setup
++
++Ensure you have Python 3.10+ installed.
++
++```bash
++cd card-game-app
++pip install -e .
++```
++
++## Running the Game
++
++To play the interactive curses game:
++```bash
++python3 main.py
++```
++
++To run the automated smoke test verification:
++```bash
++python3 main.py --smoke
++```
++
++## Running Tests
++
++Run the test suite using `pytest`:
++```bash
++python3 -m pytest tests/ -v
++```
++
++## Controls
++
++- **Left/Right Arrows (H/L, A/D)**: Move cursor left/right across columns.
++- **Up/Down Arrows (K/J, W/S)**: Move cursor up/down within a column to select starting card of a sequence.
++- **Space/Enter**: Select starting card of a sequence, or drop sequence onto a destination column.
++- **S**: Deal a round of 10 cards from the Stock.
++- **U**: Undo the last move.
++- **R**: Restart game (allows choosing a new difficulty).
++- **Q / ESC**: Quit the game.
++- **C**: Clear current selection.
+diff --git a/card-game-app/main.py b/card-game-app/main.py
+index bdeb32c5b..8d488c60f 100644
+--- a/card-game-app/main.py
++++ b/card-game-app/main.py
+@@ -1,432 +1,10 @@
+ import sys
+ import os
+-import json
+ 
+-# Add current directory to path to ensure relative imports work reliably
+-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+-
+-from engine import GameState, Card, RANK_NAMES, SUIT_SYMBOLS
+-
+-def run_smoke_test():
+-    print("Running non-interactive smoke test verification...")
+-    
+-    # 1. Initialize a 1-suit Spider solitaire game
+-    state = GameState(difficulty=1)
+-    
+-    # 2. Verify the card count in columns (54) and stock (50)
+-    total_tableau = sum(len(col) for col in state.tableau)
+-    print(f"Tableau card count: {total_tableau} (Expected: 54)")
+-    assert total_tableau == 54, f"Tableau card count must be 54, got {total_tableau}"
+-    
+-    stock_count = len(state.stock)
+-    print(f"Stock card count: {stock_count} (Expected: 50)")
+-    assert stock_count == 50, f"Stock card count must be 50, got {stock_count}"
+-    
+-    # 3. Force-create a valid move in the initial state to ensure 100% determinism
+-    # Set top of col 0 to Q of Spades (12) and top of col 1 to J of Spades (11)
+-    state.tableau[0][-1] = Card(12, 'S', face_up=True)
+-    state.tableau[1][-1] = Card(11, 'S', face_up=True)
+-    
+-    idx_col1 = len(state.tableau[1]) - 1
+-    print("Checking move validation...")
+-    can_m = state.can_move(1, idx_col1, 0)
+-    print(f"Can move J onto Q? {can_m}")
+-    assert can_m, "Deterministic move should be valid"
+-    
+-    print("Executing move...")
+-    success = state.move_cards(1, idx_col1, 0)
+-    print(f"Move success? {success}")
+-    assert success, "Move execution must succeed"
+-    
+-    # Verify columns and score updated
+-    assert len(state.tableau[1]) == 5, f"Col 1 should have 5 cards, got {len(state.tableau[1])}"
+-    assert len(state.tableau[0]) == 7, f"Col 0 should have 7 cards, got {len(state.tableau[0])}"
+-    assert state.tableau[0][-1].rank == 11, "Col 0 top card should be J"
+-    assert state.tableau[0][-2].rank == 12, "Col 0 second top card should be Q"
+-    assert state.score == 499, f"Score should be 499, got {state.score}"
+-    assert state.moves_count == 1, f"Moves count should be 1, got {state.moves_count}"
+-    
+-    # 4. Deal from stock and verify stock size decreases by 10 and columns increase
+-    print("Dealing from stock...")
+-    deal_ok = state.deal_from_stock()
+-    print(f"Deal success? {deal_ok}")
+-    assert deal_ok, "Deal from stock must succeed"
+-    assert len(state.stock) == 40, f"Stock size should be 40, got {len(state.stock)}"
+-    assert len(state.tableau[0]) == 8, f"Col 0 should now have 8 cards, got {len(state.tableau[0])}"
+-    assert state.score == 498, f"Score should be 498, got {state.score}"
+-    assert state.moves_count == 2, f"Moves count should be 2, got {state.moves_count}"
+-    
+-    # 5. Perform an undo and verify correctness
+-    print("Undoing deal...")
+-    undo_ok = state.undo()
+-    print(f"Undo success? {undo_ok}")
+-    assert undo_ok, "Undo must succeed"
+-    assert len(state.stock) == 50, f"Stock size should return to 50, got {len(state.stock)}"
+-    assert len(state.tableau[0]) == 7, f"Col 0 should return to 7 cards, got {len(state.tableau[0])}"
+-    assert state.score == 499, f"Score should return to 499, got {state.score}"
+-    assert state.moves_count == 1, f"Moves count should return to 1, got {state.moves_count}"
+-    
+-    # 6. Print JSON report of the execution status and exit with code 0
+-    report = {
+-        "outcome": "succeeded",
+-        "assertions_verified": True,
+-        "tableau_cards": total_tableau,
+-        "stock_cards": len(state.stock),
+-        "smoke_test_passed": True
+-    }
+-    print(json.dumps(report, indent=2))
+-    sys.exit(0)
+-
+-
+-def get_card_color_pair(card, is_selected, is_cursor):
+-    is_red = card.suit in ('H', 'D')
+-    if is_cursor:
+-        return 4 if is_red else 3
+-    elif is_selected:
+-        return 6 if is_red else 5
+-    else:
+-        return 1 if is_red else 2
+-
+-
+-def confirm_action(stdscr, prompt_text):
+-    height, width = stdscr.getmaxyx()
+-    stdscr.move(height - 3, 0)
+-    stdscr.clrtoeol()
+-    stdscr.addstr(height - 3, 2, f"{prompt_text} (y/n): ", curses.A_BOLD | curses.color_pair(8))
+-    stdscr.refresh()
+-    
+-    while True:
+-        ch = stdscr.getch()
+-        if ch in (ord('y'), ord('Y')):
+-            return True
+-        elif ch in (ord('n'), ord('N'), 27):
+-            return False
+-
+-
+-def choose_difficulty(stdscr):
+-    height, width = stdscr.getmaxyx()
+-    stdscr.move(height - 3, 0)
+-    stdscr.clrtoeol()
+-    stdscr.addstr(height - 3, 2, "Select Difficulty: [1] 1-Suit (Easy) [2] 2-Suit (Medium) [4] 4-Suit (Hard) (ESC to cancel): ", curses.A_BOLD | curses.color_pair(8))
+-    stdscr.refresh()
+-    
+-    while True:
+-        ch = stdscr.getch()
+-        if ch == ord('1'):
+-            return 1
+-        elif ch == ord('2'):
+-            return 2
+-        elif ch == ord('4'):
+-            return 4
+-        elif ch == 27: # ESC
+-            return None
+-
+-
+-def play_game(stdscr):
+-    # Hide standard cursor
+-    try:
+-        curses.curs_set(0)
+-    except Exception:
+-        pass
+-        
+-    # Init colors
+-    import curses
+-    try:
+-        curses.start_color()
+-        curses.use_default_colors()
+-        bg = -1
+-    except Exception:
+-        bg = curses.COLOR_BLACK
+-        
+-    curses.init_pair(1, curses.COLOR_RED, bg)     # Red card
+-    curses.init_pair(2, curses.COLOR_WHITE, bg)   # Black card
+-    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Cursor (Black)
+-    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_CYAN)     # Cursor (Red)
+-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_YELLOW) # Selected (Black)
+-    curses.init_pair(6, curses.COLOR_RED, curses.COLOR_YELLOW)   # Selected (Red)
+-    curses.init_pair(7, curses.COLOR_GREEN, bg)   # Status success
+-    curses.init_pair(8, curses.COLOR_YELLOW, bg)  # Status warn
+-    
+-    # Start default game
+-    difficulty = 1
+-    state = GameState(difficulty)
+-    
+-    cursor_col = 0
+-    cursor_row = len(state.tableau[cursor_col]) - 1
+-    
+-    selected_col = None
+-    selected_card_idx = None
+-    
+-    status_message = "🕷️ Welcome to Spider Solitaire! Use Arrow keys to move cursor, Enter/Space to select."
+-    status_is_error = False
+-    
+-    while True:
+-        stdscr.erase()
+-        height, width = stdscr.getmaxyx()
+-        
+-        # Guard for small screen sizes
+-        if width < 80 or height < 22:
+-            stdscr.addstr(0, 0, "Terminal screen is too small!")
+-            stdscr.addstr(1, 0, f"Current: {width}x{height} (Required: at least 80x22)")
+-            stdscr.addstr(3, 0, "Please enlarge your terminal or press 'q' to Quit.")
+-            stdscr.refresh()
+-            ch = stdscr.getch()
+-            if ch in (ord('q'), ord('Q'), 27):
+-                break
+-            continue
+-            
+-        # 1. Header Row
+-        stdscr.addstr(0, 2, "🕷️  SPIDER SOLITAIRE", curses.A_BOLD | curses.color_pair(7))
+-        diff_str = {1: "1-Suit (Easy)", 2: "2-Suit (Medium)", 4: "4-Suit (Hard)"}[state.difficulty]
+-        summary_str = f"Score: {state.score:<4}  Moves: {state.moves_count:<4}  Difficulty: {diff_str}"
+-        stdscr.addstr(0, width - len(summary_str) - 2, summary_str, curses.A_BOLD)
+-        stdscr.addstr(1, 0, "=" * width)
+-        
+-        # 2. Stock & Foundation Row
+-        num_deals = len(state.stock) // 10
+-        stock_desc = "Stock: "
+-        stdscr.addstr(3, 2, stock_desc)
+-        for d in range(5):
+-            if d < num_deals:
+-                stdscr.addstr(3, 2 + len(stock_desc) + d * 6, "[░░░]", curses.color_pair(2))
+-            else:
+-                stdscr.addstr(3, 2 + len(stock_desc) + d * 6, "[   ]", curses.A_DIM)
+-        stdscr.addstr(3, 2 + len(stock_desc) + 5 * 6, f" ({num_deals} deals left)", curses.A_DIM)
+-        
+-        completed_desc = "Completed: "
+-        stdscr.addstr(3, width - 48, completed_desc)
+-        for i in range(8):
+-            comp_x = width - 48 + len(completed_desc) + i * 5
+-            if i < len(state.completed_suits):
+-                suit = state.completed_suits[i]
+-                suit_sym = SUIT_SYMBOLS[suit]
+-                color_p = 1 if suit in ('H', 'D') else 2
+-                stdscr.addstr(3, comp_x, f"[K{suit_sym}]", curses.color_pair(color_p) | curses.A_BOLD)
+-            else:
+-                stdscr.addstr(3, comp_x, "[  ]", curses.A_DIM)
+-                
+-        stdscr.addstr(4, 0, "-" * width)
+-        
+-        # 3. Tableau Rendering
+-        for col_idx in range(10):
+-            col_x = col_idx * 8 + 1
+-            col_cards = state.tableau[col_idx]
+-            
+-            # Label
+-            col_lbl_style = curses.A_BOLD
+-            if cursor_col == col_idx and selected_col is None:
+-                col_lbl_style |= curses.A_UNDERLINE
+-            stdscr.addstr(5, col_x, f" Col {col_idx+1:<2}", col_lbl_style)
+-            stdscr.addstr(6, col_x, "------")
+-            
+-            # Get counts and partition
+-            num_fd = sum(1 for c in col_cards if not c.face_up)
+-            
+-            y = 7
+-            if num_fd > 0:
+-                stdscr.addstr(y, col_x, f"[░x{num_fd}]", curses.color_pair(2))
+-                y += 1
+-                
+-            if not col_cards:
+-                # Column is empty
+-                if cursor_col == col_idx:
+-                    stdscr.addstr(y, col_x, "[ - ]", curses.color_pair(3))
+-                else:
+-                    stdscr.addstr(y, col_x, "[---]", curses.A_DIM)
+-            else:
+-                for card_idx, card in enumerate(col_cards):
+-                    if not card.face_up:
+-                        continue
+-                        
+-                    is_cur = (col_idx == cursor_col and card_idx == cursor_row)
+-                    is_sel = (selected_col == col_idx and card_idx >= selected_card_idx)
+-                    
+-                    pair = get_card_color_pair(card, is_sel, is_cur)
+-                    card_str = f"[{RANK_NAMES[card.rank]:>2}{SUIT_SYMBOLS[card.suit]}]"
+-                    
+-                    draw_row = 7 + (1 if num_fd > 0 else 0) + (card_idx - num_fd)
+-                    if draw_row < height - 5:
+-                        stdscr.addstr(draw_row, col_x, card_str, curses.color_pair(pair))
+-                        
+-        # 4. Footer & Control Panel
+-        stdscr.addstr(height - 5, 0, "=" * width)
+-        
+-        status_style = curses.color_pair(8) if status_is_error else curses.color_pair(7)
+-        stdscr.addstr(height - 4, 2, status_message[:width-4], status_style | curses.A_BOLD)
+-        
+-        instr_str = "Arrows/WASD: Move Cursor | Enter/Space: Select/Move | S: Deal Stock | U: Undo | R: Restart | Q: Quit"
+-        stdscr.addstr(height - 2, 2, instr_str[:width-4], curses.A_DIM)
+-        
+-        stdscr.refresh()
+-        
+-        # User input
+-        ch = stdscr.getch()
+-        
+-        # Navigation
+-        if ch in (curses.KEY_LEFT, ord('h'), ord('H'), ord('a'), ord('A')):
+-            cursor_col = (cursor_col - 1) % 10
+-            col_cards = state.tableau[cursor_col]
+-            cursor_row = max(0, len(col_cards) - 1)
+-            status_message = f"Column {cursor_col + 1} selected."
+-            status_is_error = False
+-            
+-        elif ch in (curses.KEY_RIGHT, ord('l'), ord('L'), ord('d'), ord('D')):
+-            cursor_col = (cursor_col + 1) % 10
+-            col_cards = state.tableau[cursor_col]
+-            cursor_row = max(0, len(col_cards) - 1)
+-            status_message = f"Column {cursor_col + 1} selected."
+-            status_is_error = False
+-            
+-        elif ch in (curses.KEY_UP, ord('k'), ord('K'), ord('w'), ord('W')):
+-            if selected_col is None:
+-                col_cards = state.tableau[cursor_col]
+-                num_fd = sum(1 for c in col_cards if not c.face_up)
+-                if len(col_cards) > 0:
+-                    cursor_row = max(num_fd, cursor_row - 1)
+-            else:
+-                status_message = "Locked on selected sequence. Choose destination column and press Enter/Space."
+-                status_is_error = True
+-                
+-        elif ch in (curses.KEY_DOWN, ord('j'), ord('J'), ord('s'), ord('S')) and ch not in (ord('s'), ord('S')):
+-            if selected_col is None:
+-                col_cards = state.tableau[cursor_col]
+-                if len(col_cards) > 0:
+-                    cursor_row = min(len(col_cards) - 1, cursor_row + 1)
+-            else:
+-                status_message = "Locked on selected sequence. Choose destination column and press Enter/Space."
+-                status_is_error = True
+-                
+-        elif ch in (ord(' '), 10, 13, curses.KEY_ENTER):
+-            if selected_col is None:
+-                # Select sequence
+-                col_cards = state.tableau[cursor_col]
+-                if not col_cards:
+-                    status_message = "Cannot select from an empty column!"
+-                    status_is_error = True
+-                else:
+-                    valid_starts = state.get_movable_sequence_start_indices(cursor_col)
+-                    if cursor_row in valid_starts:
+-                        selected_col = cursor_col
+-                        selected_card_idx = cursor_row
+-                        status_message = f"Selected cards from Col {selected_col + 1}. Choose target column and press Enter."
+-                        status_is_error = False
+-                    else:
+-                        status_message = "Invalid selection! Cards must be descending and of the same suit."
+-                        status_is_error = True
+-            else:
+-                # Attempt move
+-                if cursor_col == selected_col:
+-                    # Deselect
+-                    selected_col = None
+-                    selected_card_idx = None
+-                    status_message = "Selection cleared."
+-                    status_is_error = False
+-                else:
+-                    success = state.move_cards(selected_col, selected_card_idx, cursor_col)
+-                    if success:
+-                        selected_col = None
+-                        selected_card_idx = None
+-                        status_message = "Moved successfully!"
+-                        status_is_error = False
+-                        
+-                        # Set cursor row to bottom of new column
+-                        cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
+-                        
+-                        # Check Win
+-                        if state.is_won():
+-                            stdscr.erase()
+-                            stdscr.addstr(height // 2 - 2, (width - 40) // 2, "🎉 CONGRATULATIONS! YOU WON! 🎉", curses.A_BOLD | curses.color_pair(7))
+-                            stdscr.addstr(height // 2, (width - 30) // 2, f"Final Score: {state.score}", curses.A_BOLD)
+-                            stdscr.addstr(height // 2 + 1, (width - 30) // 2, f"Total Moves: {state.moves_count}", curses.A_BOLD)
+-                            stdscr.addstr(height // 2 + 3, (width - 40) // 2, "Press any key to exit...", curses.A_DIM)
+-                            stdscr.refresh()
+-                            stdscr.getch()
+-                            break
+-                    else:
+-                        status_message = "Invalid move! Target card must be 1 rank higher than selected card."
+-                        status_is_error = True
+-                        
+-        elif ch in (ord('c'), ord('C'), 27): # ESC or C clears selection
+-            if selected_col is not None:
+-                selected_col = None
+-                selected_card_idx = None
+-                status_message = "Selection cleared."
+-                status_is_error = False
+-            else:
+-                # Prompt Quit on Esc if nothing is selected
+-                if confirm_action(stdscr, "Are you sure you want to quit?"):
+-                    break
+-                else:
+-                    status_message = "Quit cancelled."
+-                    status_is_error = False
+-                    
+-        elif ch in (ord('s'), ord('S')):
+-            if not state.can_deal_from_stock():
+-                if len(state.stock) < 10:
+-                    status_message = "Stock is empty!"
+-                else:
+-                    status_message = "Cannot deal: all empty columns must be filled first!"
+-                status_is_error = True
+-            else:
+-                success = state.deal_from_stock()
+-                if success:
+-                    selected_col = None
+-                    selected_card_idx = None
+-                    cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
+-                    status_message = "Dealt 10 cards from the stock!"
+-                    status_is_error = False
+-                    
+-        elif ch in (ord('u'), ord('U')):
+-            if state.undo():
+-                selected_col = None
+-                selected_card_idx = None
+-                cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
+-                status_message = "Last move undone."
+-                status_is_error = False
+-            else:
+-                status_message = "Nothing to undo!"
+-                status_is_error = True
+-                
+-        elif ch in (ord('r'), ord('R')):
+-            if confirm_action(stdscr, "Are you sure you want to restart?"):
+-                diff = choose_difficulty(stdscr)
+-                if diff is not None:
+-                    difficulty = diff
+-                state = GameState(difficulty)
+-                cursor_col = 0
+-                cursor_row = len(state.tableau[cursor_col]) - 1
+-                selected_col = None
+-                selected_card_idx = None
+-                status_message = f"Started a new {difficulty}-Suit game!"
+-                status_is_error = False
+-            else:
+-                status_message = "Restart cancelled."
+-                status_is_error = False
+-                
+-        elif ch in (ord('q'), ord('Q')):
+-            if confirm_action(stdscr, "Are you sure you want to quit?"):
+-                break
+-            else:
+-                status_message = "Quit cancelled."
+-                status_is_error = False
+-                
+-        elif ch == curses.KEY_RESIZE:
+-            # Re-read terminal dimensions next loop
+-            pass
+-
+-
+-def main():
+-    if len(sys.argv) > 1 and sys.argv[1] == '--smoke':
+-        run_smoke_test()
+-    else:
+-        import curses
+-        from curses import wrapper
+-        try:
+-            wrapper(play_game)
+-        except KeyboardInterrupt:
+-            print("\nGame exited.")
+-            sys.exit(0)
++# Add src to python path to import card_game_tui package correctly
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
+ 
++from card_game_tui.main import main
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/card-game-app/pyproject.toml b/card-game-app/pyproject.toml
+new file mode 100644
+index 000000000..84a4ace54
+--- /dev/null
++++ b/card-game-app/pyproject.toml
+@@ -0,0 +1,31 @@
++[build-system]
++requires = ["setuptools>=61.0.0", "wheel"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "card_game_tui"
++version = "0.1.0"
++description = "A terminal-based Spider Solitaire game in Python"
++readme = "README.md"
++requires-python = ">=3.10"
++license = {text = "MIT"}
++classifiers = [
++    "Programming Language :: Python :: 3",
++    "License :: OSI Approved :: MIT License",
++    "Operating System :: OS Independent",
++]
++dependencies = []
++
++[project.scripts]
++card-game-tui = "card_game_tui.main:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++minversion = "6.0"
++addopts = "-ra -q"
++testpaths = [
++    "tests",
++]
++pythonpath = ["src"]
+diff --git a/card-game-app/src/card_game_tui/__init__.py b/card-game-app/src/card_game_tui/__init__.py
+new file mode 100644
+index 000000000..124c54346
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/__init__.py
+@@ -0,0 +1 @@
++# TUI Spider Solitaire Game Package
+diff --git a/card-game-app/engine.py b/card-game-app/src/card_game_tui/engine.py
+similarity index 100%
+rename from card-game-app/engine.py
+rename to card-game-app/src/card_game_tui/engine.py
+diff --git a/card-game-app/src/card_game_tui/main.py b/card-game-app/src/card_game_tui/main.py
+new file mode 100644
+index 000000000..0bdf75277
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/main.py
+@@ -0,0 +1,424 @@
++import sys
++import os
++import json
++import curses
++
++from .engine import GameState, Card, RANK_NAMES, SUIT_SYMBOLS
++
++def run_smoke_test():
++    print("Running non-interactive smoke test verification...")
++    
++    # 1. Initialize a 1-suit Spider solitaire game
++    state = GameState(difficulty=1)
++    
++    # 2. Verify the card count in columns (54) and stock (50)
++    total_tableau = sum(len(col) for col in state.tableau)
++    print(f"Tableau card count: {total_tableau} (Expected: 54)")
++    assert total_tableau == 54, f"Tableau card count must be 54, got {total_tableau}"
++    
++    stock_count = len(state.stock)
++    print(f"Stock card count: {stock_count} (Expected: 50)")
++    assert stock_count == 50, f"Stock card count must be 50, got {stock_count}"
++    
++    # 3. Force-create a valid move in the initial state to ensure 100% determinism
++    # Set top of col 0 to Q of Spades (12) and top of col 1 to J of Spades (11)
++    state.tableau[0][-1] = Card(12, 'S', face_up=True)
++    state.tableau[1][-1] = Card(11, 'S', face_up=True)
++    
++    idx_col1 = len(state.tableau[1]) - 1
++    print("Checking move validation...")
++    can_m = state.can_move(1, idx_col1, 0)
++    print(f"Can move J onto Q? {can_m}")
++    assert can_m, "Deterministic move should be valid"
++    
++    print("Executing move...")
++    success = state.move_cards(1, idx_col1, 0)
++    print(f"Move success? {success}")
++    assert success, "Move execution must succeed"
++    
++    # Verify columns and score updated
++    assert len(state.tableau[1]) == 5, f"Col 1 should have 5 cards, got {len(state.tableau[1])}"
++    assert len(state.tableau[0]) == 7, f"Col 0 should have 7 cards, got {len(state.tableau[0])}"
++    assert state.tableau[0][-1].rank == 11, "Col 0 top card should be J"
++    assert state.tableau[0][-2].rank == 12, "Col 0 second top card should be Q"
++    assert state.score == 499, f"Score should be 499, got {state.score}"
++    assert state.moves_count == 1, f"Moves count should be 1, got {state.moves_count}"
++    
++    # 4. Deal from stock and verify stock size decreases by 10 and columns increase
++    print("Dealing from stock...")
++    deal_ok = state.deal_from_stock()
++    print(f"Deal success? {deal_ok}")
++    assert deal_ok, "Deal from stock must succeed"
++    assert len(state.stock) == 40, f"Stock size should be 40, got {len(state.stock)}"
++    assert len(state.tableau[0]) == 8, f"Col 0 should now have 8 cards, got {len(state.tableau[0])}"
++    assert state.score == 498, f"Score should be 498, got {state.score}"
++    assert state.moves_count == 2, f"Moves count should be 2, got {state.moves_count}"
++    
++    # 5. Perform an undo and verify correctness
++    print("Undoing deal...")
++    undo_ok = state.undo()
++    print(f"Undo success? {undo_ok}")
++    assert undo_ok, "Undo must succeed"
++    assert len(state.stock) == 50, f"Stock size should return to 50, got {len(state.stock)}"
++    assert len(state.tableau[0]) == 7, f"Col 0 should return to 7 cards, got {len(state.tableau[0])}"
++    assert state.score == 499, f"Score should return to 499, got {state.score}"
++    assert state.moves_count == 1, f"Moves count should return to 1, got {state.moves_count}"
++    
++    # 6. Print JSON report of the execution status and exit with code 0
++    report = {
++        "outcome": "succeeded",
++        "assertions_verified": True,
++        "tableau_cards": total_tableau,
++        "stock_cards": len(state.stock),
++        "smoke_test_passed": True
++    }
++    print(json.dumps(report, indent=2))
++    sys.exit(0)
++
++
++def get_card_color_pair(card, is_selected, is_cursor):
++    is_red = card.suit in ('H', 'D')
++    if is_cursor:
++        return 4 if is_red else 3
++    elif is_selected:
++        return 6 if is_red else 5
++    else:
++        return 1 if is_red else 2
++
++
++def confirm_action(stdscr, prompt_text):
++    height, width = stdscr.getmaxyx()
++    stdscr.move(height - 3, 0)
++    stdscr.clrtoeol()
++    stdscr.addstr(height - 3, 2, f"{prompt_text} (y/n): ", curses.A_BOLD | curses.color_pair(8))
++    stdscr.refresh()
++    
++    while True:
++        ch = stdscr.getch()
++        if ch in (ord('y'), ord('Y')):
++            return True
++        elif ch in (ord('n'), ord('N'), 27):
++            return False
++
++
++def choose_difficulty(stdscr):
++    height, width = stdscr.getmaxyx()
++    stdscr.move(height - 3, 0)
++    stdscr.clrtoeol()
++    stdscr.addstr(height - 3, 2, "Select Difficulty: [1] 1-Suit (Easy) [2] 2-Suit (Medium) [4] 4-Suit (Hard) (ESC to cancel): ", curses.A_BOLD | curses.color_pair(8))
++    stdscr.refresh()
++    
++    while True:
++        ch = stdscr.getch()
++        if ch == ord('1'):
++            return 1
++        elif ch == ord('2'):
++            return 2
++        elif ch == ord('4'):
++            return 4
++        elif ch == 27: # ESC
++            return None
++
++
++def play_game(stdscr):
++    # Hide standard cursor
++    try:
++        curses.curs_set(0)
++    except Exception:
++        pass
++        
++    # Init colors
++    try:
++        curses.start_color()
++        curses.use_default_colors()
++        bg = -1
++    except Exception:
++        bg = curses.COLOR_BLACK
++        
++    curses.init_pair(1, curses.COLOR_RED, bg)     # Red card
++    curses.init_pair(2, curses.COLOR_WHITE, bg)   # Black card
++    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)   # Cursor (Black)
++    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_CYAN)     # Cursor (Red)
++    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_YELLOW) # Selected (Black)
++    curses.init_pair(6, curses.COLOR_RED, curses.COLOR_YELLOW)   # Selected (Red)
++    curses.init_pair(7, curses.COLOR_GREEN, bg)   # Status success
++    curses.init_pair(8, curses.COLOR_YELLOW, bg)  # Status warn
++    
++    # Start default game
++    difficulty = 1
++    state = GameState(difficulty)
++    
++    cursor_col = 0
++    cursor_row = len(state.tableau[cursor_col]) - 1
++    
++    selected_col = None
++    selected_card_idx = None
++    
++    status_message = "🕷️ Welcome to Spider Solitaire! Use Arrow keys to move cursor, Enter/Space to select."
++    status_is_error = False
++    
++    while True:
++        stdscr.erase()
++        height, width = stdscr.getmaxyx()
++        
++        # Guard for small screen sizes
++        if width < 80 or height < 22:
++            stdscr.addstr(0, 0, "Terminal screen is too small!")
++            stdscr.addstr(1, 0, f"Current: {width}x{height} (Required: at least 80x22)")
++            stdscr.addstr(3, 0, "Please enlarge your terminal or press 'q' to Quit.")
++            stdscr.refresh()
++            ch = stdscr.getch()
++            if ch in (ord('q'), ord('Q'), 27):
++                break
++            continue
++            
++        # 1. Header Row
++        stdscr.addstr(0, 2, "🕷️  SPIDER SOLITAIRE", curses.A_BOLD | curses.color_pair(7))
++        diff_str = {1: "1-Suit (Easy)", 2: "2-Suit (Medium)", 4: "4-Suit (Hard)"}[state.difficulty]
++        summary_str = f"Score: {state.score:<4}  Moves: {state.moves_count:<4}  Difficulty: {diff_str}"
++        stdscr.addstr(0, width - len(summary_str) - 2, summary_str, curses.A_BOLD)
++        stdscr.addstr(1, 0, "=" * width)
++        
++        # 2. Stock & Foundation Row
++        num_deals = len(state.stock) // 10
++        stock_desc = "Stock: "
++        stdscr.addstr(3, 2, stock_desc)
++        for d in range(5):
++            if d < num_deals:
++                stdscr.addstr(3, 2 + len(stock_desc) + d * 6, "[░░░]", curses.color_pair(2))
++            else:
++                stdscr.addstr(3, 2 + len(stock_desc) + d * 6, "[   ]", curses.A_DIM)
++        stdscr.addstr(3, 2 + len(stock_desc) + 5 * 6, f" ({num_deals} deals left)", curses.A_DIM)
++        
++        completed_desc = "Completed: "
++        stdscr.addstr(3, width - 48, completed_desc)
++        for i in range(8):
++            comp_x = width - 48 + len(completed_desc) + i * 5
++            if i < len(state.completed_suits):
++                suit = state.completed_suits[i]
++                suit_sym = SUIT_SYMBOLS[suit]
++                color_p = 1 if suit in ('H', 'D') else 2
++                stdscr.addstr(3, comp_x, f"[K{suit_sym}]", curses.color_pair(color_p) | curses.A_BOLD)
++            else:
++                stdscr.addstr(3, comp_x, "[  ]", curses.A_DIM)
++                
++        stdscr.addstr(4, 0, "-" * width)
++        
++        # 3. Tableau Rendering
++        for col_idx in range(10):
++            col_x = col_idx * 8 + 1
++            col_cards = state.tableau[col_idx]
++            
++            # Label
++            col_lbl_style = curses.A_BOLD
++            if cursor_col == col_idx and selected_col is None:
++                col_lbl_style |= curses.A_UNDERLINE
++            stdscr.addstr(5, col_x, f" Col {col_idx+1:<2}", col_lbl_style)
++            stdscr.addstr(6, col_x, "------")
++            
++            # Get counts and partition
++            num_fd = sum(1 for c in col_cards if not c.face_up)
++            
++            y = 7
++            if num_fd > 0:
++                stdscr.addstr(y, col_x, f"[░x{num_fd}]", curses.color_pair(2))
++                y += 1
++                
++            if not col_cards:
++                # Column is empty
++                if cursor_col == col_idx:
++                    stdscr.addstr(y, col_x, "[ - ]", curses.color_pair(3))
++                else:
++                    stdscr.addstr(y, col_x, "[---]", curses.A_DIM)
++            else:
++                for card_idx, card in enumerate(col_cards):
++                    if not card.face_up:
++                        continue
++                        
++                    is_cur = (col_idx == cursor_col and card_idx == cursor_row)
++                    is_sel = (selected_col == col_idx and card_idx >= selected_card_idx)
++                    
++                    pair = get_card_color_pair(card, is_sel, is_cur)
++                    card_str = f"[{RANK_NAMES[card.rank]:>2}{SUIT_SYMBOLS[card.suit]}]"
++                    
++                    draw_row = 7 + (1 if num_fd > 0 else 0) + (card_idx - num_fd)
++                    if draw_row < height - 5:
++                        stdscr.addstr(draw_row, col_x, card_str, curses.color_pair(pair))
++                        
++        # 4. Footer & Control Panel
++        stdscr.addstr(height - 5, 0, "=" * width)
++        
++        status_style = curses.color_pair(8) if status_is_error else curses.color_pair(7)
++        stdscr.addstr(height - 4, 2, status_message[:width-4], status_style | curses.A_BOLD)
++        
++        instr_str = "Arrows/WASD: Move Cursor | Enter/Space: Select/Move | S: Deal Stock | U: Undo | R: Restart | Q: Quit"
++        stdscr.addstr(height - 2, 2, instr_str[:width-4], curses.A_DIM)
++        
++        stdscr.refresh()
++        
++        # User input
++        ch = stdscr.getch()
++        
++        # Navigation
++        if ch in (curses.KEY_LEFT, ord('h'), ord('H'), ord('a'), ord('A')):
++            cursor_col = (cursor_col - 1) % 10
++            col_cards = state.tableau[cursor_col]
++            cursor_row = max(0, len(col_cards) - 1)
++            status_message = f"Column {cursor_col + 1} selected."
++            status_is_error = False
++            
++        elif ch in (curses.KEY_RIGHT, ord('l'), ord('L'), ord('d'), ord('D')):
++            cursor_col = (cursor_col + 1) % 10
++            col_cards = state.tableau[cursor_col]
++            cursor_row = max(0, len(col_cards) - 1)
++            status_message = f"Column {cursor_col + 1} selected."
++            status_is_error = False
++            
++        elif ch in (curses.KEY_UP, ord('k'), ord('K'), ord('w'), ord('W')):
++            if selected_col is None:
++                col_cards = state.tableau[cursor_col]
++                num_fd = sum(1 for c in col_cards if not c.face_up)
++                if len(col_cards) > 0:
++                    cursor_row = max(num_fd, cursor_row - 1)
++            else:
++                status_message = "Locked on selected sequence. Choose destination column and press Enter/Space."
++                status_is_error = True
++                
++        elif ch in (curses.KEY_DOWN, ord('j'), ord('J'), ord('s'), ord('S')) and ch not in (ord('s'), ord('S')):
++            if selected_col is None:
++                col_cards = state.tableau[cursor_col]
++                if len(col_cards) > 0:
++                    cursor_row = min(len(col_cards) - 1, cursor_row + 1)
++            else:
++                status_message = "Locked on selected sequence. Choose destination column and press Enter/Space."
++                status_is_error = True
++                
++        elif ch in (ord(' '), 10, 13, curses.KEY_ENTER):
++            if selected_col is None:
++                # Select sequence
++                col_cards = state.tableau[cursor_col]
++                if not col_cards:
++                    status_message = "Cannot select from an empty column!"
++                    status_is_error = True
++                else:
++                    valid_starts = state.get_movable_sequence_start_indices(cursor_col)
++                    if cursor_row in valid_starts:
++                        selected_col = cursor_col
++                        selected_card_idx = cursor_row
++                        status_message = f"Selected cards from Col {selected_col + 1}. Choose target column and press Enter."
++                        status_is_error = False
++                    else:
++                        status_message = "Invalid selection! Cards must be descending and of the same suit."
++                        status_is_error = True
++            else:
++                # Attempt move
++                if cursor_col == selected_col:
++                    # Deselect
++                    selected_col = None
++                    selected_card_idx = None
++                    status_message = "Selection cleared."
++                    status_is_error = False
++                else:
++                    success = state.move_cards(selected_col, selected_card_idx, cursor_col)
++                    if success:
++                        selected_col = None
++                        selected_card_idx = None
++                        status_message = "Moved successfully!"
++                        status_is_error = False
++                        
++                        # Set cursor row to bottom of new column
++                        cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
++                        
++                        # Check Win
++                        if state.is_won():
++                            stdscr.erase()
++                            stdscr.addstr(height // 2 - 2, (width - 40) // 2, "🎉 CONGRATULATIONS! YOU WON! 🎉", curses.A_BOLD | curses.color_pair(7))
++                            stdscr.addstr(height // 2, (width - 30) // 2, f"Final Score: {state.score}", curses.A_BOLD)
++                            stdscr.addstr(height // 2 + 1, (width - 30) // 2, f"Total Moves: {state.moves_count}", curses.A_BOLD)
++                            stdscr.addstr(height // 2 + 3, (width - 40) // 2, "Press any key to exit...", curses.A_DIM)
++                            stdscr.refresh()
++                            stdscr.getch()
++                            break
++                    else:
++                        status_message = "Invalid move! Target card must be 1 rank higher than selected card."
++                        status_is_error = True
++                        
++        elif ch in (ord('c'), ord('C'), 27): # ESC or C clears selection
++            if selected_col is not None:
++                selected_col = None
++                selected_card_idx = None
++                status_message = "Selection cleared."
++                status_is_error = False
++            else:
++                # Prompt Quit on Esc if nothing is selected
++                if confirm_action(stdscr, "Are you sure you want to quit?"):
++                    break
++                else:
++                    status_message = "Quit cancelled."
++                    status_is_error = False
++                    
++        elif ch in (ord('s'), ord('S')):
++            if not state.can_deal_from_stock():
++                if len(state.stock) < 10:
++                    status_message = "Stock is empty!"
++                else:
++                    status_message = "Cannot deal: all empty columns must be filled first!"
++                status_is_error = True
++            else:
++                success = state.deal_from_stock()
++                if success:
++                    selected_col = None
++                    selected_card_idx = None
++                    cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
++                    status_message = "Dealt 10 cards from the stock!"
++                    status_is_error = False
++                    
++        elif ch in (ord('u'), ord('U')):
++            if state.undo():
++                selected_col = None
++                selected_card_idx = None
++                cursor_row = max(0, len(state.tableau[cursor_col]) - 1)
++                status_message = "Last move undone."
++                status_is_error = False
++            else:
++                status_message = "Nothing to undo!"
++                status_is_error = True
++                
++        elif ch in (ord('r'), ord('R')):
++            if confirm_action(stdscr, "Are you sure you want to restart?"):
++                diff = choose_difficulty(stdscr)
++                if diff is not None:
++                    difficulty = diff
++                state = GameState(difficulty)
++                cursor_col = 0
++                cursor_row = len(state.tableau[cursor_col]) - 1
++                selected_col = None
++                selected_card_idx = None
++                status_message = f"Started a new {difficulty}-Suit game!"
++                status_is_error = False
++            else:
++                status_message = "Restart cancelled."
++                status_is_error = False
++                
++        elif ch in (ord('q'), ord('Q')):
++            if confirm_action(stdscr, "Are you sure you want to quit?"):
++                break
++            else:
++                status_message = "Quit cancelled."
++                status_is_error = False
++                
++        elif ch == curses.KEY_RESIZE:
++            # Re-read terminal dimensions next loop
++            pass
++
++
++def main():
++    if len(sys.argv) > 1 and sys.argv[1] == '--smoke':
++        run_smoke_test()
++    else:
++        from curses import wrapper
++        try:
++            wrapper(play_game)
++        except KeyboardInterrupt:
++            print("\nGame exited.")
++            sys.exit(0)
+diff --git a/card-game-app/tests/__init__.py b/card-game-app/tests/__init__.py
+new file mode 100644
+index 000000000..304b92512
+--- /dev/null
++++ b/card-game-app/tests/__init__.py
+@@ -0,0 +1 @@
++# Tests Package
+diff --git a/card-game-app/test_engine.py b/card-game-app/tests/test_engine.py
+similarity index 98%
+rename from card-game-app/test_engine.py
+rename to card-game-app/tests/test_engine.py
+index ff24caefe..8751fb452 100644
+--- a/card-game-app/test_engine.py
++++ b/card-game-app/tests/test_engine.py
+@@ -1,5 +1,5 @@
+ import unittest
+-from engine import GameState, Card, RANK_NAMES, SUIT_SYMBOLS
++from card_game_tui.engine import GameState, Card, RANK_NAMES, SUIT_SYMBOLS
+ 
+ class TestSpiderSolitaireEngine(unittest.TestCase):
+     def test_initialization_1_suit(self):
