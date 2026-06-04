@@ -505,7 +505,7 @@
     "kind": "running"
   },
   "status_updated_at": "2026-06-04T21:54:06.649399Z",
-  "last_event_at": "2026-06-04T23:26:07.268797Z",
+  "last_event_at": "2026-06-04T23:27:49.066773Z",
   "pending_control": null,
   "checkpoints": [
     {
@@ -935,9 +935,9 @@
       }
     },
     {
-      "seq": 0,
+      "seq": 1823,
       "checkpoint": {
-        "timestamp": "2026-06-04T23:26:07.509785Z",
+        "timestamp": "2026-06-04T23:26:13.211201Z",
         "current_node": "simplify_opus",
         "completed_nodes": [
           "start",
@@ -949,15 +949,218 @@
         ],
         "node_retries": {},
         "context_values": {
+          "internal.retry_count.simplify_opus": 0,
+          "current_node": "simplify_opus",
+          "internal.retry_count.start": 0,
+          "internal.work_dir": "/home/daytona/workspace/fabro",
+          "last_response": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCI",
+          "response.implement": "Done.\n\nCreated the requested two commits in order:\n\n1. `04d658727 Remove anonymous principal variant`\n2. `e3bfa60ac Make run provenance and creators total`\n\nImplemented commit 2 end-to-end:\n- Made `Run.created_by`, `RunSpec.provenance`, `RunProvenance.subject`, and run-created provenance total/non-optional.\n- Updated create/retry/server/demo/projection/event conversion flows.\n- Removed projection fallback creator behavior.\n- Updated OpenAPI and regenerated generated TS API models.\n- Added gated `fabro_types::test_support`.\n- Updated Rust/TS fixtures, snapshots, and tests.\n- Confirmed no pending snapshot artifacts and working tree is clean.\n\nVerification passed:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace --no-fail-fast`\n- `cargo nextest run -p fabro-server`\n- `cargo nextest run -p fabro-cli cmd::inspect::inspect_resolves_selector_via_server_endpoint --no-capture`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck && bun test && bun run build`\n- `git diff --check`\n- final invariant sweep for removed anonymous/nullable provenance patterns; remaining `subject` hits were unrelated todo/web-auth fields.\n\nManual browser/UI E2E was not run in this terminal session.",
+          "graph.rankdir": "LR",
+          "internal.fidelity": "compact",
+          "failure_class": "",
+          "internal.retry_count.preflight_lint": 0,
+          "internal.retry_count.toolchain": 0,
+          "outcome": "succeeded",
+          "response.simplify_opus": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCIPAL`/`testPrincipal()` definition: `app/data/runs.test.ts`, `app/lib/run-actions.test.ts`, `app/routes/automations-new.test.tsx`, `app/routes/run-files.render.test.tsx`, `app/routes/run-detail.test.ts`, `app/routes/runs.test.tsx`, `app/routes/runs.preferences.test.tsx`, `app/components/run-summary-panel.test.tsx`.\n- One Rust shared helper (`remote_run_summary_json` in `lib/crates/fabro-cli/tests/it/cmd/support.rs`) hand-wrote the principal JSON that matches `fabro_types::test_support::test_principal()`.\n\n**Items deliberately left as-is:**\n- The middleware `match &context.principal { Some(Principal::X) => ..., _ => auth_rejection(...) }` pattern is clean and readable; extracting a helper would obscure intent.\n- The `fabro-workflow/src/test_support.rs` provenance uses `Principal::System { Engine }` deliberately (workflow runs originate from the engine), so it isn't a duplicate of `test_run_provenance()`.\n- The `inspect.rs` snapshot embeds principal JSON inside an `fabro_snapshot!` stdout literal — by design, since snapshots assert exact textual output.\n- `run_summary_round_trip.rs` hand-writes the principal JSON because the test asserts wire-shape parity.\n\n### Fixes applied\n\n1. Added `apps/fabro-web/app/lib/test-fixtures.ts` exporting `testPrincipal(): Principal`.\n2. Updated all 8 frontend tests to import `testPrincipal` from that helper and removed their local definitions.\n3. Replaced the hand-written `created_by` JSON in `lib/crates/fabro-cli/tests/it/cmd/support.rs::remote_run_summary_json` with `fabro_types::test_support::test_principal()` interpolated via `serde_json::json!`.\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all` — passes\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — passes\n- `cargo nextest run --workspace` — 6503 passed\n- `cd apps/fabro-web && bun run typecheck` — passes\n- `cd apps/fabro-web && bun test` — 508 passed",
+          "failure_signature": "",
+          "internal.thread_id": "implement",
+          "thread.preflight_lint.current_node": "implement",
+          "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
+          "graph.goal": "# Plan: Make run actors and provenance total\n\n## Context\n\nThis is a greenfield app. Backward compatibility with old serialized runs, old API clients, old generated models, and old tests is not a constraint. Prefer the clean invariant and remove all traces of the placeholder shape.\n\n`Principal::Anonymous` currently represents \"no authenticated actor on this request\" inside auth middleware. That is auth state, not an actor. A `Principal` should only mean \"who acted.\"\n\nLikewise, a persisted run should always have a creator. `Run.created_by`, `RunSpec.provenance`, `RunProvenance.subject`, and `run.created` event provenance should all be total. No `Option<Principal>`, no nullable OpenAPI fields, no legacy deserialization defaults, and no fallback creator in projection code.\n\nTwo commits, in order.\n\n---\n\n## Commit 1 - Remove `Principal::Anonymous`\n\nBreaking cleanup. `Principal` becomes actor-only. Missing/invalid auth is represented as absent request principal, not as an anonymous principal variant.\n\n### Rust\n\n`lib/crates/fabro-types/src/principal.rs`:\n- Drop `Anonymous`.\n- Drop `Anonymous` arms in `kind()` and `display()`.\n- Delete anonymous serialization/round-trip test coverage.\n\n`lib/crates/fabro-server/src/principal_middleware.rs`:\n- `RequestAuthContext.principal: Principal` -> `Option<Principal>`.\n- `RequestAuthLogContext.principal: Principal` -> `Option<Principal>`.\n- `initial()` and `rejected()` set `principal: None`.\n- `authenticated(...)`, `authenticated_worker(...)`, and `authenticated_user(...)` set `principal: Some(...)`.\n- Update `principal_without_log_unused_fields` to preserve `None` and strip user avatar data only inside `Some(Principal::User(...))`.\n- Update all gate helpers to match `Option<Principal>`:\n  - `require_user`\n  - `require_authenticated_user`\n  - `require_run_management_actor`\n  - `require_worker_or_user_for_run`\n  - `require_run_management_target`\n- `None` routes to the existing `auth_rejection(context.auth_status, context.auth_error_code)` behavior.\n- `Some(Principal::Worker { .. })` keeps the current forbidden-vs-auth-rejection distinctions.\n- Update tests that assert the initial/rejected principal to assert `None`.\n\n`lib/crates/fabro-server/src/server.rs` HTTP logging:\n- Keep the `principal_kind` field on every HTTP log line.\n- Compute `principal_kind` as `auth_context.principal.as_ref().map(Principal::kind).unwrap_or(\"none\")`.\n- Match `auth_context.principal` as an `Option<Principal>`:\n  - `Some(User(...))`, `Some(Worker { ... })`, `Some(Webhook { ... })`, `Some(Slack { ... })` keep their extra fields.\n  - `None | Some(Agent { .. } | System { .. })` emits only the common HTTP fields.\n\n`docs/internal/logging-strategy.md`:\n- Replace the `anonymous` HTTP caller category guidance with `none` for requests that have no principal.\n- Keep `auth_status` as the field that distinguishes missing, invalid, expired, and authenticated auth state.\n\n### OpenAPI and generated clients\n\n`docs/public/api-reference/fabro-api.yaml`:\n- Remove `PrincipalAnonymous` from the `Principal` `oneOf`.\n- Remove `anonymous` from the `Principal` discriminator mapping.\n- Delete the `PrincipalAnonymous` schema.\n\nRegenerate:\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\nExpected generated cleanup:\n- `lib/packages/fabro-api-client/src/models/principal-anonymous.ts` disappears.\n- `Principal` union no longer includes `{ kind: \"anonymous\" }`.\n- `lib/packages/fabro-api-client/src/models/index.ts` no longer exports `principal-anonymous`.\n\n### Frontend\n\n`apps/fabro-web/app/lib/principal-display.tsx`:\n- Remove the `\"anonymous\"` switch case and unused icon import.\n\n`apps/fabro-web/app/components/run-summary-panel.test.tsx` and API-client exhaustiveness tests:\n- Remove anonymous principal cases.\n\n### Documentation sweep\n\nRemove anonymous-principal references from product/API docs and tests. Be careful not to touch unrelated uses of \"anonymous\" such as telemetry anonymous IDs or Git's `remote_anonymous` API.\n\nUseful sweep:\n- `rg -n \"Principal::Anonymous|PrincipalAnonymous|kind: 'anonymous'|kind: \\\"anonymous\\\"|anonymous actor|anonymous subject|principal_kind.*anonymous|\\\"anonymous\\\"\" lib/crates apps/fabro-web lib/packages/fabro-api-client docs/public docs/internal`\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace`\n- `cd apps/fabro-web && bun run typecheck && bun test`\n- Manual: start `fabro server start`, hit a protected endpoint without a token, confirm 401 and an HTTP log with `principal_kind=\"none\"` and `auth_status=\"missing\"`.\n\n---\n\n## Commit 2 - Make run provenance and creator non-optional\n\nFull-chain invariant. Every persisted run has exactly one creator principal. No nullable schema fields, no legacy defaults, no projection fallbacks.\n\n### Core type changes\n\n`lib/crates/fabro-types/src/run_summary.rs`:\n- `Run.created_by: Option<Principal>` -> `Principal`.\n- Drop `#[serde(default)]`.\n\n`lib/crates/fabro-types/src/run.rs`:\n- `RunProvenance.subject: Option<Principal>` -> `Principal`.\n- Drop `#[serde(default, skip_serializing_if = \"Option::is_none\")]`.\n- Drop `Default` derive on `RunProvenance`.\n- `RunSpec.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop `#[serde(default, skip_serializing_if = \"Option::is_none\")]` on `RunSpec.provenance`.\n\n`lib/crates/fabro-types/src/run_event/run.rs`:\n- `RunCreatedProps.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop default/skip serialization attributes for provenance.\n\n`lib/crates/fabro-workflow/src/event/events.rs`:\n- `Event::RunCreated.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop default/skip serialization attributes for provenance.\n\n### Creation and retry flow\n\n`lib/crates/fabro-workflow/src/operations/create.rs`:\n- `CreateRunInput.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `PersistCreateOptions.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `RunSpec { provenance }` stores the total provenance directly.\n- `Event::RunCreated { provenance }` emits total provenance directly.\n\n`lib/crates/fabro-server/src/server/handler/runs.rs`:\n- `run_provenance(headers, subject)` returns `RunProvenance { subject: subject.clone(), ... }`.\n- Build provenance before creating `CreateRunInput`.\n\n`lib/crates/fabro-server/src/run_manifest.rs`:\n- Change `create_run_input(...)` to accept `provenance: RunProvenance` and set it directly, or stop using the helper for the final `CreateRunInput` construction. Do not create a temporary input with missing provenance.\n\n`lib/crates/fabro-workflow/src/operations/retry.rs`:\n- `RetryRunInput.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `retry_run(...)` writes the new run's `run.created` event with total provenance.\n\n`lib/crates/fabro-server/src/server/handler/lifecycle.rs`:\n- Pass `run_provenance(&headers, &actor)` directly into `RetryRunInput`.\n\n### Event conversion and projections\n\n`lib/crates/fabro-workflow/src/event/convert.rs`:\n- Convert `Event::RunCreated.provenance` into `RunCreatedProps.provenance` directly.\n- Remove `Some(...)` wrapping for run-created provenance.\n\n`lib/crates/fabro-workflow/src/event/stored_fields.rs`:\n- `Event::RunCreated { provenance, .. }` sets `actor: Some(provenance.subject.clone())`.\n\n`lib/crates/fabro-store/src/run_state.rs`:\n- `projection_from_created(...)` builds `RunSpec { provenance: props.provenance.clone(), ... }`.\n- `build_summary(...)` sets `created_by: state.spec.provenance.subject.clone()`.\n- Delete or rewrite tests that deserialize projections with `\"provenance\": null`.\n\n`lib/crates/fabro-types/src/run_projection.rs` and projection tests:\n- Replace all test `RunSpec` literals with total provenance.\n- Remove tests whose only purpose is legacy/null provenance tolerance.\n\n### OpenAPI\n\n`docs/public/api-reference/fabro-api.yaml`:\n- `Run.created_by` references `Principal` directly. Remove `oneOf [..., null]`.\n- `RunProvenance.required` includes `subject`.\n- `RunProvenance.subject` references `Principal` directly. Remove `oneOf [..., null]`.\n- `RunSpec.required` includes `provenance`.\n- `RunSpec.provenance` references `RunProvenance` directly. Remove `oneOf [..., null]`.\n- If `run.created` event properties are represented separately in the spec, make that event provenance required and non-nullable too.\n\nRegenerate:\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\nDo not hand-edit generated client files.\n\n### Demo mode\n\n`lib/crates/fabro-server/src/demo/mod.rs`:\n- Add a clearly synthetic demo principal using `AuthMethod::DevToken`, not GitHub:\n  ```rust\n  static DEMO_PRINCIPAL: LazyLock<Principal> = LazyLock::new(|| {\n      Principal::user(\n          IdpIdentity::new(\"fabro:demo\", \"demo\").unwrap(),\n          \"demo\".to_string(),\n          AuthMethod::DevToken,\n      )\n  });\n  ```\n- Replace `created_by: None` with `created_by: DEMO_PRINCIPAL.clone()`.\n- If demo creates any full `RunSpec` or `run.created` event data, give it `RunProvenance { subject: DEMO_PRINCIPAL.clone(), ... }`.\n\n### Test support\n\nDo not add fake auth helpers to `fabro_types::fixtures`; that module is run-id constants.\n\nUse the existing `fabro-types` `test-support` feature:\n- Add `#[cfg(any(test, feature = \"test-support\"))] pub mod test_support;` in `lib/crates/fabro-types/src/lib.rs` if it does not already exist.\n- Add `lib/crates/fabro-types/src/test_support.rs` with:\n  - `test_principal() -> Principal`\n  - `test_run_provenance() -> RunProvenance`\n- Use an obviously fake dev-token identity, e.g. issuer `fabro:test`, subject `test-user`, login `test`.\n- In crates that need the helper from integration tests or cross-crate tests, dual-list `fabro-types` in `dev-dependencies` with `features = [\"test-support\"]`, following existing repo patterns.\n\nUpdate all constructors:\n- Replace `provenance: None` in `RunSpec`, `CreateRunInput`, `RetryRunInput`, `Event::RunCreated`, and `RunCreatedProps` literals with `test_run_provenance()` or a locally meaningful provenance.\n- Replace `subject: Some(...)` with `subject: ...`.\n- Replace `subject: None` only when it is actually `RunProvenance.subject`; leave unrelated todo/commit/message `subject` fields alone.\n- Replace `created_by: None` / `created_by: null` with `test_principal()` or a frontend TS principal fixture.\n- Delete tests that assert nullable or omitted creator/provenance behavior.\n\nRepresentative Rust areas:\n- `lib/crates/fabro-store/src/run_state.rs`\n- `lib/crates/fabro-store/tests/serializable_projection.rs`\n- `lib/crates/fabro-workflow/src/operations/{create,retry,start}.rs`\n- `lib/crates/fabro-workflow/src/event/{convert,sink,stored_fields}.rs`\n- `lib/crates/fabro-workflow/src/handler/**`\n- `lib/crates/fabro-workflow/src/pipeline/**`\n- `lib/crates/fabro-workflow/src/run_{lookup,metadata}.rs`\n- `lib/crates/fabro-server/src/server/tests.rs`\n- `lib/crates/fabro-server/src/server/handler/**`\n- `lib/crates/fabro-server/tests/it/**`\n- `lib/crates/fabro-cli/tests/it/support/mod.rs`\n- `lib/crates/fabro-dump/src/lib.rs`\n- `lib/crates/fabro-tool/src/{common,create,interact,search}.rs`\n- `lib/crates/fabro-api/tests/{principal_round_trip,run_summary_round_trip,run_projection_round_trip,run_event_round_trip}.rs`\n- `lib/crates/fabro-types/tests/{run_spec_serde,run_spec_methods,run_event_serde}.rs`\n\nRepresentative TypeScript areas:\n- `apps/fabro-web/app/**` tests with `created_by: null`\n- `apps/fabro-web/app/data/runs.ts`\n- `apps/fabro-web/app/components/run-summary-panel.tsx`\n- `apps/fabro-web/app/components/runs-list/**`\n- `lib/packages/fabro-api-client/tests/principal-exhaustive.ts`\n\nUseful sweep after edits:\n- `rg -n \"Principal::Anonymous|PrincipalAnonymous|principal-anonymous|kind: ['\\\"]anonymous|created_by:\\\\s*(None|null)|provenance:\\\\s*None|subject:\\\\s*Some\\\\(|subject:\\\\s*None\" lib/crates apps/fabro-web lib/packages/fabro-api-client docs/public docs/internal`\n\nReview each hit. The only acceptable remaining matches should be unrelated uses of \"anonymous\" and unrelated non-principal `subject` fields.\n\n### Frontend\n\n`apps/fabro-web/app/components/run-summary-panel.tsx`:\n- `run?.created_by` may still be guarded by `run` loading state, but `created_by` itself is non-null once `run` exists.\n- Pass `run.created_by` directly to `principalDisplay(...)` inside loaded-run branches.\n\n`apps/fabro-web/app/data/runs.ts` and run-list components:\n- Treat `createdBy` as a total principal in UI data derived from a loaded API run.\n- Remove empty/fallback rendering that only existed for missing creator data.\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace`\n- `cargo nextest run -p fabro-server`\n- `cd apps/fabro-web && bun run typecheck && bun test && bun run build`\n- Manual end-to-end:\n  - `fabro server start`\n  - `cd apps/fabro-web && bun run dev`\n  - Authenticate and create a run through the UI.\n  - Confirm `/api/v1/runs/:id` has non-null `created_by`.\n  - Confirm `/api/v1/runs/:id/state` has non-null `spec.provenance.subject`.\n  - Retry a failed run and confirm the retried run has the retrying user as creator.\n  - Hit demo mode with `X-Fabro-Demo: 1` and confirm the run summary renders the synthetic `demo` dev-token user.\n",
+          "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
+          "last_stage": "simplify_opus",
+          "internal.retry_count.implement": 0,
+          "thread.preflight_compile.current_node": "preflight_lint",
+          "thread.start.current_node": "toolchain",
+          "thread.implement.current_node": "simplify_opus",
+          "thread.toolchain.current_node": "preflight_compile",
+          "internal.run_id": "01KTAA1N20RX3J8ATGKVP3EKYQ",
+          "internal.retry_count.preflight_compile": 0,
+          "internal.node_visit_count": 1
+        },
+        "node_outcomes": {
+          "simplify_opus": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCI",
+              "response.simplify_opus": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCIPAL`/`testPrincipal()` definition: `app/data/runs.test.ts`, `app/lib/run-actions.test.ts`, `app/routes/automations-new.test.tsx`, `app/routes/run-files.render.test.tsx`, `app/routes/run-detail.test.ts`, `app/routes/runs.test.tsx`, `app/routes/runs.preferences.test.tsx`, `app/components/run-summary-panel.test.tsx`.\n- One Rust shared helper (`remote_run_summary_json` in `lib/crates/fabro-cli/tests/it/cmd/support.rs`) hand-wrote the principal JSON that matches `fabro_types::test_support::test_principal()`.\n\n**Items deliberately left as-is:**\n- The middleware `match &context.principal { Some(Principal::X) => ..., _ => auth_rejection(...) }` pattern is clean and readable; extracting a helper would obscure intent.\n- The `fabro-workflow/src/test_support.rs` provenance uses `Principal::System { Engine }` deliberately (workflow runs originate from the engine), so it isn't a duplicate of `test_run_provenance()`.\n- The `inspect.rs` snapshot embeds principal JSON inside an `fabro_snapshot!` stdout literal — by design, since snapshots assert exact textual output.\n- `run_summary_round_trip.rs` hand-writes the principal JSON because the test asserts wire-shape parity.\n\n### Fixes applied\n\n1. Added `apps/fabro-web/app/lib/test-fixtures.ts` exporting `testPrincipal(): Principal`.\n2. Updated all 8 frontend tests to import `testPrincipal` from that helper and removed their local definitions.\n3. Replaced the hand-written `created_by` JSON in `lib/crates/fabro-cli/tests/it/cmd/support.rs::remote_run_summary_json` with `fabro_types::test_support::test_principal()` interpolated via `serde_json::json!`.\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all` — passes\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — passes\n- `cargo nextest run --workspace` — 6503 passed\n- `cd apps/fabro-web && bun run typecheck` — passes\n- `cd apps/fabro-web && bun test` — 508 passed",
+              "last_stage": "simplify_opus"
+            },
+            "notes": "Stage completed: simplify_opus",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "anthropic",
+                    "model_id": "claude-opus-4-7"
+                  },
+                  "tokens": {
+                    "input_tokens": 115032,
+                    "output_tokens": 25451,
+                    "reasoning_tokens": 0,
+                    "cache_read_tokens": 7034058,
+                    "cache_write_tokens": 923769
+                  }
+                },
+                "facts": {
+                  "algorithm": "anthropic",
+                  "cache_write_5m_tokens": 923769,
+                  "cache_write_1h_tokens": 0
+                }
+              },
+              "total_usd_micros": 10502020
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/components/run-summary-panel.test.tsx",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/data/runs.test.ts",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/lib/run-actions.test.ts",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/lib/test-fixtures.ts",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/routes/automations-new.test.tsx",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/routes/run-detail.test.ts",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/routes/run-files.render.test.tsx",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/routes/runs.preferences.test.tsx",
+              "/home/daytona/workspace/fabro/apps/fabro-web/app/routes/runs.test.tsx",
+              "/home/daytona/workspace/fabro/lib/crates/fabro-cli/tests/it/cmd/support.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 502928,
+              "tool_time_ms": 264545,
+              "active_time_ms": 767473
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 2767,
+              "active_time_ms": 2767
+            }
+          },
+          "implement": {
+            "status": "succeeded",
+            "context_updates": {
+              "response.implement": "Done.\n\nCreated the requested two commits in order:\n\n1. `04d658727 Remove anonymous principal variant`\n2. `e3bfa60ac Make run provenance and creators total`\n\nImplemented commit 2 end-to-end:\n- Made `Run.created_by`, `RunSpec.provenance`, `RunProvenance.subject`, and run-created provenance total/non-optional.\n- Updated create/retry/server/demo/projection/event conversion flows.\n- Removed projection fallback creator behavior.\n- Updated OpenAPI and regenerated generated TS API models.\n- Added gated `fabro_types::test_support`.\n- Updated Rust/TS fixtures, snapshots, and tests.\n- Confirmed no pending snapshot artifacts and working tree is clean.\n\nVerification passed:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace --no-fail-fast`\n- `cargo nextest run -p fabro-server`\n- `cargo nextest run -p fabro-cli cmd::inspect::inspect_resolves_selector_via_server_endpoint --no-capture`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck && bun test && bun run build`\n- `git diff --check`\n- final invariant sweep for removed anonymous/nullable provenance patterns; remaining `subject` hits were unrelated todo/web-auth fields.\n\nManual browser/UI E2E was not run in this terminal session.",
+              "last_response": "Done.\n\nCreated the requested two commits in order:\n\n1. `04d658727 Remove anonymous principal variant`\n2. `e3bfa60ac Make run provenance and creators total`\n\nImplemented commit 2 end-to-end:\n- Made `Ru",
+              "last_stage": "implement"
+            },
+            "notes": "Stage completed: implement",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 5027083,
+                    "output_tokens": 50960,
+                    "reasoning_tokens": 17280,
+                    "cache_read_tokens": 35289600,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 44827415
+            },
+            "files_touched": [
+              "/home/daytona/workspace/fabro/lib/crates/fabro-types/src/test_support.rs"
+            ],
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 2537906,
+              "tool_time_ms": 1604390,
+              "active_time_ms": 4142296
+            }
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 143186,
+              "active_time_ms": 143186
+            }
+          },
+          "preflight_compile": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo check -q --workspace 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 136124,
+              "active_time_ms": 136124
+            }
+          }
+        },
+        "next_node_id": "simplify_gpt",
+        "git_commit_sha": "6be8f6b5d09f452619bffca852308953dab45e69",
+        "node_visits": {
+          "preflight_lint": 1,
+          "implement": 1,
+          "preflight_compile": 1,
+          "simplify_opus": 1,
+          "start": 1,
+          "toolchain": 1
+        }
+      },
+      "diff": {
+        "patch": "diff --git a/apps/fabro-web/app/components/run-summary-panel.test.tsx b/apps/fabro-web/app/components/run-summary-panel.test.tsx\nindex 56e4c3171..3d7175d9d 100644\n--- a/apps/fabro-web/app/components/run-summary-panel.test.tsx\n+++ b/apps/fabro-web/app/components/run-summary-panel.test.tsx\n@@ -6,6 +6,7 @@ import {\n   RunSummaryPanelView,\n   type RunSummaryPanelViewProps,\n } from \"./run-summary-panel\";\n+import { testPrincipal } from \"../lib/test-fixtures\";\n \n function instanceText(instance: TestRenderer.ReactTestInstance): string {\n   const parts: string[] = [];\n@@ -52,15 +53,10 @@ function cellAfterLabel(\n \n function makeRun(overrides: Record<string, any> = {}) {\n   return {\n-    id: \"run_1\",\n-    created_by: {\n-      kind:        \"user\",\n-      identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-      login:       \"test\",\n-      auth_method: \"dev_token\",\n-    },\n-    diff:    null,\n-    billing: null,\n+    id:         \"run_1\",\n+    created_by: testPrincipal(),\n+    diff:       null,\n+    billing:    null,\n     ...overrides,\n   } as any;\n }\ndiff --git a/apps/fabro-web/app/data/runs.test.ts b/apps/fabro-web/app/data/runs.test.ts\nindex e8a461cf3..adff4a1a0 100644\n--- a/apps/fabro-web/app/data/runs.test.ts\n+++ b/apps/fabro-web/app/data/runs.test.ts\n@@ -1,5 +1,5 @@\n import { describe, expect, test } from \"bun:test\";\n-import type { Principal, Run, RunStatus as ApiRunStatus } from \"@qltysh/fabro-api-client\";\n+import type { Run, RunStatus as ApiRunStatus } from \"@qltysh/fabro-api-client\";\n import {\n   columnForStatus,\n   columnStatusDisplay,\n@@ -8,15 +8,7 @@ import {\n   mapRunToRunItem,\n   runStatusDisplay,\n } from \"./runs\";\n-\n-function testPrincipal(): Principal {\n-  return {\n-    kind:        \"user\",\n-    identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-    login:       \"test\",\n-    auth_method: \"dev_token\",\n-  };\n-}\n+import { testPrincipal } from \"../lib/test-fixtures\";\n \n function makeRun(overrides: Partial<Run> = {}): Run {\n   return {\ndiff --git a/apps/fabro-web/app/lib/run-actions.test.ts b/apps/fabro-web/app/lib/run-actions.test.ts\nindex d8745f19b..a13afd650 100644\n--- a/apps/fabro-web/app/lib/run-actions.test.ts\n+++ b/apps/fabro-web/app/lib/run-actions.test.ts\n@@ -24,13 +24,7 @@ import {\n   unarchiveRuns,\n } from \"./run-actions\";\n import { generatedAxios } from \"./api-client\";\n-\n-const TEST_PRINCIPAL = {\n-  kind:        \"user\",\n-  identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-  login:       \"test\",\n-  auth_method: \"dev_token\",\n-};\n+import { testPrincipal } from \"./test-fixtures\";\n \n type StubResponseInit = {\n   status: number;\n@@ -54,7 +48,7 @@ function makeRun(status: RunStatus, archived = false): Run {\n     workflow:         { slug: \"fix_build\", name: \"Fix Build\", graph_name: null, node_count: 0, edge_count: 0 },\n     automation:       null,\n     repository:       null,\n-    created_by:       TEST_PRINCIPAL,\n+    created_by:       testPrincipal(),\n     origin:           { kind: \"api\" },\n     labels:           {},\n     lifecycle:        {\ndiff --git a/apps/fabro-web/app/lib/test-fixtures.ts b/apps/fabro-web/app/lib/test-fixtures.ts\nnew file mode 100644\nindex 000000000..3d669dcad\n--- /dev/null\n+++ b/apps/fabro-web/app/lib/test-fixtures.ts\n@@ -0,0 +1,10 @@\n+import type { Principal } from \"@qltysh/fabro-api-client\";\n+\n+export function testPrincipal(): Principal {\n+  return {\n+    kind:        \"user\",\n+    identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n+    login:       \"test\",\n+    auth_method: \"dev_token\",\n+  };\n+}\ndiff --git a/apps/fabro-web/app/routes/automations-new.test.tsx b/apps/fabro-web/app/routes/automations-new.test.tsx\nindex 9667247b8..69f8ae58f 100644\n--- a/apps/fabro-web/app/routes/automations-new.test.tsx\n+++ b/apps/fabro-web/app/routes/automations-new.test.tsx\n@@ -4,6 +4,7 @@ import TestRenderer, { act } from \"react-test-renderer\";\n import { createMemoryRouter, RouterProvider } from \"react-router\";\n \n import { ToastProvider } from \"../components/toast\";\n+import { testPrincipal } from \"../lib/test-fixtures\";\n import { setupReactTestEnv } from \"../lib/test-utils\";\n \n let currentRun: any = null;\n@@ -101,13 +102,6 @@ mock.module(\"swr\", () => ({\n const { default: AutomationsNew } = await import(\"./automations-new\");\n mock.restore();\n \n-const TEST_PRINCIPAL = {\n-  kind:        \"user\",\n-  identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-  login:       \"test\",\n-  auth_method: \"dev_token\",\n-};\n-\n function makeRun(overrides: Record<string, unknown> = {}) {\n   return {\n     id:               \"run_1\",\n@@ -127,7 +121,7 @@ function makeRun(overrides: Record<string, unknown> = {}) {\n       origin_url: \"https://github.com/fallback/repo.git\",\n       provider:   \"github\",\n     },\n-    created_by:       TEST_PRINCIPAL,\n+    created_by:       testPrincipal(),\n     origin:           { kind: \"api\" },\n     labels:           {},\n     lifecycle:        {\ndiff --git a/apps/fabro-web/app/routes/run-detail.test.ts b/apps/fabro-web/app/routes/run-detail.test.ts\nindex 1fc2a775f..3cc8ad351 100644\n--- a/apps/fabro-web/app/routes/run-detail.test.ts\n+++ b/apps/fabro-web/app/routes/run-detail.test.ts\n@@ -13,6 +13,7 @@ import {\n \n import { ToastProvider } from \"../components/toast\";\n import { DemoModeProvider } from \"../lib/demo-mode\";\n+import { testPrincipal } from \"../lib/test-fixtures\";\n \n let currentRunSummary: any = null;\n let currentRunState: any = null;\n@@ -20,13 +21,6 @@ let currentQuestions: any[] = [];\n let deleteRunApiResult: Promise<unknown> | null = null;\n const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];\n \n-const TEST_PRINCIPAL = {\n-  kind:        \"user\",\n-  identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-  login:       \"test\",\n-  auth_method: \"dev_token\",\n-};\n-\n const deleteRunApiMock = mock((_id: string) =>\n   deleteRunApiResult ?? Promise.resolve({}),\n );\n@@ -228,7 +222,7 @@ function makeRunSummary({\n     workflow:         { slug: \"default\", name: \"Default\", graph_name: null, node_count: 0, edge_count: 0 },\n     automation,\n     repository:       { name: \"fabro\", origin_url: null, provider: \"unknown\" },\n-    created_by:       TEST_PRINCIPAL,\n+    created_by:       testPrincipal(),\n     origin:           { kind: \"api\" },\n     labels:           {},\n     lifecycle:        {\ndiff --git a/apps/fabro-web/app/routes/run-files.render.test.tsx b/apps/fabro-web/app/routes/run-files.render.test.tsx\nindex 9b4cb1a08..1b434d76b 100644\n--- a/apps/fabro-web/app/routes/run-files.render.test.tsx\n+++ b/apps/fabro-web/app/routes/run-files.render.test.tsx\n@@ -5,13 +5,7 @@ import { MemoryRouter, Route, Routes } from \"react-router\";\n import { toast as sonnerToast } from \"sonner\";\n \n import { ToastProvider } from \"../components/toast\";\n-\n-const TEST_PRINCIPAL = {\n-  kind:        \"user\",\n-  identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-  login:       \"test\",\n-  auth_method: \"dev_token\",\n-};\n+import { testPrincipal } from \"../lib/test-fixtures\";\n \n let currentFilesPayload: any = null;\n let currentCommitsPayload: any = null;\n@@ -58,7 +52,7 @@ mock.module(\"../lib/queries\", () => ({\n       workflow:         { slug: \"default\", name: \"Default\", graph_name: null, node_count: 0, edge_count: 0 },\n       automation:       null,\n       repository:       { name: \"fabro\", origin_url: null, provider: \"unknown\" },\n-      created_by:       TEST_PRINCIPAL,\n+      created_by:       testPrincipal(),\n       origin:           { kind: \"api\" },\n       labels:           {},\n       lifecycle:        {\ndiff --git a/apps/fabro-web/app/routes/runs.preferences.test.tsx b/apps/fabro-web/app/routes/runs.preferences.test.tsx\nindex 21af44aef..fd217d152 100644\n--- a/apps/fabro-web/app/routes/runs.preferences.test.tsx\n+++ b/apps/fabro-web/app/routes/runs.preferences.test.tsx\n@@ -1,10 +1,11 @@\n import { afterEach, beforeEach, describe, expect, mock, test } from \"bun:test\";\n import TestRenderer, { act } from \"react-test-renderer\";\n import { createMemoryRouter, RouterProvider } from \"react-router\";\n-import type { PaginatedRunList, Principal, Run } from \"@qltysh/fabro-api-client\";\n+import type { PaginatedRunList, Run } from \"@qltysh/fabro-api-client\";\n \n import { ToastProvider } from \"../components/toast\";\n import { CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY } from \"../components/runs-list/preferences\";\n+import { testPrincipal } from \"../lib/test-fixtures\";\n import { setupReactTestEnv } from \"../lib/test-utils\";\n \n class MemoryStorage {\n@@ -27,15 +28,6 @@ let previousElement: unknown;\n let hadElement = false;\n const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];\n \n-function testPrincipal(): Principal {\n-  return {\n-    kind:        \"user\",\n-    identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-    login:       \"test\",\n-    auth_method: \"dev_token\",\n-  };\n-}\n-\n function run(id: string, repo = \"qlty/fabro\", workflow = \"release\"): Run {\n   return {\n     id,\ndiff --git a/apps/fabro-web/app/routes/runs.test.tsx b/apps/fabro-web/app/routes/runs.test.tsx\nindex 6f71938c9..e20e018ed 100644\n--- a/apps/fabro-web/app/routes/runs.test.tsx\n+++ b/apps/fabro-web/app/routes/runs.test.tsx\n@@ -1,5 +1,5 @@\n import { describe, expect, test } from \"bun:test\";\n-import type { BoardColumn, Principal, Run } from \"@qltysh/fabro-api-client\";\n+import type { BoardColumn, Run } from \"@qltysh/fabro-api-client\";\n \n import {\n   buildBoardColumns,\n@@ -11,15 +11,7 @@ import {\n   shouldRefreshBoardForEvent,\n } from \"./runs\";\n import { summarizeBatchLifecycleAction } from \"../components/runs-list/batch-lifecycle\";\n-\n-function testPrincipal(): Principal {\n-  return {\n-    kind:        \"user\",\n-    identity:    { issuer: \"fabro:test\", subject: \"test-user\" },\n-    login:       \"test\",\n-    auth_method: \"dev_token\",\n-  };\n-}\n+import { testPrincipal } from \"../lib/test-fixtures\";\n \n function boardRun(id: string, column: BoardColumn, questionText?: string): Run {\n   const status =\ndiff --git a/lib/crates/fabro-cli/tests/it/cmd/support.rs b/lib/crates/fabro-cli/tests/it/cmd/support.rs\nindex 93ad4d6a9..4625cb81c 100644\n--- a/lib/crates/fabro-cli/tests/it/cmd/support.rs\n+++ b/lib/crates/fabro-cli/tests/it/cmd/support.rs\n@@ -177,15 +177,7 @@ pub(crate) fn remote_run_summary_json(\n             \"origin_url\": null,\n             \"provider\": \"unknown\"\n         },\n-        \"created_by\": {\n-            \"kind\": \"user\",\n-            \"identity\": {\n-                \"issuer\": \"fabro:test\",\n-                \"subject\": \"test-user\"\n-            },\n-            \"login\": \"test\",\n-            \"auth_method\": \"dev_token\"\n-        },\n+        \"created_by\": fabro_types::test_support::test_principal(),\n         \"origin\": {\n             \"kind\": \"api\"\n         },\n",
+        "summary": {
+          "files_changed": 98,
+          "additions": 478,
+          "deletions": 325
+        }
+      }
+    },
+    {
+      "seq": 0,
+      "checkpoint": {
+        "timestamp": "2026-06-04T23:27:49.120353Z",
+        "current_node": "simplify_gpt",
+        "completed_nodes": [
+          "start",
+          "toolchain",
+          "preflight_compile",
+          "preflight_lint",
+          "implement",
+          "simplify_opus",
+          "simplify_gpt"
+        ],
+        "node_retries": {},
+        "context_values": {
           "internal.retry_count.preflight_compile": 0,
           "internal.node_visit_count": 1,
           "internal.retry_count.preflight_lint": 0,
-          "last_response": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCI",
+          "last_response": "Reviewed the latest simplification diff with all three agents:\n\n- Code reuse review: no actionable issues.\n- Code quality review: no actionable issues. The only note was that `testPrincipal()` returns",
           "outcome": "succeeded",
           "failure_class": "",
           "internal.run_id": "01KTAA1N20RX3J8ATGKVP3EKYQ",
           "thread.toolchain.current_node": "preflight_compile",
           "internal.retry_count.implement": 0,
+          "response.simplify_gpt": "Reviewed the latest simplification diff with all three agents:\n\n- Code reuse review: no actionable issues.\n- Code quality review: no actionable issues. The only note was that `testPrincipal()` returns a fresh object per call, which is already safe and appropriate.\n- Efficiency review: no findings.\n\nNo code changes were needed.\n\nVerification run:\n\n```bash\ncd apps/fabro-web && bun test \\\n  app/components/run-summary-panel.test.tsx \\\n  app/data/runs.test.ts \\\n  app/lib/run-actions.test.ts \\\n  app/routes/automations-new.test.tsx \\\n  app/routes/run-detail.test.ts \\\n  app/routes/run-files.render.test.tsx \\\n  app/routes/runs.preferences.test.tsx \\\n  app/routes/runs.test.tsx\n```\n\nResult: `104 pass, 0 fail`.\n\nWorking tree remains clean.",
           "internal.work_dir": "/home/daytona/workspace/fabro",
           "graph.rankdir": "LR",
           "graph.model_stylesheet": "\n            * { model: claude-opus-4-7; }\n        ",
@@ -965,17 +1168,19 @@
           "response.simplify_opus": "All 6503 workspace tests pass. Summary of the cleanup:\n\n## Code Review Findings and Fixes\n\n### Findings\n\n**Code reuse (high-priority):**\n- 8 frontend test files duplicated the same inline `TEST_PRINCIPAL`/`testPrincipal()` definition: `app/data/runs.test.ts`, `app/lib/run-actions.test.ts`, `app/routes/automations-new.test.tsx`, `app/routes/run-files.render.test.tsx`, `app/routes/run-detail.test.ts`, `app/routes/runs.test.tsx`, `app/routes/runs.preferences.test.tsx`, `app/components/run-summary-panel.test.tsx`.\n- One Rust shared helper (`remote_run_summary_json` in `lib/crates/fabro-cli/tests/it/cmd/support.rs`) hand-wrote the principal JSON that matches `fabro_types::test_support::test_principal()`.\n\n**Items deliberately left as-is:**\n- The middleware `match &context.principal { Some(Principal::X) => ..., _ => auth_rejection(...) }` pattern is clean and readable; extracting a helper would obscure intent.\n- The `fabro-workflow/src/test_support.rs` provenance uses `Principal::System { Engine }` deliberately (workflow runs originate from the engine), so it isn't a duplicate of `test_run_provenance()`.\n- The `inspect.rs` snapshot embeds principal JSON inside an `fabro_snapshot!` stdout literal — by design, since snapshots assert exact textual output.\n- `run_summary_round_trip.rs` hand-writes the principal JSON because the test asserts wire-shape parity.\n\n### Fixes applied\n\n1. Added `apps/fabro-web/app/lib/test-fixtures.ts` exporting `testPrincipal(): Principal`.\n2. Updated all 8 frontend tests to import `testPrincipal` from that helper and removed their local definitions.\n3. Replaced the hand-written `created_by` JSON in `lib/crates/fabro-cli/tests/it/cmd/support.rs::remote_run_summary_json` with `fabro_types::test_support::test_principal()` interpolated via `serde_json::json!`.\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all` — passes\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings` — passes\n- `cargo nextest run --workspace` — 6503 passed\n- `cd apps/fabro-web && bun run typecheck` — passes\n- `cd apps/fabro-web && bun test` — 508 passed",
           "internal.fidelity": "compact",
           "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-          "last_stage": "simplify_opus",
+          "last_stage": "simplify_gpt",
           "internal.retry_count.start": 0,
           "thread.preflight_lint.current_node": "implement",
           "internal.retry_count.simplify_opus": 0,
           "response.implement": "Done.\n\nCreated the requested two commits in order:\n\n1. `04d658727 Remove anonymous principal variant`\n2. `e3bfa60ac Make run provenance and creators total`\n\nImplemented commit 2 end-to-end:\n- Made `Run.created_by`, `RunSpec.provenance`, `RunProvenance.subject`, and run-created provenance total/non-optional.\n- Updated create/retry/server/demo/projection/event conversion flows.\n- Removed projection fallback creator behavior.\n- Updated OpenAPI and regenerated generated TS API models.\n- Added gated `fabro_types::test_support`.\n- Updated Rust/TS fixtures, snapshots, and tests.\n- Confirmed no pending snapshot artifacts and working tree is clean.\n\nVerification passed:\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace --no-fail-fast`\n- `cargo nextest run -p fabro-server`\n- `cargo nextest run -p fabro-cli cmd::inspect::inspect_resolves_selector_via_server_endpoint --no-capture`\n- `cd lib/packages/fabro-api-client && bun run typecheck`\n- `cd apps/fabro-web && bun run typecheck && bun test && bun run build`\n- `git diff --check`\n- final invariant sweep for removed anonymous/nullable provenance patterns; remaining `subject` hits were unrelated todo/web-auth fields.\n\nManual browser/UI E2E was not run in this terminal session.",
+          "internal.retry_count.simplify_gpt": 0,
+          "thread.simplify_opus.current_node": "simplify_gpt",
           "thread.implement.current_node": "simplify_opus",
           "thread.start.current_node": "toolchain",
           "graph.goal": "# Plan: Make run actors and provenance total\n\n## Context\n\nThis is a greenfield app. Backward compatibility with old serialized runs, old API clients, old generated models, and old tests is not a constraint. Prefer the clean invariant and remove all traces of the placeholder shape.\n\n`Principal::Anonymous` currently represents \"no authenticated actor on this request\" inside auth middleware. That is auth state, not an actor. A `Principal` should only mean \"who acted.\"\n\nLikewise, a persisted run should always have a creator. `Run.created_by`, `RunSpec.provenance`, `RunProvenance.subject`, and `run.created` event provenance should all be total. No `Option<Principal>`, no nullable OpenAPI fields, no legacy deserialization defaults, and no fallback creator in projection code.\n\nTwo commits, in order.\n\n---\n\n## Commit 1 - Remove `Principal::Anonymous`\n\nBreaking cleanup. `Principal` becomes actor-only. Missing/invalid auth is represented as absent request principal, not as an anonymous principal variant.\n\n### Rust\n\n`lib/crates/fabro-types/src/principal.rs`:\n- Drop `Anonymous`.\n- Drop `Anonymous` arms in `kind()` and `display()`.\n- Delete anonymous serialization/round-trip test coverage.\n\n`lib/crates/fabro-server/src/principal_middleware.rs`:\n- `RequestAuthContext.principal: Principal` -> `Option<Principal>`.\n- `RequestAuthLogContext.principal: Principal` -> `Option<Principal>`.\n- `initial()` and `rejected()` set `principal: None`.\n- `authenticated(...)`, `authenticated_worker(...)`, and `authenticated_user(...)` set `principal: Some(...)`.\n- Update `principal_without_log_unused_fields` to preserve `None` and strip user avatar data only inside `Some(Principal::User(...))`.\n- Update all gate helpers to match `Option<Principal>`:\n  - `require_user`\n  - `require_authenticated_user`\n  - `require_run_management_actor`\n  - `require_worker_or_user_for_run`\n  - `require_run_management_target`\n- `None` routes to the existing `auth_rejection(context.auth_status, context.auth_error_code)` behavior.\n- `Some(Principal::Worker { .. })` keeps the current forbidden-vs-auth-rejection distinctions.\n- Update tests that assert the initial/rejected principal to assert `None`.\n\n`lib/crates/fabro-server/src/server.rs` HTTP logging:\n- Keep the `principal_kind` field on every HTTP log line.\n- Compute `principal_kind` as `auth_context.principal.as_ref().map(Principal::kind).unwrap_or(\"none\")`.\n- Match `auth_context.principal` as an `Option<Principal>`:\n  - `Some(User(...))`, `Some(Worker { ... })`, `Some(Webhook { ... })`, `Some(Slack { ... })` keep their extra fields.\n  - `None | Some(Agent { .. } | System { .. })` emits only the common HTTP fields.\n\n`docs/internal/logging-strategy.md`:\n- Replace the `anonymous` HTTP caller category guidance with `none` for requests that have no principal.\n- Keep `auth_status` as the field that distinguishes missing, invalid, expired, and authenticated auth state.\n\n### OpenAPI and generated clients\n\n`docs/public/api-reference/fabro-api.yaml`:\n- Remove `PrincipalAnonymous` from the `Principal` `oneOf`.\n- Remove `anonymous` from the `Principal` discriminator mapping.\n- Delete the `PrincipalAnonymous` schema.\n\nRegenerate:\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\nExpected generated cleanup:\n- `lib/packages/fabro-api-client/src/models/principal-anonymous.ts` disappears.\n- `Principal` union no longer includes `{ kind: \"anonymous\" }`.\n- `lib/packages/fabro-api-client/src/models/index.ts` no longer exports `principal-anonymous`.\n\n### Frontend\n\n`apps/fabro-web/app/lib/principal-display.tsx`:\n- Remove the `\"anonymous\"` switch case and unused icon import.\n\n`apps/fabro-web/app/components/run-summary-panel.test.tsx` and API-client exhaustiveness tests:\n- Remove anonymous principal cases.\n\n### Documentation sweep\n\nRemove anonymous-principal references from product/API docs and tests. Be careful not to touch unrelated uses of \"anonymous\" such as telemetry anonymous IDs or Git's `remote_anonymous` API.\n\nUseful sweep:\n- `rg -n \"Principal::Anonymous|PrincipalAnonymous|kind: 'anonymous'|kind: \\\"anonymous\\\"|anonymous actor|anonymous subject|principal_kind.*anonymous|\\\"anonymous\\\"\" lib/crates apps/fabro-web lib/packages/fabro-api-client docs/public docs/internal`\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace`\n- `cd apps/fabro-web && bun run typecheck && bun test`\n- Manual: start `fabro server start`, hit a protected endpoint without a token, confirm 401 and an HTTP log with `principal_kind=\"none\"` and `auth_status=\"missing\"`.\n\n---\n\n## Commit 2 - Make run provenance and creator non-optional\n\nFull-chain invariant. Every persisted run has exactly one creator principal. No nullable schema fields, no legacy defaults, no projection fallbacks.\n\n### Core type changes\n\n`lib/crates/fabro-types/src/run_summary.rs`:\n- `Run.created_by: Option<Principal>` -> `Principal`.\n- Drop `#[serde(default)]`.\n\n`lib/crates/fabro-types/src/run.rs`:\n- `RunProvenance.subject: Option<Principal>` -> `Principal`.\n- Drop `#[serde(default, skip_serializing_if = \"Option::is_none\")]`.\n- Drop `Default` derive on `RunProvenance`.\n- `RunSpec.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop `#[serde(default, skip_serializing_if = \"Option::is_none\")]` on `RunSpec.provenance`.\n\n`lib/crates/fabro-types/src/run_event/run.rs`:\n- `RunCreatedProps.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop default/skip serialization attributes for provenance.\n\n`lib/crates/fabro-workflow/src/event/events.rs`:\n- `Event::RunCreated.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- Drop default/skip serialization attributes for provenance.\n\n### Creation and retry flow\n\n`lib/crates/fabro-workflow/src/operations/create.rs`:\n- `CreateRunInput.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `PersistCreateOptions.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `RunSpec { provenance }` stores the total provenance directly.\n- `Event::RunCreated { provenance }` emits total provenance directly.\n\n`lib/crates/fabro-server/src/server/handler/runs.rs`:\n- `run_provenance(headers, subject)` returns `RunProvenance { subject: subject.clone(), ... }`.\n- Build provenance before creating `CreateRunInput`.\n\n`lib/crates/fabro-server/src/run_manifest.rs`:\n- Change `create_run_input(...)` to accept `provenance: RunProvenance` and set it directly, or stop using the helper for the final `CreateRunInput` construction. Do not create a temporary input with missing provenance.\n\n`lib/crates/fabro-workflow/src/operations/retry.rs`:\n- `RetryRunInput.provenance: Option<RunProvenance>` -> `RunProvenance`.\n- `retry_run(...)` writes the new run's `run.created` event with total provenance.\n\n`lib/crates/fabro-server/src/server/handler/lifecycle.rs`:\n- Pass `run_provenance(&headers, &actor)` directly into `RetryRunInput`.\n\n### Event conversion and projections\n\n`lib/crates/fabro-workflow/src/event/convert.rs`:\n- Convert `Event::RunCreated.provenance` into `RunCreatedProps.provenance` directly.\n- Remove `Some(...)` wrapping for run-created provenance.\n\n`lib/crates/fabro-workflow/src/event/stored_fields.rs`:\n- `Event::RunCreated { provenance, .. }` sets `actor: Some(provenance.subject.clone())`.\n\n`lib/crates/fabro-store/src/run_state.rs`:\n- `projection_from_created(...)` builds `RunSpec { provenance: props.provenance.clone(), ... }`.\n- `build_summary(...)` sets `created_by: state.spec.provenance.subject.clone()`.\n- Delete or rewrite tests that deserialize projections with `\"provenance\": null`.\n\n`lib/crates/fabro-types/src/run_projection.rs` and projection tests:\n- Replace all test `RunSpec` literals with total provenance.\n- Remove tests whose only purpose is legacy/null provenance tolerance.\n\n### OpenAPI\n\n`docs/public/api-reference/fabro-api.yaml`:\n- `Run.created_by` references `Principal` directly. Remove `oneOf [..., null]`.\n- `RunProvenance.required` includes `subject`.\n- `RunProvenance.subject` references `Principal` directly. Remove `oneOf [..., null]`.\n- `RunSpec.required` includes `provenance`.\n- `RunSpec.provenance` references `RunProvenance` directly. Remove `oneOf [..., null]`.\n- If `run.created` event properties are represented separately in the spec, make that event provenance required and non-nullable too.\n\nRegenerate:\n- `cargo build -p fabro-api`\n- `cd lib/packages/fabro-api-client && bun run generate`\n\nDo not hand-edit generated client files.\n\n### Demo mode\n\n`lib/crates/fabro-server/src/demo/mod.rs`:\n- Add a clearly synthetic demo principal using `AuthMethod::DevToken`, not GitHub:\n  ```rust\n  static DEMO_PRINCIPAL: LazyLock<Principal> = LazyLock::new(|| {\n      Principal::user(\n          IdpIdentity::new(\"fabro:demo\", \"demo\").unwrap(),\n          \"demo\".to_string(),\n          AuthMethod::DevToken,\n      )\n  });\n  ```\n- Replace `created_by: None` with `created_by: DEMO_PRINCIPAL.clone()`.\n- If demo creates any full `RunSpec` or `run.created` event data, give it `RunProvenance { subject: DEMO_PRINCIPAL.clone(), ... }`.\n\n### Test support\n\nDo not add fake auth helpers to `fabro_types::fixtures`; that module is run-id constants.\n\nUse the existing `fabro-types` `test-support` feature:\n- Add `#[cfg(any(test, feature = \"test-support\"))] pub mod test_support;` in `lib/crates/fabro-types/src/lib.rs` if it does not already exist.\n- Add `lib/crates/fabro-types/src/test_support.rs` with:\n  - `test_principal() -> Principal`\n  - `test_run_provenance() -> RunProvenance`\n- Use an obviously fake dev-token identity, e.g. issuer `fabro:test`, subject `test-user`, login `test`.\n- In crates that need the helper from integration tests or cross-crate tests, dual-list `fabro-types` in `dev-dependencies` with `features = [\"test-support\"]`, following existing repo patterns.\n\nUpdate all constructors:\n- Replace `provenance: None` in `RunSpec`, `CreateRunInput`, `RetryRunInput`, `Event::RunCreated`, and `RunCreatedProps` literals with `test_run_provenance()` or a locally meaningful provenance.\n- Replace `subject: Some(...)` with `subject: ...`.\n- Replace `subject: None` only when it is actually `RunProvenance.subject`; leave unrelated todo/commit/message `subject` fields alone.\n- Replace `created_by: None` / `created_by: null` with `test_principal()` or a frontend TS principal fixture.\n- Delete tests that assert nullable or omitted creator/provenance behavior.\n\nRepresentative Rust areas:\n- `lib/crates/fabro-store/src/run_state.rs`\n- `lib/crates/fabro-store/tests/serializable_projection.rs`\n- `lib/crates/fabro-workflow/src/operations/{create,retry,start}.rs`\n- `lib/crates/fabro-workflow/src/event/{convert,sink,stored_fields}.rs`\n- `lib/crates/fabro-workflow/src/handler/**`\n- `lib/crates/fabro-workflow/src/pipeline/**`\n- `lib/crates/fabro-workflow/src/run_{lookup,metadata}.rs`\n- `lib/crates/fabro-server/src/server/tests.rs`\n- `lib/crates/fabro-server/src/server/handler/**`\n- `lib/crates/fabro-server/tests/it/**`\n- `lib/crates/fabro-cli/tests/it/support/mod.rs`\n- `lib/crates/fabro-dump/src/lib.rs`\n- `lib/crates/fabro-tool/src/{common,create,interact,search}.rs`\n- `lib/crates/fabro-api/tests/{principal_round_trip,run_summary_round_trip,run_projection_round_trip,run_event_round_trip}.rs`\n- `lib/crates/fabro-types/tests/{run_spec_serde,run_spec_methods,run_event_serde}.rs`\n\nRepresentative TypeScript areas:\n- `apps/fabro-web/app/**` tests with `created_by: null`\n- `apps/fabro-web/app/data/runs.ts`\n- `apps/fabro-web/app/components/run-summary-panel.tsx`\n- `apps/fabro-web/app/components/runs-list/**`\n- `lib/packages/fabro-api-client/tests/principal-exhaustive.ts`\n\nUseful sweep after edits:\n- `rg -n \"Principal::Anonymous|PrincipalAnonymous|principal-anonymous|kind: ['\\\"]anonymous|created_by:\\\\s*(None|null)|provenance:\\\\s*None|subject:\\\\s*Some\\\\(|subject:\\\\s*None\" lib/crates apps/fabro-web lib/packages/fabro-api-client docs/public docs/internal`\n\nReview each hit. The only acceptable remaining matches should be unrelated uses of \"anonymous\" and unrelated non-principal `subject` fields.\n\n### Frontend\n\n`apps/fabro-web/app/components/run-summary-panel.tsx`:\n- `run?.created_by` may still be guarded by `run` loading state, but `created_by` itself is non-null once `run` exists.\n- Pass `run.created_by` directly to `principalDisplay(...)` inside loaded-run branches.\n\n`apps/fabro-web/app/data/runs.ts` and run-list components:\n- Treat `createdBy` as a total principal in UI data derived from a loaded API run.\n- Remove empty/fallback rendering that only existed for missing creator data.\n\n### Verification\n\n- `cargo +nightly-2026-04-14 fmt --check --all`\n- `cargo +nightly-2026-04-14 clippy --workspace --all-targets -- -D warnings`\n- `cargo build --workspace`\n- `cargo nextest run --workspace`\n- `cargo nextest run -p fabro-server`\n- `cd apps/fabro-web && bun run typecheck && bun test && bun run build`\n- Manual end-to-end:\n  - `fabro server start`\n  - `cd apps/fabro-web && bun run dev`\n  - Authenticate and create a run through the UI.\n  - Confirm `/api/v1/runs/:id` has non-null `created_by`.\n  - Confirm `/api/v1/runs/:id/state` has non-null `spec.provenance.subject`.\n  - Retry a failed run and confirm the retried run has the retrying user as creator.\n  - Hit demo mode with `X-Fabro-Demo: 1` and confirm the run summary renders the synthetic `demo` dev-token user.\n",
-          "internal.thread_id": "implement",
+          "internal.thread_id": "simplify_opus",
           "thread.preflight_compile.current_node": "preflight_lint",
-          "current_node": "simplify_opus",
+          "current_node": "simplify_gpt",
           "internal.retry_count.toolchain": 0
         },
         "node_outcomes": {
@@ -1043,38 +1248,6 @@
               "active_time_ms": 767473
             }
           },
-          "toolchain": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
-            },
-            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
-            "usage": null,
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 0,
-              "tool_time_ms": 2767,
-              "active_time_ms": 2767
-            }
-          },
-          "preflight_lint": {
-            "status": "succeeded",
-            "context_updates": {
-              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
-            },
-            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
-            "usage": null,
-            "timing": {
-              "wall_time_ms": 0,
-              "inference_time_ms": 0,
-              "tool_time_ms": 143186,
-              "active_time_ms": 143186
-            }
-          },
-          "start": {
-            "status": "succeeded",
-            "usage": null
-          },
           "implement": {
             "status": "succeeded",
             "context_updates": {
@@ -1113,15 +1286,84 @@
               "tool_time_ms": 1604390,
               "active_time_ms": 4142296
             }
+          },
+          "simplify_gpt": {
+            "status": "succeeded",
+            "context_updates": {
+              "last_response": "Reviewed the latest simplification diff with all three agents:\n\n- Code reuse review: no actionable issues.\n- Code quality review: no actionable issues. The only note was that `testPrincipal()` returns",
+              "response.simplify_gpt": "Reviewed the latest simplification diff with all three agents:\n\n- Code reuse review: no actionable issues.\n- Code quality review: no actionable issues. The only note was that `testPrincipal()` returns a fresh object per call, which is already safe and appropriate.\n- Efficiency review: no findings.\n\nNo code changes were needed.\n\nVerification run:\n\n```bash\ncd apps/fabro-web && bun test \\\n  app/components/run-summary-panel.test.tsx \\\n  app/data/runs.test.ts \\\n  app/lib/run-actions.test.ts \\\n  app/routes/automations-new.test.tsx \\\n  app/routes/run-detail.test.ts \\\n  app/routes/run-files.render.test.tsx \\\n  app/routes/runs.preferences.test.tsx \\\n  app/routes/runs.test.tsx\n```\n\nResult: `104 pass, 0 fail`.\n\nWorking tree remains clean.",
+              "last_stage": "simplify_gpt"
+            },
+            "notes": "Stage completed: simplify_gpt",
+            "usage": {
+              "input": {
+                "usage": {
+                  "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.5"
+                  },
+                  "tokens": {
+                    "input_tokens": 141716,
+                    "output_tokens": 2008,
+                    "reasoning_tokens": 661,
+                    "cache_read_tokens": 107520,
+                    "cache_write_tokens": 0
+                  }
+                },
+                "facts": {
+                  "algorithm": "openai"
+                }
+              },
+              "total_usd_micros": 842410
+            },
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 75331,
+              "tool_time_ms": 19291,
+              "active_time_ms": 94622
+            }
+          },
+          "toolchain": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/fc14b2ba2d770e5cd3169df7a29525c962adfc4cfa3097b9098c63ebd61a748c"
+            },
+            "notes": "Script completed: command -v cargo >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && sudo ln -sf $HOME/.cargo/bin/* /usr/local/bin/; }; cargo --version 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 2767,
+              "active_time_ms": 2767
+            }
+          },
+          "preflight_lint": {
+            "status": "succeeded",
+            "context_updates": {
+              "command.output": "blob://sha256/12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+            },
+            "notes": "Script completed: cargo +nightly-2026-04-14 clippy -q --workspace --all-targets -- -D warnings 2>&1",
+            "usage": null,
+            "timing": {
+              "wall_time_ms": 0,
+              "inference_time_ms": 0,
+              "tool_time_ms": 143186,
+              "active_time_ms": 143186
+            }
+          },
+          "start": {
+            "status": "succeeded",
+            "usage": null
           }
         },
-        "next_node_id": "simplify_gpt",
+        "next_node_id": "verify",
         "node_visits": {
           "preflight_lint": 1,
           "start": 1,
           "implement": 1,
           "simplify_opus": 1,
           "preflight_compile": 1,
+          "simplify_gpt": 1,
           "toolchain": 1
         }
       },
@@ -1158,7 +1400,12 @@
       "first_event_seq": 1406,
       "prompt": null,
       "response": null,
-      "completion": null,
+      "completion": {
+        "outcome": "succeeded",
+        "notes": "Stage completed: simplify_opus",
+        "failure_reason": null,
+        "timestamp": "2026-06-04T23:26:07.508023Z"
+      },
       "provider_used": {
         "mode": "agent",
         "provider": "anthropic",
@@ -1171,6 +1418,12 @@
       "output": null,
       "started_at": "2026-06-04T23:13:18.016567Z",
       "handler": "agent",
+      "timing": {
+        "wall_time_ms": 769493,
+        "inference_time_ms": 502928,
+        "tool_time_ms": 264545,
+        "active_time_ms": 767473
+      },
       "usage": {
         "input_tokens": 115032,
         "output_tokens": 25451,
@@ -1411,7 +1664,7 @@
         ],
         "warnings": []
       },
-      "state": "running"
+      "state": "succeeded"
     },
     "preflight_compile@1": {
       "first_event_seq": 32,
@@ -1494,6 +1747,268 @@
         "cache_write_tokens": 0
       },
       "state": "succeeded"
+    },
+    "simplify_gpt@1": {
+      "first_event_seq": 1826,
+      "prompt": null,
+      "response": null,
+      "completion": null,
+      "provider_used": {
+        "mode": "agent",
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "diff": null,
+      "script_invocation": null,
+      "script_timing": null,
+      "parallel_results": null,
+      "output": null,
+      "started_at": "2026-06-04T23:26:13.214777Z",
+      "handler": "agent",
+      "usage": {
+        "input_tokens": 141716,
+        "output_tokens": 2008,
+        "total_tokens": 251905,
+        "reasoning_tokens": 661,
+        "cache_read_tokens": 107520,
+        "cache_write_tokens": 0,
+        "total_usd_micros": 842410
+      },
+      "model": {
+        "provider": "openai",
+        "model_id": "gpt-5.5"
+      },
+      "todos": {
+        "kind": "openai_plan",
+        "list_id": "openai_plan:a40b9cb7-1bab-451a-b105-77cbe6dca407",
+        "items": [
+          {
+            "id": "76645fa5b16d4a8d",
+            "status": "completed",
+            "order": 0,
+            "subject": "Inspect current git diff"
+          },
+          {
+            "id": "6ffd5878ab9e7ca6",
+            "status": "completed",
+            "order": 1,
+            "subject": "Launch three review agents with full diff"
+          },
+          {
+            "id": "cfad2d0d7b60b18e",
+            "status": "completed",
+            "order": 2,
+            "subject": "Aggregate findings and apply fixes"
+          },
+          {
+            "id": "0988c34c277ec1eb",
+            "status": "completed",
+            "order": 3,
+            "subject": "Run targeted verification"
+          }
+        ]
+      },
+      "subagents": [
+        {
+          "agent_id": "98ad0d6c",
+          "depth": 1,
+          "task": "Code Reuse Review. Working tree is clean; review the most recent simplification commit. The full diff is saved at /tmp/fabro-simplify-review.diff (284 lines, 10654 bytes). Read that file first and treat it as the full diff. For each change, search for existing utilities/helpers that could replace newly written code, flag any duplicated function, and flag inline logic that could use existing utilities. Focus only on changed files unless needed to find reuse. Return concise findings with file paths/lines and suggested fixes; say 'no findings' if clean.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 9
+          }
+        },
+        {
+          "agent_id": "6dae69a5",
+          "depth": 1,
+          "task": "Code Quality Review. Working tree is clean; review the most recent simplification commit. The full diff is saved at /tmp/fabro-simplify-review.diff (284 lines, 10654 bytes). Read that file first and treat it as the full diff. Review for redundant state, parameter sprawl, copy-paste, leaky abstractions, stringly-typed code, unnecessary JSX nesting, and unnecessary comments. Focus only on changed files unless needed. Return concise findings with file paths/lines and suggested fixes; say 'no findings' if clean.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 9
+          }
+        },
+        {
+          "agent_id": "01a8c98b",
+          "depth": 1,
+          "task": "Efficiency Review. Working tree is clean; review the most recent simplification commit. The full diff is saved at /tmp/fabro-simplify-review.diff (284 lines, 10654 bytes). Read that file first and treat it as the full diff. Review for unnecessary work, missed concurrency, hot-path bloat, recurring no-op updates, unnecessary existence checks, memory issues, and overly broad operations. Focus only on changed files unless needed. Return concise findings with file paths/lines and suggested fixes; say 'no findings' if clean.",
+          "status": {
+            "kind": "completed",
+            "success": true,
+            "turns_used": 9
+          }
+        }
+      ],
+      "permission_level": "full",
+      "agent_tools": [
+        {
+          "name": "apply_patch",
+          "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        },
+        {
+          "name": "close_agent",
+          "description": "Close a running subagent that is no longer needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "glob",
+          "description": "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "grep",
+          "description": "Search file contents with a regex pattern. Use path to choose the search root, glob_filter to limit matching files, case_insensitive for case folding, and max_results to cap output.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "read_file",
+          "description": "Read files before editing them. Returns line-numbered text and supports offset/limit for large files. Use this instead of shell cat, head, tail, or sed when inspecting repository files.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "read",
+          "invoked": true
+        },
+        {
+          "name": "request_user_input",
+          "description": "Ask the human one or more questions and wait for their answers before continuing this stage.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "send_input",
+          "description": "Send a follow-up message to a running subagent when new information or corrected instructions are needed.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": false
+        },
+        {
+          "name": "shell",
+          "description": "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "shell",
+          "invoked": true
+        },
+        {
+          "name": "spawn_agent",
+          "description": "Spawn a subagent for independent work or context isolation. Use it for tasks that can proceed separately, and avoid duplicating the same work in the parent session.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "update_plan",
+          "description": "Update the multi-step plan for the current task. Submit the entire plan; existing steps are reconciled by exact step text.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": true
+        },
+        {
+          "name": "wait",
+          "description": "Wait for a subagent to complete, then use the result to synthesize the outcome for the user.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "subagent",
+          "invoked": true
+        },
+        {
+          "name": "web_fetch",
+          "description": "Fetch content from a URL that starts with http:// or https://. Pass a prompt to extract specific information or summarize the page; omit prompt to return the page content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "web_search",
+          "description": "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "other",
+          "invoked": false
+        },
+        {
+          "name": "write_file",
+          "description": "Create new files, or overwrite an existing file only when replacement is explicitly intended. Prefer edit_file for targeted changes to existing files because write_file overwrites the full file content.",
+          "source": {
+            "kind": "native"
+          },
+          "category": "write",
+          "invoked": false
+        }
+      ],
+      "context_window": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "context_window_tokens": 272000,
+        "input_tokens": 20886,
+        "usage_percent": 7.678676470588235,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-06-04T23:27:49.065903Z",
+        "event_seq": 1960,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 920,
+            "usage_percent": 0.3382352941176471
+          },
+          {
+            "category": "tools",
+            "tokens": 1346,
+            "usage_percent": 0.4948529411764706
+          },
+          {
+            "category": "memory",
+            "tokens": 3204,
+            "usage_percent": 1.1779411764705883
+          },
+          {
+            "category": "conversation",
+            "tokens": 15410,
+            "usage_percent": 5.665441176470588
+          },
+          {
+            "category": "other",
+            "tokens": 6,
+            "usage_percent": 0.0022058823529411764
+          }
+        ],
+        "warnings": []
+      },
+      "state": "running"
     },
     "toolchain@1": {
       "first_event_seq": 22,
