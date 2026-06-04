@@ -1,6 +1,6 @@
 import unittest
 import copy
-from game import Card, Deck, GameState
+from card_game_tui.game import Card, Deck, GameState
 
 class TestFreeCellGame(unittest.TestCase):
     def test_card_properties(self):

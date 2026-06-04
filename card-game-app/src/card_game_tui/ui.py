@@ -1,7 +1,7 @@
 import curses
 import os
 import sys
-from game import GameState, Card
+from .game import GameState, Card
 
 def init_colors():
     # Only initialize if color is supported
@@ -146,7 +146,10 @@ def draw_board(stdscr, state, selected_src, message):
 def play_game():
     def main_loop(stdscr):
         # Set up screen
-        curses.curs_set(0) # Hide cursor
+        try:
+            curses.curs_set(0) # Hide cursor
+        except curses.error:
+            pass # Some terminals don't support hiding cursor
         init_colors()
         
         state = GameState()

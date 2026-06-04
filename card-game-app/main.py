@@ -2,11 +2,13 @@
 import sys
 import os
 
-# Ensure the card-game-app directory is in the import path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Ensure the src/ directory is in the import path
+src_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
-from game import GameState, Card
-import ui
+from card_game_tui.game import GameState, Card
+from card_game_tui.ui import play_game
 
 def print_ascii_state(state):
     print("\n" + "=" * 60)
@@ -118,7 +120,7 @@ if __name__ == "__main__":
     else:
         # Run normal interactive curses game
         try:
-            ui.play_game()
+            play_game()
         except Exception as e:
             print(f"An error occurred: {e}", file=sys.stderr)
             sys.exit(1)
