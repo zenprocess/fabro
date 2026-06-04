@@ -1,0 +1,387 @@
+{
+  "title": "Build a terminal-based FreeCell solitaire game in Python",
+  "spec": {
+    "run_id": "01KTA9QX6NW1T6QENXFS43CXCH",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "Build a terminal-based FreeCell solitaire game in Python"
+        },
+        "working_dir": null,
+        "metadata": {
+          "solitaire_variant": "freecell"
+        },
+        "inputs": {},
+        "model": {
+          "provider": "gemini",
+          "name": "gemini-3.5-flash",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "CardGameFast",
+      "nodes": {
+        "fix_app": {
+          "id": "fix_app",
+          "attrs": {
+            "max_retries": {
+              "Integer": 2
+            },
+            "prompt": {
+              "String": "The fast card game verification failed.\n\nRead .ai/card-game-fast-verify.md and fix the issues in card-game-app/.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if all issues are fixed, outcome=failed with failure_reason otherwise."
+            },
+            "shape": {
+              "String": "box"
+            },
+            "class": {
+              "String": "hard"
+            },
+            "label": {
+              "String": "Fix App"
+            }
+          },
+          "classes": [
+            "hard"
+          ]
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "label": {
+              "String": "Exit"
+            },
+            "shape": {
+              "String": "Msquare"
+            }
+          }
+        },
+        "implement_app": {
+          "id": "implement_app",
+          "attrs": {
+            "prompt": {
+              "String": "Read .ai/card-game-fast-plan.md.\n\nBuild the complete app under card-game-app/ in one focused pass:\n- pyproject.toml\n- main.py\n- src/card_game_tui/ package\n- tests/ package\n- README.md\n\nImplement:\n- Card, Deck, Pile, or equivalent game-state types\n- Requested game rules: initial setup/deal where applicable, move/action validation, auto-complete or helper actions where applicable, win/loss condition, undo\n- Curses UI with card rendering, board layout, keyboard input, move/action selection, and help text\n- --smoke mode that imports the app, creates a game, renders a text snapshot or summary, and exits without curses interaction\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if the app builds, tests pass, and smoke mode works, outcome=failed with failure_reason otherwise."
+            },
+            "class": {
+              "String": "hard"
+            },
+            "label": {
+              "String": "Implement App"
+            },
+            "max_retries": {
+              "Integer": 2
+            },
+            "shape": {
+              "String": "box"
+            }
+          },
+          "classes": [
+            "hard"
+          ]
+        },
+        "verify_app": {
+          "id": "verify_app",
+          "attrs": {
+            "prompt": {
+              "String": "Verify the completed card game app.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck:\n- The app is under card-game-app/\n- It uses curses for the interactive TUI\n- It implements the requested game rules\n- README.md explains setup, run, tests, and controls\n- No generated files are outside card-game-app/ except .ai/ reports and root status.json\n\nWrite findings to .ai/card-game-fast-verify.md.\nWrite status.json at workspace root: outcome=succeeded if the app is demo-ready, outcome=failed with specific missing or broken items."
+            },
+            "goal_gate": {
+              "Boolean": true
+            },
+            "label": {
+              "String": "Verify App"
+            },
+            "class": {
+              "String": "verify"
+            },
+            "shape": {
+              "String": "box"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "label": {
+              "String": "Start"
+            }
+          }
+        },
+        "plan_app": {
+          "id": "plan_app",
+          "attrs": {
+            "prompt": {
+              "String": "Goal: $goal\n\nCreate a concise implementation plan for the requested Python terminal card game.\n\nCover:\n- Game rules and data structures (Card, Deck, Pile or equivalent state types)\n- Terminal rendering approach using the standard-library curses module\n- Input handling and move/action validation\n- Win/loss detection\n- UI layout\n- Test strategy\n\nPut all app files under card-game-app/. Include `python3 main.py --smoke` for non-interactive demo verification.\n\nWrite the plan to .ai/card-game-fast-plan.md.\nWrite status.json at workspace root: outcome=succeeded if the plan is complete, outcome=failed with failure_reason otherwise."
+            },
+            "shape": {
+              "String": "box"
+            },
+            "label": {
+              "String": "Plan App"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "plan_app",
+          "attrs": {}
+        },
+        {
+          "from": "plan_app",
+          "to": "implement_app",
+          "attrs": {}
+        },
+        {
+          "from": "implement_app",
+          "to": "verify_app",
+          "attrs": {}
+        },
+        {
+          "from": "verify_app",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "verify_app",
+          "to": "fix_app",
+          "attrs": {
+            "label": {
+              "String": "Fix"
+            },
+            "condition": {
+              "String": "outcome=failed"
+            }
+          }
+        },
+        {
+          "from": "verify_app",
+          "to": "fix_app",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "fix_app",
+          "to": "verify_app",
+          "attrs": {}
+        }
+      ],
+      "attrs": {
+        "retry_target": {
+          "String": "implement_app"
+        },
+        "default_max_retries": {
+          "Integer": 2
+        },
+        "rankdir": {
+          "String": "LR"
+        },
+        "goal": {
+          "String": "Build a terminal-based FreeCell solitaire game in Python"
+        }
+      }
+    },
+    "graph_source": "digraph CardGameFast {\n    graph [\n        goal=\"Quickly build a terminal-based card game in Python\",\n        rankdir=LR,\n        default_max_retries=2,\n        retry_target=\"implement_app\"\n    ]\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    plan_app [\n        label=\"Plan App\",\n        shape=box,\n        prompt=\"Goal: $goal\n\nCreate a concise implementation plan for the requested Python terminal card game.\n\nCover:\n- Game rules and data structures (Card, Deck, Pile or equivalent state types)\n- Terminal rendering approach using the standard-library curses module\n- Input handling and move/action validation\n- Win/loss detection\n- UI layout\n- Test strategy\n\nPut all app files under card-game-app/. Include `python3 main.py --smoke` for non-interactive demo verification.\n\nWrite the plan to .ai/card-game-fast-plan.md.\nWrite status.json at workspace root: outcome=succeeded if the plan is complete, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    implement_app [\n        label=\"Implement App\",\n        shape=box,\n        class=\"hard\",\n        max_retries=2,\n        prompt=\"Read .ai/card-game-fast-plan.md.\n\nBuild the complete app under card-game-app/ in one focused pass:\n- pyproject.toml\n- main.py\n- src/card_game_tui/ package\n- tests/ package\n- README.md\n\nImplement:\n- Card, Deck, Pile, or equivalent game-state types\n- Requested game rules: initial setup/deal where applicable, move/action validation, auto-complete or helper actions where applicable, win/loss condition, undo\n- Curses UI with card rendering, board layout, keyboard input, move/action selection, and help text\n- --smoke mode that imports the app, creates a game, renders a text snapshot or summary, and exits without curses interaction\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if the app builds, tests pass, and smoke mode works, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_app [\n        label=\"Verify App\",\n        shape=box,\n        class=\"verify\",\n        goal_gate=true,\n        prompt=\"Verify the completed card game app.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck:\n- The app is under card-game-app/\n- It uses curses for the interactive TUI\n- It implements the requested game rules\n- README.md explains setup, run, tests, and controls\n- No generated files are outside card-game-app/ except .ai/ reports and root status.json\n\nWrite findings to .ai/card-game-fast-verify.md.\nWrite status.json at workspace root: outcome=succeeded if the app is demo-ready, outcome=failed with specific missing or broken items.\"\n    ]\n\n    fix_app [\n        label=\"Fix App\",\n        shape=box,\n        class=\"hard\",\n        max_retries=2,\n        prompt=\"The fast card game verification failed.\n\nRead .ai/card-game-fast-verify.md and fix the issues in card-game-app/.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if all issues are fixed, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    start -> plan_app -> implement_app -> verify_app\n\n    verify_app -> exit    [condition=\"outcome=succeeded\"]\n    verify_app -> fix_app [condition=\"outcome=failed\", label=\"Fix\"]\n    verify_app -> fix_app [label=\"Fallback\"]\n    fix_app -> verify_app\n}\n",
+    "workflow_slug": "card-game-fast",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "labels": {
+      "solitaire_variant": "freecell"
+    },
+    "provenance": {
+      "server": {
+        "version": "0.253.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.253.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.253.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "3fb6f3a1b6285f95b361df0abadf9608f45647c4b53391311ed0c483075fa756",
+    "definition_blob": "07c92311eda35a968cb20418297fccf636afd994ca1ffddd1993d87ed53b9aae",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "497aaba6f20c1fac052346c39f52e08fabadb179",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KTA9QX6NW1T6QENXFS43CXCH",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-06-04T21:48:29.320071Z",
+  "last_event_at": "2026-06-04T21:48:49.551515Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "kind": "ready",
+    "plan": {
+      "provider": "daytona"
+    },
+    "instance": {
+      "provider": "daytona",
+      "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+      "runtime": {
+        "id": "fabro-01KTA9QX6NW1T6QENXFS43CXCH",
+        "working_directory": "/home/daytona/workspace/fabro",
+        "repo_cloned": true,
+        "clone_origin_url": "https://github.com/fabro-sh/fabro",
+        "clone_branch": "main",
+        "workspace_root": "/home/daytona/workspace",
+        "repos_root": "/home/daytona/repos",
+        "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+        "primary_repo_link": "/home/daytona/workspace/fabro"
+      }
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
