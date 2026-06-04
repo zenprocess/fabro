@@ -1,0 +1,339 @@
+diff --git a/card-game-app/README.md b/card-game-app/README.md
+new file mode 100644
+index 000000000..2ed2d0ebe
+--- /dev/null
++++ b/card-game-app/README.md
+@@ -0,0 +1,71 @@
++# FreeCell Solitaire TUI
++
++An elegant, terminal-based FreeCell Solitaire game built in Python using the standard library `curses` module.
++
++## Features
++
++- **Standard FreeCell Rules**: 4 Free Cells, 4 Foundations, 8 Tableaus.
++- **Auto-Solve Support**: Automatically moves safe cards (e.g. Aces, 2s, and cards whose lower-rank opposite color counter-parts are already solved) to the foundations.
++- **Unlimited Undo**: Press `U` to rollback any moves.
++- **Vibrant UI**: Color-coded cards (Red/Black), visual cursor navigation, selection highlighting, and clear status messages.
++- **Help Panel**: Interactive help overlays rule definitions and keybindings.
++- **Deterministic Seed Support**: Allows reproducible card shuffles for testing.
++- **Automated Smoke Test**: Runs fully headless and verifies core game logic under `--smoke` mode.
++
++## Installation & Running
++
++### Requirements
++
++- Python 3.10 or newer
++
++### Setup
++
++Install the package in developer mode (including dev dependencies for testing):
++
++```bash
++cd card-game-app
++python3 -m pip install -e ".[dev]"
++```
++
++### Running the Game
++
++To launch the interactive terminal interface:
++
++```bash
++python3 main.py
++```
++
++To run the headless smoke test:
++
++```bash
++python3 main.py --smoke
++```
++
++## How to Play
++
++### Rules
++
++1. Build **Tableaus** (columns 1-8) downwards in alternating colors (e.g., Red 9 on Black 10).
++2. Build **Foundations** (top-right slots) upwards from Ace to King matching the respective suit.
++3. Use the **Free Cells** (top-left slots) to temporarily hold any single card.
++4. Moving a descending, alternating-color sequence of cards between tableaus is allowed, provided there are enough empty Free Cells and Tableaus to facilitate the transition.
++
++### Controls
++
++- **Navigation**: Arrow keys, `WASD`, or `HJKL`.
++- **Select / Move**: `Space` or `Enter`.
++  - Press on a source pile to select its bottom card (or sequence).
++  - Press on a destination pile to execute the move.
++  - Press on the same pile again to cancel the selection.
++- **Undo**: `U`
++- **Restart/New Game**: `N`
++- **Help Menu**: `H`
++- **Quit**: `Q` or `ESC`
++
++## Running Tests
++
++To execute the unit tests via `pytest`:
++
++```bash
++pytest tests/ -v
++```
+diff --git a/card-game-app/main.py b/card-game-app/main.py
+index 9d421c0ef..ba5a2fa05 100755
+--- a/card-game-app/main.py
++++ b/card-game-app/main.py
+@@ -1,7 +1,12 @@
+ #!/usr/bin/env python3
+ import sys
+-from game import FreeCellGame
+-from ui import FreeCellUI
++import os
++
++# Add src to path so we can run main.py directly even if card-game-app isn't installed
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
++
++from card_game_tui.game import FreeCellGame
++from card_game_tui.ui import FreeCellUI
+ 
+ def run_smoke_test() -> int:
+     """Runs a non-interactive smoke test/verification of the FreeCell game logic."""
+@@ -10,7 +15,11 @@ def run_smoke_test() -> int:
+     # 1. Initialize deterministic game with fixed seed
+     game = FreeCellGame(seed=42)
+     
+-    # 2. Verify initial deals
++    # 2. Render initial state snapshot
++    print("\nInitial Game State:")
++    print(game.get_summary())
++    
++    # 3. Verify initial deals
+     print("Verifying initial card distribution...")
+     if len(game.tableaus) != 8:
+         print(f"Error: Expected 8 tableaus, got {len(game.tableaus)}", file=sys.stderr)
+@@ -24,7 +33,7 @@ def run_smoke_test() -> int:
+         
+     print(f"Initial tableau card counts match perfectly: {lengths}")
+     
+-    # 3. Verify single card move to Free Cell
++    # 4. Verify single card move to Free Cell
+     top_card_t0 = game.tableaus[0][-1]
+     print(f"Moving card {top_card_t0} from Tableau 0 to Free Cell 0...")
+     
+@@ -33,6 +42,9 @@ def run_smoke_test() -> int:
+         print("Error: Failed to move card to empty free cell", file=sys.stderr)
+         return 1
+         
++    print("\nGame State after move:")
++    print(game.get_summary())
++        
+     if game.free_cells[0] != top_card_t0:
+         print(f"Error: Card at Free Cell 0 should be {top_card_t0}, got {game.free_cells[0]}", file=sys.stderr)
+         return 1
+@@ -43,7 +55,7 @@ def run_smoke_test() -> int:
+         
+     print("Single card move to Free Cell validated successfully.")
+ 
+-    # 4. Verify invalid move is rejected
++    # 5. Verify invalid move is rejected
+     next_card_t0 = game.tableaus[0][-1]
+     print(f"Attempting illegal move: placing {next_card_t0} into already occupied Free Cell 0...")
+     success = game.move_card_to_free_cell('tableau', 0, 0)
+@@ -52,13 +64,16 @@ def run_smoke_test() -> int:
+         return 1
+     print("Illegal move correctly rejected.")
+ 
+-    # 5. Verify undo functionality works
++    # 6. Verify undo functionality works
+     print("Testing Undo functionality...")
+     undo_success = game.undo()
+     if not undo_success:
+         print("Error: Undo failed", file=sys.stderr)
+         return 1
+         
++    print("\nGame State after undo:")
++    print(game.get_summary())
++        
+     if game.free_cells[0] is not None:
+         print(f"Error: Expected Free Cell 0 to be empty after undo, got {game.free_cells[0]}", file=sys.stderr)
+         return 1
+@@ -69,7 +84,7 @@ def run_smoke_test() -> int:
+         
+     print("Undo functionality validated successfully.")
+ 
+-    # 6. Verify valid moves check works
++    # 7. Verify valid moves check works
+     print("Verifying if state check for available moves is active...")
+     if not game.has_any_valid_moves():
+         print("Error: Game has valid moves but has_any_valid_moves() returned False", file=sys.stderr)
+diff --git a/card-game-app/pyproject.toml b/card-game-app/pyproject.toml
+new file mode 100644
+index 000000000..781ee2a9d
+--- /dev/null
++++ b/card-game-app/pyproject.toml
+@@ -0,0 +1,22 @@
++[build-system]
++requires = ["setuptools>=61.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "card_game_tui"
++version = "0.1.0"
++description = "A terminal-based FreeCell solitaire game in Python"
++readme = "README.md"
++requires-python = ">=3.10"
++dependencies = []
++
++[project.optional-dependencies]
++dev = [
++    "pytest>=7.0.0",
++]
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++pythonpath = ["src"]
+diff --git a/card-game-app/src/card_game_tui/__init__.py b/card-game-app/src/card_game_tui/__init__.py
+new file mode 100644
+index 000000000..b0398d734
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/__init__.py
+@@ -0,0 +1,2 @@
++from .game import Card, Deck, FreeCellGame
++from .ui import FreeCellUI
+diff --git a/card-game-app/game.py b/card-game-app/src/card_game_tui/game.py
+similarity index 91%
+rename from card-game-app/game.py
+rename to card-game-app/src/card_game_tui/game.py
+index 9a92e19cb..7c2c1289c 100644
+--- a/card-game-app/game.py
++++ b/card-game-app/src/card_game_tui/game.py
+@@ -267,11 +267,6 @@ class FreeCellGame:
+ 
+     def auto_solve_step(self) -> bool:
+         # Automatically move cards to foundations if they are safe to do so
+-        # A card is safe to move to a foundation if both cards of lower rank of opposite color are already in the foundations
+-        # (meaning there's no need to build on them in the tableaus).
+-        # For simplicity and classic play, we can just auto-move any card that can legally go to foundations
+-        # if it's an Ace or 2, or if cards of lower rank are already at foundations.
+-        # Let's write a simple auto-foundation-move step and return True if a move was made.
+         suits = ['H', 'D', 'C', 'S']
+         
+         def is_safe_for_foundation(card: Card) -> bool:
+@@ -279,9 +274,6 @@ class FreeCellGame:
+             if card.rank <= 2:
+                 return True
+             # Otherwise, check the ranks of opposite color suits in foundation.
+-            # e.g., if card is 5 of Hearts (Red), opposite colors are Clubs (Black) and Spades (Black).
+-            # If both Black foundations have at least rank 4, then 5 of Hearts is safe because no black cards
+-            # of rank 4 or lower can ever need to be placed on 5 of Hearts.
+             opp_suits = ['C', 'S'] if card.color == 'red' else ['H', 'D']
+             opp_rank_limit = card.rank - 1
+             for os in opp_suits:
+@@ -340,3 +332,37 @@ class FreeCellGame:
+         elif src_type == 'tableau':
+             return self.tableaus[src_idx].pop() if self.tableaus[src_idx] else None
+         return None
++
++    def get_summary(self) -> str:
++        lines = []
++        lines.append("=" * 50)
++        lines.append("FREECELL GAME STATE SUMMARY")
++        lines.append("=" * 50)
++        
++        # Free cells
++        fc_strs = [f"[{c}]" if c else "[   ]" for c in self.free_cells]
++        lines.append(f"Free Cells:  " + " ".join(fc_strs))
++        
++        # Foundations
++        f_strs = []
++        for suit in ['H', 'D', 'C', 'S']:
++            cards = self.foundations[suit]
++            top = str(cards[-1]) if cards else " "
++            f_strs.append(f"{suit}:[{top:>3}]")
++        lines.append(f"Foundations: " + " ".join(f_strs))
++        lines.append("-" * 50)
++        
++        # Tableaus
++        lines.append("Tableaus:")
++        max_len = max(len(t) for t in self.tableaus)
++        for r in range(max_len):
++            row_parts = []
++            for t_idx in range(8):
++                tab = self.tableaus[t_idx]
++                if r < len(tab):
++                    row_parts.append(f"{str(tab[r]):>5}")
++                else:
++                    row_parts.append("     ")
++            lines.append(" ".join(row_parts))
++        lines.append("=" * 50)
++        return "\n".join(lines)
+diff --git a/card-game-app/ui.py b/card-game-app/src/card_game_tui/ui.py
+similarity index 99%
+rename from card-game-app/ui.py
+rename to card-game-app/src/card_game_tui/ui.py
+index fa29ce8b2..f612aed5f 100644
+--- a/card-game-app/ui.py
++++ b/card-game-app/src/card_game_tui/ui.py
+@@ -1,7 +1,7 @@
+ import curses
+ import locale
+ import sys
+-from game import FreeCellGame, Card
++from .game import FreeCellGame, Card
+ 
+ # Enable localized Unicode support for suit symbols
+ try:
+diff --git a/card-game-app/tests/__init__.py b/card-game-app/tests/__init__.py
+new file mode 100644
+index 000000000..d4839a6b1
+--- /dev/null
++++ b/card-game-app/tests/__init__.py
+@@ -0,0 +1 @@
++# Tests package
+diff --git a/card-game-app/test_game.py b/card-game-app/tests/test_game.py
+similarity index 76%
+rename from card-game-app/test_game.py
+rename to card-game-app/tests/test_game.py
+index 30e24e835..004e5ac66 100644
+--- a/card-game-app/test_game.py
++++ b/card-game-app/tests/test_game.py
+@@ -1,5 +1,5 @@
+ import unittest
+-from game import Card, Deck, FreeCellGame
++from card_game_tui.game import Card, Deck, FreeCellGame
+ 
+ class TestCard(unittest.TestCase):
+     def test_card_properties(self):
+@@ -94,6 +94,34 @@ class TestFreeCellGame(unittest.TestCase):
+         self.assertEqual(game.tableaus[0][-1], Card('H', 9))
+         self.assertEqual(game.tableaus[0][-2], Card('S', 10))
+ 
++    def test_move_to_tableau_sequence(self):
++        game = FreeCellGame(seed=42)
++        # Empty all free cells and tableaus to control state
++        game.free_cells = [None] * 4
++        game.tableaus = [[] for _ in range(8)]
++        
++        # Tableau 0: King of Clubs, Queen of Hearts
++        game.tableaus[0] = [Card('C', 13), Card('H', 12)]
++        # Tableau 1: Jack of Spades
++        game.tableaus[1] = [Card('S', 11)]
++        
++        # Place Jack of Spades (Black 11) on Queen of Hearts (Red 12)
++        success = game.move_to_tableau('tableau', 1, 0)
++        self.assertTrue(success)
++        self.assertEqual(game.tableaus[0][-1], Card('S', 11))
++        self.assertEqual(game.tableaus[0][-2], Card('H', 12))
++        
++        # Now Tableau 0 has: KC, QH, JS (a valid sequence: Black 13, Red 12, Black 11)
++        # Let's place a Red 10 (10 of Diamonds) on Tableau 2
++        game.tableaus[2] = [Card('D', 10)]
++        
++        # Let's place Queen of Hearts + Jack of Spades sequence onto a King of Spades (Black 13) in Tableau 3
++        game.tableaus[3] = [Card('S', 13)]
++        success = game.move_to_tableau('tableau', 0, 3)
++        self.assertTrue(success)
++        self.assertEqual(game.tableaus[3], [Card('S', 13), Card('H', 12), Card('S', 11)])
++        self.assertEqual(game.tableaus[0], [Card('C', 13)])
++
+     def test_undo(self):
+         game = FreeCellGame(seed=42)
+         init_state = game.get_state()
