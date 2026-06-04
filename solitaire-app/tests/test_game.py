@@ -375,6 +375,45 @@ class TestSolitaireUI(unittest.TestCase):
         self.assertEqual(len(self.game.waste), 1)
         self.assertEqual(self.tui.status_msg, "Drawn card.")
 
+    def test_draw_card_representation(self):
+        from unittest.mock import MagicMock, patch
+        stdscr = MagicMock()
+        
+        with patch('solitaire_tui.ui.curses.color_pair', return_value=0):
+            # 1. Test None (empty slot) card representation
+            self.tui.draw_card_representation(stdscr, y=5, x=10, card=None, is_cursor=False, is_selected=False)
+            stdscr.addstr.assert_any_call(5, 10, "[  -]", unittest.mock.ANY)
+            
+            # 2. Test face-down card representation
+            face_down_card = Card('H', 1, is_face_up=False)
+            stdscr.reset_mock()
+            self.tui.draw_card_representation(stdscr, y=5, x=10, card=face_down_card, is_cursor=False, is_selected=False)
+            stdscr.addstr.assert_any_call(5, 10, "[###]", unittest.mock.ANY)
+
+            # 3. Test face-up card representation
+            face_up_card = Card('H', 10, is_face_up=True)
+            stdscr.reset_mock()
+            self.tui.draw_card_representation(stdscr, y=5, x=10, card=face_up_card, is_cursor=False, is_selected=False)
+            stdscr.addstr.assert_any_call(5, 10, "[", unittest.mock.ANY)
+            try:
+                stdscr.addstr.assert_any_call(5, 11, "10♥", unittest.mock.ANY)
+            except AssertionError:
+                stdscr.addstr.assert_any_call(5, 11, "10H", unittest.mock.ANY)
+            stdscr.addstr.assert_any_call(5, 14, "]", unittest.mock.ANY)
+
+    def test_draw_screen(self):
+        from unittest.mock import MagicMock, patch
+        stdscr = MagicMock()
+        stdscr.getmaxyx.return_value = (24, 80)
+        
+        with patch('solitaire_tui.ui.curses.color_pair', return_value=0):
+            self.tui.draw_screen(stdscr)
+            
+            stdscr.erase.assert_called_once()
+            stdscr.refresh.assert_called_once()
+            stdscr.addstr.assert_any_call(0, 2, "KLONDIKE SOLITAIRE", unittest.mock.ANY)
+            stdscr.addstr.assert_any_call(3, 2, "STOCK", unittest.mock.ANY)
+
 
 if __name__ == '__main__':
     unittest.main()
