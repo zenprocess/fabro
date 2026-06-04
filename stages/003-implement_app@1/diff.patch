@@ -1,0 +1,899 @@
+diff --git a/solitaire-app/README.md b/solitaire-app/README.md
+new file mode 100644
+index 000000000..5bc193dc0
+--- /dev/null
++++ b/solitaire-app/README.md
+@@ -0,0 +1,64 @@
++# Python Klondike Solitaire Curses TUI
++
++A terminal-based Klondike Solitaire game in Python using the standard library `curses` module, featuring full game rules, multi-step undo history, win detection, an interactive TUI, and automated smoke & unit tests.
++
++## Features
++
++- **Pure Python Game Engine**: Decoupled game rules, move validation, and state history management.
++- **TUI Controls**: Intuitive grid navigation using Arrow Keys or WASD.
++- **Card Selection & Dragging**: Visual highlight of selected cards or multi-card stacks when dragging.
++- **Full Solitaire Rules**: Stock and waste drawing/recycling, tableau piles, foundation piles (building up Aces to Kings), and auto-reveal of face-down cards.
++- **Multi-Step Undo**: Unlimited undo states.
++- **Color Support**: Red suit coloration and distinct styling for highlights/selections.
++- **Robust Verification**: Automated unit test suite via `pytest` and a headless `--smoke` test.
++
++---
++
++## Installation & Setup
++
++No external dependencies are required to run the game, as it uses Python's standard `curses` library. To run tests, `pytest` is required.
++
++### 1. Run Unit Tests
++
++Execute the following to run all unit tests for game rules, state changes, and win detection:
++
++```bash
++cd solitaire-app
++python3 -m pytest tests/ -v
++```
++
++### 2. Run Non-Interactive Smoke Test
++
++Run a programmatically simulated full game simulation that validates drawing, moving, undos, and win detection:
++
++```bash
++cd solitaire-app
++python3 main.py --smoke
++```
++
++### 3. Play the Game
++
++Launch the interactive curses terminal interface:
++
++```bash
++cd solitaire-app
++python3 main.py
++```
++
++*Note: Ensure your terminal window is at least 80 columns wide and 24 rows high.*
++
++---
++
++## Control Scheme
++
++- **Arrow Keys** or **WASD**: Move the cursor between areas:
++  - **Top Row**: Stock (far-left), Waste, and the 4 Foundations (♠, ♥, ♦, ♣).
++  - **Tableau Row**: The 7 column piles. Inside columns, use Up/Down keys to choose which card to select.
++- **Space** or **Enter**:
++  - If cursor is on **Stock**: Draw a card.
++  - If no card is selected: Select the current card or stack.
++  - If a stack is already selected: Move the selected cards to the current cursor position.
++- **Esc** or **'c' / 'C'**: Cancel the current selection.
++- **'u' / 'U'**: Undo the last move.
++- **'r' / 'R'**: Restart / deal a new game.
++- **'q' / 'Q'**: Quit the game.
+diff --git a/solitaire-app/main.py b/solitaire-app/main.py
+new file mode 100644
+index 000000000..6b0367e62
+--- /dev/null
++++ b/solitaire-app/main.py
+@@ -0,0 +1,87 @@
++import sys
++import os
++
++# Add src to sys.path so we can import packages correctly
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
++
++from solitaire_tui.game_logic import GameState, Card
++from solitaire_tui.tui import start_game
++
++def run_smoke_test():
++    print("=== SOLITAIRE TUI SMOKE TEST ===")
++    
++    # 1. Initialize a deterministic game state
++    print("Initializing GameState with seed=100...")
++    state = GameState(seed=100)
++    assert len(state.stock) == 24
++    assert len(state.waste) == 0
++    assert sum(len(col) for col in state.tableau) == 28
++    print("Initialization check: PASSED")
++
++    # 2. Verify stock drawing and recycling logic
++    print("Drawing cards from stock...")
++    initial_stock_len = len(state.stock)
++    for _ in range(initial_stock_len):
++        assert state.draw_card()
++    assert len(state.stock) == 0
++    assert len(state.waste) == initial_stock_len
++    
++    print("Recycling waste back to stock...")
++    assert state.draw_card()
++    assert len(state.stock) == initial_stock_len
++    assert len(state.waste) == 0
++    print("Draw & Recycle check: PASSED")
++
++    # 3. Programmatically execute a valid move and assert state change
++    print("Executing a mock valid move...")
++    red_jack = Card("♥", 11, face_up=True)
++    black_ten = Card("♠", 10, face_up=True)
++    
++    state.tableau[0] = [red_jack]
++    state.tableau[1] = [black_ten]
++    
++    assert state.validate_move("tableau", 1, 0, "tableau", 0)
++    assert state.move_cards("tableau", 1, 0, "tableau", 0)
++    
++    assert len(state.tableau[1]) == 0
++    assert len(state.tableau[0]) == 2
++    assert state.tableau[0][1] == black_ten
++    print("Move execution check: PASSED")
++
++    # 4. Verify undo reverts the mock state change
++    print("Reverting the move with Undo...")
++    assert state.undo()
++    assert len(state.tableau[0]) == 1
++    assert len(state.tableau[1]) == 1
++    assert state.tableau[0][0] == red_jack
++    assert state.tableau[1][0] == black_ten
++    print("Undo check: PASSED")
++
++    # 5. Create a nearly complete foundation set, execute final winning move, and assert win
++    print("Simulating winning condition...")
++    for suit in GameState.SUITS:
++        state.foundations[suit] = [Card(suit, rank, face_up=True) for rank in range(1, 13)]
++        
++    assert not state.check_win()
++    
++    # Final winning move: Ace, then 2... now King (13) of each suit is placed on its foundation
++    for suit in GameState.SUITS:
++        king = Card(suit, 13, face_up=True)
++        state.waste = [king]
++        assert state.move_cards("waste", None, None, "foundation", suit)
++        
++    assert state.check_win()
++    print("Win detection check: PASSED")
++
++    print("\nText snapshot of winning state:")
++    for suit, found in state.foundations.items():
++        print(f"  Foundation {suit}: {found[-1] if found else 'empty'}")
++    
++    print("\n=== SMOKE TEST SUCCEEDED ===")
++    sys.exit(0)
++
++if __name__ == "__main__":
++    if "--smoke" in sys.argv:
++        run_smoke_test()
++    else:
++        start_game()
+diff --git a/solitaire-app/pyproject.toml b/solitaire-app/pyproject.toml
+new file mode 100644
+index 000000000..3bc6f2ad8
+--- /dev/null
++++ b/solitaire-app/pyproject.toml
+@@ -0,0 +1,19 @@
++[build-system]
++requires = ["setuptools>=61.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "solitaire-tui"
++version = "0.1.0"
++description = "Terminal-based Klondike solitaire game with curses"
++requires-python = ">=3.11"
++dependencies = []
++
++[project.optional-dependencies]
++test = [
++    "pytest",
++]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
+diff --git a/solitaire-app/src/solitaire_tui/__init__.py b/solitaire-app/src/solitaire_tui/__init__.py
+new file mode 100644
+index 000000000..2fd1f2b41
+--- /dev/null
++++ b/solitaire-app/src/solitaire_tui/__init__.py
+@@ -0,0 +1 @@
++# Solitaire TUI package
+diff --git a/solitaire-app/src/solitaire_tui/game_logic.py b/solitaire-app/src/solitaire_tui/game_logic.py
+new file mode 100644
+index 000000000..c459cd2c5
+--- /dev/null
++++ b/solitaire-app/src/solitaire_tui/game_logic.py
+@@ -0,0 +1,203 @@
++import random
++import copy
++
++class Card:
++    def __init__(self, suit: str, rank: int, face_up: bool = False):
++        self.suit = suit  # ♠, ♥, ♦, ♣
++        self.rank = rank  # 1 to 13
++        self.face_up = face_up
++
++    @property
++    def color(self) -> str:
++        return "red" if self.suit in ("♥", "♦") else "black"
++
++    @property
++    def rank_str(self) -> str:
++        if self.rank == 1:
++            return "A"
++        elif self.rank == 11:
++            return "J"
++        elif self.rank == 12:
++            return "Q"
++        elif self.rank == 13:
++            return "K"
++        else:
++            return str(self.rank)
++
++    def copy(self):
++        return Card(self.suit, self.rank, self.face_up)
++
++    def __repr__(self) -> str:
++        return f"{self.suit}{self.rank_str}" if self.face_up else "##"
++
++    def __eq__(self, other):
++        if not isinstance(other, Card):
++            return False
++        return self.suit == other.suit and self.rank == other.rank and self.face_up == other.face_up
++
++
++class GameState:
++    SUITS = ["♠", "♥", "♦", "♣"]
++
++    def __init__(self, seed=None):
++        self.seed = seed
++        self.stock = []
++        self.waste = []
++        self.tableau = [[] for _ in range(7)]
++        self.foundations = {suit: [] for suit in self.SUITS}
++        self.undo_stack = []
++        self.deal()
++
++    def deal(self):
++        # Create deck
++        deck = [Card(suit, rank) for suit in self.SUITS for rank in range(1, 14)]
++        
++        # Shuffle
++        rng = random.Random(self.seed)
++        rng.shuffle(deck)
++
++        # Clear existing piles
++        self.stock = []
++        self.waste = []
++        self.tableau = [[] for _ in range(7)]
++        self.foundations = {suit: [] for suit in self.SUITS}
++        self.undo_stack = []
++
++        # Deal to tableau
++        for i in range(7):
++            for j in range(i + 1):
++                card = deck.pop()
++                if j == i:
++                    card.face_up = True
++                self.tableau[i].append(card)
++
++        # Remaining to stock
++        self.stock = deck
++
++    def save_state(self):
++        snapshot = {
++            'stock': [card.copy() for card in self.stock],
++            'waste': [card.copy() for card in self.waste],
++            'tableau': [[card.copy() for card in col] for col in self.tableau],
++            'foundations': {suit: [card.copy() for card in col] for suit, col in self.foundations.items()}
++        }
++        self.undo_stack.append(snapshot)
++
++    def undo(self) -> bool:
++        if not self.undo_stack:
++            return False
++        snapshot = self.undo_stack.pop()
++        self.stock = [card.copy() for card in snapshot['stock']]
++        self.waste = [card.copy() for card in snapshot['waste']]
++        self.tableau = [[card.copy() for card in col] for col in snapshot['tableau']]
++        self.foundations = {suit: [card.copy() for card in col] for suit, col in snapshot['foundations'].items()}
++        return True
++
++    def draw_card(self) -> bool:
++        self.save_state()
++        if self.stock:
++            card = self.stock.pop()
++            card.face_up = True
++            self.waste.append(card)
++            return True
++        elif self.waste:
++            # Recycle
++            self.stock = [card.copy() for card in reversed(self.waste)]
++            for card in self.stock:
++                card.face_up = False
++            self.waste = []
++            return True
++        return False
++
++    def check_win(self) -> bool:
++        return all(len(self.foundations[suit]) == 13 for suit in self.SUITS)
++
++    def validate_move(self, src_type: str, src_idx, card_idx, dst_type: str, dst_idx) -> bool:
++        # Validate source
++        if src_type == "waste":
++            if not self.waste:
++                return False
++            moving_cards = [self.waste[-1]]
++        elif src_type == "tableau":
++            if src_idx < 0 or src_idx >= 7:
++                return False
++            col = self.tableau[src_idx]
++            if not col or card_idx < 0 or card_idx >= len(col):
++                return False
++            if not col[card_idx].face_up:
++                return False
++            moving_cards = col[card_idx:]
++        elif src_type == "foundation":
++            if src_idx not in self.SUITS:
++                return False
++            found = self.foundations[src_idx]
++            if not found:
++                return False
++            moving_cards = [found[-1]]
++        else:
++            return False
++
++        # Validate destination
++        first_moving = moving_cards[0]
++
++        if dst_type == "tableau":
++            if dst_idx < 0 or dst_idx >= 7:
++                return False
++            # Self-move is invalid
++            if src_type == "tableau" and src_idx == dst_idx:
++                return False
++            dst_col = self.tableau[dst_idx]
++            if not dst_col:
++                # Empty tableau can only accept a King (13)
++                return first_moving.rank == 13
++            else:
++                dst_card = dst_col[-1]
++                return first_moving.color != dst_card.color and first_moving.rank == dst_card.rank - 1
++
++        elif dst_type == "foundation":
++            if dst_idx not in self.SUITS:
++                return False
++            # Can only move 1 card to foundation at a time
++            if len(moving_cards) > 1:
++                return False
++            # Self-move is invalid
++            if src_type == "foundation" and src_idx == dst_idx:
++                return False
++            if first_moving.suit != dst_idx:
++                return False
++            found = self.foundations[dst_idx]
++            if not found:
++                return first_moving.rank == 1  # Ace
++            else:
++                return first_moving.rank == found[-1].rank + 1
++
++        return False
++
++    def move_cards(self, src_type: str, src_idx, card_idx, dst_type: str, dst_idx) -> bool:
++        if not self.validate_move(src_type, src_idx, card_idx, dst_type, dst_idx):
++            return False
++
++        self.save_state()
++
++        # Extract card(s)
++        if src_type == "waste":
++            card = self.waste.pop()
++            moving_cards = [card]
++        elif src_type == "tableau":
++            col = self.tableau[src_idx]
++            moving_cards = col[card_idx:]
++            self.tableau[src_idx] = col[:card_idx]
++            # Auto-reveal top card of source column
++            if self.tableau[src_idx] and not self.tableau[src_idx][-1].face_up:
++                self.tableau[src_idx][-1].face_up = True
++        elif src_type == "foundation":
++            card = self.foundations[src_idx].pop()
++            moving_cards = [card]
++
++        # Insert cards
++        if dst_type == "tableau":
++            self.tableau[dst_idx].extend(moving_cards)
++        elif dst_type == "foundation":
++            self.foundations[dst_idx].extend(moving_cards)
++
++        return True
+diff --git a/solitaire-app/src/solitaire_tui/tui.py b/solitaire-app/src/solitaire_tui/tui.py
+new file mode 100644
+index 000000000..b27c68443
+--- /dev/null
++++ b/solitaire-app/src/solitaire_tui/tui.py
+@@ -0,0 +1,312 @@
++import os
++import curses
++from solitaire_tui.game_logic import Card, GameState
++
++def init_colors():
++    if curses.has_colors():
++        curses.start_color()
++        # Pair 1: Red cards on Black background
++        curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)
++        # Pair 2: Black cards/White text on Black background
++        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
++        # Pair 3: Cyan labels/decorations
++        curses.init_pair(3, curses.COLOR_CYAN, curses.COLOR_BLACK)
++        # Pair 4: Black text on White/Cyan for highlights (Black cards)
++        curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_WHITE)
++        # Pair 5: Red text on White/Cyan for highlights (Red cards)
++        curses.init_pair(5, curses.COLOR_RED, curses.COLOR_WHITE)
++
++def format_card(card: Card) -> str:
++    if not card.face_up:
++        return "[ ## ]"
++    r_str = card.rank_str
++    if len(r_str) == 1:
++        return f"[ {card.suit}{r_str} ]"
++    else:
++        return f"[ {card.suit}{r_str}]"
++
++def draw_board(stdscr, state: GameState, cursor_area: str, cursor_col: int, cursor_card_idx: int, selected_source):
++    stdscr.erase()
++    
++    # 1. Draw Title and instructions
++    stdscr.addstr(1, 2, "=== KLONDIKE SOLITAIRE ===", curses.color_pair(3) | curses.A_BOLD)
++    stdscr.addstr(2, 2, "Controls: Arrows/WASD: Move | Space/Enter: Select/Move | U: Undo | R: New Game | Q: Quit | Esc/C: Cancel", curses.color_pair(3))
++    
++    # Draw selection status if any
++    if selected_source:
++        src_type, src_idx, card_idx = selected_source
++        if src_type == "waste":
++            status_str = "Selected: Waste"
++        elif src_type == "foundation":
++            status_str = f"Selected: Foundation {src_idx}"
++        else:
++            card_repr = state.tableau[src_idx][card_idx]
++            status_str = f"Selected: {card_repr} in Column {src_idx + 1}"
++        stdscr.addstr(3, 2, status_str, curses.color_pair(1) | curses.A_BOLD)
++    else:
++        stdscr.addstr(3, 2, "                                                                      ")
++
++    # 2. Draw Stock & Waste
++    # Stock label and card
++    stdscr.addstr(5, 4, "STOCK", curses.color_pair(3))
++    stock_focused = (cursor_area == "top" and cursor_col == 0)
++    stock_card_str = "[ ## ]" if state.stock else "[    ]"
++    stock_attr = curses.color_pair(4) if stock_focused else curses.color_pair(2)
++    stdscr.addstr(6, 4, stock_card_str, stock_attr)
++    
++    # Waste label and card
++    stdscr.addstr(5, 13, "WASTE", curses.color_pair(3))
++    waste_focused = (cursor_area == "top" and cursor_col == 1)
++    waste_selected = (selected_source and selected_source[0] == "waste")
++    
++    if state.waste:
++        top_waste = state.waste[-1]
++        waste_card_str = format_card(top_waste)
++        is_red = top_waste.color == "red"
++        if waste_focused or waste_selected:
++            waste_attr = curses.color_pair(5) if is_red else curses.color_pair(4)
++        else:
++            waste_attr = curses.color_pair(1) if is_red else curses.color_pair(2)
++    else:
++        waste_card_str = "[    ]"
++        waste_attr = curses.color_pair(4) if waste_focused else curses.color_pair(2)
++        
++    stdscr.addstr(6, 13, waste_card_str, waste_attr)
++    
++    # 3. Draw Foundations
++    SUITS = GameState.SUITS
++    stdscr.addstr(5, 31, "FOUNDATIONS", curses.color_pair(3))
++    for i, suit in enumerate(SUITS):
++        fx = 31 + i * 9
++        f_focused = (cursor_area == "top" and cursor_col == 3 + i)
++        f_selected = (selected_source and selected_source[0] == "foundation" and selected_source[1] == suit)
++        
++        found_pile = state.foundations[suit]
++        if found_pile:
++            top_card = found_pile[-1]
++            card_str = format_card(top_card)
++            is_red = top_card.color == "red"
++            if f_focused or f_selected:
++                f_attr = curses.color_pair(5) if is_red else curses.color_pair(4)
++            else:
++                f_attr = curses.color_pair(1) if is_red else curses.color_pair(2)
++        else:
++            # Empty foundation placeholder
++            card_str = f"[  {suit} ]"
++            is_red = suit in ("♥", "♦")
++            if f_focused:
++                f_attr = curses.color_pair(5) if is_red else curses.color_pair(4)
++            else:
++                f_attr = curses.color_pair(1) if is_red else curses.color_pair(2)
++                
++        stdscr.addstr(6, fx, card_str, f_attr)
++
++    # 4. Draw Tableau Piles
++    for col_idx in range(7):
++        tx = 4 + col_idx * 9
++        col = state.tableau[col_idx]
++        
++        # Draw Column Label
++        stdscr.addstr(9, tx, f" Col {col_idx+1} ", curses.color_pair(3))
++        
++        if not col:
++            # Draw empty placeholder
++            col_focused = (cursor_area == "tableau" and cursor_col == col_idx)
++            card_str = "[    ]"
++            attr = curses.color_pair(4) if col_focused else curses.color_pair(2)
++            stdscr.addstr(10, tx, card_str, attr)
++        else:
++            for card_idx, card in enumerate(col):
++                ty = 10 + card_idx
++                col_focused = (cursor_area == "tableau" and cursor_col == col_idx and cursor_card_idx == card_idx)
++                
++                # Check if this card is part of the selected stack
++                card_selected = False
++                if selected_source and selected_source[0] == "tableau" and selected_source[1] == col_idx:
++                    if card_idx >= selected_source[2]:
++                        card_selected = True
++                
++                card_str = format_card(card)
++                is_red = card.face_up and card.color == "red"
++                
++                if col_focused or card_selected:
++                    attr = curses.color_pair(5) if is_red else curses.color_pair(4)
++                else:
++                    if card.face_up:
++                        attr = curses.color_pair(1) if is_red else curses.color_pair(2)
++                    else:
++                        attr = curses.color_pair(2) # Grey/white for face down
++                
++                stdscr.addstr(ty, tx, card_str, attr)
++
++    # 5. Draw Win Message if won
++    if state.check_win():
++        stdscr.addstr(22, 15, "CONGRATULATIONS! YOU WON THE GAME! Press 'R' to play again.", curses.color_pair(1) | curses.A_BOLD | curses.A_BLINK)
++
++    stdscr.refresh()
++
++def main_loop(stdscr):
++    # Setup Esc delay and options
++    os.environ.setdefault('ESCDELAY', '25')
++    curses.curs_set(0)
++    stdscr.keypad(True)
++    init_colors()
++    
++    state = GameState()
++    
++    # Cursor state
++    cursor_area = "tableau" # "top" or "tableau"
++    cursor_col = 0 # 0-6
++    cursor_card_idx = 0 # within tableau column
++    selected_source = None # (area, col, card_idx) or None
++    
++    SUITS = GameState.SUITS
++    
++    while True:
++        # Validate and clamp cursor_card_idx
++        if cursor_area == "tableau":
++            col = state.tableau[cursor_col]
++            if not col:
++                cursor_card_idx = 0
++            else:
++                first_face_up = next((idx for idx, card in enumerate(col) if card.face_up), 0)
++                last_card_idx = len(col) - 1
++                if cursor_card_idx < first_face_up:
++                    cursor_card_idx = first_face_up
++                elif cursor_card_idx > last_card_idx:
++                    cursor_card_idx = last_card_idx
++                    
++        # Check terminal size
++        height, width = stdscr.getmaxyx()
++        if height < 24 or width < 80:
++            stdscr.erase()
++            stdscr.addstr(0, 0, f"Terminal size too small: {width}x{height}", curses.color_pair(1))
++            stdscr.addstr(1, 0, "Please resize your terminal to at least 80x24.", curses.color_pair(2))
++            stdscr.refresh()
++            ch = stdscr.getch()
++            if ch in (ord('q'), ord('Q')):
++                break
++            continue
++
++        draw_board(stdscr, state, cursor_area, cursor_col, cursor_card_idx, selected_source)
++        
++        ch = stdscr.getch()
++        if ch == -1:
++            continue
++            
++        # Quit
++        if ch in (ord('q'), ord('Q')):
++            break
++            
++        # New Game
++        elif ch in (ord('r'), ord('R')):
++            state = GameState()
++            cursor_area = "tableau"
++            cursor_col = 0
++            cursor_card_idx = 0
++            selected_source = None
++            
++        # Undo
++        elif ch in (ord('u'), ord('U')):
++            state.undo()
++            selected_source = None
++            
++        # Cancel selection
++        elif ch in (27, ord('c'), ord('C')): # 27 is Escape
++            selected_source = None
++            
++        # Navigation
++        elif ch in (curses.KEY_LEFT, ord('a'), ord('A')):
++            if cursor_col > 0:
++                cursor_col -= 1
++                if cursor_area == "tableau":
++                    col = state.tableau[cursor_col]
++                    if col:
++                        cursor_card_idx = len(col) - 1
++                    else:
++                        cursor_card_idx = 0
++                        
++        elif ch in (curses.KEY_RIGHT, ord('d'), ord('D')):
++            if cursor_col < 6:
++                cursor_col += 1
++                if cursor_area == "tableau":
++                    col = state.tableau[cursor_col]
++                    if col:
++                        cursor_card_idx = len(col) - 1
++                    else:
++                        cursor_card_idx = 0
++                        
++        elif ch in (curses.KEY_UP, ord('w'), ord('W')):
++            if cursor_area == "tableau":
++                col = state.tableau[cursor_col]
++                if not col:
++                    cursor_area = "top"
++                else:
++                    first_face_up = next((idx for idx, card in enumerate(col) if card.face_up), 0)
++                    if cursor_card_idx > first_face_up:
++                        cursor_card_idx -= 1
++                    else:
++                        cursor_area = "top"
++                        
++        elif ch in (curses.KEY_DOWN, ord('s'), ord('S')):
++            if cursor_area == "top":
++                cursor_area = "tableau"
++                col = state.tableau[cursor_col]
++                if col:
++                    cursor_card_idx = len(col) - 1
++                else:
++                    cursor_card_idx = 0
++            elif cursor_area == "tableau":
++                col = state.tableau[cursor_col]
++                if col:
++                    last_card_idx = len(col) - 1
++                    if cursor_card_idx < last_card_idx:
++                        cursor_card_idx += 1
++                        
++        # Selection / Movement Action
++        elif ch in (ord(' '), 10, 13, curses.KEY_ENTER):
++            if selected_source is None:
++                # Select source
++                if cursor_area == "top":
++                    if cursor_col == 0:
++                        state.draw_card()
++                    elif cursor_col == 1:
++                        if state.waste:
++                            selected_source = ("waste", None, None)
++                    elif cursor_col >= 3:
++                        suit = SUITS[cursor_col - 3]
++                        if state.foundations[suit]:
++                            selected_source = ("foundation", suit, None)
++                elif cursor_area == "tableau":
++                    col = state.tableau[cursor_col]
++                    if col:
++                        selected_source = ("tableau", cursor_col, cursor_card_idx)
++            else:
++                # Attempt move to destination
++                src_type, src_idx, card_idx = selected_source
++                
++                success = False
++                if cursor_area == "tableau":
++                    success = state.move_cards(src_type, src_idx, card_idx, "tableau", cursor_col)
++                elif cursor_area == "top" and cursor_col >= 3:
++                    suit = SUITS[cursor_col - 3]
++                    success = state.move_cards(src_type, src_idx, card_idx, "foundation", suit)
++                
++                if success:
++                    selected_source = None
++                    if cursor_area == "tableau":
++                        col = state.tableau[cursor_col]
++                        cursor_card_idx = len(col) - 1 if col else 0
++                else:
++                    # Move failed. Select current position if valid source.
++                    if cursor_area == "tableau" and state.tableau[cursor_col]:
++                        selected_source = ("tableau", cursor_col, cursor_card_idx)
++                    elif cursor_area == "top" and cursor_col == 1 and state.waste:
++                        selected_source = ("waste", None, None)
++                    elif cursor_area == "top" and cursor_col >= 3 and state.foundations[SUITS[cursor_col - 3]]:
++                        selected_source = ("foundation", SUITS[cursor_col - 3], None)
++                    else:
++                        selected_source = None
++
++def start_game():
++    curses.wrapper(main_loop)
+diff --git a/solitaire-app/tests/__init__.py b/solitaire-app/tests/__init__.py
+new file mode 100644
+index 000000000..c3571db9b
+--- /dev/null
++++ b/solitaire-app/tests/__init__.py
+@@ -0,0 +1 @@
++# Tests for Solitaire TUI
+diff --git a/solitaire-app/tests/test_game_logic.py b/solitaire-app/tests/test_game_logic.py
+new file mode 100644
+index 000000000..3bf13865d
+--- /dev/null
++++ b/solitaire-app/tests/test_game_logic.py
+@@ -0,0 +1,164 @@
++import pytest
++from solitaire_tui.game_logic import Card, GameState
++
++def test_game_initialization():
++    state = GameState(seed=42)
++    # Total cards in standard deck = 52
++    # Tableau has 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28 cards
++    # Stock has 52 - 28 = 24 cards
++    # Waste and foundations are empty
++    assert len(state.stock) == 24
++    assert len(state.waste) == 0
++    assert sum(len(col) for col in state.tableau) == 28
++    assert all(len(state.foundations[suit]) == 0 for suit in GameState.SUITS)
++
++    # Check that tableau top cards are face-up and others are face-down
++    for i, col in enumerate(state.tableau):
++        assert len(col) == i + 1
++        for j in range(i):
++            assert not col[j].face_up
++        assert col[-1].face_up
++
++def test_draw_and_recycle():
++    state = GameState(seed=42)
++    initial_stock_count = len(state.stock)
++    
++    # Draw all cards
++    for _ in range(initial_stock_count):
++        assert state.draw_card()
++    
++    assert len(state.stock) == 0
++    assert len(state.waste) == initial_stock_count
++    assert all(card.face_up for card in state.waste)
++
++    # Recycle
++    assert state.draw_card()
++    assert len(state.stock) == initial_stock_count
++    assert len(state.waste) == 0
++    assert all(not card.face_up for card in state.stock)
++
++def test_legal_tableau_moves():
++    # Setup state manually for controlled validation
++    state = GameState(seed=42)
++    
++    # Let's create a red Jack and black 10
++    red_jack = Card("♥", 11, face_up=True)
++    black_ten = Card("♠", 10, face_up=True)
++
++    state.tableau[0] = [red_jack]
++    state.tableau[1] = [black_ten]
++
++    # Valid move: black 10 (col 1) onto red Jack (col 0)
++    assert state.validate_move("tableau", 1, 0, "tableau", 0)
++    assert state.move_cards("tableau", 1, 0, "tableau", 0)
++
++    assert len(state.tableau[1]) == 0
++    assert len(state.tableau[0]) == 2
++    assert state.tableau[0][0] == red_jack
++    assert state.tableau[0][1] == black_ten
++
++def test_king_on_empty_tableau():
++    state = GameState(seed=42)
++    state.tableau[0] = []
++    
++    king = Card("♦", 13, face_up=True)
++    queen = Card("♦", 12, face_up=True)
++
++    state.tableau[1] = [king]
++    state.tableau[2] = [queen]
++
++    # King can move to empty
++    assert state.validate_move("tableau", 1, 0, "tableau", 0)
++    # Queen cannot move to empty
++    assert not state.validate_move("tableau", 2, 0, "tableau", 0)
++
++    assert state.move_cards("tableau", 1, 0, "tableau", 0)
++    assert state.tableau[0] == [king]
++
++def test_foundation_moves():
++    state = GameState(seed=42)
++    
++    ace = Card("♠", 1, face_up=True)
++    two = Card("♠", 2, face_up=True)
++
++    state.waste = [two, ace]
++
++    # Ace of Spades to Spade foundation
++    assert state.validate_move("waste", None, None, "foundation", "♠")
++    assert state.move_cards("waste", None, None, "foundation", "♠")
++
++    assert state.foundations["♠"] == [ace]
++    assert state.waste == [two]
++
++    # Now two of Spades to Spade foundation
++    assert state.validate_move("waste", None, None, "foundation", "♠")
++    assert state.move_cards("waste", None, None, "foundation", "♠")
++    assert state.foundations["♠"] == [ace, two]
++    assert len(state.waste) == 0
++
++def test_invalid_moves():
++    state = GameState(seed=42)
++    
++    red_ten = Card("♦", 10, face_up=True)
++    red_nine = Card("♥", 9, face_up=True)
++    black_ten = Card("♣", 10, face_up=True)
++
++    state.tableau[0] = [red_ten]
++    state.tableau[1] = [red_nine]  # same color
++    state.tableau[2] = [black_ten] # same rank
++
++    # Same color (red 9 on red 10) is invalid
++    assert not state.validate_move("tableau", 1, 0, "tableau", 0)
++    # Same rank (black 10 on red 10) is invalid
++    assert not state.validate_move("tableau", 2, 0, "tableau", 0)
++
++def test_undo():
++    state = GameState(seed=42)
++    
++    # Record initial state
++    initial_stock_len = len(state.stock)
++    initial_waste_len = len(state.waste)
++
++    # Action 1: Draw card
++    assert state.draw_card()
++    assert len(state.stock) == initial_stock_len - 1
++    assert len(state.waste) == 1
++
++    # Action 2: Undo
++    assert state.undo()
++    assert len(state.stock) == initial_stock_len
++    assert len(state.waste) == initial_waste_len
++
++    # Multi-step undo
++    # Setup move
++    red_jack = Card("♥", 11, face_up=True)
++    black_ten = Card("♠", 10, face_up=True)
++    state.tableau[0] = [red_jack]
++    state.tableau[1] = [black_ten]
++
++    state.move_cards("tableau", 1, 0, "tableau", 0)
++    assert len(state.tableau[0]) == 2
++    assert len(state.tableau[1]) == 0
++
++    state.undo()
++    assert len(state.tableau[0]) == 1
++    assert len(state.tableau[1]) == 1
++    assert state.tableau[0][0] == red_jack
++    assert state.tableau[1][0] == black_ten
++
++def test_win_detection():
++    state = GameState(seed=42)
++    
++    # Fill foundations manually up to Queen (12)
++    for suit in GameState.SUITS:
++        state.foundations[suit] = [Card(suit, rank, face_up=True) for rank in range(1, 13)]
++
++    assert not state.check_win()
++
++    # Move King to each foundation
++    for suit in GameState.SUITS:
++        king = Card(suit, 13, face_up=True)
++        state.waste = [king]
++        assert state.move_cards("waste", None, None, "foundation", suit)
++
++    assert state.check_win()
