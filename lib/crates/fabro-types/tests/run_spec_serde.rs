@@ -4,7 +4,7 @@ use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunSpec};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
-use fabro_types::{AutomationRef, WorkflowSettings, fixtures};
+use fabro_types::{AutomationRef, RunProvenance, WorkflowSettings, fixtures, test_support};
 
 fn templated_settings() -> WorkflowSettings {
     let mut settings = WorkflowSettings::default();
@@ -27,7 +27,7 @@ fn run_spec_round_trips_templated_settings() {
         }),
         source_directory: Some("/Users/client/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance:       None,
+        provenance:       test_support::test_run_provenance(),
         manifest_blob:    None,
         definition_blob:  None,
         git:              Some(GitContext {
@@ -75,15 +75,47 @@ fn run_spec_round_trips_templated_settings() {
 }
 
 #[test]
-fn run_spec_defaults_automation_for_legacy_specs() {
+fn run_spec_defaults_automation_when_absent() {
+    let provenance = test_support::test_run_provenance();
     let json = serde_json::json!({
         "run_id": fixtures::RUN_1,
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
-        "labels": {}
+        "labels": {},
+        "provenance": provenance,
     });
 
-    let record: RunSpec = serde_json::from_value(json).expect("legacy spec should deserialize");
+    let record: RunSpec = serde_json::from_value(json).expect("spec should deserialize");
 
     assert_eq!(record.automation, None);
+}
+
+#[test]
+fn run_spec_requires_total_provenance() {
+    let mut missing = serde_json::json!({
+        "run_id": fixtures::RUN_1,
+        "settings": WorkflowSettings::default(),
+        "graph": Graph::new("ship"),
+        "labels": {},
+    });
+    assert!(serde_json::from_value::<RunSpec>(missing.clone()).is_err());
+
+    missing["provenance"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<RunSpec>(missing).is_err());
+}
+
+#[test]
+fn run_provenance_requires_total_subject() {
+    let mut provenance =
+        serde_json::to_value(test_support::test_run_provenance()).expect("provenance serializes");
+    provenance
+        .as_object_mut()
+        .expect("provenance is an object")
+        .remove("subject");
+    assert!(serde_json::from_value::<RunProvenance>(provenance).is_err());
+
+    let null_subject = serde_json::json!({
+        "subject": null,
+    });
+    assert!(serde_json::from_value::<RunProvenance>(null_subject).is_err());
 }

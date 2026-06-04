@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { BoardColumn, Run } from "@qltysh/fabro-api-client";
+import type { BoardColumn, Principal, Run } from "@qltysh/fabro-api-client";
 
 import {
   buildBoardColumns,
@@ -11,6 +11,15 @@ import {
   shouldRefreshBoardForEvent,
 } from "./runs";
 import { summarizeBatchLifecycleAction } from "../components/runs-list/batch-lifecycle";
+
+function testPrincipal(): Principal {
+  return {
+    kind:        "user",
+    identity:    { issuer: "fabro:test", subject: "test-user" },
+    login:       "test",
+    auth_method: "dev_token",
+  };
+}
 
 function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
   const status =
@@ -34,7 +43,7 @@ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
     workflow:         { slug: "test", name: "Test", graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "repo", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       testPrincipal(),
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -137,7 +137,7 @@ fn run_spec_json() -> serde_json::Value {
         automation:       None,
         source_directory: None,
         labels:           std::collections::HashMap::new(),
-        provenance:       None,
+        provenance:       fabro_types::test_support::test_run_provenance(),
         manifest_blob:    None,
         definition_blob:  None,
         git:              None,

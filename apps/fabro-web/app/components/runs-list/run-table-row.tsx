@@ -54,7 +54,7 @@ export function RunTableRow({
       </td>
       {show("created_by") && (
         <td className="relative z-10 w-8 whitespace-nowrap px-3 py-2.5">
-          {run.createdBy && (() => {
+          {(() => {
             const display = principalDisplay(run.createdBy);
             return (
               <Tooltip label={display.label}>

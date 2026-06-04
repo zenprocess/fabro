@@ -148,7 +148,7 @@ mod tests {
                 ("env".to_string(), "test".to_string()),
                 ("team".to_string(), "workflow".to_string()),
             ]),
-            provenance: None,
+            provenance: fabro_types::test_support::test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
             fork_source_ref: None,

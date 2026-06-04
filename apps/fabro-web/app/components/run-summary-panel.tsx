@@ -116,7 +116,7 @@ export function RunSummaryPanelView({
   artifactsCount,
   artifactsLoading,
 }: RunSummaryPanelViewProps) {
-  const created = run?.created_by ? principalDisplay(run.created_by) : null;
+  const created = run == null ? null : principalDisplay(run.created_by);
   const diff = run?.diff ?? null;
   const cost = formatUsdMicros(run?.billing?.total_usd_micros);
   const sandboxKind = sandboxLifecycleKind(run?.sandbox);

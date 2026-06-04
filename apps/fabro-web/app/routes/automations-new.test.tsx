@@ -101,6 +101,13 @@ mock.module("swr", () => ({
 const { default: AutomationsNew } = await import("./automations-new");
 mock.restore();
 
+const TEST_PRINCIPAL = {
+  kind:        "user",
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token",
+};
+
 function makeRun(overrides: Record<string, unknown> = {}) {
   return {
     id:               "run_1",
@@ -120,7 +127,7 @@ function makeRun(overrides: Record<string, unknown> = {}) {
       origin_url: "https://github.com/fallback/repo.git",
       provider:   "github",
     },
-    created_by:       null,
+    created_by:       TEST_PRINCIPAL,
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

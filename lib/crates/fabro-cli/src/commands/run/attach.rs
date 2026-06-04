@@ -841,7 +841,7 @@ mod tests {
             automation: None,
             source_directory: None,
             labels: std::collections::HashMap::default(),
-            provenance: None,
+            provenance: fabro_types::test_support::test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
             git: None,

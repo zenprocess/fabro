@@ -7,7 +7,7 @@
     reason = "Demo fixture data favors literal fidelity over pedantic style lints."
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -23,13 +23,23 @@ use fabro_api::types::{
     RunFilesMeta, RunFilesMetaScope, RunFilesMetaSource, SandboxService,
     SandboxServiceListResponse,
 };
-use fabro_types::{SandboxServiceDiscoverySource, SandboxServiceListMeta};
+use fabro_types::{
+    AuthMethod, IdpIdentity, Principal, SandboxServiceDiscoverySource, SandboxServiceListMeta,
+};
 use serde_json::json;
 
 use crate::error::ApiError;
 use crate::principal_middleware::RequiredUser;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
 use crate::server::{AppState, EventListParams, PaginationParams, parse_stage_id_path};
+
+static DEMO_PRINCIPAL: LazyLock<Principal> = LazyLock::new(|| {
+    Principal::user(
+        IdpIdentity::new("fabro:demo", "demo").expect("demo identity should be valid"),
+        "demo".to_string(),
+        AuthMethod::DevToken,
+    )
+});
 
 fn paginated_response<T: serde::Serialize>(
     items: Vec<T>,
@@ -1096,7 +1106,7 @@ mod runs {
         RunSize, RunTimestamps, StageId, WorkflowRef, WorkflowSettings,
     };
 
-    use super::ts;
+    use super::{DEMO_PRINCIPAL, ts};
     use crate::server::run_stage_from_stage_id;
 
     fn labels(entries: &[(&str, &str)]) -> HashMap<String, String> {
@@ -1171,7 +1181,7 @@ mod runs {
                 repo_origin_url,
                 source_directory.as_deref(),
             )),
-            created_by: None,
+            created_by: DEMO_PRINCIPAL.clone(),
             origin: RunOrigin::default(),
             labels: labels(entries),
             lifecycle: RunLifecycle {

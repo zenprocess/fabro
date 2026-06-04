@@ -2133,7 +2133,7 @@ reasoning = false
             },
             automation: None,
             repository: None,
-            created_by: None,
+            created_by: fabro_types::test_support::test_principal(),
             origin: RunOrigin::default(),
             labels: HashMap::new(),
             lifecycle: RunLifecycle {

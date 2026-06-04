@@ -40,8 +40,8 @@ export function systemKind(principal: PrincipalSystem): string {
   }
 }
 
-type Provenance = NonNullable<RunSpec["provenance"]>;
-type Subject = NonNullable<Provenance["subject"]>;
+type Provenance = RunSpec["provenance"];
+type Subject = Provenance["subject"];
 
 type SubjectIsNotAny = AssertFalse<IsAny<Subject>>;
 type SubjectExtendsPrincipal = AssertExtends<Subject, Principal>;

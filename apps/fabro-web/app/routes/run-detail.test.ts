@@ -20,6 +20,13 @@ let currentQuestions: any[] = [];
 let deleteRunApiResult: Promise<unknown> | null = null;
 const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
 
+const TEST_PRINCIPAL = {
+  kind:        "user",
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token",
+};
+
 const deleteRunApiMock = mock((_id: string) =>
   deleteRunApiResult ?? Promise.resolve({}),
 );
@@ -221,7 +228,7 @@ function makeRunSummary({
     workflow:         { slug: "default", name: "Default", graph_name: null, node_count: 0, edge_count: 0 },
     automation,
     repository:       { name: "fabro", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       TEST_PRINCIPAL,
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

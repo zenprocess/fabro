@@ -69,7 +69,7 @@ async fn append_completed_run_with_final_patch(
         workflow_slug:    None,
         automation:       None,
         db_prefix:        None,
-        provenance:       None,
+        provenance:       fabro_types::test_support::test_run_provenance(),
         manifest_blob:    None,
         git:              None,
         fork_source_ref:  None,

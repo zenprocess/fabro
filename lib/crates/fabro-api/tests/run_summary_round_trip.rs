@@ -12,7 +12,7 @@ use fabro_types::{
     AskFabro, AskFabroUnavailableReason, AutomationRef, DiffSummary, PullRequestLink,
     RepositoryProvider, RepositoryRef, Run, RunApproval, RunApprovalState, RunBillingSummary,
     RunId, RunLifecycle, RunLinks, RunOrigin, RunRunnableSource, RunSize, RunTimestamps, RunTiming,
-    WorkflowRef, fixtures,
+    WorkflowRef, fixtures, test_support,
 };
 use serde_json::json;
 
@@ -88,7 +88,7 @@ fn run_summary_json_matches_openapi_shape() {
             origin_url: None,
             provider:   RepositoryProvider::Unknown,
         }),
-        created_by:       None,
+        created_by:       test_support::test_principal(),
         origin:           RunOrigin::default(),
         labels:           HashMap::from([("team".to_string(), "core".to_string())]),
         lifecycle:        RunLifecycle {
@@ -161,7 +161,15 @@ fn run_summary_json_matches_openapi_shape() {
                 "origin_url": null,
                 "provider": "unknown"
             },
-            "created_by": null,
+            "created_by": {
+                "kind": "user",
+                "identity": {
+                    "issuer": "fabro:test",
+                    "subject": "test-user"
+                },
+                "login": "test",
+                "auth_method": "dev_token"
+            },
             "origin": {
                 "kind": "api"
             },
@@ -238,6 +246,15 @@ fn run_summary_deserializes_when_optional_fields_are_absent() {
             "name": null,
             "graph_name": "GraphName"
         },
+        "created_by": {
+            "kind": "user",
+            "identity": {
+                "issuer": "fabro:test",
+                "subject": "test-user"
+            },
+            "login": "test",
+            "auth_method": "dev_token"
+        },
         "origin": {
             "kind": "api"
         },
@@ -275,6 +292,7 @@ fn run_summary_deserializes_when_optional_fields_are_absent() {
     assert_eq!(summary.workflow.edge_count, 0);
     assert_eq!(summary.goal, "ship it");
     assert_eq!(summary.title, "ship it");
+    assert_eq!(summary.created_by, test_support::test_principal());
     assert_eq!(summary.labels, HashMap::new());
     assert_eq!(summary.source_directory, None);
     assert_eq!(
@@ -298,6 +316,50 @@ fn run_summary_deserializes_when_optional_fields_are_absent() {
     assert_eq!(summary.retried_from, None);
     assert_eq!(summary.diff, None);
     assert_eq!(summary.pull_request, None);
+}
+
+#[test]
+fn run_summary_requires_created_by() {
+    let created_at = Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).unwrap();
+    let run_id = RunId::with_timestamp(created_at, 7);
+
+    let result = serde_json::from_value::<Run>(json!({
+        "id": run_id.to_string(),
+        "goal": "ship it",
+        "title": "ship it",
+        "workflow": {
+            "slug": null,
+            "name": null,
+            "graph_name": "GraphName"
+        },
+        "origin": {
+            "kind": "api"
+        },
+        "labels": {},
+        "lifecycle": {
+            "status": {
+                "kind": "running"
+            },
+            "archived": false
+        },
+        "repository": {
+            "name": "fabro",
+            "origin_url": null,
+            "provider": "unknown"
+        },
+        "models": [],
+        "timestamps": {
+            "created_at": "2026-04-20T12:00:00Z",
+            "started_at": null,
+            "last_event_at": null,
+            "completed_at": null
+        },
+        "links": {
+            "web": null
+        }
+    }));
+
+    assert!(result.is_err());
 }
 
 #[test]

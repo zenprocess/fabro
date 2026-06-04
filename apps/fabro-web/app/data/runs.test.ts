@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Run, RunStatus as ApiRunStatus } from "@qltysh/fabro-api-client";
+import type { Principal, Run, RunStatus as ApiRunStatus } from "@qltysh/fabro-api-client";
 import {
   columnForStatus,
   columnStatusDisplay,
@@ -9,6 +9,15 @@ import {
   runStatusDisplay,
 } from "./runs";
 
+function testPrincipal(): Principal {
+  return {
+    kind:        "user",
+    identity:    { issuer: "fabro:test", subject: "test-user" },
+    login:       "test",
+    auth_method: "dev_token",
+  };
+}
+
 function makeRun(overrides: Partial<Run> = {}): Run {
   return {
     id:               "01ABC",
@@ -17,7 +26,7 @@ function makeRun(overrides: Partial<Run> = {}): Run {
     workflow:         { slug: "fix_build", name: "Fix Build", graph_name: "FixBuild", node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "myrepo", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       testPrincipal(),
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -27,7 +27,9 @@ use fabro_static::EnvVars;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{EnvironmentProvider, RunGoal, RunNamespace};
-use fabro_types::{ManifestPath, RunId, SandboxProviderKind, ServerSettings, WorkflowSettings};
+use fabro_types::{
+    ManifestPath, RunId, RunProvenance, SandboxProviderKind, ServerSettings, WorkflowSettings,
+};
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
@@ -194,6 +196,7 @@ pub(crate) fn create_run_input(
     prepared: PreparedManifest,
     configured_providers: Vec<ProviderId>,
     web_url: Option<String>,
+    provenance: RunProvenance,
 ) -> CreateRunInput {
     CreateRunInput {
         workflow: WorkflowInput::Bundled(prepared.workflow_input),
@@ -209,7 +212,7 @@ pub(crate) fn create_run_input(
         git: prepared.git,
         fork_source_ref: None,
         parent_id: prepared.parent_id,
-        provenance: None,
+        provenance,
         configured_providers,
         web_url,
     }
