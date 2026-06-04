@@ -81,9 +81,13 @@ class SolitaireTUI:
         if self.cursor_zone == 'top':
             if self.cursor_col == 0:
                 # Draw from Stock to Waste
+                was_empty_stock = not self.game.stock
                 success = self.game.draw()
                 if success:
-                    self.status_msg = "Drawn card."
+                    if was_empty_stock:
+                        self.status_msg = "Recycled waste to stock."
+                    else:
+                        self.status_msg = "Drawn card."
                 else:
                     self.status_msg = "Stock and Waste are empty."
                 self.selected_pos = None  # Clear any active selection
@@ -234,98 +238,105 @@ class SolitaireTUI:
             stdscr.addstr(y, x + 4, right_br, attr)
 
     def draw_screen(self, stdscr) -> None:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        
-        # Check window size
-        if h < 20 or w < 60:
-            stdscr.addstr(0, 0, "Terminal too small. Please enlarge to at least 80x24.", curses.color_pair(1))
+        try:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            
+            # Check window size
+            if h < 20 or w < 60:
+                try:
+                    stdscr.addstr(0, 0, "Terminal too small. Please enlarge to at least 80x24.", curses.color_pair(1))
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                return
+
+            # Title / Help Banner
+            stdscr.addstr(0, 2, "KLONDIKE SOLITAIRE", curses.color_pair(4) | curses.A_BOLD)
+            help_text = "Arrows/Vim:Move | Space/Enter:Select/Draw | A:Auto-Move | U:Undo | R:Restart | Q:Quit"
+            stdscr.addstr(1, 2, help_text[:w-3], curses.color_pair(3))
+
+            # Top row elements positioning
+            # Stock (col 0), Waste (col 1), gap (col 2), Foundations 0-3 (cols 3-6)
+            x_coords = [2 + i * 8 for i in range(7)]
+
+            # --- Draw STOCK ---
+            is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 0)
+            is_selected = False  # Stock can never be selected
+            stdscr.addstr(3, x_coords[0], "STOCK", curses.color_pair(3))
+            
+            if self.game.stock:
+                # Top card of Stock is face down
+                self.draw_card_representation(stdscr, 4, x_coords[0], Card('S', 1, False), is_cursor, is_selected)
+            else:
+                self.draw_card_representation(stdscr, 4, x_coords[0], None, is_cursor, is_selected)
+
+            # --- Draw WASTE ---
+            is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 1)
+            is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == 1)
+            stdscr.addstr(3, x_coords[1], "WASTE", curses.color_pair(3))
+            
+            if self.game.waste:
+                self.draw_card_representation(stdscr, 4, x_coords[1], self.game.waste[-1], is_cursor, is_selected)
+            else:
+                self.draw_card_representation(stdscr, 4, x_coords[1], None, is_cursor, is_selected)
+
+            # --- Draw FOUNDATIONS ---
+            for i in range(4):
+                col_idx = 3 + i
+                is_cursor = (self.cursor_zone == 'top' and self.cursor_col == col_idx)
+                is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == col_idx)
+                stdscr.addstr(3, x_coords[col_idx], f"FOUND {i+1}", curses.color_pair(3))
+                
+                pile = self.game.foundations[i]
+                if pile:
+                    self.draw_card_representation(stdscr, 4, x_coords[col_idx], pile[-1], is_cursor, is_selected)
+                else:
+                    self.draw_card_representation(stdscr, 4, x_coords[col_idx], None, is_cursor, is_selected)
+
+            # --- Draw TABLEAU ---
+            stdscr.addstr(6, 2, "TABLEAU COLUMNS:", curses.color_pair(4))
+            for col_idx in range(7):
+                pile = self.game.tableau[col_idx]
+                x = x_coords[col_idx]
+                
+                # Label
+                stdscr.addstr(7, x, f"COL {col_idx+1}", curses.color_pair(3))
+                
+                if not pile:
+                    is_cursor = (self.cursor_zone == 'bottom' and self.cursor_col == col_idx)
+                    is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'bottom' and self.selected_pos[1] == col_idx)
+                    self.draw_card_representation(stdscr, 8, x, None, is_cursor, is_selected)
+                else:
+                    for card_idx, card in enumerate(pile):
+                        y = 8 + card_idx
+                        # Check cursor highlighting
+                        is_cursor = (
+                            self.cursor_zone == 'bottom' and 
+                            self.cursor_col == col_idx and 
+                            self.cursor_card_idx == card_idx
+                        )
+                        # Check selection highlighting
+                        # If this column is selected as source, we highlight the selected card and all cards below it!
+                        is_selected = False
+                        if self.selected_pos is not None:
+                            src_zone, src_col, src_card_idx = self.selected_pos
+                            if src_zone == 'bottom' and src_col == col_idx and card_idx >= src_card_idx:
+                                is_selected = True
+
+                        self.draw_card_representation(stdscr, y, x, card, is_cursor, is_selected)
+
+            # Draw Status Bar at bottom
+            stdscr.addstr(h - 2, 2, f"Status: {self.status_msg}"[:w-3], curses.color_pair(4) | curses.A_BOLD)
+            
+            # Draw game seed info or undo history count
+            info_str = f"Undos available: {len(self.game.history)}"
+            if w > len(info_str) + 10:
+                stdscr.addstr(h - 2, w - len(info_str) - 3, info_str, curses.color_pair(3))
+
             stdscr.refresh()
-            return
-
-        # Title / Help Banner
-        stdscr.addstr(0, 2, "KLONDIKE SOLITAIRE", curses.color_pair(4) | curses.A_BOLD)
-        help_text = "Arrows/Vim:Move | Space/Enter:Select/Draw | A:Auto-Move | U:Undo | R:Restart | Q:Quit"
-        stdscr.addstr(1, 2, help_text[:w-3], curses.color_pair(3))
-
-        # Top row elements positioning
-        # Stock (col 0), Waste (col 1), gap (col 2), Foundations 0-3 (cols 3-6)
-        x_coords = [2 + i * 8 for i in range(7)]
-
-        # --- Draw STOCK ---
-        is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 0)
-        is_selected = False  # Stock can never be selected
-        stdscr.addstr(3, x_coords[0], "STOCK", curses.color_pair(3))
-        
-        if self.game.stock:
-            # Top card of Stock is face down
-            self.draw_card_representation(stdscr, 4, x_coords[0], Card('S', 1, False), is_cursor, is_selected)
-        else:
-            self.draw_card_representation(stdscr, 4, x_coords[0], None, is_cursor, is_selected)
-
-        # --- Draw WASTE ---
-        is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 1)
-        is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == 1)
-        stdscr.addstr(3, x_coords[1], "WASTE", curses.color_pair(3))
-        
-        if self.game.waste:
-            self.draw_card_representation(stdscr, 4, x_coords[1], self.game.waste[-1], is_cursor, is_selected)
-        else:
-            self.draw_card_representation(stdscr, 4, x_coords[1], None, is_cursor, is_selected)
-
-        # --- Draw FOUNDATIONS ---
-        for i in range(4):
-            col_idx = 3 + i
-            is_cursor = (self.cursor_zone == 'top' and self.cursor_col == col_idx)
-            is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == col_idx)
-            stdscr.addstr(3, x_coords[col_idx], f"FOUND {i+1}", curses.color_pair(3))
-            
-            pile = self.game.foundations[i]
-            if pile:
-                self.draw_card_representation(stdscr, 4, x_coords[col_idx], pile[-1], is_cursor, is_selected)
-            else:
-                self.draw_card_representation(stdscr, 4, x_coords[col_idx], None, is_cursor, is_selected)
-
-        # --- Draw TABLEAU ---
-        stdscr.addstr(6, 2, "TABLEAU COLUMNS:", curses.color_pair(4))
-        for col_idx in range(7):
-            pile = self.game.tableau[col_idx]
-            x = x_coords[col_idx]
-            
-            # Label
-            stdscr.addstr(7, x, f"COL {col_idx+1}", curses.color_pair(3))
-            
-            if not pile:
-                is_cursor = (self.cursor_zone == 'bottom' and self.cursor_col == col_idx)
-                is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'bottom' and self.selected_pos[1] == col_idx)
-                self.draw_card_representation(stdscr, 8, x, None, is_cursor, is_selected)
-            else:
-                for card_idx, card in enumerate(pile):
-                    y = 8 + card_idx
-                    # Check cursor highlighting
-                    is_cursor = (
-                        self.cursor_zone == 'bottom' and 
-                        self.cursor_col == col_idx and 
-                        self.cursor_card_idx == card_idx
-                    )
-                    # Check selection highlighting
-                    # If this column is selected as source, we highlight the selected card and all cards below it!
-                    is_selected = False
-                    if self.selected_pos is not None:
-                        src_zone, src_col, src_card_idx = self.selected_pos
-                        if src_zone == 'bottom' and src_col == col_idx and card_idx >= src_card_idx:
-                            is_selected = True
-
-                    self.draw_card_representation(stdscr, y, x, card, is_cursor, is_selected)
-
-        # Draw Status Bar at bottom
-        stdscr.addstr(h - 2, 2, f"Status: {self.status_msg}"[:w-3], curses.color_pair(4) | curses.A_BOLD)
-        
-        # Draw game seed info or undo history count
-        info_str = f"Undos available: {len(self.game.history)}"
-        stdscr.addstr(h - 2, w - len(info_str) - 3, info_str, curses.color_pair(3))
-
-        stdscr.refresh()
+        except curses.error:
+            pass
 
     def run(self, stdscr) -> None:
         # Initialize color scheme
@@ -397,6 +408,10 @@ class SolitaireTUI:
                 self.cursor_card_idx = 0
                 self.selected_pos = None
                 self.status_msg = "New game started!"
+
+            # Handle Help
+            elif ch in (ord('?'), ord('H')):
+                self.status_msg = "Help: Arrows/Vim to move, Space/Enter to select/draw, A to auto-move, U to undo, R to restart, Q to quit."
 
             # Handle Resize
             elif ch == curses.KEY_RESIZE:

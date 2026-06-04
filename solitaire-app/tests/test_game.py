@@ -328,5 +328,53 @@ class TestSolitaireGame(unittest.TestCase):
         self.game.tableau[3] = [Card(suit='C', rank=6, is_face_up=True)]
         self.assertFalse(self.game.can_move_tableau_to_tableau(src_col=2, dest_col=3, card_idx=0))
 
+
+class TestSolitaireUI(unittest.TestCase):
+    def setUp(self):
+        from solitaire_tui.game import GameState
+        from solitaire_tui.ui import SolitaireTUI
+        self.game = GameState(seed=42)
+        self.tui = SolitaireTUI(self.game)
+
+    def test_cursor_navigation(self):
+        # Starts at 'top', col 0
+        self.assertEqual(self.tui.cursor_zone, 'top')
+        self.assertEqual(self.tui.cursor_col, 0)
+
+        # Move right
+        self.tui.move_cursor('right')
+        self.assertEqual(self.tui.cursor_col, 1)
+
+        # Move right again (should skip col 2 and land on col 3)
+        self.tui.move_cursor('right')
+        self.assertEqual(self.tui.cursor_col, 3)
+
+        # Move down to tableau
+        self.tui.move_cursor('down')
+        self.assertEqual(self.tui.cursor_zone, 'bottom')
+        self.assertEqual(self.tui.cursor_col, 3)
+        # Tableau 3 has 4 cards, so card index should be 3 (0-based)
+        self.assertEqual(self.tui.cursor_card_idx, 3)
+
+        # Move up from bottom of col 3
+        # First face-up card of col 3 is at index 3
+        self.tui.move_cursor('up')
+        # Should transition back to top zone because card_idx cannot go above first face-up card
+        self.assertEqual(self.tui.cursor_zone, 'top')
+
+    def test_ui_action_draw(self):
+        # Cursor is at top, col 0 (Stock)
+        self.tui.cursor_zone = 'top'
+        self.tui.cursor_col = 0
+        
+        self.assertEqual(len(self.game.stock), 24)
+        self.assertEqual(len(self.game.waste), 0)
+        
+        self.tui.handle_action()
+        self.assertEqual(len(self.game.stock), 23)
+        self.assertEqual(len(self.game.waste), 1)
+        self.assertEqual(self.tui.status_msg, "Drawn card.")
+
+
 if __name__ == '__main__':
     unittest.main()

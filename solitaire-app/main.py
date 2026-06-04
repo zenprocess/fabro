@@ -40,8 +40,8 @@ def run_smoke_test() -> None:
     loader = unittest.TestLoader()
     # Discover and run tests
     try:
-        from tests.test_game import TestSolitaireGame
-        suite = loader.loadTestsFromTestCase(TestSolitaireGame)
+        import tests.test_game as test_game
+        suite = loader.loadTestsFromModule(test_game)
     except Exception as e:
         print(f"✗ Failed to import tests: {e}")
         sys.exit(1)
