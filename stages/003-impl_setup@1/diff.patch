@@ -1,0 +1,485 @@
+diff --git a/card-game-app/README.md b/card-game-app/README.md
+new file mode 100644
+index 000000000..2f9a5ef06
+--- /dev/null
++++ b/card-game-app/README.md
+@@ -0,0 +1,31 @@
++# Terminal FreeCell Solitaire
++
++A terminal-based FreeCell Solitaire game implemented in Python 3 using `curses`.
++
++## Installation and Setup
++
++Ensure you have Python 3.8+ installed.
++
++To install dependencies for testing:
++```bash
++pip install -e ".[dev]"
++```
++
++## Running the Game
++
++To run the interactive TUI game:
++```bash
++python3 main.py
++```
++
++To run headless smoke tests:
++```bash
++python3 main.py --smoke
++```
++
++## Running Tests
++
++To run the automated tests:
++```bash
++pytest
++```
+diff --git a/card-game-app/main.py b/card-game-app/main.py
+new file mode 100644
+index 000000000..017d39544
+--- /dev/null
++++ b/card-game-app/main.py
+@@ -0,0 +1,40 @@
++import os
++import sys
++
++# Ensure src directory is in Python path for easy execution
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
++
++from card_game_tui.engine import GameState, Move, validate_move
++from card_game_tui.tui import run_curses_app
++
++def main():
++    if "--smoke" in sys.argv:
++        print("Running headless smoke tests...")
++        try:
++            state = GameState()
++            state.deal(seed=42)
++            
++            # Assert initial setup
++            assert sum(len(col) for col in state.tableau) == 52, "Tableau must contain 52 cards"
++            assert len(state.tableau[0]) == 7, "Column 1 must have 7 cards"
++            assert len(state.tableau[7]) == 6, "Column 8 must have 6 cards"
++            assert all(fc is None for fc in state.free_cells), "Freecells must start empty"
++            
++            # Verify move validation logic doesn't crash
++            # Attempt an illegal move and ensure it gets rejected
++            invalid_move = Move('C', 0, 'C', 1, 1)
++            valid, reason = validate_move(state, invalid_move)
++            assert not valid, "Expected illegal move to be rejected"
++            
++            print("Smoke tests passed successfully.")
++            sys.exit(0)
++        except Exception as e:
++            print(f"Smoke test failed: {e}", file=sys.stderr)
++            sys.exit(1)
++    else:
++        # Run standard interactive curses application
++        import curses
++        curses.wrapper(run_curses_app)
++
++if __name__ == "__main__":
++    main()
+diff --git a/card-game-app/pyproject.toml b/card-game-app/pyproject.toml
+new file mode 100644
+index 000000000..50f320ccd
+--- /dev/null
++++ b/card-game-app/pyproject.toml
+@@ -0,0 +1,24 @@
++[build-system]
++requires = ["setuptools>=61.0.0", "wheel"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "card-game-tui"
++version = "0.1.0"
++description = "A terminal-based FreeCell solitaire game in Python"
++readme = "README.md"
++requires-python = ">=3.8"
++dependencies = []
++
++[project.optional-dependencies]
++dev = [
++    "pytest>=7.0.0",
++]
++
++[tool.pytest.ini_options]
++minversion = "6.0"
++addopts = "-ra -q"
++testpaths = [
++    "tests",
++]
++pythonpath = ["src"]
+diff --git a/card-game-app/src/card_game_tui/__init__.py b/card-game-app/src/card_game_tui/__init__.py
+new file mode 100644
+index 000000000..66b555966
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/__init__.py
+@@ -0,0 +1,12 @@
++from .engine import Suit, Rank, Card, Move, GameState, validate_move
++from .tui import run_curses_app
++
++__all__ = [
++    "Suit",
++    "Rank",
++    "Card",
++    "Move",
++    "GameState",
++    "validate_move",
++    "run_curses_app",
++]
+diff --git a/card-game-app/src/card_game_tui/engine.py b/card-game-app/src/card_game_tui/engine.py
+new file mode 100644
+index 000000000..7d7c36cb3
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/engine.py
+@@ -0,0 +1,217 @@
++from enum import Enum
++from typing import List, Optional, Dict, Tuple, NamedTuple
++import random
++
++class Suit(Enum):
++    SPADES = "♠"
++    HEARTS = "♥"
++    DIAMONDS = "♦"
++    CLUBS = "♣"
++
++    @property
++    def color(self) -> str:
++        if self in (Suit.HEARTS, Suit.DIAMONDS):
++            return "RED"
++        return "BLACK"
++
++class Rank(Enum):
++    ACE = 1
++    TWO = 2
++    THREE = 3
++    FOUR = 4
++    FIVE = 5
++    SIX = 6
++    SEVEN = 7
++    EIGHT = 8
++    NINE = 9
++    TEN = 10
++    JACK = 11
++    QUEEN = 12
++    KING = 13
++
++    @property
++    def symbol(self) -> str:
++        mapping = {
++            Rank.ACE: "A",
++            Rank.JACK: "J",
++            Rank.QUEEN: "Q",
++            Rank.KING: "K"
++        }
++        return mapping.get(self, str(self.value))
++
++class Card:
++    def __init__(self, rank: Rank, suit: Suit):
++        self.rank: Rank = rank
++        self.suit: Suit = suit
++
++    @property
++    def color(self) -> str:
++        return self.suit.color
++
++    def is_opposite_color(self, other: "Card") -> bool:
++        return self.color != other.color
++
++    def can_be_placed_on_tableau(self, other: "Card") -> bool:
++        """Checks if self can be placed on other (which is on top of a Tableau column)."""
++        return self.is_opposite_color(other) and self.rank.value == other.rank.value - 1
++
++    def __repr__(self) -> str:
++        return f"{self.rank.symbol}{self.suit.value}"
++
++    def __eq__(self, other: object) -> bool:
++        if not isinstance(other, Card):
++            return NotImplemented
++        return self.rank == other.rank and self.suit == other.suit
++
++class Move(NamedTuple):
++    src_type: str  # 'C' (Tableau), 'F' (Freecell)
++    src_idx: int   # 0-indexed
++    dst_type: str  # 'C' (Tableau), 'F' (Freecell), 'A' (Foundation)
++    dst_idx: int   # 0-indexed
++    card_count: int = 1  # For sequence moves
++
++class GameState:
++    def __init__(self):
++        self.tableau: List[List[Card]] = [[] for _ in range(8)]
++        self.free_cells: List[Optional[Card]] = [None] * 4
++        self.foundations: Dict[Suit, List[Card]] = {
++            Suit.SPADES: [],
++            Suit.HEARTS: [],
++            Suit.DIAMONDS: [],
++            Suit.CLUBS: []
++        }
++        self.history: List[Tuple[List[List[Card]], List[Optional[Card]], Dict[Suit, List[Card]]]] = []
++        self.redo_history: List[Tuple[List[List[Card]], List[Optional[Card]], Dict[Suit, List[Card]]]] = []
++
++    def deal(self, seed: Optional[int] = None) -> None:
++        """Generates, shuffles, and distributes a standard 52-card deck."""
++        deck = [Card(rank, suit) for suit in Suit for rank in Rank]
++        if seed is not None:
++            random.seed(seed)
++        else:
++            random.seed()
++        random.shuffle(deck)
++
++        self.tableau = [[] for _ in range(8)]
++        self.free_cells = [None] * 4
++        self.foundations = {s: [] for s in Suit}
++        self.history.clear()
++        self.redo_history.clear()
++
++        # Deal cards: 7 to columns 0-3, 6 to columns 4-7
++        for idx, card in enumerate(deck):
++            col = idx % 8
++            self.tableau[col].append(card)
++
++    def save_state(self) -> Tuple[List[List[Card]], List[Optional[Card]], Dict[Suit, List[Card]]]:
++        """Creates a deep copy of current piles to push to history."""
++        tableau_copy = [col.copy() for col in self.tableau]
++        free_cells_copy = list(self.free_cells)
++        foundations_copy = {suit: pile.copy() for suit, pile in self.foundations.items()}
++        return (tableau_copy, free_cells_copy, foundations_copy)
++
++    def restore_state(self, state_tuple: Tuple[List[List[Card]], List[Optional[Card]], Dict[Suit, List[Card]]]) -> None:
++        self.tableau, self.free_cells, self.foundations = state_tuple
++
++    def push_history(self) -> None:
++        self.history.append(self.save_state())
++        self.redo_history.clear()
++
++    def undo(self) -> bool:
++        if not self.history:
++            return False
++        self.redo_history.append(self.save_state())
++        self.restore_state(self.history.pop())
++        return True
++
++    def redo(self) -> bool:
++        if not self.redo_history:
++            return False
++        self.history.append(self.save_state())
++        self.restore_state(self.redo_history.pop())
++        return True
++
++def get_source_cards(state: GameState, src_type: str, src_idx: int, card_count: int) -> List[Card]:
++    if src_type == 'C':
++        col = state.tableau[src_idx]
++        if len(col) < card_count:
++            return []
++        return col[-card_count:]
++    elif src_type == 'F':
++        if card_count != 1:
++            return []
++        card = state.free_cells[src_idx]
++        return [card] if card is not None else []
++    return []
++
++def is_valid_sequence(cards: List[Card]) -> bool:
++    if not cards:
++        return False
++    for i in range(len(cards) - 1):
++        curr = cards[i]
++        nxt = cards[i + 1]
++        if not nxt.can_be_placed_on_tableau(curr):
++            return False
++    return True
++
++def get_max_movable_cards(state: GameState, target_is_empty_col: bool) -> int:
++    F = sum(1 for fc in state.free_cells if fc is None)
++    T = sum(1 for col in state.tableau if not col)
++    if target_is_empty_col and T > 0:
++        T -= 1
++    return (1 + F) * (2 ** T)
++
++def validate_move(state: GameState, move: Move) -> Tuple[bool, str]:
++    """
++    Returns (True, "") if the move is legal, or (False, "reason") if illegal.
++    """
++    # 1. Fetch source card(s)
++    src_cards = get_source_cards(state, move.src_type, move.src_idx, move.card_count)
++    if not src_cards:
++        return False, "Source is empty or invalid."
++
++    # 2. If moving multiple cards, verify they form a valid alternating descending sequence
++    if len(src_cards) > 1:
++        if not is_valid_sequence(src_cards):
++            return False, "Selected cards do not form a valid alternating color descending sequence."
++
++    # 3. Validate Destination
++    if move.dst_type == 'F':  # Destination is FreeCell
++        if move.card_count > 1:
++            return False, "Cannot move a sequence to a FreeCell."
++        if state.free_cells[move.dst_idx] is not None:
++            return False, "Target FreeCell is occupied."
++
++    elif move.dst_type == 'A':  # Destination is Foundation
++        if move.card_count > 1:
++            return False, "Cannot move a sequence to a Foundation."
++        card = src_cards[0]
++        f_pile = state.foundations[card.suit]
++        if not f_pile:
++            if card.rank != Rank.ACE:
++                return False, "Foundations must start with an Ace."
++        else:
++            top_card = f_pile[-1]
++            if card.rank.value != top_card.rank.value + 1:
++                return False, f"Cannot place {card} on {top_card}. Must be next rank up."
++
++    elif move.dst_type == 'C':  # Destination is Tableau
++        dest_col = state.tableau[move.dst_idx]
++        first_src_card = src_cards[0]  # The highest rank card in the sequence being moved
++
++        if not dest_col:
++            # Moving sequence/card to empty tableau column
++            # Verify supermove capacity limit
++            max_allowed = get_max_movable_cards(state, target_is_empty_col=True)
++            if len(src_cards) > max_allowed:
++                return False, f"Insufficient empty FreeCells/Columns to move {len(src_cards)} cards (Max: {max_allowed})."
++        else:
++            dest_card = dest_col[-1]
++            if not first_src_card.can_be_placed_on_tableau(dest_card):
++                return False, f"Cannot place {first_src_card} on {dest_card}. Must be alternating color and rank-1."
++            # Verify supermove capacity limit
++            max_allowed = get_max_movable_cards(state, target_is_empty_col=False)
++            if len(src_cards) > max_allowed:
++                return False, f"Insufficient empty FreeCells/Columns to move {len(src_cards)} cards (Max: {max_allowed})."
++
++    return True, ""
+diff --git a/card-game-app/src/card_game_tui/tui.py b/card-game-app/src/card_game_tui/tui.py
+new file mode 100644
+index 000000000..27341fa27
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/tui.py
+@@ -0,0 +1,9 @@
++def run_curses_app(stdscr) -> None:
++    """
++    Placeholder for the interactive curses application.
++    """
++    stdscr.clear()
++    stdscr.addstr(0, 0, "Terminal FreeCell Solitaire (TUI)")
++    stdscr.addstr(2, 0, "Press any key to exit...")
++    stdscr.refresh()
++    stdscr.getch()
+diff --git a/card-game-app/tests/__init__.py b/card-game-app/tests/__init__.py
+new file mode 100644
+index 000000000..04f642d07
+--- /dev/null
++++ b/card-game-app/tests/__init__.py
+@@ -0,0 +1 @@
++# Tests for Card Game TUI
+diff --git a/card-game-app/tests/test_card.py b/card-game-app/tests/test_card.py
+new file mode 100644
+index 000000000..8474c30fa
+--- /dev/null
++++ b/card-game-app/tests/test_card.py
+@@ -0,0 +1,29 @@
++from card_game_tui.engine import Card, Rank, Suit
++
++def test_card_properties():
++    card = Card(Rank.ACE, Suit.SPADES)
++    assert card.rank == Rank.ACE
++    assert card.suit == Suit.SPADES
++    assert card.color == "BLACK"
++    assert repr(card) == "A♠"
++
++def test_card_opposite_color():
++    card_spades = Card(Rank.ACE, Suit.SPADES)
++    card_hearts = Card(Rank.TWO, Suit.HEARTS)
++    card_clubs = Card(Rank.THREE, Suit.CLUBS)
++    
++    assert card_spades.is_opposite_color(card_hearts)
++    assert not card_spades.is_opposite_color(card_clubs)
++
++def test_can_be_placed_on_tableau():
++    card_red_jack = Card(Rank.JACK, Suit.HEARTS)
++    card_black_queen = Card(Rank.QUEEN, Suit.SPADES)
++    card_red_queen = Card(Rank.QUEEN, Suit.DIAMONDS)
++    card_black_ten = Card(Rank.TEN, Suit.CLUBS)
++    
++    # Red Jack can be placed on Black Queen
++    assert card_red_jack.can_be_placed_on_tableau(card_black_queen)
++    # Red Jack cannot be placed on Red Queen (same color)
++    assert not card_red_jack.can_be_placed_on_tableau(card_red_queen)
++    # Red Jack cannot be placed on Black Ten (wrong rank order)
++    assert not card_red_jack.can_be_placed_on_tableau(card_black_ten)
+diff --git a/card-game-app/tests/test_integration.py b/card-game-app/tests/test_integration.py
+new file mode 100644
+index 000000000..381c7d4bf
+--- /dev/null
++++ b/card-game-app/tests/test_integration.py
+@@ -0,0 +1,6 @@
++from card_game_tui.engine import GameState
++
++def test_integration_setup():
++    state = GameState()
++    state.deal(seed=123)
++    assert sum(len(col) for col in state.tableau) == 52
+diff --git a/card-game-app/tests/test_rules.py b/card-game-app/tests/test_rules.py
+new file mode 100644
+index 000000000..762874070
+--- /dev/null
++++ b/card-game-app/tests/test_rules.py
+@@ -0,0 +1,10 @@
++from card_game_tui.engine import GameState, Move, validate_move, Card, Rank, Suit
++
++def test_validate_move_initial_illegal():
++    state = GameState()
++    state.deal(seed=42)
++    # Moving card from empty FreeCell is illegal
++    move = Move('F', 0, 'C', 0, 1)
++    valid, reason = validate_move(state, move)
++    assert not valid
++    assert "Source is empty or invalid" in reason
+diff --git a/card-game-app/tests/test_state.py b/card-game-app/tests/test_state.py
+new file mode 100644
+index 000000000..3c6206f61
+--- /dev/null
++++ b/card-game-app/tests/test_state.py
+@@ -0,0 +1,30 @@
++from card_game_tui.engine import GameState
++
++def test_deal():
++    state = GameState()
++    state.deal(seed=42)
++    assert sum(len(col) for col in state.tableau) == 52
++    assert len(state.tableau[0]) == 7
++    assert len(state.tableau[7]) == 6
++    assert all(fc is None for fc in state.free_cells)
++
++def test_undo_redo():
++    state = GameState()
++    state.deal(seed=42)
++    
++    # Push history
++    state.push_history()
++    
++    # Modify state
++    card = state.tableau[0].pop()
++    state.free_cells[0] = card
++    
++    # Undo
++    assert state.undo()
++    assert state.free_cells[0] is None
++    assert len(state.tableau[0]) == 7
++    
++    # Redo
++    assert state.redo()
++    assert state.free_cells[0] == card
++    assert len(state.tableau[0]) == 6
+diff --git a/status.json b/status.json
+index ee6907d7f..905fb370f 100644
+--- a/status.json
++++ b/status.json
+@@ -1,3 +1,3 @@
+ {
+   "outcome": "succeeded"
+-}
+\ No newline at end of file
++}
