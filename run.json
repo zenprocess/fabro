@@ -1,0 +1,788 @@
+{
+  "title": "Build a terminal-based FreeCell solitaire game in Python",
+  "spec": {
+    "run_id": "01KTA1FC5W5W0BHTQSV865A1H6",
+    "settings": {
+      "project": {
+        "name": null,
+        "description": null,
+        "metadata": {}
+      },
+      "workflow": {
+        "name": null,
+        "description": null,
+        "graph": "workflow.fabro",
+        "metadata": {}
+      },
+      "run": {
+        "goal": {
+          "type": "inline",
+          "value": "Build a terminal-based FreeCell solitaire game in Python"
+        },
+        "working_dir": null,
+        "metadata": {},
+        "inputs": {},
+        "model": {
+          "provider": "gemini",
+          "name": "gemini-3.5-flash",
+          "fallbacks": [],
+          "controls": {
+            "reasoning_effort": null,
+            "speed": null
+          }
+        },
+        "git": {
+          "author": null
+        },
+        "prepare": {
+          "commands": [],
+          "timeout_ms": 300000
+        },
+        "execution": {
+          "mode": "normal",
+          "approval": "prompt"
+        },
+        "checkpoint": {
+          "exclude_globs": [],
+          "skip_git_hooks": false
+        },
+        "clone": {
+          "enabled": true
+        },
+        "run_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "meta_branch": {
+          "enabled": true,
+          "push": true
+        },
+        "environment": {
+          "id": "fabro-dev",
+          "provider": "daytona",
+          "image": {
+            "docker": null,
+            "dockerfile": {
+              "type": "inline",
+              "value": "FROM ubuntu:24.04\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        curl git ripgrep ca-certificates build-essential pkg-config libssl-dev unzip python3 \\\n        xvfb xfce4 xfce4-terminal x11vnc novnc dbus-x11 \\\n        libx11-6 libxrandr2 libxext6 libxrender1 libxfixes3 libxss1 libxtst6 libxi6 \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Install real Chromium (not the snap stub) via xtradeb PPA\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        software-properties-common curl gnupg \\\n    && add-apt-repository -y ppa:xtradeb/apps \\\n    && apt-get update \\\n    && apt-get install -y --no-install-recommends chromium \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Wrapper: Chromium needs --no-sandbox when running as root in a container,\n# and --disable-dev-shm-usage avoids crashes from small /dev/shm\nRUN printf '#!/bin/bash\\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage \"$@\"\\n' \\\n        > /usr/local/bin/chromium-wrapper \\\n    && chmod +x /usr/local/bin/chromium-wrapper\n\n# Make the wrapper the default in the system .desktop file and via alternatives\nRUN sed -i 's|^Exec=.*|Exec=/usr/local/bin/chromium-wrapper %U|' \\\n        /usr/share/applications/chromium.desktop \\\n    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \\\n        /usr/local/bin/chromium-wrapper 100\n\n# Tell XFCE's exo-open that Chromium is the WebBrowser helper (system-wide)\nRUN mkdir -p /etc/xdg/xfce4 /usr/share/xfce4/helpers \\\n    && printf 'WebBrowser=custom-WebBrowser\\n' > /etc/xdg/xfce4/helpers.rc \\\n    && printf '[Desktop Entry]\\n\\\nVersion=1.0\\n\\\nType=X-XFCE-Helper\\n\\\nName=Chromium\\n\\\nIcon=chromium\\n\\\nX-XFCE-Category=WebBrowser\\n\\\nX-XFCE-CommandsWithParameter=/usr/local/bin/chromium-wrapper \"%%s\"\\n\\\nX-XFCE-Commands=/usr/local/bin/chromium-wrapper\\n' \\\n        > /usr/share/xfce4/helpers/custom-WebBrowser.desktop\n\n# GitHub CLI\nRUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \\\n        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \\\n    && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" \\\n        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\\n    && apt-get update && apt-get install -y --no-install-recommends gh \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Rust\nRUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nENV PATH=\"/root/.cargo/bin:${PATH}\"\nRUN rustup toolchain install nightly-2026-04-14 --profile minimal --component clippy,rustfmt\nRUN cargo install cargo-nextest --locked\nENV CARGO_INCREMENTAL=0\n\n# Bun\nRUN curl -fsSL https://bun.sh/install | bash\nENV PATH=\"/root/.bun/bin:${PATH}\"\n\nWORKDIR /root\n"
+            }
+          },
+          "resources": {
+            "cpu": 8,
+            "memory": "16GB",
+            "disk": "20GB"
+          },
+          "network": {
+            "mode": "allow_all",
+            "allow": []
+          },
+          "lifecycle": {
+            "preserve": false,
+            "stop_on_terminal": true,
+            "auto_stop": "30m"
+          },
+          "labels": {
+            "repo": "fabro-sh/fabro"
+          },
+          "volumes": [],
+          "env": {}
+        },
+        "notifications": {
+          "feed": {
+            "enabled": true,
+            "provider": "slack",
+            "events": [
+              "run.started",
+              "run.completed",
+              "run.failed"
+            ],
+            "slack": {
+              "channel": "#feed-fabro"
+            }
+          }
+        },
+        "interviews": {
+          "provider": null,
+          "slack": null
+        },
+        "agent": {
+          "fabro_tools": false,
+          "permissions": null,
+          "mcps": {}
+        },
+        "hooks": [],
+        "scm": {
+          "provider": null,
+          "owner": null,
+          "repository": null,
+          "github": null
+        },
+        "pull_request": {
+          "enabled": true,
+          "draft": false,
+          "auto_merge": false,
+          "merge_strategy": "squash"
+        },
+        "artifacts": {
+          "include": []
+        },
+        "integrations": {
+          "github": {
+            "permissions": {}
+          }
+        }
+      }
+    },
+    "graph": {
+      "name": "CardGame",
+      "nodes": {
+        "impl_setup": {
+          "id": "impl_setup",
+          "attrs": {
+            "prompt": {
+              "String": "Read .ai/card-game-spec.md.\n\nCreate the Python project skeleton under card-game-app/:\n- pyproject.toml with pytest configured\n- main.py entrypoint\n- src/card_game_tui/ package\n- tests/ directory\n- README.md stub\n\nAdd minimal importable modules so the project compiles.\n\nRun:\ncd card-game-app && python3 -m py_compile main.py src/card_game_tui/*.py\n\nWrite status.json at workspace root: outcome=succeeded if the project skeleton exists and compiles, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Setup Project"
+            },
+            "shape": {
+              "String": "box"
+            }
+          }
+        },
+        "check_ui": {
+          "id": "check_ui",
+          "attrs": {
+            "label": {
+              "String": "UI OK?"
+            },
+            "shape": {
+              "String": "diamond"
+            }
+          }
+        },
+        "verify_integration": {
+          "id": "verify_integration",
+          "attrs": {
+            "class": {
+              "String": "verify"
+            },
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Verify final integration.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck README.md includes setup, run, test, and controls instructions.\n\nWrite findings to .ai/verify_integration.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Verify Integration"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "impl_data": {
+          "id": "impl_data",
+          "attrs": {
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Read .ai/card-game-spec.md.\n\nImplement Card, Deck, Pile, or equivalent game-state types under card-game-app/src/card_game_tui/.\n\nAdd focused unit tests under card-game-app/tests/.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nWrite status.json at workspace root: outcome=succeeded if tests pass and the data model is implemented, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Data Structures"
+            }
+          }
+        },
+        "review": {
+          "id": "review",
+          "attrs": {
+            "goal_gate": {
+              "Boolean": true
+            },
+            "class": {
+              "String": "hard"
+            },
+            "label": {
+              "String": "Final Review"
+            },
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Review the complete card game app against .ai/card-game-spec.md.\n\nConfirm:\n- The app is in card-game-app/\n- It is Python 3.11+ and uses curses for the TUI\n- The requested game rules are implemented correctly\n- Keyboard controls are usable and documented\n- Tests pass\n- Smoke mode works without an interactive terminal\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 main.py --smoke\n\nWrite review to .ai/card-game-review.md.\nWrite status.json at workspace root: outcome=succeeded if the app is complete and demo-ready, outcome=failed with specific missing or broken items."
+            }
+          },
+          "classes": [
+            "hard"
+          ]
+        },
+        "verify_setup": {
+          "id": "verify_setup",
+          "attrs": {
+            "prompt": {
+              "String": "Verify setup for the card game app.\n\nCheck:\n1. card-game-app/pyproject.toml exists\n2. card-game-app/main.py exists\n3. card-game-app/src/card_game_tui exists\n4. Python files compile\n\nRun:\ncd card-game-app && python3 -m py_compile main.py src/card_game_tui/*.py\n\nWrite findings to .ai/verify_setup.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Verify Setup"
+            },
+            "class": {
+              "String": "verify"
+            },
+            "shape": {
+              "String": "box"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "verify_logic": {
+          "id": "verify_logic",
+          "attrs": {
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Verify the card game logic.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nCheck move/action validation, win/loss detection, and undo.\n\nWrite findings to .ai/verify_logic.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise."
+            },
+            "class": {
+              "String": "verify"
+            },
+            "label": {
+              "String": "Verify Logic"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "impl_ui": {
+          "id": "impl_ui",
+          "attrs": {
+            "label": {
+              "String": "Terminal UI"
+            },
+            "max_retries": {
+              "Integer": 2
+            },
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Read .ai/card-game-spec.md and the game logic.\n\nImplement the curses TUI:\n- Card rendering using ASCII art\n- Board layout\n- Keyboard input\n- Move/action selection\n- Help text\n- `python3 main.py --smoke` non-interactive smoke path\n\nKeep rendering helpers testable where practical and avoid coupling game rules to curses.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if tests pass, files compile, and smoke mode works, outcome=failed with failure_reason otherwise."
+            },
+            "class": {
+              "String": "hard"
+            }
+          },
+          "classes": [
+            "hard"
+          ]
+        },
+        "check_data": {
+          "id": "check_data",
+          "attrs": {
+            "label": {
+              "String": "Data OK?"
+            },
+            "shape": {
+              "String": "diamond"
+            }
+          }
+        },
+        "expand_spec": {
+          "id": "expand_spec",
+          "attrs": {
+            "label": {
+              "String": "Expand Spec"
+            },
+            "prompt": {
+              "String": "Goal: $goal\n\nCreate a detailed implementation spec for the requested Python terminal card game.\n\nCover:\n- Game rules and data structures (Card, Deck, Pile or equivalent state types)\n- Terminal rendering approach using the standard-library curses module\n- Input handling and move/action validation\n- Win/loss detection\n- UI layout\n- Test strategy\n\nKeep game rules testable without curses. Include a smoke mode so `python3 main.py --smoke` starts enough of the app to prove imports and setup without requiring an interactive terminal.\n\nWrite the spec to .ai/card-game-spec.md.\nWrite status.json at workspace root: outcome=succeeded if the spec is complete, outcome=failed with failure_reason otherwise."
+            },
+            "shape": {
+              "String": "box"
+            }
+          }
+        },
+        "check_setup": {
+          "id": "check_setup",
+          "attrs": {
+            "shape": {
+              "String": "diamond"
+            },
+            "label": {
+              "String": "Setup OK?"
+            }
+          }
+        },
+        "check_logic": {
+          "id": "check_logic",
+          "attrs": {
+            "shape": {
+              "String": "diamond"
+            },
+            "label": {
+              "String": "Logic OK?"
+            }
+          }
+        },
+        "check_review": {
+          "id": "check_review",
+          "attrs": {
+            "shape": {
+              "String": "diamond"
+            },
+            "label": {
+              "String": "Review OK?"
+            }
+          }
+        },
+        "exit": {
+          "id": "exit",
+          "attrs": {
+            "label": {
+              "String": "Exit"
+            },
+            "shape": {
+              "String": "Msquare"
+            }
+          }
+        },
+        "impl_logic": {
+          "id": "impl_logic",
+          "attrs": {
+            "shape": {
+              "String": "box"
+            },
+            "max_retries": {
+              "Integer": 2
+            },
+            "prompt": {
+              "String": "Read .ai/card-game-spec.md and the current card-game-app implementation.\n\nImplement the requested card game's rules:\n- Initial setup/deal where applicable\n- Move/action validation\n- Auto-complete or helper actions where applicable\n- Win/loss condition\n- Undo\n\nAdd tests for legal actions, illegal actions, win/loss detection, and edge cases.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nWrite status.json at workspace root: outcome=succeeded if all tests pass and rules are implemented, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Game Logic"
+            },
+            "class": {
+              "String": "hard"
+            }
+          },
+          "classes": [
+            "hard"
+          ]
+        },
+        "verify_ui": {
+          "id": "verify_ui",
+          "attrs": {
+            "prompt": {
+              "String": "Verify the terminal UI.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck that:\n- main.py can start smoke mode\n- UI module imports without requiring an interactive terminal\n- Board rendering helpers have tests or smoke coverage\n- Controls are documented in README.md\n\nWrite findings to .ai/verify_ui.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Verify UI"
+            },
+            "class": {
+              "String": "verify"
+            },
+            "shape": {
+              "String": "box"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "verify_data": {
+          "id": "verify_data",
+          "attrs": {
+            "class": {
+              "String": "verify"
+            },
+            "prompt": {
+              "String": "Verify the card game data structures.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py\n\nCheck that the core game-state types are defined and basic operations work.\n\nWrite findings to .ai/verify_data.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Verify Data"
+            },
+            "shape": {
+              "String": "box"
+            }
+          },
+          "classes": [
+            "verify"
+          ]
+        },
+        "impl_integration": {
+          "id": "impl_integration",
+          "attrs": {
+            "shape": {
+              "String": "box"
+            },
+            "prompt": {
+              "String": "Finish the card game app.\n\nDo the integration work:\n- Wire main.py to start the curses game loop normally\n- Keep --smoke non-interactive\n- Add README.md run instructions and controls\n- Add any missing tests needed for confidence\n- Ensure no generated files are outside card-game-app/ except .ai/ reports and root status.json\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if the app is playable and tests pass, outcome=failed with failure_reason otherwise."
+            },
+            "label": {
+              "String": "Integrate"
+            }
+          }
+        },
+        "start": {
+          "id": "start",
+          "attrs": {
+            "shape": {
+              "String": "Mdiamond"
+            },
+            "label": {
+              "String": "Start"
+            }
+          }
+        },
+        "check_integration": {
+          "id": "check_integration",
+          "attrs": {
+            "shape": {
+              "String": "diamond"
+            },
+            "label": {
+              "String": "Integration OK?"
+            }
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": "start",
+          "to": "expand_spec",
+          "attrs": {}
+        },
+        {
+          "from": "expand_spec",
+          "to": "impl_setup",
+          "attrs": {}
+        },
+        {
+          "from": "impl_setup",
+          "to": "verify_setup",
+          "attrs": {}
+        },
+        {
+          "from": "verify_setup",
+          "to": "check_setup",
+          "attrs": {}
+        },
+        {
+          "from": "check_setup",
+          "to": "impl_data",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_setup",
+          "to": "impl_setup",
+          "attrs": {
+            "label": {
+              "String": "Retry"
+            },
+            "condition": {
+              "String": "outcome=failed"
+            }
+          }
+        },
+        {
+          "from": "check_setup",
+          "to": "impl_setup",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "impl_data",
+          "to": "verify_data",
+          "attrs": {}
+        },
+        {
+          "from": "verify_data",
+          "to": "check_data",
+          "attrs": {}
+        },
+        {
+          "from": "check_data",
+          "to": "impl_logic",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_data",
+          "to": "impl_data",
+          "attrs": {
+            "condition": {
+              "String": "outcome=failed"
+            },
+            "label": {
+              "String": "Retry"
+            }
+          }
+        },
+        {
+          "from": "check_data",
+          "to": "impl_data",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "impl_logic",
+          "to": "verify_logic",
+          "attrs": {}
+        },
+        {
+          "from": "verify_logic",
+          "to": "check_logic",
+          "attrs": {}
+        },
+        {
+          "from": "check_logic",
+          "to": "impl_ui",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_logic",
+          "to": "impl_logic",
+          "attrs": {
+            "condition": {
+              "String": "outcome=failed"
+            },
+            "label": {
+              "String": "Retry"
+            }
+          }
+        },
+        {
+          "from": "check_logic",
+          "to": "impl_logic",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "impl_ui",
+          "to": "verify_ui",
+          "attrs": {}
+        },
+        {
+          "from": "verify_ui",
+          "to": "check_ui",
+          "attrs": {}
+        },
+        {
+          "from": "check_ui",
+          "to": "impl_integration",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_ui",
+          "to": "impl_ui",
+          "attrs": {
+            "condition": {
+              "String": "outcome=failed"
+            },
+            "label": {
+              "String": "Retry"
+            }
+          }
+        },
+        {
+          "from": "check_ui",
+          "to": "impl_ui",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "impl_integration",
+          "to": "verify_integration",
+          "attrs": {}
+        },
+        {
+          "from": "verify_integration",
+          "to": "check_integration",
+          "attrs": {}
+        },
+        {
+          "from": "check_integration",
+          "to": "review",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_integration",
+          "to": "impl_integration",
+          "attrs": {
+            "label": {
+              "String": "Retry"
+            },
+            "condition": {
+              "String": "outcome=failed"
+            }
+          }
+        },
+        {
+          "from": "check_integration",
+          "to": "impl_integration",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        },
+        {
+          "from": "review",
+          "to": "check_review",
+          "attrs": {}
+        },
+        {
+          "from": "check_review",
+          "to": "exit",
+          "attrs": {
+            "condition": {
+              "String": "outcome=succeeded"
+            }
+          }
+        },
+        {
+          "from": "check_review",
+          "to": "impl_ui",
+          "attrs": {
+            "label": {
+              "String": "Fix"
+            },
+            "condition": {
+              "String": "outcome=failed"
+            }
+          }
+        },
+        {
+          "from": "check_review",
+          "to": "impl_ui",
+          "attrs": {
+            "label": {
+              "String": "Fallback"
+            }
+          }
+        }
+      ],
+      "attrs": {
+        "rankdir": {
+          "String": "LR"
+        },
+        "default_max_retries": {
+          "Integer": 3
+        },
+        "fallback_retry_target": {
+          "String": "impl_logic"
+        },
+        "retry_target": {
+          "String": "impl_setup"
+        },
+        "goal": {
+          "String": "Build a terminal-based FreeCell solitaire game in Python"
+        }
+      }
+    },
+    "graph_source": "digraph CardGame {\n    graph [\n        goal=\"Build a terminal-based card game in Python\",\n        rankdir=LR,\n        default_max_retries=3,\n        retry_target=\"impl_setup\",\n        fallback_retry_target=\"impl_logic\"\n    ]\n\n    start [shape=Mdiamond, label=\"Start\"]\n    exit  [shape=Msquare, label=\"Exit\"]\n\n    expand_spec [\n        label=\"Expand Spec\",\n        shape=box,\n        prompt=\"Goal: $goal\n\nCreate a detailed implementation spec for the requested Python terminal card game.\n\nCover:\n- Game rules and data structures (Card, Deck, Pile or equivalent state types)\n- Terminal rendering approach using the standard-library curses module\n- Input handling and move/action validation\n- Win/loss detection\n- UI layout\n- Test strategy\n\nKeep game rules testable without curses. Include a smoke mode so `python3 main.py --smoke` starts enough of the app to prove imports and setup without requiring an interactive terminal.\n\nWrite the spec to .ai/card-game-spec.md.\nWrite status.json at workspace root: outcome=succeeded if the spec is complete, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    impl_setup [\n        label=\"Setup Project\",\n        shape=box,\n        prompt=\"Read .ai/card-game-spec.md.\n\nCreate the Python project skeleton under card-game-app/:\n- pyproject.toml with pytest configured\n- main.py entrypoint\n- src/card_game_tui/ package\n- tests/ directory\n- README.md stub\n\nAdd minimal importable modules so the project compiles.\n\nRun:\ncd card-game-app && python3 -m py_compile main.py src/card_game_tui/*.py\n\nWrite status.json at workspace root: outcome=succeeded if the project skeleton exists and compiles, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_setup [\n        label=\"Verify Setup\",\n        shape=box,\n        class=\"verify\",\n        prompt=\"Verify setup for the card game app.\n\nCheck:\n1. card-game-app/pyproject.toml exists\n2. card-game-app/main.py exists\n3. card-game-app/src/card_game_tui exists\n4. Python files compile\n\nRun:\ncd card-game-app && python3 -m py_compile main.py src/card_game_tui/*.py\n\nWrite findings to .ai/verify_setup.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    check_setup [shape=diamond, label=\"Setup OK?\"]\n\n    impl_data [\n        label=\"Data Structures\",\n        shape=box,\n        prompt=\"Read .ai/card-game-spec.md.\n\nImplement Card, Deck, Pile, or equivalent game-state types under card-game-app/src/card_game_tui/.\n\nAdd focused unit tests under card-game-app/tests/.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nWrite status.json at workspace root: outcome=succeeded if tests pass and the data model is implemented, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_data [\n        label=\"Verify Data\",\n        shape=box,\n        class=\"verify\",\n        prompt=\"Verify the card game data structures.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py\n\nCheck that the core game-state types are defined and basic operations work.\n\nWrite findings to .ai/verify_data.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    check_data [shape=diamond, label=\"Data OK?\"]\n\n    impl_logic [\n        label=\"Game Logic\",\n        shape=box,\n        class=\"hard\",\n        max_retries=2,\n        prompt=\"Read .ai/card-game-spec.md and the current card-game-app implementation.\n\nImplement the requested card game's rules:\n- Initial setup/deal where applicable\n- Move/action validation\n- Auto-complete or helper actions where applicable\n- Win/loss condition\n- Undo\n\nAdd tests for legal actions, illegal actions, win/loss detection, and edge cases.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nWrite status.json at workspace root: outcome=succeeded if all tests pass and rules are implemented, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_logic [\n        label=\"Verify Logic\",\n        shape=box,\n        class=\"verify\",\n        prompt=\"Verify the card game logic.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v\n\nCheck move/action validation, win/loss detection, and undo.\n\nWrite findings to .ai/verify_logic.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    check_logic [shape=diamond, label=\"Logic OK?\"]\n\n    impl_ui [\n        label=\"Terminal UI\",\n        shape=box,\n        class=\"hard\",\n        max_retries=2,\n        prompt=\"Read .ai/card-game-spec.md and the game logic.\n\nImplement the curses TUI:\n- Card rendering using ASCII art\n- Board layout\n- Keyboard input\n- Move/action selection\n- Help text\n- `python3 main.py --smoke` non-interactive smoke path\n\nKeep rendering helpers testable where practical and avoid coupling game rules to curses.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if tests pass, files compile, and smoke mode works, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_ui [\n        label=\"Verify UI\",\n        shape=box,\n        class=\"verify\",\n        prompt=\"Verify the terminal UI.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck that:\n- main.py can start smoke mode\n- UI module imports without requiring an interactive terminal\n- Board rendering helpers have tests or smoke coverage\n- Controls are documented in README.md\n\nWrite findings to .ai/verify_ui.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    check_ui [shape=diamond, label=\"UI OK?\"]\n\n    impl_integration [\n        label=\"Integrate\",\n        shape=box,\n        prompt=\"Finish the card game app.\n\nDo the integration work:\n- Wire main.py to start the curses game loop normally\n- Keep --smoke non-interactive\n- Add README.md run instructions and controls\n- Add any missing tests needed for confidence\n- Ensure no generated files are outside card-game-app/ except .ai/ reports and root status.json\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 main.py --smoke\n\nWrite status.json at workspace root: outcome=succeeded if the app is playable and tests pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    verify_integration [\n        label=\"Verify Integration\",\n        shape=box,\n        class=\"verify\",\n        prompt=\"Verify final integration.\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke\n\nCheck README.md includes setup, run, test, and controls instructions.\n\nWrite findings to .ai/verify_integration.md.\nWrite status.json at workspace root: outcome=succeeded if all checks pass, outcome=failed with failure_reason otherwise.\"\n    ]\n\n    check_integration [shape=diamond, label=\"Integration OK?\"]\n\n    review [\n        label=\"Final Review\",\n        shape=box,\n        class=\"hard\",\n        goal_gate=true,\n        prompt=\"Review the complete card game app against .ai/card-game-spec.md.\n\nConfirm:\n- The app is in card-game-app/\n- It is Python 3.11+ and uses curses for the TUI\n- The requested game rules are implemented correctly\n- Keyboard controls are usable and documented\n- Tests pass\n- Smoke mode works without an interactive terminal\n\nRun:\ncd card-game-app && python3 -m pytest tests/ -v && python3 main.py --smoke\n\nWrite review to .ai/card-game-review.md.\nWrite status.json at workspace root: outcome=succeeded if the app is complete and demo-ready, outcome=failed with specific missing or broken items.\"\n    ]\n\n    check_review [shape=diamond, label=\"Review OK?\"]\n\n    start -> expand_spec -> impl_setup -> verify_setup -> check_setup\n\n    check_setup -> impl_data  [condition=\"outcome=succeeded\"]\n    check_setup -> impl_setup [condition=\"outcome=failed\", label=\"Retry\"]\n    check_setup -> impl_setup [label=\"Fallback\"]\n\n    impl_data -> verify_data -> check_data\n\n    check_data -> impl_logic [condition=\"outcome=succeeded\"]\n    check_data -> impl_data  [condition=\"outcome=failed\", label=\"Retry\"]\n    check_data -> impl_data  [label=\"Fallback\"]\n\n    impl_logic -> verify_logic -> check_logic\n\n    check_logic -> impl_ui    [condition=\"outcome=succeeded\"]\n    check_logic -> impl_logic [condition=\"outcome=failed\", label=\"Retry\"]\n    check_logic -> impl_logic [label=\"Fallback\"]\n\n    impl_ui -> verify_ui -> check_ui\n\n    check_ui -> impl_integration [condition=\"outcome=succeeded\"]\n    check_ui -> impl_ui          [condition=\"outcome=failed\", label=\"Retry\"]\n    check_ui -> impl_ui          [label=\"Fallback\"]\n\n    impl_integration -> verify_integration -> check_integration\n\n    check_integration -> review           [condition=\"outcome=succeeded\"]\n    check_integration -> impl_integration [condition=\"outcome=failed\", label=\"Retry\"]\n    check_integration -> impl_integration [label=\"Fallback\"]\n\n    review -> check_review\n\n    check_review -> exit    [condition=\"outcome=succeeded\"]\n    check_review -> impl_ui [condition=\"outcome=failed\", label=\"Fix\"]\n    check_review -> impl_ui [label=\"Fallback\"]\n}\n",
+    "workflow_slug": "card-game",
+    "source_directory": "/Users/bhelmkamp/p/fabro-sh/fabro",
+    "provenance": {
+      "server": {
+        "version": "0.253.0-nightly.0"
+      },
+      "client": {
+        "user_agent": "fabro-cli/0.253.0-nightly.0",
+        "name": "fabro-cli",
+        "version": "0.253.0-nightly.0"
+      },
+      "subject": {
+        "kind": "user",
+        "identity": {
+          "issuer": "https://github.com",
+          "subject": "19"
+        },
+        "login": "brynary",
+        "auth_method": "github",
+        "avatar_url": "https://avatars.githubusercontent.com/u/19?v=4"
+      }
+    },
+    "manifest_blob": "c544f50fd73b40a3eb0f378afcd2a5c74acba71357235e3d2c627cd0b89afcf1",
+    "definition_blob": "106d6b297a7ac376ceb5efddb97ad8fcd747d9e95c72795b72a61592fad72860",
+    "git": {
+      "origin_url": "https://github.com/fabro-sh/fabro",
+      "branch": "main",
+      "sha": "497aaba6f20c1fac052346c39f52e08fabadb179",
+      "dirty": "dirty",
+      "push_outcome": {
+        "type": "not_attempted"
+      }
+    }
+  },
+  "web_url": "http://127.0.0.1:32276/runs/01KTA1FC5W5W0BHTQSV865A1H6",
+  "start": null,
+  "status": {
+    "kind": "starting"
+  },
+  "status_updated_at": "2026-06-04T19:24:01.141164Z",
+  "last_event_at": "2026-06-04T19:24:18.295047Z",
+  "pending_control": null,
+  "checkpoints": [],
+  "conclusion": null,
+  "sandbox": {
+    "kind": "ready",
+    "plan": {
+      "provider": "daytona"
+    },
+    "instance": {
+      "provider": "daytona",
+      "snapshot": "fabro-fdb28dec-1233-892c-b9d7-9f88f8353e7a",
+      "runtime": {
+        "id": "fabro-01KTA1FC5W5W0BHTQSV865A1H6",
+        "working_directory": "/home/daytona/workspace/fabro",
+        "repo_cloned": true,
+        "clone_origin_url": "https://github.com/fabro-sh/fabro",
+        "clone_branch": "main",
+        "workspace_root": "/home/daytona/workspace",
+        "repos_root": "/home/daytona/repos",
+        "primary_repo_path": "/home/daytona/repos/fabro-sh/fabro",
+        "primary_repo_link": "/home/daytona/workspace/fabro"
+      }
+    }
+  },
+  "pull_request": null,
+  "superseded_by": null,
+  "pending_interviews": {},
+  "stages": {}
+}
