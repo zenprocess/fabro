@@ -1,0 +1,1064 @@
+diff --git a/.ai/solitaire-spec.md b/.ai/solitaire-spec.md
+new file mode 100644
+index 000000000..7fc44e87a
+--- /dev/null
++++ b/.ai/solitaire-spec.md
+@@ -0,0 +1,144 @@
++# Terminal Klondike Solitaire Spec
++
++This document details the specification and implementation plan for a terminal-based Klondike Solitaire game in Python 3.11+ using the standard `curses` library.
++
++The application is structured to decouple core game rules and state from the presentation layer. This allows full testability of game mechanics without initializing a terminal.
++
++---
++
++## 1. Directory Structure
++
++All files are located in `solitaire-app/`:
++
++```
++solitaire-app/
++├── main.py        # Entry point: handles CLI args (including --smoke) and starts TUI
++├── game.py        # Core Klondike Solitaire game model and rule engine (pure Python)
++├── ui.py          # curses-based terminal user interface and input handler
++└── test_game.py   # Automated unit tests for game logic
++```
++
++---
++
++## 2. Core Game Engine (`game.py`)
++
++The game rules are modeled strictly around standard **Draw-One Klondike Solitaire**.
++
++### 2.1 Domain Entities
++
++```python
++from dataclasses import dataclass
++from typing import List, Optional, Tuple
++
++@dataclass
++class Card:
++    suit: str       # 'H' (Hearts), 'D' (Diamonds), 'C' (Clubs), 'S' (Spades)
++    rank: int       # 1 (Ace) to 13 (King)
++    is_face_up: bool = False
++
++    @property
++    def is_red(self) -> bool:
++        return self.suit in ('H', 'D')
++
++    @property
++    def label(self) -> str:
++        # e.g., "A", "2"..."10", "J", "Q", "K"
++        ranks = {1: "A", 11: "J", 12: "Q", 13: "K"}
++        return ranks.get(self.rank, str(self.rank))
++```
++
++### 2.2 Game State Model
++
++`GameState` encapsulates all piles and tracks move history for **unlimited Undo** functionality:
++
++- **Stock (`List[Card]`)**: Face-down draw pile.
++- **Waste (`List[Card]`)**: Face-up drawn cards.
++- **Foundations (`List[List[Card]]`)**: 4 piles, initially empty.
++- **Tableau (`List[List[Card]]`)**: 7 piles. Tableau $i$ has $i$ cards, with top card face-up.
++- **History (`List[dict]`)**: Deep copies or delta representations of prior states to support Undo.
++
++### 2.3 Core Mechanics & Rules
++
++- **Deal**: Shuffle a 52-card deck. Deal cards to Tableau columns (Col 1 has 1, Col 2 has 2... Col 7 has 7). Reveal the top card of each. Remaining 24 cards go to the Stock.
++- **Draw**: Pop 1 card from Stock and append to Waste (face-up). If Stock is empty, recycle Waste by reversing it back to Stock (so that the original draw order is maintained).
++- **Tableau-to-Tableau Moves**:
++  - A card or a valid face-up build (stack of decreasing/alternating color cards) can be moved from column $A$ to column $B$.
++  - Target column top card must be opposite color and exactly 1 rank higher.
++  - If the target column is empty, only a King (rank 13) can be placed there.
++- **Tableau-to-Foundation Moves**:
++  - Move the top card of a Tableau column to a Foundation.
++  - If the Foundation is empty, only an Ace (rank 1) of that suit is allowed.
++  - If not empty, the card must be of the same suit and exactly 1 rank higher than the current top card of that Foundation.
++- **Waste-to-Tableau/Foundation**:
++  - Similar rules applied to the top card of the Waste pile.
++- **Foundation-to-Tableau**:
++  - Allows pulling a card back down from a Foundation pile to a Tableau column (following Tableau placement rules).
++- **Auto-Flip**:
++  - If a move exposes a face-down card at the top of a Tableau column, it must be automatically flipped face-up.
++- **Win Condition**:
++  - All 4 Foundation piles contain 13 cards (ending with Kings).
++
++---
++
++## 3. Terminal TUI Layer (`ui.py`)
++
++The UI layer runs in `curses` using a grid-based navigation scheme.
++
++### 3.1 Layout Design
++
++The screen is divided into two main zones:
++
++```
++  [Stock]   [Waste]               [F1]   [F2]   [F3]   [F4]
++   [ ]       [9♦]                 [A♥]   [ ]    [ ]    [ ]
++  
++  
++  [Col 1]   [Col 2]   [Col 3]   [Col 4]   [Col 5]   [Col 6]   [Col 7]
++   [10♣]     [ ]       [ ]       [ ]       [ ]       [ ]       [ ]
++             [J♥]      [ ]       [ ]       [ ]       [ ]       [ ]
++                       [Q♠]      [ ]       [ ]       [ ]       [ ]
++```
++
++### 3.2 Keyboard Navigation & Controls
++
++We implement a keyboard-driven cursor navigation scheme:
++
++1. **Cursor (Highlighted Element)**:
++   - Use **Arrow keys** or Vim keys (`h`, `j`, `k`, `l`) to move the cursor.
++   - Piles are arranged on a virtual grid:
++     - Top row: Stock, Waste, Foundation 1, Foundation 2, Foundation 3, Foundation 4.
++     - Bottom row: Tableau columns 1 to 7.
++   - When cursor is on a Tableau column, pressing **Up** or **Down** moves the cursor within the face-up cards of that column. This allows selecting a specific card in a stack to move a partial build!
++
++2. **Selecting and Moving**:
++   - **Space** or **Enter**:
++     - If the cursor is on the **Stock** pile: trigger a Draw operation.
++     - If no card/pile is currently selected: select the current pile (and card index if in Tableau) as the **source**. The selection is visually highlighted.
++     - If a **source** is already selected: move the selected card/stack from the source pile to the currently highlighted pile (the **target**). Then clear selection.
++   - **Escape** or `c`: Cancel current selection.
++
++3. **Global Shortcuts**:
++   - `u` or `U`: Undo last move.
++   - `r` or `R`: Restart game (re-shuffles and deals).
++   - `q` or `Q`: Quit game.
++
++### 3.3 Text & Color Configuration
++
++- Red suits (Hearts/Diamonds) are rendered with red foreground text on appropriate backgrounds.
++- Black suits (Clubs/Spades) are rendered with black or standard terminal color text.
++- Face-down cards are rendered as `[ ]` or `[#]`.
++- Face-up cards are rendered as `[10♦]`, `[A♥]`, `[K♠]`, `[Q♣]`, etc., using Unicode suit symbols or ASCII fallbacks (`H`, `D`, `C`, `S`).
++
++---
++
++## 4. Verification and Testing
++
++### 4.1 Unit Testing (`test_game.py`)
++- Standard Python unit tests using `unittest`.
++- Covers deck setup, drawing, valid/invalid moves for all directions, auto-flip, and victory validation.
++- Runs purely in CLI without loading `curses`.
++
++### 4.2 Smoke Mode
++- Run `python3 main.py --smoke`.
++- The entry point parses `--smoke`, verifies all imports, initializes a mock terminal/session state, runs tests, and immediately exits with exit code `0`.
++- Ensures zero-dependency execution environment checks.
+diff --git a/solitaire-app/game.py b/solitaire-app/game.py
+new file mode 100644
+index 000000000..c91f9abbd
+--- /dev/null
++++ b/solitaire-app/game.py
+@@ -0,0 +1,273 @@
++import random
++from dataclasses import dataclass, field
++from typing import List, Optional, Tuple, Dict, Any
++import copy
++
++@dataclass
++class Card:
++    suit: str       # 'H' (Hearts), 'D' (Diamonds), 'C' (Clubs), 'S' (Spades)
++    rank: int       # 1 (Ace) to 13 (King)
++    is_face_up: bool = False
++
++    @property
++    def is_red(self) -> bool:
++        return self.suit in ('H', 'D')
++
++    @property
++    def label(self) -> str:
++        ranks = {1: "A", 11: "J", 12: "Q", 13: "K"}
++        return ranks.get(self.rank, str(self.rank))
++
++    def __repr__(self) -> str:
++        suit_syms = {'H': '♥', 'D': '♦', 'C': '♣', 'S': '♠'}
++        sym = suit_syms.get(self.suit, self.suit)
++        face = self.label + sym if self.is_face_up else "##"
++        return f"[{face}]"
++
++
++class GameState:
++    def __init__(self, seed: Optional[int] = None) -> None:
++        self.stock: List[Card] = []
++        self.waste: List[Card] = []
++        self.foundations: List[List[Card]] = [[] for _ in range(4)]
++        self.tableau: List[List[Card]] = [[] for _ in range(7)]
++        self.history: List[Dict[str, Any]] = []
++        self.seed = seed
++        self.deal()
++
++    def serialize_state(self) -> Dict[str, Any]:
++        """Returns a deep copy of the current state of all piles."""
++        return {
++            "stock": copy.deepcopy(self.stock),
++            "waste": copy.deepcopy(self.waste),
++            "foundations": copy.deepcopy(self.foundations),
++            "tableau": copy.deepcopy(self.tableau),
++        }
++
++    def restore_state(self, state: Dict[str, Any]) -> None:
++        """Restores the state from a serialized state dictionary."""
++        self.stock = copy.deepcopy(state["stock"])
++        self.waste = copy.deepcopy(state["waste"])
++        self.foundations = copy.deepcopy(state["foundations"])
++        self.tableau = copy.deepcopy(state["tableau"])
++
++    def record_history(self) -> None:
++        """Saves current state to history before a mutating operation."""
++        self.history.append(self.serialize_state())
++
++    def undo(self) -> bool:
++        """Undoes the last recorded move. Returns True if successful."""
++        if not self.history:
++            return False
++        previous_state = self.history.pop()
++        self.restore_state(previous_state)
++        return True
++
++    def deal(self) -> None:
++        """Creates a standard 52-card deck, shuffles, and deals a new game."""
++        suits = ['H', 'D', 'C', 'S']
++        deck = [Card(suit=s, rank=r, is_face_up=False) for s in suits for r in range(1, 14)]
++        
++        if self.seed is not None:
++            random.seed(self.seed)
++        else:
++            random.seed()
++        random.shuffle(deck)
++
++        self.stock = []
++        self.waste = []
++        self.foundations = [[] for _ in range(4)]
++        self.tableau = [[] for _ in range(7)]
++        self.history = []
++
++        # Deal to Tableau
++        # Col 0 gets 1 card, Col 1 gets 2 cards, ..., Col 6 gets 7 cards
++        for i in range(7):
++            for j in range(i + 1):
++                card = deck.pop()
++                if j == i:
++                    card.is_face_up = True
++                self.tableau[i].append(card)
++
++        # Remaining cards go to Stock (face-down)
++        self.stock = deck
++
++    def draw(self) -> bool:
++        """Draws one card from Stock to Waste. Recycles Waste to Stock if Stock is empty."""
++        self.record_history()
++        
++        if not self.stock:
++            if not self.waste:
++                # Both empty, nothing to do
++                self.history.pop()  # don't save useless history
++                return False
++            # Recycle Waste back to Stock
++            # When we flip waste back to stock, we preserve order by reversing
++            self.stock = list(reversed(self.waste))
++            for card in self.stock:
++                card.is_face_up = False
++            self.waste = []
++            return True
++
++        card = self.stock.pop()
++        card.is_face_up = True
++        self.waste.append(card)
++        return True
++
++    def can_move_tableau_to_tableau(self, src_col: int, dest_col: int, card_idx: int) -> bool:
++        if not (0 <= src_col < 7) or not (0 <= dest_col < 7):
++            return False
++        if src_col == dest_col:
++            return False
++        
++        src_pile = self.tableau[src_col]
++        if not src_pile or card_idx < 0 or card_idx >= len(src_pile):
++            return False
++        
++        moving_card = src_pile[card_idx]
++        if not moving_card.is_face_up:
++            return False
++
++        # If dest is empty, moving card must be a King (rank 13)
++        dest_pile = self.tableau[dest_col]
++        if not dest_pile:
++            return moving_card.rank == 13
++
++        dest_card = dest_pile[-1]
++        if not dest_card.is_face_up:
++            return False
++
++        # Opposite color and rank exactly one less
++        return (moving_card.is_red != dest_card.is_red) and (moving_card.rank == dest_card.rank - 1)
++
++    def can_move_waste_to_tableau(self, dest_col: int) -> bool:
++        if not self.waste:
++            return False
++        if not (0 <= dest_col < 7):
++            return False
++
++        moving_card = self.waste[-1]
++        dest_pile = self.tableau[dest_col]
++        
++        if not dest_pile:
++            return moving_card.rank == 13
++
++        dest_card = dest_pile[-1]
++        return (moving_card.is_red != dest_card.is_red) and (moving_card.rank == dest_card.rank - 1)
++
++    def can_move_waste_to_foundation(self, dest_found: int) -> bool:
++        if not self.waste:
++            return False
++        if not (0 <= dest_found < 4):
++            return False
++
++        moving_card = self.waste[-1]
++        found_pile = self.foundations[dest_found]
++
++        if not found_pile:
++            return moving_card.rank == 1  # Ace
++
++        top_found_card = found_pile[-1]
++        return (moving_card.suit == top_found_card.suit) and (moving_card.rank == top_found_card.rank + 1)
++
++    def can_move_tableau_to_foundation(self, src_col: int, dest_found: int) -> bool:
++        if not (0 <= src_col < 7) or not (0 <= dest_found < 4):
++            return False
++
++        src_pile = self.tableau[src_col]
++        if not src_pile:
++            return False
++
++        moving_card = src_pile[-1]
++        found_pile = self.foundations[dest_found]
++
++        if not found_pile:
++            return moving_card.rank == 1  # Ace
++
++        top_found_card = found_pile[-1]
++        return (moving_card.suit == top_found_card.suit) and (moving_card.rank == top_found_card.rank + 1)
++
++    def can_move_foundation_to_tableau(self, src_found: int, dest_col: int) -> bool:
++        if not (0 <= src_found < 4) or not (0 <= dest_col < 7):
++            return False
++
++        found_pile = self.foundations[src_found]
++        if not found_pile:
++            return False
++
++        moving_card = found_pile[-1]
++        dest_pile = self.tableau[dest_col]
++
++        if not dest_pile:
++            return moving_card.rank == 13
++
++        dest_card = dest_pile[-1]
++        return (moving_card.is_red != dest_card.is_red) and (moving_card.rank == dest_card.rank - 1)
++
++    def auto_reveal(self, col_idx: int) -> None:
++        """Reveals the top card of a Tableau column if it is face-down."""
++        pile = self.tableau[col_idx]
++        if pile and not pile[-1].is_face_up:
++            pile[-1].is_face_up = True
++
++    def move_tableau_to_tableau(self, src_col: int, dest_col: int, card_idx: int) -> bool:
++        if not self.can_move_tableau_to_tableau(src_col, dest_col, card_idx):
++            return False
++        
++        self.record_history()
++        src_pile = self.tableau[src_col]
++        dest_pile = self.tableau[dest_col]
++        
++        moving_stack = src_pile[card_idx:]
++        self.tableau[src_col] = src_pile[:card_idx]
++        dest_pile.extend(moving_stack)
++        
++        self.auto_reveal(src_col)
++        return True
++
++    def move_waste_to_tableau(self, dest_col: int) -> bool:
++        if not self.can_move_waste_to_tableau(dest_col):
++            return False
++        
++        self.record_history()
++        card = self.waste.pop()
++        self.tableau[dest_col].append(card)
++        return True
++
++    def move_waste_to_foundation(self, dest_found: int) -> bool:
++        if not self.can_move_waste_to_foundation(dest_found):
++            return False
++
++        self.record_history()
++        card = self.waste.pop()
++        self.foundations[dest_found].append(card)
++        return True
++
++    def move_tableau_to_foundation(self, src_col: int, dest_found: int) -> bool:
++        if not self.can_move_tableau_to_foundation(src_col, dest_found):
++            return False
++
++        self.record_history()
++        card = self.tableau[src_col].pop()
++        self.foundations[dest_found].append(card)
++        
++        self.auto_reveal(src_col)
++        return True
++
++    def move_foundation_to_tableau(self, src_found: int, dest_col: int) -> bool:
++        if not self.can_move_foundation_to_tableau(src_found, dest_col):
++            return False
++
++        self.record_history()
++        card = self.foundations[src_found].pop()
++        self.tableau[dest_col].append(card)
++        return True
++
++    def check_win(self) -> bool:
++        """Check if all four foundation piles are fully built up to Kings."""
++        for found_pile in self.foundations:
++            if len(found_pile) != 13:
++                return False
++            if found_pile[-1].rank != 13:
++                return False
++        return True
+diff --git a/solitaire-app/main.py b/solitaire-app/main.py
+new file mode 100644
+index 000000000..71febf900
+--- /dev/null
++++ b/solitaire-app/main.py
+@@ -0,0 +1,74 @@
++import sys
++import argparse
++import unittest
++
++def run_smoke_test() -> None:
++    """Proves imports work, instantiates core classes, and runs self-tests."""
++    print("Running Solitaire smoke tests...")
++    
++    # 1. Test Imports
++    try:
++        from game import Card, GameState
++        from ui import SolitaireTUI
++        print("✓ Successfully imported core modules (game, ui).")
++    except Exception as e:
++        print(f"✗ Failed to import core modules: {e}")
++        sys.exit(1)
++
++    # 2. Test instantiation of core logic
++    try:
++        game = GameState(seed=123)
++        print(f"✓ GameState instantiated. Stock size: {len(game.stock)} cards.")
++        
++        tui = SolitaireTUI(game)
++        print("✓ SolitaireTUI instantiated.")
++    except Exception as e:
++        print(f"✗ Failed to instantiate game components: {e}")
++        sys.exit(1)
++
++    # 3. Run full unit tests to confirm rule-engine validity
++    print("Running automated unit tests...")
++    loader = unittest.TestLoader()
++    # Discover and run tests in the solitaire-app folder
++    from test_game import TestSolitaireGame
++    suite = loader.loadTestsFromTestCase(TestSolitaireGame)
++    runner = unittest.TextTestRunner(verbosity=1)
++    result = runner.run(suite)
++    
++    if result.wasSuccessful():
++        print("✓ All automated rules unit tests passed successfully!")
++    else:
++        print("✗ Automated unit tests failed!")
++        sys.exit(1)
++
++    print("Smoke mode passed successfully.")
++    sys.exit(0)
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description="Terminal Klondike Solitaire")
++    parser.add_argument(
++        "--smoke",
++        action="store_true",
++        help="Run non-interactive smoke tests to verify imports, setup, and game rules."
++    )
++    args = parser.parse_args()
++
++    if args.smoke:
++        run_smoke_test()
++
++    # Normal execution starts curses-based TUI
++    import curses
++    from game import GameState
++    from ui import SolitaireTUI
++
++    game = GameState()
++    tui = SolitaireTUI(game)
++    
++    try:
++        curses.wrapper(tui.run)
++    except Exception as e:
++        print(f"Error running solitaire TUI: {e}", file=sys.stderr)
++        sys.exit(1)
++
++if __name__ == "__main__":
++    main()
+diff --git a/solitaire-app/test_game.py b/solitaire-app/test_game.py
+new file mode 100644
+index 000000000..4b7c2bce1
+--- /dev/null
++++ b/solitaire-app/test_game.py
+@@ -0,0 +1,130 @@
++import unittest
++from game import GameState, Card
++
++class TestSolitaireGame(unittest.TestCase):
++    def setUp(self):
++        # Use a fixed seed for reproducible tests
++        self.game = GameState(seed=42)
++
++    def test_initial_deal(self):
++        # Verify 7 tableau columns have correct card counts (1 to 7)
++        for i in range(7):
++            self.assertEqual(len(self.game.tableau[i]), i + 1)
++            # Top card of each column must be face-up
++            self.assertTrue(self.game.tableau[i][-1].is_face_up)
++            # Other cards in column must be face-down
++            for j in range(i):
++                self.assertFalse(self.game.tableau[i][j].is_face_up)
++
++        # Foundations must be empty initially
++        for f in self.game.foundations:
++            self.assertEqual(len(f), 0)
++
++        # Stock must contain the remaining cards (52 - 28 = 24)
++        self.assertEqual(len(self.game.stock), 24)
++        # Waste should be empty initially
++        self.assertEqual(len(self.game.waste), 0)
++
++    def test_draw_and_recycle(self):
++        initial_stock_len = len(self.game.stock)
++        
++        # Draw all cards
++        for _ in range(initial_stock_len):
++            success = self.game.draw()
++            self.assertTrue(success)
++
++        self.assertEqual(len(self.game.stock), 0)
++        self.assertEqual(len(self.game.waste), initial_stock_len)
++
++        # Draw again to recycle
++        success = self.game.draw()
++        self.assertTrue(success)
++        self.assertEqual(len(self.game.stock), initial_stock_len)
++        self.assertEqual(len(self.game.waste), 0)
++
++    def test_cannot_move_invalid_tableau_to_tableau(self):
++        # Try to move a card to an empty slot or invalid card
++        # Setup specific tableau configuration manually to test rules
++        self.game.tableau[0] = [Card(suit='H', rank=5, is_face_up=True)]
++        self.game.tableau[1] = [Card(suit='S', rank=7, is_face_up=True)]
++        
++        # Moving 5 of Hearts onto 7 of Spades is invalid (rank diff != 1)
++        self.assertFalse(self.game.can_move_tableau_to_tableau(src_col=0, dest_col=1, card_idx=0))
++
++        # Moving 5 of Hearts onto an empty column is invalid (must be King)
++        self.game.tableau[2] = []
++        self.assertFalse(self.game.can_move_tableau_to_tableau(src_col=0, dest_col=2, card_idx=0))
++
++    def test_valid_tableau_to_tableau_move(self):
++        self.game.tableau[0] = [Card(suit='H', rank=6, is_face_up=True)]
++        self.game.tableau[1] = [
++            Card(suit='C', rank=8, is_face_up=False),
++            Card(suit='S', rank=7, is_face_up=True)
++        ]
++
++        # 6 of Hearts onto 7 of Spades: valid! (opposite color, rank = 7 - 1)
++        self.assertTrue(self.game.can_move_tableau_to_tableau(src_col=0, dest_col=1, card_idx=0))
++
++        # Perform the move
++        success = self.game.move_tableau_to_tableau(src_col=0, dest_col=1, card_idx=0)
++        self.assertTrue(success)
++        self.assertEqual(len(self.game.tableau[0]), 0)
++        self.assertEqual(len(self.game.tableau[1]), 3)
++        self.assertEqual(self.game.tableau[1][-1].rank, 6)
++
++    def test_auto_reveal(self):
++        self.game.tableau[0] = [Card(suit='H', rank=6, is_face_up=True)]
++        self.game.tableau[1] = [
++            Card(suit='C', rank=8, is_face_up=False),
++            Card(suit='S', rank=7, is_face_up=True)
++        ]
++
++        # Move 7 of Spades from tableau[1] to tableau[0] is invalid due to colors/ranks,
++        # let's set up a valid case where a face-down card gets exposed and revealed.
++        self.game.tableau[0] = [Card(suit='D', rank=8, is_face_up=True)]
++        self.game.tableau[1] = [
++            Card(suit='C', rank=10, is_face_up=False),
++            Card(suit='S', rank=7, is_face_up=True)
++        ]
++
++        # Let's change tableau[0] top card to 8 of Diamonds (Red) and tableau[1] to 7 of Spades (Black)
++        success = self.game.move_tableau_to_tableau(src_col=1, dest_col=0, card_idx=1)
++        self.assertTrue(success)
++        # Check that the face-down card left in tableau[1] (10 of Clubs) is now face-up!
++        self.assertTrue(self.game.tableau[1][0].is_face_up)
++
++    def test_undo_functionality(self):
++        self.game.tableau[0] = [Card(suit='D', rank=8, is_face_up=True)]
++        self.game.tableau[1] = [
++            Card(suit='C', rank=10, is_face_up=False),
++            Card(suit='S', rank=7, is_face_up=True)
++        ]
++
++        initial_state = self.game.serialize_state()
++
++        success = self.game.move_tableau_to_tableau(src_col=1, dest_col=0, card_idx=1)
++        self.assertTrue(success)
++
++        # Undo the move
++        undo_success = self.game.undo()
++        self.assertTrue(undo_success)
++
++        # Verify state is restored
++        self.assertEqual(len(self.game.tableau[1]), 2)
++        self.assertFalse(self.game.tableau[1][0].is_face_up)
++        self.assertTrue(self.game.tableau[1][1].is_face_up)
++        self.assertEqual(len(self.game.tableau[0]), 1)
++
++    def test_win_condition(self):
++        # Empty game state check_win should be False
++        self.assertFalse(self.game.check_win())
++
++        # Set up a winning board state
++        suits = ['H', 'D', 'C', 'S']
++        for i, suit in enumerate(suits):
++            self.game.foundations[i] = [Card(suit=suit, rank=r, is_face_up=True) for r in range(1, 14)]
++
++        self.assertTrue(self.game.check_win())
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/solitaire-app/ui.py b/solitaire-app/ui.py
+new file mode 100644
+index 000000000..9950c1459
+--- /dev/null
++++ b/solitaire-app/ui.py
+@@ -0,0 +1,404 @@
++import curses
++from game import GameState, Card
++from typing import Optional, Tuple
++
++class SolitaireTUI:
++    def __init__(self, game: GameState) -> None:
++        self.game = game
++        
++        # Cursor positioning
++        # zone: 'top' or 'bottom'
++        self.cursor_zone = 'top'
++        # col: 0 to 6 (for 'top' or 'bottom')
++        self.cursor_col = 0
++        # card_idx: index within the Tableau column (only used when zone == 'bottom')
++        self.cursor_card_idx = 0
++
++        # Selection state
++        # (zone, col, card_idx) or None
++        self.selected_pos: Optional[Tuple[str, int, int]] = None
++        self.status_msg = "Welcome to Klondike Solitaire! Arrow/Vim keys to move, Space/Enter to select/draw."
++
++    def get_first_face_up_idx(self, col: int) -> int:
++        """Returns the index of the first face-up card in Tableau column col."""
++        pile = self.game.tableau[col]
++        for idx, card in enumerate(pile):
++            if card.is_face_up:
++                return idx
++        return 0
++
++    def move_cursor(self, direction: str) -> None:
++        if self.cursor_zone == 'top':
++            if direction == 'left':
++                if self.cursor_col > 0:
++                    self.cursor_col -= 1
++                    if self.cursor_col == 2:  # Skip the gap column
++                        self.cursor_col = 1
++            elif direction == 'right':
++                if self.cursor_col < 6:
++                    self.cursor_col += 1
++                    if self.cursor_col == 2:  # Skip the gap column
++                        self.cursor_col = 3
++            elif direction == 'down':
++                self.cursor_zone = 'bottom'
++                # Transition to tableau column of same index
++                pile_len = len(self.game.tableau[self.cursor_col])
++                self.cursor_card_idx = max(0, pile_len - 1)
++            elif direction == 'up':
++                pass  # Already at top row
++
++        elif self.cursor_zone == 'bottom':
++            col = self.cursor_col
++            pile = self.game.tableau[col]
++            
++            if direction == 'left':
++                if self.cursor_col > 0:
++                    self.cursor_col -= 1
++                    # Update card index to the top card of the new column
++                    new_pile_len = len(self.game.tableau[self.cursor_col])
++                    self.cursor_card_idx = max(0, new_pile_len - 1)
++            elif direction == 'right':
++                if self.cursor_col < 6:
++                    self.cursor_col += 1
++                    new_pile_len = len(self.game.tableau[self.cursor_col])
++                    self.cursor_card_idx = max(0, new_pile_len - 1)
++            elif direction == 'up':
++                first_face_up = self.get_first_face_up_idx(col)
++                if pile and self.cursor_card_idx > first_face_up:
++                    self.cursor_card_idx -= 1
++                else:
++                    # Transition to top row
++                    self.cursor_zone = 'top'
++                    # Map to closest top-row element (skip gap)
++                    if self.cursor_col == 2:
++                        self.cursor_col = 1
++            elif direction == 'down':
++                if pile and self.cursor_card_idx < len(pile) - 1:
++                    self.cursor_card_idx += 1
++
++    def handle_action(self) -> None:
++        """Handles Space/Enter press based on current cursor position."""
++        if self.cursor_zone == 'top':
++            if self.cursor_col == 0:
++                # Draw from Stock to Waste
++                success = self.game.draw()
++                if success:
++                    self.status_msg = "Drawn card."
++                else:
++                    self.status_msg = "Stock and Waste are empty."
++                self.selected_pos = None  # Clear any active selection
++            elif self.cursor_col == 1:
++                # Waste pile selected or moved to
++                if not self.game.waste:
++                    self.status_msg = "Waste is empty."
++                    return
++                
++                if self.selected_pos is None:
++                    self.selected_pos = ('top', 1, len(self.game.waste) - 1)
++                    self.status_msg = "Selected card from Waste. Choose target."
++                else:
++                    # You can't move anything onto the waste pile
++                    self.status_msg = "Cannot move cards onto the Waste pile."
++                    self.selected_pos = None
++            elif self.cursor_col >= 3:
++                found_idx = self.cursor_col - 3
++                if self.selected_pos is None:
++                    # Select from Foundation
++                    if not self.game.foundations[found_idx]:
++                        self.status_msg = "Foundation is empty."
++                        return
++                    self.selected_pos = ('top', self.cursor_col, len(self.game.foundations[found_idx]) - 1)
++                    self.status_msg = f"Selected from Foundation {found_idx + 1}."
++                else:
++                    # Move to Foundation
++                    src_zone, src_col, src_card_idx = self.selected_pos
++                    success = False
++                    if src_zone == 'top' and src_col == 1:
++                        success = self.game.move_waste_to_foundation(found_idx)
++                    elif src_zone == 'bottom':
++                        success = self.game.move_tableau_to_foundation(src_col, found_idx)
++                    
++                    if success:
++                        self.status_msg = f"Moved to Foundation {found_idx + 1}."
++                        if self.game.check_win():
++                            self.status_msg = "CONGRATULATIONS! YOU WON THE GAME!"
++                    else:
++                        self.status_msg = "Invalid move to Foundation."
++                    self.selected_pos = None
++
++        elif self.cursor_zone == 'bottom':
++            dest_col = self.cursor_col
++            if self.selected_pos is None:
++                # Select Tableau pile/card
++                pile = self.game.tableau[dest_col]
++                if not pile:
++                    self.status_msg = "Tableau column is empty."
++                    return
++                # Verify chosen card is face up
++                if not pile[self.cursor_card_idx].is_face_up:
++                    self.status_msg = "Cannot select face-down card."
++                    return
++                self.selected_pos = ('bottom', dest_col, self.cursor_card_idx)
++                self.status_msg = f"Selected cards from Column {dest_col + 1}."
++            else:
++                # Execute move to Tableau column
++                src_zone, src_col, src_card_idx = self.selected_pos
++                success = False
++                if src_zone == 'top' and src_col == 1:
++                    success = self.game.move_waste_to_tableau(dest_col)
++                elif src_zone == 'top' and src_col >= 3:
++                    success = self.game.move_foundation_to_tableau(src_col - 3, dest_col)
++                elif src_zone == 'bottom':
++                    success = self.game.move_tableau_to_tableau(src_col, dest_col, src_card_idx)
++                
++                if success:
++                    self.status_msg = "Move successful."
++                else:
++                    self.status_msg = "Invalid move."
++                
++                # Update cursor_card_idx to the new top card of destination
++                new_len = len(self.game.tableau[dest_col])
++                self.cursor_card_idx = max(0, new_len - 1)
++                self.selected_pos = None
++
++    def handle_auto_move(self) -> None:
++        """Tries to automatically move the current highlighted card to any valid foundation."""
++        success = False
++        target_found = -1
++
++        if self.cursor_zone == 'top' and self.cursor_col == 1:
++            # Try to move from waste to any foundation
++            for f_idx in range(4):
++                if self.game.can_move_waste_to_foundation(f_idx):
++                    success = self.game.move_waste_to_foundation(f_idx)
++                    target_found = f_idx
++                    break
++        elif self.cursor_zone == 'bottom':
++            # Try to move top card of tableau column to any foundation
++            col = self.cursor_col
++            if self.game.tableau[col]:
++                for f_idx in range(4):
++                    if self.game.can_move_tableau_to_foundation(col, f_idx):
++                        success = self.game.move_tableau_to_foundation(col, f_idx)
++                        target_found = f_idx
++                        # Update cursor position
++                        new_len = len(self.game.tableau[col])
++                        self.cursor_card_idx = max(0, new_len - 1)
++                        break
++
++        if success:
++            self.status_msg = f"Auto-moved card to Foundation {target_found + 1}."
++            if self.game.check_win():
++                self.status_msg = "CONGRATULATIONS! YOU WON THE GAME!"
++        else:
++            self.status_msg = "No valid Foundation move available."
++
++    def draw_card_representation(self, stdscr, y: int, x: int, card: Optional[Card], is_cursor: bool, is_selected: bool) -> None:
++        # Determine bracket symbols
++        left_br, right_br = "[", "]"
++        if is_selected:
++            left_br, right_br = "*", "*"
++
++        # Determine attributes
++        attr = curses.A_NORMAL
++        if is_cursor:
++            attr |= curses.A_REVERSE
++
++        if card is None:
++            # Empty slot indicator
++            color = curses.color_pair(5)  # Cyan
++            stdscr.addstr(y, x, f"{left_br}  -{right_br}", color | attr)
++        elif not card.is_face_up:
++            # Face down card
++            color = curses.color_pair(2)  # White/Standard
++            stdscr.addstr(y, x, f"{left_br}###{right_br}", color | attr)
++        else:
++            # Face up card
++            color = curses.color_pair(1) if card.is_red else curses.color_pair(2)
++            suit_syms = {'H': 'H', 'D': 'D', 'C': 'C', 'S': 'S'}
++            # If terminal supports unicode, we can use symbols
++            try:
++                suit_syms = {'H': '♥', 'D': '♦', 'C': '♣', 'S': '♠'}
++            except Exception:
++                pass
++            
++            sym = suit_syms.get(card.suit, card.suit)
++            rank_lbl = card.label
++            if len(rank_lbl) == 1:
++                lbl = f" {rank_lbl}{sym}"
++            else:
++                lbl = f"{rank_lbl}{sym}"
++                
++            stdscr.addstr(y, x, left_br, attr)
++            stdscr.addstr(y, x + 1, lbl, color | attr)
++            stdscr.addstr(y, x + 4, right_br, attr)
++
++    def draw_screen(self, stdscr) -> None:
++        stdscr.erase()
++        h, w = stdscr.getmaxyx()
++        
++        # Check window size
++        if h < 20 or w < 60:
++            stdscr.addstr(0, 0, "Terminal too small. Please enlarge to at least 80x24.", curses.color_pair(1))
++            stdscr.refresh()
++            return
++
++        # Title / Help Banner
++        stdscr.addstr(0, 2, "KLONDIKE SOLITAIRE", curses.color_pair(4) | curses.A_BOLD)
++        help_text = "Arrows/Vim:Move | Space/Enter:Select/Draw | A:Auto-Move | U:Undo | R:Restart | Q:Quit"
++        stdscr.addstr(1, 2, help_text[:w-3], curses.color_pair(3))
++
++        # Top row elements positioning
++        # Stock (col 0), Waste (col 1), gap (col 2), Foundations 0-3 (cols 3-6)
++        x_coords = [2 + i * 8 for i in range(7)]
++
++        # --- Draw STOCK ---
++        is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 0)
++        is_selected = False  # Stock can never be selected
++        stdscr.addstr(3, x_coords[0], "STOCK", curses.color_pair(3))
++        
++        if self.game.stock:
++            # Top card of Stock is face down
++            self.draw_card_representation(stdscr, 4, x_coords[0], Card('S', 1, False), is_cursor, is_selected)
++        else:
++            self.draw_card_representation(stdscr, 4, x_coords[0], None, is_cursor, is_selected)
++
++        # --- Draw WASTE ---
++        is_cursor = (self.cursor_zone == 'top' and self.cursor_col == 1)
++        is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == 1)
++        stdscr.addstr(3, x_coords[1], "WASTE", curses.color_pair(3))
++        
++        if self.game.waste:
++            self.draw_card_representation(stdscr, 4, x_coords[1], self.game.waste[-1], is_cursor, is_selected)
++        else:
++            self.draw_card_representation(stdscr, 4, x_coords[1], None, is_cursor, is_selected)
++
++        # --- Draw FOUNDATIONS ---
++        for i in range(4):
++            col_idx = 3 + i
++            is_cursor = (self.cursor_zone == 'top' and self.cursor_col == col_idx)
++            is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'top' and self.selected_pos[1] == col_idx)
++            stdscr.addstr(3, x_coords[col_idx], f"FOUND {i+1}", curses.color_pair(3))
++            
++            pile = self.game.foundations[i]
++            if pile:
++                self.draw_card_representation(stdscr, 4, x_coords[col_idx], pile[-1], is_cursor, is_selected)
++            else:
++                self.draw_card_representation(stdscr, 4, x_coords[col_idx], None, is_cursor, is_selected)
++
++        # --- Draw TABLEAU ---
++        stdscr.addstr(6, 2, "TABLEAU COLUMNS:", curses.color_pair(4))
++        for col_idx in range(7):
++            pile = self.game.tableau[col_idx]
++            x = x_coords[col_idx]
++            
++            # Label
++            stdscr.addstr(7, x, f"COL {col_idx+1}", curses.color_pair(3))
++            
++            if not pile:
++                is_cursor = (self.cursor_zone == 'bottom' and self.cursor_col == col_idx)
++                is_selected = (self.selected_pos is not None and self.selected_pos[0] == 'bottom' and self.selected_pos[1] == col_idx)
++                self.draw_card_representation(stdscr, 8, x, None, is_cursor, is_selected)
++            else:
++                for card_idx, card in enumerate(pile):
++                    y = 8 + card_idx
++                    # Check cursor highlighting
++                    is_cursor = (
++                        self.cursor_zone == 'bottom' and 
++                        self.cursor_col == col_idx and 
++                        self.cursor_card_idx == card_idx
++                    )
++                    # Check selection highlighting
++                    # If this column is selected as source, we highlight the selected card and all cards below it!
++                    is_selected = False
++                    if self.selected_pos is not None:
++                        src_zone, src_col, src_card_idx = self.selected_pos
++                        if src_zone == 'bottom' and src_col == col_idx and card_idx >= src_card_idx:
++                            is_selected = True
++
++                    self.draw_card_representation(stdscr, y, x, card, is_cursor, is_selected)
++
++        # Draw Status Bar at bottom
++        stdscr.addstr(h - 2, 2, f"Status: {self.status_msg}"[:w-3], curses.color_pair(4) | curses.A_BOLD)
++        
++        # Draw game seed info or undo history count
++        info_str = f"Undos available: {len(self.game.history)}"
++        stdscr.addstr(h - 2, w - len(info_str) - 3, info_str, curses.color_pair(3))
++
++        stdscr.refresh()
++
++    def run(self, stdscr) -> None:
++        # Initialize color scheme
++        if curses.has_colors():
++            curses.start_color()
++            curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)     # Hearts/Diamonds
++            curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)   # Spades/Clubs
++            curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # Navigation/Headers
++            curses.init_pair(4, curses.COLOR_GREEN, curses.COLOR_BLACK)   # Success/Banners
++            curses.init_pair(5, curses.COLOR_CYAN, curses.COLOR_BLACK)    # Empty Slots
++
++        curses.curs_set(0)
++        stdscr.keypad(True)
++
++        while True:
++            self.draw_screen(stdscr)
++            try:
++                ch = stdscr.getch()
++            except KeyboardInterrupt:
++                break
++
++            if ch == -1:
++                continue
++
++            # Handle Quit
++            if ch in (ord('q'), ord('Q')):
++                break
++
++            # Handle Movement
++            elif ch == curses.KEY_LEFT or ch == ord('h'):
++                self.move_cursor('left')
++            elif ch == curses.KEY_RIGHT or ch == ord('l'):
++                self.move_cursor('right')
++            elif ch == curses.KEY_UP or ch == ord('k'):
++                self.move_cursor('up')
++            elif ch == curses.KEY_DOWN or ch == ord('j'):
++                self.move_cursor('down')
++
++            # Handle Selection / Draw / Move
++            elif ch in (ord(' '), 10, 13, curses.KEY_ENTER):  # Space, Enter, Return
++                self.handle_action()
++
++            # Handle Cancel selection
++            elif ch in (27, ord('c'), ord('C')):  # Escape, 'c', 'C'
++                self.selected_pos = None
++                self.status_msg = "Selection cancelled."
++
++            # Handle Auto-move
++            elif ch in (ord('a'), ord('A')):
++                self.handle_auto_move()
++
++            # Handle Undo
++            elif ch in (ord('u'), ord('U')):
++                if self.game.undo():
++                    self.status_msg = "Last move undone."
++                    self.selected_pos = None
++                    # Make sure cursor positions are validated against new column lens
++                    if self.cursor_zone == 'bottom':
++                        pile_len = len(self.game.tableau[self.cursor_col])
++                        self.cursor_card_idx = min(self.cursor_card_idx, max(0, pile_len - 1))
++                else:
++                    self.status_msg = "Nothing to undo."
++
++            # Handle Restart
++            elif ch in (ord('r'), ord('R')):
++                self.game.deal()
++                self.cursor_zone = 'top'
++                self.cursor_col = 0
++                self.cursor_card_idx = 0
++                self.selected_pos = None
++                self.status_msg = "New game started!"
++
++            # Handle Resize
++            elif ch == curses.KEY_RESIZE:
++                stdscr.clear()
++                stdscr.refresh()
+diff --git a/status.json b/status.json
+new file mode 100644
+index 000000000..905fb370f
+--- /dev/null
++++ b/status.json
+@@ -0,0 +1,3 @@
++{
++  "outcome": "succeeded"
++}
