@@ -45,10 +45,6 @@ def main():
     if "--smoke" in sys.argv:
         sys.exit(run_smoke_test())
     else:
-        print("FreeCell Solitaire TUI")
-        print("To run the smoke test, execute with --smoke")
-        print("Starting interactive UI (Placeholder)...")
-        # In future milestones, this will invoke the curses UI
         from card_game_tui.tui import TUIApp
         app = TUIApp()
         app.run()
