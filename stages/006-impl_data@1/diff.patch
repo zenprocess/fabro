@@ -1,0 +1,402 @@
+diff --git a/card-game-app/src/card_game_tui/engine.py b/card-game-app/src/card_game_tui/engine.py
+index 7d7c36cb3..167d153a0 100644
+--- a/card-game-app/src/card_game_tui/engine.py
++++ b/card-game-app/src/card_game_tui/engine.py
+@@ -131,6 +131,190 @@ class GameState:
+         self.restore_state(self.redo_history.pop())
+         return True
+ 
++    def execute_move(self, move: Move) -> Tuple[bool, str]:
++        """
++        Validates and executes a move.
++        Automatically saves state to history before execution and clears redo history.
++        Runs auto-home after a successful move.
++        Returns (True, "") if successful, or (False, reason) if invalid.
++        """
++        valid, reason = validate_move(self, move)
++        if not valid:
++            return False, reason
++
++        # Save state to history for undo
++        self.push_history()
++
++        # Retrieve source cards
++        src_cards = get_source_cards(self, move.src_type, move.src_idx, move.card_count)
++
++        # Remove card(s) from source
++        if move.src_type == 'C':
++            for _ in range(move.card_count):
++                self.tableau[move.src_idx].pop()
++        elif move.src_type == 'F':
++            self.free_cells[move.src_idx] = None
++
++        # Add card(s) to destination
++        if move.dst_type == 'C':
++            self.tableau[move.dst_idx].extend(src_cards)
++        elif move.dst_type == 'F':
++            self.free_cells[move.dst_idx] = src_cards[0]
++        elif move.dst_type == 'A':
++            card = src_cards[0]
++            self.foundations[card.suit].append(card)
++
++        # Automatically run auto-homing
++        self.auto_home()
++
++        return True, ""
++
++    def is_safe_to_auto_home(self, card: Card) -> bool:
++        """
++        A card of rank R and suit S can be safely moved to its foundation if:
++        1. It is a legal foundation move.
++        2. All cards of rank R-1 of the opposite color are already in the foundation piles.
++        3. All cards of rank R-2 of the same color are already in the foundation piles.
++        """
++        # 1. Must be a legal foundation move
++        f_pile = self.foundations[card.suit]
++        if not f_pile:
++            if card.rank != Rank.ACE:
++                return False
++        else:
++            top_card = f_pile[-1]
++            if card.rank.value != top_card.rank.value + 1:
++                return False
++
++        # 2. Opposite color suits must have reached at least rank R - 1
++        opp_suits = [s for s in Suit if s.color != card.suit.color]
++        for os in opp_suits:
++            os_pile = self.foundations[os]
++            os_rank = os_pile[-1].rank.value if os_pile else 0
++            if os_rank < card.rank.value - 1:
++                return False
++
++        # 3. Same color other suit must have reached at least rank R - 2
++        same_suits = [s for s in Suit if s.color == card.suit.color and s != card.suit]
++        for ss in same_suits:
++            ss_pile = self.foundations[ss]
++            ss_rank = ss_pile[-1].rank.value if ss_pile else 0
++            if ss_rank < card.rank.value - 2:
++                return False
++
++        return True
++
++    def auto_home(self) -> bool:
++        """
++        Automatically moves safe cards to foundations.
++        Returns True if at least one card was auto-homed.
++        """
++        homed_any = False
++        while True:
++            moved_this_pass = False
++            # Check FreeCells
++            for i, card in enumerate(self.free_cells):
++                if card is not None and self.is_safe_to_auto_home(card):
++                    self.foundations[card.suit].append(card)
++                    self.free_cells[i] = None
++                    moved_this_pass = True
++                    homed_any = True
++                    break
++            if moved_this_pass:
++                continue
++
++            # Check Tableau columns
++            for i, col in enumerate(self.tableau):
++                if col:
++                    card = col[-1]
++                    if self.is_safe_to_auto_home(card):
++                        col.pop()
++                        self.foundations[card.suit].append(card)
++                        moved_this_pass = True
++                        homed_any = True
++                        break
++            if not moved_this_pass:
++                break
++        return homed_any
++
++    def is_won(self) -> bool:
++        """
++        Returns True if the game is won (all 52 cards are in the foundations).
++        """
++        return all(len(self.foundations[suit]) == 13 for suit in Suit)
++
++    def is_lost(self) -> bool:
++        """
++        Returns True if no legal moves are possible and the game is not won.
++        """
++        if self.is_won():
++            return False
++
++        # We need to check if there is ANY legal move possible.
++        # Sources from Tableau
++        for src_idx in range(8):
++            col = self.tableau[src_idx]
++            if not col:
++                continue
++            
++            # We can try moving sequences of length 1 up to len(col)
++            for card_count in range(1, len(col) + 1):
++                src_cards = col[-card_count:]
++                if len(src_cards) > 1 and not is_valid_sequence(src_cards):
++                    break  # Sequence gets increasingly invalid, so no longer sequences can be valid
++                
++                # Try destination: other Tableau columns
++                for dst_idx in range(8):
++                    if src_idx == dst_idx:
++                        continue
++                    move = Move('C', src_idx, 'C', dst_idx, card_count)
++                    valid, _ = validate_move(self, move)
++                    if valid:
++                        return False
++                
++                # FreeCells (only valid for card_count == 1)
++                if card_count == 1:
++                    for dst_idx in range(4):
++                        move = Move('C', src_idx, 'F', dst_idx, 1)
++                        valid, _ = validate_move(self, move)
++                        if valid:
++                            return False
++                            
++                # Foundations (only valid for card_count == 1)
++                if card_count == 1:
++                    for dst_idx in range(4):
++                        move = Move('C', src_idx, 'A', dst_idx, 1)
++                        valid, _ = validate_move(self, move)
++                        if valid:
++                            return False
++                            
++        # Sources from FreeCells
++        for src_idx in range(4):
++            if self.free_cells[src_idx] is None:
++                continue
++            # Try destination: Tableau
++            for dst_idx in range(8):
++                move = Move('F', src_idx, 'C', dst_idx, 1)
++                valid, _ = validate_move(self, move)
++                if valid:
++                    return False
++            # Try destination: other FreeCells
++            for dst_idx in range(4):
++                if src_idx == dst_idx:
++                    continue
++                move = Move('F', src_idx, 'F', dst_idx, 1)
++                valid, _ = validate_move(self, move)
++                if valid:
++                    return False
++            # Try destination: Foundations
++            for dst_idx in range(4):
++                move = Move('F', src_idx, 'A', dst_idx, 1)
++                valid, _ = validate_move(self, move)
++                if valid:
++                    return False
++                     
++        return True
++
+ def get_source_cards(state: GameState, src_type: str, src_idx: int, card_count: int) -> List[Card]:
+     if src_type == 'C':
+         col = state.tableau[src_idx]
+diff --git a/card-game-app/tests/test_rules.py b/card-game-app/tests/test_rules.py
+index 762874070..b24ab70be 100644
+--- a/card-game-app/tests/test_rules.py
++++ b/card-game-app/tests/test_rules.py
+@@ -1,5 +1,7 @@
+ from card_game_tui.engine import GameState, Move, validate_move, Card, Rank, Suit
+ 
++from card_game_tui.engine import GameState, Move, validate_move, Card, Rank, Suit, get_max_movable_cards
++
+ def test_validate_move_initial_illegal():
+     state = GameState()
+     state.deal(seed=42)
+@@ -8,3 +10,71 @@ def test_validate_move_initial_illegal():
+     valid, reason = validate_move(state, move)
+     assert not valid
+     assert "Source is empty or invalid" in reason
++
++def test_get_max_movable_cards():
++    state = GameState()
++    # Initial state: 4 free cells empty, 0 empty columns
++    state.free_cells = [None] * 4
++    state.tableau = [[Card(Rank.ACE, Suit.SPADES)] for _ in range(8)]
++    assert get_max_movable_cards(state, target_is_empty_col=False) == 5
++
++    # 1 free cell occupied, 0 empty columns -> F = 3, T = 0
++    state.free_cells[0] = Card(Rank.KING, Suit.HEARTS)
++    assert get_max_movable_cards(state, target_is_empty_col=False) == 4
++
++    # F = 3, 2 empty columns -> T = 2.
++    # If target is NOT empty, max = (1 + 3) * 2^2 = 16
++    state.tableau[0] = []
++    state.tableau[1] = []
++    assert get_max_movable_cards(state, target_is_empty_col=False) == 16
++    # If target is empty, T is effectively reduced by 1 -> max = (1 + 3) * 2^1 = 8
++    assert get_max_movable_cards(state, target_is_empty_col=True) == 8
++
++def test_validate_move_sequence():
++    state = GameState()
++    state.free_cells = [None] * 4
++    # Columns:
++    # C0: [K♥, Q♠, J♥] -> valid sequence
++    # C1: [10♣]
++    state.tableau = [[] for _ in range(8)]
++    state.tableau[0] = [
++        Card(Rank.KING, Suit.HEARTS),
++        Card(Rank.QUEEN, Suit.SPADES),
++        Card(Rank.JACK, Suit.HEARTS)
++    ]
++    state.tableau[1] = [Card(Rank.TEN, Suit.CLUBS)]
++
++    # Move sequence J♥ (len 1) to 10♣ is invalid because J cannot go on 10
++    move_invalid = Move('C', 0, 'C', 1, 1)
++    valid, reason = validate_move(state, move_invalid)
++    assert not valid
++
++    # Move sequence J♥ (len 1) is valid to move to empty C2
++    move_valid_single = Move('C', 0, 'C', 2, 1)
++    valid, reason = validate_move(state, move_valid_single)
++    assert valid
++
++    # Let's check moving a sequence [Q♠, J♥] (len 2) onto an empty column
++    move_seq = Move('C', 0, 'C', 2, 2)
++    valid, reason = validate_move(state, move_seq)
++    assert valid
++
++    # If we fill all free cells and make column moves restricted:
++    # F = 0, T = 6 (6 empty columns, but moving to C2 reduces effective empty cols to 5)
++    # Let's make all other columns occupied so T = 0.
++    state.free_cells = [Card(Rank.TWO, Suit.DIAMONDS)] * 4
++    # Set other columns occupied
++    for i in range(2, 8):
++        state.tableau[i] = [Card(Rank.ACE, Suit.DIAMONDS)]
++    
++    # But C2 will be our target column, set it to King of Diamonds (K♦)
++    # The sequence starting card is Queen of Spades (Q♠). Q♠ can go on K♦.
++    state.tableau[2] = [Card(Rank.KING, Suit.DIAMONDS)]
++    
++    # Now F = 0, T = 0 -> max movable is (1+0)*2^0 = 1.
++    # Moving [Q♠, J♥] (len 2) to C2 (K♦) should fail due to capacity.
++    move_too_long = Move('C', 0, 'C', 2, 2)
++    valid, reason = validate_move(state, move_too_long)
++    assert not valid
++    assert "Insufficient empty FreeCells" in reason
++
+diff --git a/card-game-app/tests/test_state.py b/card-game-app/tests/test_state.py
+index 3c6206f61..8fa28a0f8 100644
+--- a/card-game-app/tests/test_state.py
++++ b/card-game-app/tests/test_state.py
+@@ -1,4 +1,4 @@
+-from card_game_tui.engine import GameState
++from card_game_tui.engine import GameState, Card, Rank, Suit, Move
+ 
+ def test_deal():
+     state = GameState()
+@@ -28,3 +28,102 @@ def test_undo_redo():
+     assert state.redo()
+     assert state.free_cells[0] == card
+     assert len(state.tableau[0]) == 6
++
++def test_execute_move():
++    state = GameState()
++    state.tableau = [[] for _ in range(8)]
++    state.free_cells = [None] * 4
++    # Put J♥ at C0 and Q♠ at C1
++    state.tableau[0] = [Card(Rank.JACK, Suit.HEARTS)]
++    state.tableau[1] = [Card(Rank.QUEEN, Suit.SPADES)]
++
++    # Attempt valid move: J♥ onto Q♠
++    move = Move('C', 0, 'C', 1, 1)
++    success, reason = state.execute_move(move)
++    assert success
++    assert not state.tableau[0]
++    assert len(state.tableau[1]) == 2
++    assert state.tableau[1][1] == Card(Rank.JACK, Suit.HEARTS)
++
++    # Undo should restore J♥ to C0
++    assert state.undo()
++    assert len(state.tableau[0]) == 1
++    assert len(state.tableau[1]) == 1
++
++def test_auto_home():
++    state = GameState()
++    state.tableau = [[] for _ in range(8)]
++    state.free_cells = [None] * 4
++    state.foundations = {suit: [] for suit in Suit}
++
++    # Ace of Spades (A♠) should auto-home immediately
++    ace_spades = Card(Rank.ACE, Suit.SPADES)
++    state.free_cells[0] = ace_spades
++    state.auto_home()
++    assert state.free_cells[0] is None
++    assert len(state.foundations[Suit.SPADES]) == 1
++    assert state.foundations[Suit.SPADES][0] == ace_spades
++
++    # Two of Spades (2♠) is added. Should it auto-home?
++    # opposite-color Aces (A♥, A♦) are NOT in foundation yet, so 2♠ should NOT auto-home.
++    two_spades = Card(Rank.TWO, Suit.SPADES)
++    state.free_cells[0] = two_spades
++    state.auto_home()
++    assert state.free_cells[0] == two_spades
++
++    # Add opposite color Aces (A♥, A♦) to foundations.
++    # Now, 2♠ should auto-home.
++    state.foundations[Suit.HEARTS].append(Card(Rank.ACE, Suit.HEARTS))
++    state.foundations[Suit.DIAMONDS].append(Card(Rank.ACE, Suit.DIAMONDS))
++    state.auto_home()
++    assert state.free_cells[0] is None
++    assert len(state.foundations[Suit.SPADES]) == 2
++    assert state.foundations[Suit.SPADES][1] == two_spades
++
++def test_is_won():
++    state = GameState()
++    assert not state.is_won()
++
++    # Fill foundations with all cards
++    for suit in Suit:
++        state.foundations[suit] = [Card(rank, suit) for rank in Rank]
++    assert state.is_won()
++
++def test_is_lost():
++    state = GameState()
++    state.tableau = [[] for _ in range(8)]
++    state.free_cells = [None] * 4
++    state.foundations = {suit: [] for suit in Suit}
++
++    # No cards -> not lost because we won (wait, won is also checked inside is_lost to return False)
++    # Let's populate foundations with 12 cards, and leave 4 Kings locked in tableau columns such that no moves can be made
++    for suit in Suit:
++        state.foundations[suit] = [Card(rank, suit) for rank in Rank if rank != Rank.KING]
++    
++    # 4 Kings are in the tableau but they cannot be moved to foundations because, say, they are stacked under each other or we just place them in columns
++    # Actually, a King is a valid foundation move if Queen is in foundation, so putting King of Spades in C0 when Queen of Spades is in foundation is a valid move!
++    # Let's create a genuinely locked state:
++    # A single King is in C0, but it is Card(Rank.KING, Suit.SPADES) and Queen of Spades is NOT in foundation (it's in C1, but blocked by a Red King).
++    # Even simpler:
++    # Let's put a single 5♠ on C0 and 10♦ on C1.
++    # No free cells available.
++    state.foundations = {suit: [] for suit in Suit}
++    state.free_cells = [Card(Rank.KING, Suit.HEARTS)] * 4  # All occupied
++    state.tableau[0] = [Card(Rank.FIVE, Suit.SPADES)]
++    state.tableau[1] = [Card(Rank.TEN, Suit.DIAMONDS)]
++    # All other columns empty. F = 0, T = 6. Max movable card count to empty column is (1+0)*2^5 = 32.
++    # But wait, we can move 5♠ to empty column C2! So it is not lost.
++    # To prevent moving to empty columns, let's fill all 8 columns with 1 card each:
++    state.tableau = [[Card(Rank.FIVE, Suit.SPADES)] for _ in range(8)]
++    # FreeCells are all occupied:
++    state.free_cells = [Card(Rank.KING, Suit.HEARTS)] * 4
++    # Foundations empty:
++    state.foundations = {suit: [] for suit in Suit}
++    
++    # In this state, we have 5♠ in all columns. No columns are empty.
++    # No cards can be placed on each other (since they are all 5♠, which doesn't alternate color/rank-1).
++    # No cards can be moved to free cells (occupied).
++    # No cards can be moved to foundations (need Aces, but all have 5).
++    # Thus, no legal moves are possible!
++    assert state.is_lost()
++
+diff --git a/status.json b/status.json
+index ee6907d7f..905fb370f 100644
+--- a/status.json
++++ b/status.json
+@@ -1,3 +1,3 @@
+ {
+   "outcome": "succeeded"
+-}
+\ No newline at end of file
++}
