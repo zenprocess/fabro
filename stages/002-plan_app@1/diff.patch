@@ -1,0 +1,984 @@
+diff --git a/.ai/card-game-fast-plan.md b/.ai/card-game-fast-plan.md
+new file mode 100644
+index 000000000..47c11d64f
+--- /dev/null
++++ b/.ai/card-game-fast-plan.md
+@@ -0,0 +1,97 @@
++# Implementation Plan - Terminal FreeCell Solitaire in Python
++
++This document outlines the design and implementation strategy for a terminal-based FreeCell solitaire game. The application will be located under `card-game-app/` and will support both an interactive curses UI and a non-interactive `--smoke` mode.
++
++## 1. Game Rules & Data Structures
++
++### Card Model
++- **Suit**: Spades (♠), Hearts (♥), Diamonds (♦), Clubs (♣).
++- **Rank**: Ace (1) to King (13).
++- **Color**: Red (Hearts, Diamonds) or Black (Spades, Clubs).
++- **Representation**: Displayed as `[A♠]`, `[10♦]`, `[K♣]`, etc. (with red color highlighting for Heart/Diamond suits).
++
++### Board State
++- **Cascades (Tableau)**: 8 columns of cards.
++  - Initially, 52 cards are dealt face-up: 7 cards in the first 4 columns, 6 cards in the remaining 4.
++- **Free Cells**: 4 slots, each holding at most 1 card.
++- **Foundations**: 4 piles, one for each suit, built up from Ace to King.
++- **Move History**: A stack of previous board states to support full **Undo** (`U`).
++
++### Move Validation Rules
++1. **To Free Cell**: Any single card can be moved to an empty Free Cell.
++2. **To Foundation**:
++   - An Ace can be moved to an empty Foundation pile.
++   - A card of rank $R$ and suit $S$ can be moved to Foundation pile of suit $S$ if the top card is of rank $R-1$.
++3. **To Cascade**:
++   - A card of rank $R$ and color $C$ can be placed on a cascade's bottom card of rank $R+1$ and opposite color.
++   - Any card can be placed on an empty cascade.
++4. **Sequence Moves**:
++   - Moving a packed sequence of size $L$ from Cascade A to Cascade B is allowed if the cards are sorted in alternating colors and descending ranks, and the number of cards does not exceed the maximum allowed sequence limit:
++     $$M = (F + 1) \times 2^E$$
++     where $F$ is the number of empty Free Cells, and $E$ is the number of empty Cascades (excluding source and destination).
++
++---
++
++## 2. Terminal Rendering & Curses
++
++The UI is built using Python's standard `curses` library.
++
++### Layout (Minimum 80x24 characters)
++- **Header**: Game title, Moves counter, Time elapsed, and Status line.
++- **Top Panel**:
++  - **Free Cells**: Labelled `Q`, `W`, `E`, `R`.
++  - **Foundations**: Labelled `A`, `S`, `D`, `F`.
++- **Main Panel**:
++  - **Cascades**: 8 columns labelled `1` to `8` below them. Cards are stacked vertically with overlapping cards.
++- **Footer**: Instructions & legend:
++  - `Src Key` + `Dest Key` to move.
++  - `U`: Undo, `C`: Auto-collect, `R`: Restart, `N`: New Game, `Q`/`Esc`: Quit.
++
++### Color Coding
++- **Red cards** (Hearts, Diamonds): Rendered using a red-on-black or red-on-default color pair.
++- **Black cards** (Spades, Clubs): Rendered using default/white-on-black text.
++- **Selected Card**: Highlighted with reverse video or a distinct color pair.
++
++---
++
++## 3. Input Handling & Interactive Loop
++
++The main loop:
++1. Render current state.
++2. If first key is pressed (Source):
++   - Highlight selection.
++   - Wait for second key (Destination).
++3. If both keys are valid, validate the move:
++   - If valid, execute the move, record state to undo history, and trigger an auto-collect check.
++   - If invalid, show an error status.
++4. If special key is pressed:
++   - `U`: Pop from undo history.
++   - `C`: Scan cascades/free cells for any cards that can safely be moved to foundations.
++   - `R`: Reset current game to starting layout.
++   - `N`: Deal a completely new random game.
++   - `Q` / `Esc`: Exit game.
++
++---
++
++## 4. Non-Interactive Demo (`--smoke` Mode)
++
++To support automated validation and CI:
++- Running `python3 main.py --smoke` executes a non-interactive smoke test.
++- It will:
++  1. Initialize a deterministic deck (seeded RNG or fixed sequence).
++  2. Perform a series of valid moves.
++  3. Validate move logic and status updates.
++  4. Ensure no exceptions are thrown.
++  5. Print a success message and exit with code `0`.
++
++---
++
++## 5. Test Strategy
++
++1. **Unit Tests**:
++   - Card representation & colors.
++   - Board state initialization (correct count of cards in cascades, free cells, foundations).
++   - Move validation logic (valid/invalid cascade-to-cascade, freecell-to-cascade, cascade-to-foundation).
++   - Multi-card sequence move calculation.
++2. **Integration Tests**:
++   - Smoke test running end-to-end moves without starting curses.
+diff --git a/card-game-app/engine.py b/card-game-app/engine.py
+new file mode 100644
+index 000000000..664ce6229
+--- /dev/null
++++ b/card-game-app/engine.py
+@@ -0,0 +1,373 @@
++import random
++import copy
++
++SUITS = {
++    'S': '♠',  # Spades
++    'H': '♥',  # Hearts
++    'D': '♦',  # Diamonds
++    'C': '♣'   # Clubs
++}
++
++SUIT_COLORS = {
++    'S': 'black',
++    'H': 'red',
++    'D': 'red',
++    'C': 'black'
++}
++
++RANK_NAMES = {
++    1: 'A',
++    2: '2',
++    3: '3',
++    4: '4',
++    5: '5',
++    6: '6',
++    7: '7',
++    8: '8',
++    9: '9',
++    10: '10',
++    11: 'J',
++    12: 'Q',
++    13: 'K'
++}
++
++class Card:
++    def __init__(self, suit, rank):
++        if suit not in SUITS:
++            raise ValueError(f"Invalid suit: {suit}")
++        if rank not in RANK_NAMES:
++            raise ValueError(f"Invalid rank: {rank}")
++        self.suit = suit
++        self.rank = rank
++        self.color = SUIT_COLORS[suit]
++
++    def __repr__(self):
++        return f"{RANK_NAMES[self.rank]}{SUITS[self.suit]}"
++
++    def __eq__(self, other):
++        if not isinstance(other, Card):
++            return False
++        return self.suit == other.suit and self.rank == other.rank
++
++    def to_dict(self):
++        return {'suit': self.suit, 'rank': self.rank}
++
++    @staticmethod
++    def from_dict(d):
++        if d is None:
++            return None
++        return Card(d['suit'], d['rank'])
++
++
++class FreeCellGame:
++    def __init__(self, seed=None):
++        self.seed = seed
++        self.cascades = [[] for _ in range(8)]
++        self.free_cells = [None] * 4
++        # Foundations: 0=Spades, 1=Hearts, 2=Diamonds, 3=Clubs
++        self.foundations = [[] for _ in range(4)]
++        self.foundation_suits = ['S', 'H', 'D', 'C']
++        self.history = []
++        self.move_count = 0
++        self.deal()
++
++    def deal(self):
++        # Create deck of 52 cards
++        deck = [Card(suit, rank) for suit in SUITS for rank in RANK_NAMES]
++        
++        # Shuffle
++        rng = random.Random(self.seed)
++        rng.shuffle(deck)
++
++        # Reset state
++        self.cascades = [[] for _ in range(8)]
++        self.free_cells = [None] * 4
++        self.foundations = [[] for _ in range(4)]
++        self.history = []
++        self.move_count = 0
++
++        # Deal to cascades
++        for i, card in enumerate(deck):
++            col = i % 8
++            self.cascades[col].append(card)
++
++    def save_state(self):
++        # Save deep copy of the state to history stack
++        state = {
++            'cascades': [[c.to_dict() for c in col] for col in self.cascades],
++            'free_cells': [c.to_dict() if c else None for c in self.free_cells],
++            'foundations': [[c.to_dict() for c in col] for col in self.foundations],
++            'move_count': self.move_count
++        }
++        self.history.append(state)
++
++    def undo(self):
++        if not self.history:
++            return False
++        state = self.history.pop()
++        self.cascades = [[Card.from_dict(c) for c in col] for col in state['cascades']]
++        self.free_cells = [Card.from_dict(c) if c else None for c in state['free_cells']]
++        self.foundations = [[Card.from_dict(c) for c in col] for col in state['foundations']]
++        self.move_count = state['move_count']
++        return True
++
++    def check_win(self):
++        # Won if all foundations have 13 cards
++        return all(len(f) == 13 for f in self.foundations)
++
++    def get_max_move_size(self, exclude_src_idx=None, exclude_dest_idx=None):
++        F = sum(1 for cell in self.free_cells if cell is None)
++        E = 0
++        for idx, cascade in enumerate(self.cascades):
++            if idx != exclude_src_idx and idx != exclude_dest_idx and not cascade:
++                E += 1
++        return (F + 1) * (2 ** E)
++
++    @staticmethod
++    def get_bottom_sequence(cascade):
++        if not cascade:
++            return []
++        seq = [cascade[-1]]
++        for i in range(len(cascade) - 2, -1, -1):
++            card = cascade[i]
++            prev = seq[-1]
++            if card.rank == prev.rank + 1 and card.color != prev.color:
++                seq.append(card)
++            else:
++                break
++        seq.reverse()
++        return seq
++
++    def validate_and_move(self, src_type, src_idx, dest_type, dest_idx):
++        """
++        Executes a move if valid.
++        src_type/dest_type can be 'cascade', 'freecell', or 'foundation'.
++        src_idx/dest_idx are 0-based integers.
++        Returns: (success_bool, message)
++        """
++        # Validate indices
++        if src_type == 'cascade' and not (0 <= src_idx < 8):
++            return False, "Invalid source cascade index"
++        if src_type == 'freecell' and not (0 <= src_idx < 4):
++            return False, "Invalid source free cell index"
++        if src_type == 'foundation' and not (0 <= src_idx < 4):
++            return False, "Invalid source foundation index"
++        if dest_type == 'cascade' and not (0 <= dest_idx < 8):
++            return False, "Invalid destination cascade index"
++        if dest_type == 'freecell' and not (0 <= dest_idx < 4):
++            return False, "Invalid destination free cell index"
++        if dest_type == 'foundation' and not (0 <= dest_idx < 4):
++            return False, "Invalid destination foundation index"
++
++        # Disallow moving to the exact same pile
++        if src_type == dest_type and src_idx == dest_idx:
++            return False, "Cannot move to the same pile"
++
++        # Get source cards/card
++        if src_type == 'freecell':
++            src_card = self.free_cells[src_idx]
++            if src_card is None:
++                return False, "Source free cell is empty"
++            src_cards = [src_card]
++        elif src_type == 'foundation':
++            if not self.foundations[src_idx]:
++                return False, "Source foundation is empty"
++            src_cards = [self.foundations[src_idx][-1]]
++        elif src_type == 'cascade':
++            if not self.cascades[src_idx]:
++                return False, "Source cascade is empty"
++            # We will figure out how many cards to move based on the destination
++            src_cards = []  # Will populate below based on destination
++        else:
++            return False, "Invalid source type"
++
++        # Validate based on destination
++        if dest_type == 'freecell':
++            if self.free_cells[dest_idx] is not None:
++                return False, "Destination free cell is already occupied"
++            
++            # If moving from cascade, we can only move the single bottom card
++            if src_type == 'cascade':
++                src_cards = [self.cascades[src_idx][-1]]
++
++            # Execute move
++            self.save_state()
++            card_to_move = src_cards[0]
++            # Remove from source
++            if src_type == 'freecell':
++                self.free_cells[src_idx] = None
++            elif src_type == 'foundation':
++                self.foundations[src_idx].pop()
++            elif src_type == 'cascade':
++                self.cascades[src_idx].pop()
++            # Place in destination
++            self.free_cells[dest_idx] = card_to_move
++            self.move_count += 1
++            self.auto_collect()
++            return True, "Moved card to free cell"
++
++        elif dest_type == 'foundation':
++            # Target suit for this foundation slot
++            target_suit = self.foundation_suits[dest_idx]
++
++            # If moving from cascade, we can only move the single bottom card
++            if src_type == 'cascade':
++                src_cards = [self.cascades[src_idx][-1]]
++
++            card_to_move = src_cards[0]
++            if card_to_move.suit != target_suit:
++                return False, f"Foundation is for {SUITS[target_suit]}, but card is {card_to_move}"
++
++            dest_pile = self.foundations[dest_idx]
++            if not dest_pile:
++                if card_to_move.rank != 1:
++                    return False, "Only an Ace can be placed on an empty foundation"
++            else:
++                top_card = dest_pile[-1]
++                if card_to_move.rank != top_card.rank + 1:
++                    return False, f"Cannot place {card_to_move} on {top_card} (must be consecutive rank)"
++
++            # Execute move
++            self.save_state()
++            # Remove from source
++            if src_type == 'freecell':
++                self.free_cells[src_idx] = None
++            elif src_type == 'foundation':
++                self.foundations[src_idx].pop()
++            elif src_type == 'cascade':
++                self.cascades[src_idx].pop()
++            # Place in destination
++            self.foundations[dest_idx].append(card_to_move)
++            self.move_count += 1
++            self.auto_collect()
++            return True, "Moved card to foundation"
++
++        elif dest_type == 'cascade':
++            dest_cascade = self.cascades[dest_idx]
++
++            if src_type == 'freecell' or src_type == 'foundation':
++                card_to_move = src_cards[0]
++                if dest_cascade:
++                    top_card = dest_cascade[-1]
++                    if card_to_move.rank != top_card.rank - 1 or card_to_move.color == top_card.color:
++                        return False, f"Cannot place {card_to_move} on {top_card} (must be alternating color and rank - 1)"
++                # Execute move
++                self.save_state()
++                if src_type == 'freecell':
++                    self.free_cells[src_idx] = None
++                elif src_type == 'foundation':
++                    self.foundations[src_idx].pop()
++                dest_cascade.append(card_to_move)
++                self.move_count += 1
++                self.auto_collect()
++                return True, "Moved card to cascade"
++
++            elif src_type == 'cascade':
++                # Move from cascade to cascade (potential sequence move)
++                bottom_seq = self.get_bottom_sequence(self.cascades[src_idx])
++                
++                if not dest_cascade:
++                    # Destination is empty. Move largest allowed sequence.
++                    max_allowed = self.get_max_move_size(src_idx, dest_idx)
++                    num_to_move = min(len(bottom_seq), max_allowed)
++                    if num_to_move == 0:
++                        return False, "No cards to move"
++                    
++                    self.save_state()
++                    # Pop num_to_move cards from source, and append to dest
++                    cards_to_move = self.cascades[src_idx][-num_to_move:]
++                    self.cascades[src_idx] = self.cascades[src_idx][:-num_to_move]
++                    self.cascades[dest_idx].extend(cards_to_move)
++                    self.move_count += 1
++                    self.auto_collect()
++                    return True, f"Moved sequence of {num_to_move} cards to empty cascade"
++                else:
++                    # Destination is not empty. We must match the destination's top card.
++                    dest_top = dest_cascade[-1]
++                    # We need a card in bottom_seq of rank dest_top.rank - 1 and opposite color
++                    match_card_idx = -1
++                    for i, card in enumerate(bottom_seq):
++                        if card.rank == dest_top.rank - 1 and card.color != dest_top.color:
++                            match_card_idx = i
++                            break
++                    
++                    if match_card_idx == -1:
++                        return False, f"No valid card in sequence to place on {dest_top}"
++                    
++                    # Sequence to move is bottom_seq[match_card_idx:]
++                    seq_to_move = bottom_seq[match_card_idx:]
++                    num_to_move = len(seq_to_move)
++
++                    max_allowed = self.get_max_move_size(src_idx, dest_idx)
++                    if num_to_move > max_allowed:
++                        return False, f"Cannot move {num_to_move} cards. Max allowed is {max_allowed}."
++
++                    self.save_state()
++                    self.cascades[src_idx] = self.cascades[src_idx][:-num_to_move]
++                    self.cascades[dest_idx].extend(seq_to_move)
++                    self.move_count += 1
++                    self.auto_collect()
++                    return True, f"Moved sequence of {num_to_move} cards to cascade"
++
++        return False, "Unknown destination error"
++
++    def auto_collect(self):
++        """
++        Scan all top cards (bottom of cascades and free cells) and move any safely collectible cards
++        to the foundation. Repeat until no more cards can be collected.
++        """
++        while True:
++            collected_any = False
++            
++            # Helper to check if card is safe to collect
++            def is_safe_to_collect(card):
++                if card.rank <= 2:
++                    return True
++                # Opposite suit colors must be at least card.rank - 1
++                if card.color == 'red':
++                    opposite_suits = ['S', 'C']
++                else:
++                    opposite_suits = ['H', 'D']
++
++                opp_ranks = []
++                for opp_suit in opposite_suits:
++                    # Find corresponding foundation slot rank
++                    found_idx = self.foundation_suits.index(opp_suit)
++                    found_pile = self.foundations[found_idx]
++                    opp_rank = found_pile[-1].rank if found_pile else 0
++                    opp_ranks.append(opp_rank)
++                
++                return all(r >= card.rank - 1 for r in opp_ranks)
++
++            # 1. Check Free Cells
++            for idx, card in enumerate(self.free_cells):
++                if card is not None:
++                    found_idx = self.foundation_suits.index(card.suit)
++                    found_pile = self.foundations[found_idx]
++                    next_rank = found_pile[-1].rank + 1 if found_pile else 1
++                    if card.rank == next_rank and is_safe_to_collect(card):
++                        # Move to foundation
++                        self.foundations[found_idx].append(card)
++                        self.free_cells[idx] = None
++                        collected_any = True
++                        break # Start outer loop over to respect state changes
++
++            if collected_any:
++                continue
++
++            # 2. Check Cascades
++            for idx, cascade in enumerate(self.cascades):
++                if cascade:
++                    card = cascade[-1]
++                    found_idx = self.foundation_suits.index(card.suit)
++                    found_pile = self.foundations[found_idx]
++                    next_rank = found_pile[-1].rank + 1 if found_pile else 1
++                    if card.rank == next_rank and is_safe_to_collect(card):
++                        # Move to foundation
++                        self.foundations[found_idx].append(card)
++                        cascade.pop()
++                        collected_any = True
++                        break # Start outer loop over
++
++            if not collected_any:
++                break
+diff --git a/card-game-app/main.py b/card-game-app/main.py
+new file mode 100644
+index 000000000..27c5b1af2
+--- /dev/null
++++ b/card-game-app/main.py
+@@ -0,0 +1,413 @@
++import argparse
++import sys
++import time
++
++# Ensure engine can be imported from same directory
++from engine import FreeCellGame, Card, SUITS, SUIT_COLORS, RANK_NAMES
++
++def run_smoke_test():
++    """
++    Non-interactive smoke test.
++    Loads a deterministic game (seed=42), performs a sequence of valid moves,
++    verifies logic, undoes, and verifies state correctness.
++    """
++    print("Running non-interactive FreeCell smoke test...")
++    
++    # 1. Initialize game with a seed
++    game = FreeCellGame(seed=42)
++    print(f"Game initialized with seed 42. Moves: {game.move_count}")
++    
++    # Check initial counts
++    total_cards = sum(len(col) for col in game.cascades)
++    assert total_cards == 52, f"Expected 52 cards, got {total_cards}"
++    assert len(game.cascades[0]) == 7, "Cascade 0 should have 7 cards"
++    assert len(game.cascades[4]) == 6, "Cascade 4 should have 6 cards"
++    print("Initial card counts and distribution verified successfully.")
++
++    # 2. Perform a valid move (bottom card of Cascade 0 to Free Cell 0)
++    card_0_bottom = game.cascades[0][-1]
++    print(f"Moving bottom card of Cascade 0 ({card_0_bottom}) to Free Cell 0.")
++    success, msg = game.validate_and_move('cascade', 0, 'freecell', 0)
++    assert success, f"Expected move to succeed, but failed: {msg}"
++    assert game.free_cells[0] == card_0_bottom, "Card was not placed in Free Cell 0"
++    assert len(game.cascades[0]) == 6, f"Expected Cascade 0 to have 6 cards, got {len(game.cascades[0])}"
++    assert game.move_count == 1, f"Expected move count to be 1, got {game.move_count}"
++    print("First move completed and verified successfully.")
++
++    # 3. Perform another valid move (bottom card of Cascade 1 to Free Cell 1)
++    card_1_bottom = game.cascades[1][-1]
++    print(f"Moving bottom card of Cascade 1 ({card_1_bottom}) to Free Cell 1.")
++    success, msg = game.validate_and_move('cascade', 1, 'freecell', 1)
++    assert success, f"Expected move to succeed, but failed: {msg}"
++    assert game.free_cells[1] == card_1_bottom, "Card was not placed in Free Cell 1"
++    assert len(game.cascades[1]) == 6, f"Expected Cascade 1 to have 6 cards, got {len(game.cascades[1])}"
++    assert game.move_count == 2, f"Expected move count to be 2, got {game.move_count}"
++    print("Second move completed and verified successfully.")
++
++    # 4. Perform an invalid move (moving to occupied free cell 0)
++    print("Testing invalid move: Cascade 2 bottom to occupied Free Cell 0.")
++    success, msg = game.validate_and_move('cascade', 2, 'freecell', 0)
++    assert not success, "Expected move to fail, but it succeeded!"
++    print(f"Invalid move correctly rejected. Error message: '{msg}'")
++
++    # 5. Verify Undo functionality
++    print("Undoing second move...")
++    undo_success = game.undo()
++    assert undo_success, "Undo failed"
++    assert game.free_cells[1] is None, "Expected Free Cell 1 to be empty after undo"
++    assert len(game.cascades[1]) == 7, "Expected Cascade 1 to restore its card"
++    assert game.cascades[1][-1] == card_1_bottom, "Expected original card to return to bottom of Cascade 1"
++    assert game.move_count == 1, f"Expected move count to revert to 1, got {game.move_count}"
++    print("Undo functionality verified successfully.")
++
++    # 6. Verify safe auto-collect (Aces are always auto-collected)
++    # We can programmatically deal a game, find where Ace of Spades is,
++    # and if it is at the bottom of a cascade, it should auto-collect immediately.
++    # Let's find a seed where an Ace is at the bottom of a cascade, or construct one.
++    # To keep it robust and independent of seeds, let's construct a small scenario.
++    print("Verifying auto-collect of Aces...")
++    game = FreeCellGame(seed=42)
++    # Clear out an Ace manually to the bottom of cascade 0
++    ace_spades = Card('S', 1)
++    game.cascades[0].append(ace_spades)
++    # Trigger auto-collect
++    game.auto_collect()
++    # Spades foundation is index 0. It should now contain the Ace of Spades.
++    assert len(game.foundations[0]) >= 1, "Expected Ace of Spades to be auto-collected to foundation 0"
++    assert game.foundations[0][0] == ace_spades, "Foundation 0's first card should be Ace of Spades"
++    print("Auto-collect logic verified successfully.")
++
++    print("\nSmoke test PASSED successfully!")
++    sys.exit(0)
++
++
++def run_curses_ui():
++    """
++    Launches the interactive curses terminal interface.
++    """
++    try:
++        import curses
++    except ImportError:
++        print("Error: The standard-library 'curses' module is not available on this system.")
++        sys.exit(1)
++
++    def draw_card(stdscr, y, x, card, selected=False):
++        if card is None:
++            stdscr.addstr(y, x, "[   ]", curses.color_pair(5))
++            return
++
++        # Select color pair based on card color
++        if card.color == 'red':
++            color_pair = curses.color_pair(1)  # Red text
++        else:
++            color_pair = curses.color_pair(2)  # White/Black text
++
++        if selected:
++            color_pair = color_pair | curses.A_REVERSE
++
++        rank_str = RANK_NAMES[card.rank]
++        suit_sym = SUITS[card.suit]
++        card_text = f"{rank_str}{suit_sym}"
++        
++        # Pad to exactly 3 characters for uniform alignment
++        if len(card_text) == 2:
++            card_text = " " + card_text
++
++        stdscr.addstr(y, x, "[", curses.color_pair(5))
++        stdscr.addstr(y, x + 1, card_text, color_pair)
++        stdscr.addstr(y, x + 4, "]", curses.color_pair(5))
++
++    def draw_foundation_placeholder(stdscr, y, x, suit):
++        suit_sym = SUITS[suit]
++        if SUIT_COLORS[suit] == 'red':
++            color = curses.color_pair(1)
++        else:
++            color = curses.color_pair(2)
++        stdscr.addstr(y, x, "[", curses.color_pair(5))
++        stdscr.addstr(y, x + 1, f" {suit_sym} ", color | curses.A_DIM)
++        stdscr.addstr(y, x + 4, "]", curses.color_pair(5))
++
++    def curses_main(stdscr):
++        # Configure curses environment
++        curses.curs_set(0) # Hide blinking text cursor
++        stdscr.timeout(500) # Update elapsed time every 500ms
++
++        # Color setup
++        curses.use_default_colors()
++        curses.init_pair(1, curses.COLOR_RED, -1)     # Red suits
++        curses.init_pair(2, curses.COLOR_WHITE, -1)   # Black/white suits
++        curses.init_pair(3, curses.COLOR_GREEN, -1)   # Green labels
++        curses.init_pair(4, curses.COLOR_YELLOW, -1)  # Highlight / Warning
++        curses.init_pair(5, curses.COLOR_CYAN, -1)    # Brackets/borders
++
++        # Initialize a random game
++        current_seed = random_seed()
++        game = FreeCellGame(seed=current_seed)
++        start_time = time.time()
++        
++        # Selection states
++        src_type = None
++        src_idx = None
++        status_msg = "Game started! Enter Source key..."
++        status_color_pair = curses.color_pair(3)
++
++        # Key mappings
++        key_to_pile = {
++            'q': ('freecell', 0), 'w': ('freecell', 1), 'e': ('freecell', 2), 'r': ('freecell', 3),
++            'a': ('foundation', 0), 's': ('foundation', 1), 'd': ('foundation', 2), 'f': ('foundation', 3),
++            '1': ('cascade', 0), '2': ('cascade', 1), '3': ('cascade', 2), '4': ('cascade', 3),
++            '5': ('cascade', 4), '6': ('cascade', 5), '7': ('cascade', 6), '8': ('cascade', 7)
++        }
++
++        while True:
++            # Check terminal size
++            height, width = stdscr.getmaxyx()
++            if width < 80 or height < 24:
++                stdscr.clear()
++                stdscr.addstr(0, 0, "Terminal must be at least 80x24.", curses.color_pair(4))
++                stdscr.addstr(1, 0, f"Current size: {width}x{height}", curses.color_pair(2))
++                stdscr.addstr(3, 0, "Please resize your terminal window to continue.", curses.color_pair(2))
++                stdscr.refresh()
++                # Wait for resize
++                ch = stdscr.getch()
++                if ch in [ord('q'), ord('Q'), 27]: # ESC or Q
++                    break
++                continue
++
++            stdscr.clear()
++
++            # --- RENDER HEADER ---
++            stdscr.addstr(0, 0, "┌" + "─" * 78 + "┐", curses.color_pair(5))
++            
++            # Formulate header statistics
++            elapsed_sec = int(time.time() - start_time)
++            min_part = elapsed_sec // 60
++            sec_part = elapsed_sec % 60
++            time_str = f"{min_part:02d}:{sec_part:02d}"
++            
++            stats_line = f" FREECELL SOLITAIRE   |   Moves: {game.move_count:<3}   |   Time: {time_str}   |   Seed: {current_seed:<10}"
++            stdscr.addstr(1, 0, "│" + stats_line.ljust(78) + "│", curses.color_pair(3) | curses.A_BOLD)
++            stdscr.addstr(2, 0, "└" + "─" * 78 + "┘", curses.color_pair(5))
++
++            # --- RENDER TOP SECTION (Free Cells & Foundations) ---
++            stdscr.addstr(4, 2, "FREE CELLS (Q-R)", curses.color_pair(3))
++            stdscr.addstr(4, 40, "FOUNDATIONS (A-F)", curses.color_pair(3))
++
++            # Render Labels for Free Cells
++            labels_fc = ['Q', 'W', 'E', 'R']
++            for i, label in enumerate(labels_fc):
++                is_selected = (src_type == 'freecell' and src_idx == i)
++                color = curses.color_pair(4) if is_selected else curses.color_pair(3)
++                stdscr.addstr(5, 4 + i * 8, label, color | (curses.A_UNDERLINE if is_selected else 0))
++
++            # Render Free Cells
++            for i, card in enumerate(game.free_cells):
++                is_selected = (src_type == 'freecell' and src_idx == i)
++                draw_card(stdscr, 6, 2 + i * 8, card, selected=is_selected)
++
++            # Render Labels for Foundations
++            labels_fnd = ['A (♠)', 'S (♥)', 'D (♦)', 'F (♣)']
++            for i, label in enumerate(labels_fnd):
++                is_selected = (src_type == 'foundation' and src_idx == i)
++                color = curses.color_pair(4) if is_selected else curses.color_pair(3)
++                stdscr.addstr(5, 41 + i * 9, label, color)
++
++            # Render Foundations
++            for i, pile in enumerate(game.foundations):
++                is_selected = (src_type == 'foundation' and src_idx == i)
++                if not pile:
++                    draw_foundation_placeholder(stdscr, 6, 40 + i * 9, game.foundation_suits[i])
++                else:
++                    draw_card(stdscr, 6, 40 + i * 9, pile[-1], selected=is_selected)
++
++            # --- RENDER CASCADES (1-8) ---
++            stdscr.addstr(9, 2, "CASCADES (1-8)", curses.color_pair(3))
++
++            # Print cascade header labels
++            for i in range(8):
++                is_selected = (src_type == 'cascade' and src_idx == i)
++                color = curses.color_pair(4) if is_selected else curses.color_pair(3)
++                label_text = f"({i+1})"
++                stdscr.addstr(10, 4 + i * 9, label_text, color | (curses.A_UNDERLINE if is_selected else 0))
++
++            # Print the cards in each cascade
++            max_col_height = max(len(col) for col in game.cascades)
++            # Render up to the height of the terminal dynamically
++            visible_rows = height - 16 # Reserve rows for headers/footers
++            for row_idx in range(max_col_height):
++                if row_idx >= visible_rows:
++                    # Render indicators that more cards are hidden
++                    stdscr.addstr(11 + visible_rows, 2, "... and more cards below ...", curses.color_pair(4))
++                    break
++
++                for col_idx in range(8):
++                    cascade = game.cascades[col_idx]
++                    if row_idx < len(cascade):
++                        card = cascade[row_idx]
++                        # A card is selected if it is the source and we are highlighting it.
++                        # Note: for cascades, we highlight the source column's bottom cards/sequence if selected.
++                        is_selected = False
++                        if src_type == 'cascade' and src_idx == col_idx:
++                            # Highlight the bottom sequence or bottom card
++                            seq = game.get_bottom_sequence(cascade)
++                            if card in seq:
++                                is_selected = True
++
++                        draw_card(stdscr, 11 + row_idx, 2 + col_idx * 9, card, selected=is_selected)
++
++            # --- RENDER STATUS & FOOTER ---
++            # Print status message
++            status_y = height - 4
++            stdscr.addstr(status_y, 2, "Status: ", curses.color_pair(3))
++            stdscr.addstr(status_y, 10, status_msg.ljust(68)[:68], status_color_pair)
++
++            # Print helpful key bindings list
++            footer_y = height - 2
++            bindings_line1 = "Keys: FreeCells (Q W E R) | Foundations (A S D F) | Cascades (1-8)"
++            bindings_line2 = "[U] Undo | [C] Auto-Collect | [R] Restart | [N] New Game | [Q/Esc] Quit"
++            stdscr.addstr(footer_y - 1, 2, bindings_line1, curses.color_pair(3) | curses.A_DIM)
++            stdscr.addstr(footer_y, 2, bindings_line2, curses.color_pair(3) | curses.A_DIM)
++
++            # Check if won
++            if game.check_win():
++                # Game is won! Show overlay
++                stdscr.clear()
++                win_msg = "★ CONGRATULATIONS! YOU WON! ★"
++                stdscr.addstr(height // 2 - 2, (width - len(win_msg)) // 2, win_msg, curses.color_pair(3) | curses.A_BOLD | curses.A_BLINK)
++                sub_msg = f"Completed in {game.move_count} moves and {time_str}!"
++                stdscr.addstr(height // 2, (width - len(sub_msg)) // 2, sub_msg, curses.color_pair(2))
++                prompt_msg = "Press [N] for a New Game, or [Q] to Quit."
++                stdscr.addstr(height // 2 + 2, (width - len(prompt_msg)) // 2, prompt_msg, curses.color_pair(4))
++                stdscr.refresh()
++                
++                # Victory loop
++                while True:
++                    ch = stdscr.getch()
++                    if ch in [ord('q'), ord('Q'), 27]: # Q or ESC
++                        return
++                    elif ch in [ord('n'), ord('N')]:
++                        current_seed = random_seed()
++                        game = FreeCellGame(seed=current_seed)
++                        start_time = time.time()
++                        src_type = None
++                        src_idx = None
++                        status_msg = "New game started! Enter Source key..."
++                        status_color_pair = curses.color_pair(3)
++                        break
++                continue
++
++            stdscr.refresh()
++
++            # Get user input
++            try:
++                ch = stdscr.getch()
++            except KeyboardInterrupt:
++                break
++
++            if ch == -1:
++                # Timeout, loop to update timer
++                continue
++
++            key = chr(ch).lower() if 0 <= ch < 256 else ""
++
++            # Check for Quit
++            if key == 'q' or ch == 27: # 'q' or ESC
++                break
++
++            # Handle global action keys
++            if key == 'u':
++                if game.undo():
++                    status_msg = "Undo executed."
++                    status_color_pair = curses.color_pair(3)
++                else:
++                    status_msg = "Nothing to undo."
++                    status_color_pair = curses.color_pair(4)
++                src_type, src_idx = None, None
++                continue
++            elif key == 'c' or ch == ord(' '):
++                prev_moves = game.move_count
++                game.auto_collect()
++                collected = game.move_count - prev_moves # Wait, auto_collect doesn't increment move_count currently, or does it?
++                # Actually, our auto_collect in engine.py does not increment move_count. Let's report simply
++                status_msg = "Auto-collected safe cards to foundations."
++                status_color_pair = curses.color_pair(3)
++                src_type, src_idx = None, None
++                continue
++            elif key == 'r':
++                game = FreeCellGame(seed=current_seed)
++                start_time = time.time()
++                status_msg = "Game restarted with same layout."
++                status_color_pair = curses.color_pair(3)
++                src_type, src_idx = None, None
++                continue
++            elif key == 'n':
++                current_seed = random_seed()
++                game = FreeCellGame(seed=current_seed)
++                start_time = time.time()
++                status_msg = f"New game started with seed {current_seed}."
++                status_color_pair = curses.color_pair(3)
++                src_type, src_idx = None, None
++                continue
++
++            # Process selection keys
++            if key in key_to_pile:
++                pile_type, pile_idx = key_to_pile[key]
++                
++                if src_type is None:
++                    # Selecting source
++                    # Verify source has a card
++                    has_card = False
++                    if pile_type == 'freecell' and game.free_cells[pile_idx] is not None:
++                        has_card = True
++                    elif pile_type == 'foundation' and game.foundations[pile_idx]:
++                        has_card = True
++                    elif pile_type == 'cascade' and game.cascades[pile_idx]:
++                        has_card = True
++
++                    if has_card:
++                        src_type = pile_type
++                        src_idx = pile_idx
++                        status_msg = f"Selected {pile_type.upper()} {pile_idx + 1 if pile_type == 'cascade' else labels_fc[pile_idx] if pile_type == 'freecell' else labels_fnd[pile_idx][0]}. Choose destination..."
++                        status_color_pair = curses.color_pair(3)
++                    else:
++                        status_msg = f"Selected source {pile_type.upper()} is empty!"
++                        status_color_pair = curses.color_pair(4)
++                else:
++                    # Selecting destination
++                    if pile_type == src_type and pile_idx == src_idx:
++                        # Cancel selection
++                        src_type, src_idx = None, None
++                        status_msg = "Selection cancelled."
++                        status_color_pair = curses.color_pair(3)
++                    else:
++                        success, msg = game.validate_and_move(src_type, src_idx, pile_type, pile_idx)
++                        if success:
++                            status_msg = msg
++                            status_color_pair = curses.color_pair(3)
++                        else:
++                            status_msg = f"Invalid move: {msg}"
++                            status_color_pair = curses.color_pair(4)
++                        src_type, src_idx = None, None
++            else:
++                if ch != -1:
++                    status_msg = f"Unknown key pressed: {key if key.printable() else ch}. Press bindings shown below."
++                    status_color_pair = curses.color_pair(4)
++
++    curses.wrapper(curses_main)
++
++
++def random_seed():
++    """Generates a random 5-digit seed."""
++    import random
++    return random.randint(10000, 99999)
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description="Terminal-based FreeCell solitaire game in Python.")
++    parser.add_argument('--smoke', action='store_true', help="Run non-interactive smoke test.")
++    args = parser.parse_args()
++
++    if args.smoke:
++        run_smoke_test()
++    else:
++        run_curses_ui()
+diff --git a/card-game-app/test_engine.py b/card-game-app/test_engine.py
+new file mode 100644
+index 000000000..27fe3a0c2
+--- /dev/null
++++ b/card-game-app/test_engine.py
+@@ -0,0 +1,67 @@
++import unittest
++from engine import Card, FreeCellGame
++
++class TestFreeCellEngine(unittest.TestCase):
++    def test_card_creation(self):
++        card = Card('H', 1)
++        self.assertEqual(card.suit, 'H')
++        self.assertEqual(card.rank, 1)
++        self.assertEqual(card.color, 'red')
++        self.assertEqual(str(card), "A♥")
++
++    def test_deal(self):
++        game = FreeCellGame(seed=42)
++        # Check that 52 cards were dealt correctly
++        total_cards = sum(len(c) for c in game.cascades)
++        self.assertEqual(total_cards, 52)
++        self.assertEqual(len(game.cascades[0]), 7)
++        self.assertEqual(len(game.cascades[4]), 6)
++
++    def test_get_bottom_sequence(self):
++        # Create custom cascades to test sequence identification
++        c1 = [
++            Card('H', 13), # K♥
++            Card('S', 12), # Q♠
++            Card('H', 11), # J♥
++            Card('C', 10), # 10♣
++        ]
++        seq = FreeCellGame.get_bottom_sequence(c1)
++        self.assertEqual(len(seq), 4)
++        self.assertEqual(seq[0].rank, 13)
++
++        # Break sequence in middle
++        c2 = [
++            Card('H', 13), # K♥
++            Card('H', 12), # Q♥ (same color, breaks sequence)
++            Card('S', 11), # J♠
++            Card('H', 10), # 10♥
++        ]
++        seq = FreeCellGame.get_bottom_sequence(c2)
++        self.assertEqual(len(seq), 3)
++        self.assertEqual(seq[0].rank, 12)
++
++    def test_validate_and_move_to_free_cell(self):
++        game = FreeCellGame(seed=42)
++        # Try moving bottom card of first cascade to first free cell
++        bottom_card = game.cascades[0][-1]
++        success, msg = game.validate_and_move('cascade', 0, 'freecell', 0)
++        self.assertTrue(success)
++        self.assertEqual(game.free_cells[0], bottom_card)
++        self.assertEqual(len(game.cascades[0]), 6)
++
++    def test_undo(self):
++        game = FreeCellGame(seed=42)
++        original_cascade_len = len(game.cascades[0])
++        success, msg = game.validate_and_move('cascade', 0, 'freecell', 0)
++        self.assertTrue(success)
++        
++        self.assertEqual(len(game.cascades[0]), original_cascade_len - 1)
++        self.assertIsNotNone(game.free_cells[0])
++
++        undo_success = game.undo()
++        self.assertTrue(undo_success)
++        self.assertEqual(len(game.cascades[0]), original_cascade_len)
++        self.assertIsNone(game.free_cells[0])
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/status.json b/status.json
+new file mode 100644
+index 000000000..ee6907d7f
+--- /dev/null
++++ b/status.json
+@@ -0,0 +1,3 @@
++{
++  "outcome": "succeeded"
++}
+\ No newline at end of file
