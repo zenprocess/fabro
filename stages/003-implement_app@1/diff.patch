@@ -1,0 +1,187 @@
+diff --git a/card-game-app/README.md b/card-game-app/README.md
+index 1dcc61063..4c8170564 100644
+--- a/card-game-app/README.md
++++ b/card-game-app/README.md
+@@ -3,23 +3,40 @@
+ A terminal-based Spider Solitaire game built in Python using the standard library `curses` module, with zero external dependencies.
+ 
+ ## Key Features
+-- **Responsive Terminal Design**: Supports 1-suit (Spades), 2-suit (Spades & Hearts), or 4-suit (standard) gameplay, rendering beautifully on any standard terminal.
++- **Responsive Terminal Design**: Supports 1-suit (Spades), 2-suit (Spades & Hearts), or 4-suit (standard) configurations, rendering beautifully on any standard terminal.
+ - **Visual Card Highlighting**: Distinctive Red/White colors for card suits and full multi-card selection highlights.
+ - **Intuitive Keyboard Controls**: Smooth cursor-based navigation across tableau columns and vertical selection.
+-- **Full Undo/Redo Support**: Save states stored in a history stack so you can undo any mistake.
++- **Full Undo Support**: Save states stored in an undo stack so you can roll back any move.
+ - **Non-interactive Smoke Test & Verification Suite**: Run automatic unit tests and logic validation completely headlessly.
+ 
++## Project Structure
++
++```text
++card-game-app/
++├── pyproject.toml
++├── README.md
++├── main.py
++├── src/
++│   └── card_game_tui/
++│       ├── __init__.py
++│       ├── game.py
++│       └── ui.py
++└── tests/
++    ├── __init__.py
++    └── test_game.py
++```
++
+ ## How to Play
+ 
+ Run the game using Python:
+ 
+ ```bash
+-python3 card-game-app/main.py
++python3 main.py
+ ```
+ 
+ Choose suits count (1, 2, or 4):
+ ```bash
+-python3 card-game-app/main.py --suits 2
++python3 main.py --suits 2
+ ```
+ 
+ ### Controls:
+@@ -37,10 +54,15 @@ python3 card-game-app/main.py --suits 2
+ 
+ To run the unit tests:
+ ```bash
+-PYTHONPATH=card-game-app python3 -m unittest card-game-app/test_game.py
++python3 -m pytest tests/ -v
+ ```
+ 
+ To run the non-interactive smoke test suite:
+ ```bash
+-python3 card-game-app/main.py --smoke
++python3 main.py --smoke
++```
++
++To run the full suite (testing, syntax compilation, and smoke-testing):
++```bash
++python3 -m pytest tests/ -v && python3 -m py_compile main.py src/card_game_tui/*.py && python3 main.py --smoke
+ ```
+diff --git a/card-game-app/main.py b/card-game-app/main.py
+index 175b54437..bffd0886d 100755
+--- a/card-game-app/main.py
++++ b/card-game-app/main.py
+@@ -1,7 +1,13 @@
+ #!/usr/bin/env python3
+ import sys
+ import argparse
+-from game import SpiderGame, Card
++from pathlib import Path
++
++# Add src/ directory to the library path
++src_path = Path(__file__).parent / "src"
++sys.path.insert(0, str(src_path))
++
++from card_game_tui.game import SpiderGame, Card
+ 
+ def run_smoke_test():
+     """Runs a non-interactive verification suite to confirm game rules and states."""
+@@ -84,6 +90,18 @@ def run_smoke_test():
+     assert game.tableau[0][0].face_up == True, "Remaining facedown card should be flipped face-up"
+     print("[PASSED] Run-clearing logic successfully validated.")
+ 
++    # 7. Print a simple terminal layout simulation for smoke-test
++    print("\nSimulated Terminal Layout Render:")
++    print("---------------------------------")
++    cols_render = []
++    for c_idx in range(10):
++        col_cards = game.tableau[c_idx]
++        cards_str = ", ".join(repr(card) for card in col_cards)
++        print(f"Col {c_idx}: {cards_str}")
++    print(f"Stock size: {len(game.stock)}")
++    print(f"Completed runs: {game.completed_runs}/8")
++    print("---------------------------------")
++
+     print("\n====================================================")
+     print("ALL SMOKE TESTS PASSED!")
+     print("====================================================")
+@@ -100,7 +118,7 @@ def main():
+     else:
+         # Import UI here to avoid curses import issues if running in non-terminal environments
+         try:
+-            from ui import SpiderSolitaireUI
++            from card_game_tui.ui import SpiderSolitaireUI
+         except ImportError as e:
+             print(f"Error: Could not import curses UI. Make sure you are in a terminal environment. Details: {e}", file=sys.stderr)
+             sys.exit(1)
+diff --git a/card-game-app/pyproject.toml b/card-game-app/pyproject.toml
+new file mode 100644
+index 000000000..12d950bcd
+--- /dev/null
++++ b/card-game-app/pyproject.toml
+@@ -0,0 +1,20 @@
++[build-system]
++requires = ["setuptools>=61.0.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "card_game_tui"
++version = "0.1.0"
++description = "A terminal-based Spider Solitaire game in Python using curses"
++readme = "README.md"
++requires-python = ">=3.8"
++license = {text = "MIT"}
++classifiers = [
++    "Programming Language :: Python :: 3",
++    "License :: OSI Approved :: MIT License",
++    "Operating System :: OS Independent",
++]
++
++[tool.pytest.ini_options]
++pythonpath = ["src"]
++testpaths = ["tests"]
+diff --git a/card-game-app/src/card_game_tui/__init__.py b/card-game-app/src/card_game_tui/__init__.py
+new file mode 100644
+index 000000000..6b01371db
+--- /dev/null
++++ b/card-game-app/src/card_game_tui/__init__.py
+@@ -0,0 +1 @@
++# Card Game TUI Package
+diff --git a/card-game-app/game.py b/card-game-app/src/card_game_tui/game.py
+similarity index 100%
+rename from card-game-app/game.py
+rename to card-game-app/src/card_game_tui/game.py
+diff --git a/card-game-app/ui.py b/card-game-app/src/card_game_tui/ui.py
+similarity index 99%
+rename from card-game-app/ui.py
+rename to card-game-app/src/card_game_tui/ui.py
+index a3cdbf3a4..cca85fc73 100644
+--- a/card-game-app/ui.py
++++ b/card-game-app/src/card_game_tui/ui.py
+@@ -1,6 +1,6 @@
+ import curses
+ import sys
+-from game import SpiderGame, Card
++from card_game_tui.game import SpiderGame, Card
+ 
+ class SpiderSolitaireUI:
+     def __init__(self, suits_count=1):
+diff --git a/card-game-app/tests/__init__.py b/card-game-app/tests/__init__.py
+new file mode 100644
+index 000000000..d4839a6b1
+--- /dev/null
++++ b/card-game-app/tests/__init__.py
+@@ -0,0 +1 @@
++# Tests package
+diff --git a/card-game-app/test_game.py b/card-game-app/tests/test_game.py
+similarity index 98%
+rename from card-game-app/test_game.py
+rename to card-game-app/tests/test_game.py
+index f4286223f..665fabc15 100644
+--- a/card-game-app/test_game.py
++++ b/card-game-app/tests/test_game.py
+@@ -1,5 +1,5 @@
+ import unittest
+-from game import Card, SpiderGame
++from card_game_tui.game import Card, SpiderGame
+ 
+ class TestSpiderGame(unittest.TestCase):
+     def test_card_init(self):
