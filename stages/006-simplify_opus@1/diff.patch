@@ -1,0 +1,369 @@
+diff --git a/apps/fabro-web/app/components/run-summary-panel.test.tsx b/apps/fabro-web/app/components/run-summary-panel.test.tsx
+index abc5d6e7c..219aec6b1 100644
+--- a/apps/fabro-web/app/components/run-summary-panel.test.tsx
++++ b/apps/fabro-web/app/components/run-summary-panel.test.tsx
+@@ -6,6 +6,7 @@ import {
+   RunSummaryPanelView,
+   type RunSummaryPanelViewProps,
+ } from "./run-summary-panel";
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ function instanceText(instance: TestRenderer.ReactTestInstance): string {
+   const parts: string[] = [];
+@@ -34,14 +35,6 @@ function render(props: Partial<RunSummaryPanelViewProps> = {}) {
+   return tree!;
+ }
+ 
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
+-
+ function cellAfterLabel(
+   tree: TestRenderer.ReactTestRenderer,
+   label: string,
+@@ -79,9 +72,8 @@ describe("RunSummaryPanelView", () => {
+     }
+   });
+ 
+-  test("shows unavailable copy for missing optional run fields after load", () => {
++  test("shows unavailable copy for missing run fields after load", () => {
+     const tree = render({ run: makeRun() });
+-    expect(instanceText(cellAfterLabel(tree, "Created by"))).toBe("Ttest");
+     expect(instanceText(cellAfterLabel(tree, "Changes"))).toBe(EMPTY_VALUE);
+     expect(instanceText(cellAfterLabel(tree, "Cost"))).toBe(EMPTY_VALUE);
+   });
+diff --git a/apps/fabro-web/app/components/runs-list/run-table-row.tsx b/apps/fabro-web/app/components/runs-list/run-table-row.tsx
+index 5fd17dad1..20c85f63f 100644
+--- a/apps/fabro-web/app/components/runs-list/run-table-row.tsx
++++ b/apps/fabro-web/app/components/runs-list/run-table-row.tsx
+@@ -35,6 +35,7 @@ export function RunTableRow({
+ }) {
+   const lifecycleLabel = listLifecycleStatusLabel(run);
+   const statusDisplay = columnStatusDisplay[run.status];
++  const createdByDisplay = principalDisplay(run.createdBy);
+   const show = (col: ToggleableColumn) => !hiddenColumns.has(col);
+ 
+   return (
+@@ -54,14 +55,9 @@ export function RunTableRow({
+       </td>
+       {show("created_by") && (
+         <td className="relative z-10 w-8 whitespace-nowrap px-3 py-2.5">
+-          {(() => {
+-            const display = principalDisplay(run.createdBy);
+-            return (
+-              <Tooltip label={display.label}>
+-                <span aria-label={`Created by ${display.label}`}>{display.glyph}</span>
+-              </Tooltip>
+-            );
+-          })()}
++          <Tooltip label={createdByDisplay.label}>
++            <span aria-label={`Created by ${createdByDisplay.label}`}>{createdByDisplay.glyph}</span>
++          </Tooltip>
+         </td>
+       )}
+       {show("repo") && (
+diff --git a/apps/fabro-web/app/data/runs.test.ts b/apps/fabro-web/app/data/runs.test.ts
+index 69f2dbe81..feb2ba568 100644
+--- a/apps/fabro-web/app/data/runs.test.ts
++++ b/apps/fabro-web/app/data/runs.test.ts
+@@ -8,14 +8,7 @@ import {
+   mapRunToRunItem,
+   runStatusDisplay,
+ } from "./runs";
+-
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ function makeRun(overrides: Partial<Run> = {}): Run {
+   return {
+diff --git a/apps/fabro-web/app/lib/run-actions.test.ts b/apps/fabro-web/app/lib/run-actions.test.ts
+index c5cb1245c..a95fa6b8d 100644
+--- a/apps/fabro-web/app/lib/run-actions.test.ts
++++ b/apps/fabro-web/app/lib/run-actions.test.ts
+@@ -37,15 +37,9 @@ type CapturedRequest = {
+   data?: unknown;
+ };
+ 
+-const originalAdapter = generatedAxios.defaults.adapter;
++import { TEST_PRINCIPAL } from "./test-fixtures";
+ 
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
++const originalAdapter = generatedAxios.defaults.adapter;
+ 
+ function makeRun(status: RunStatus, archived = false): Run {
+   return {
+diff --git a/apps/fabro-web/app/lib/test-fixtures.ts b/apps/fabro-web/app/lib/test-fixtures.ts
+new file mode 100644
+index 000000000..2c7b1391d
+--- /dev/null
++++ b/apps/fabro-web/app/lib/test-fixtures.ts
+@@ -0,0 +1,12 @@
++import type { Principal } from "@qltysh/fabro-api-client";
++
++/**
++ * Shared frontend test fixture mirroring `fabro_types::test_support::test_principal()`.
++ */
++export const TEST_PRINCIPAL: Principal = {
++  kind:        "user",
++  identity:    { issuer: "fabro:test", subject: "test-user" },
++  login:       "test",
++  auth_method: "dev_token",
++  avatar_url:  null,
++};
+diff --git a/apps/fabro-web/app/routes/automations-new.test.tsx b/apps/fabro-web/app/routes/automations-new.test.tsx
+index 2a767fcea..76e840c89 100644
+--- a/apps/fabro-web/app/routes/automations-new.test.tsx
++++ b/apps/fabro-web/app/routes/automations-new.test.tsx
+@@ -5,6 +5,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
+ 
+ import { ToastProvider } from "../components/toast";
+ import { setupReactTestEnv } from "../lib/test-utils";
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ let currentRun: any = null;
+ let currentRunError: unknown = null;
+@@ -101,14 +102,6 @@ mock.module("swr", () => ({
+ const { default: AutomationsNew } = await import("./automations-new");
+ mock.restore();
+ 
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
+-
+ function makeRun(overrides: Record<string, unknown> = {}) {
+   return {
+     id:               "run_1",
+diff --git a/apps/fabro-web/app/routes/run-detail.test.ts b/apps/fabro-web/app/routes/run-detail.test.ts
+index cb9906196..a850cc0b5 100644
+--- a/apps/fabro-web/app/routes/run-detail.test.ts
++++ b/apps/fabro-web/app/routes/run-detail.test.ts
+@@ -13,6 +13,7 @@ import {
+ 
+ import { ToastProvider } from "../components/toast";
+ import { DemoModeProvider } from "../lib/demo-mode";
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ let currentRunSummary: any = null;
+ let currentRunState: any = null;
+@@ -20,14 +21,6 @@ let currentQuestions: any[] = [];
+ let deleteRunApiResult: Promise<unknown> | null = null;
+ const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
+ 
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
+-
+ const deleteRunApiMock = mock((_id: string) =>
+   deleteRunApiResult ?? Promise.resolve({}),
+ );
+diff --git a/apps/fabro-web/app/routes/run-files.render.test.tsx b/apps/fabro-web/app/routes/run-files.render.test.tsx
+index b6d95b70c..40a51614e 100644
+--- a/apps/fabro-web/app/routes/run-files.render.test.tsx
++++ b/apps/fabro-web/app/routes/run-files.render.test.tsx
+@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes } from "react-router";
+ import { toast as sonnerToast } from "sonner";
+ 
+ import { ToastProvider } from "../components/toast";
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ let currentFilesPayload: any = null;
+ let currentCommitsPayload: any = null;
+@@ -18,14 +19,6 @@ const virtualizerCalls: any[] = [];
+ const providerCalls: any[] = [];
+ const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
+ 
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
+-
+ mock.module("@pierre/diffs/react", () => ({
+   MultiFileDiff: (props: any) => {
+     multiFileDiffCalls.push(props);
+diff --git a/apps/fabro-web/app/routes/runs.preferences.test.tsx b/apps/fabro-web/app/routes/runs.preferences.test.tsx
+index e2be07d12..7e18ff679 100644
+--- a/apps/fabro-web/app/routes/runs.preferences.test.tsx
++++ b/apps/fabro-web/app/routes/runs.preferences.test.tsx
+@@ -6,14 +6,7 @@ import type { PaginatedRunList, Run } from "@qltysh/fabro-api-client";
+ import { ToastProvider } from "../components/toast";
+ import { CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY } from "../components/runs-list/preferences";
+ import { setupReactTestEnv } from "../lib/test-utils";
+-
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ class MemoryStorage {
+   values = new Map<string, string>();
+diff --git a/apps/fabro-web/app/routes/runs.test.tsx b/apps/fabro-web/app/routes/runs.test.tsx
+index edc7e388f..babef285b 100644
+--- a/apps/fabro-web/app/routes/runs.test.tsx
++++ b/apps/fabro-web/app/routes/runs.test.tsx
+@@ -11,14 +11,7 @@ import {
+   shouldRefreshBoardForEvent,
+ } from "./runs";
+ import { summarizeBatchLifecycleAction } from "../components/runs-list/batch-lifecycle";
+-
+-const TEST_PRINCIPAL = {
+-  kind:        "user" as const,
+-  identity:    { issuer: "fabro:test", subject: "test-user" },
+-  login:       "test",
+-  auth_method: "dev_token" as const,
+-  avatar_url:  null,
+-};
++import { TEST_PRINCIPAL } from "../lib/test-fixtures";
+ 
+ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
+   const status =
+diff --git a/lib/crates/fabro-store/src/run_state.rs b/lib/crates/fabro-store/src/run_state.rs
+index d525906bc..f2b2a8d8a 100644
+--- a/lib/crates/fabro-store/src/run_state.rs
++++ b/lib/crates/fabro-store/src/run_state.rs
+@@ -1443,7 +1443,8 @@ mod tests {
+                 "settings": WorkflowSettings::default(),
+                 "graph": Graph::new("test"),
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         );
+@@ -1471,7 +1472,8 @@ mod tests {
+                 "graph": Graph::new("test"),
+                 "automation": automation,
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         );
+@@ -1494,7 +1496,8 @@ mod tests {
+                 "settings": WorkflowSettings::default(),
+                 "graph": Graph::new("test"),
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         )])
+@@ -1516,7 +1519,8 @@ mod tests {
+                 "settings": WorkflowSettings::default(),
+                 "graph": Graph::new("test"),
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         )])
+@@ -1593,7 +1597,8 @@ mod tests {
+                     "settings": WorkflowSettings::default(),
+                     "graph": Graph::new("test"),
+                     "labels": {},
+-                    "run_dir": "/tmp/run"
++                    "run_dir": "/tmp/run",
++                    "provenance": test_support::test_run_provenance()
+                 }),
+                 None,
+             ),
+@@ -1640,7 +1645,6 @@ mod tests {
+         properties: &serde_json::Value,
+         node_id: Option<&str>,
+     ) -> EventEnvelope {
+-        let properties = run_created_properties(event, properties);
+         EventEnvelope {
+             seq,
+             event: RunEvent::from_value(json!({
+@@ -1662,7 +1666,6 @@ mod tests {
+         properties: &serde_json::Value,
+         node_id: Option<&str>,
+     ) -> EventEnvelope {
+-        let properties = run_created_properties(event, properties);
+         EventEnvelope {
+             seq,
+             event: RunEvent::from_value(json!({
+@@ -1677,19 +1680,6 @@ mod tests {
+         }
+     }
+ 
+-    fn run_created_properties(event: &str, properties: &serde_json::Value) -> serde_json::Value {
+-        let mut properties = properties.clone();
+-        if event == "run.created" && properties.get("provenance").is_none() {
+-            if let Some(object) = properties.as_object_mut() {
+-                object.insert(
+-                    "provenance".to_string(),
+-                    serde_json::to_value(test_support::test_run_provenance()).unwrap(),
+-                );
+-            }
+-        }
+-        properties
+-    }
+-
+     #[test]
+     fn live_run_timing_returns_none_before_run_starts() {
+         let state = initialized_projection();
+@@ -2927,7 +2917,8 @@ mod tests {
+                     "attrs": { "goal": { "String": "Goal title" } }
+                 },
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         );
+@@ -2954,7 +2945,8 @@ mod tests {
+                     "attrs": { "goal": { "String": "## Plan: Legacy title\n\nDetails" } }
+                 },
+                 "labels": {},
+-                "run_dir": "/tmp/run"
++                "run_dir": "/tmp/run",
++                "provenance": test_support::test_run_provenance()
+             }),
+             None,
+         );
+@@ -2983,7 +2975,8 @@ mod tests {
+                         "attrs": { "goal": { "String": "Goal title" } }
+                     },
+                     "labels": {},
+-                    "run_dir": "/tmp/run"
++                    "run_dir": "/tmp/run",
++                    "provenance": test_support::test_run_provenance()
+                 }),
+                 None,
+             ),
