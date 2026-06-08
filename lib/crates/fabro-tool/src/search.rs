@@ -293,6 +293,7 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::{TimeZone, Utc};
+    use fabro_types::test_support::test_principal;
     use fabro_types::{RunLifecycle, RunLinks, RunOrigin, RunStatus, RunTimestamps, WorkflowRef};
 
     use super::*;
@@ -444,7 +445,7 @@ mod tests {
             },
             automation:       None,
             repository:       None,
-            created_by:       None,
+            created_by:       test_principal(),
             origin:           RunOrigin::default(),
             labels:           HashMap::from([("group".to_string(), group.to_string())]),
             lifecycle:        RunLifecycle {

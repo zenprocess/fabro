@@ -307,6 +307,7 @@ fn format_tool_error(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use fabro_types::test_support::test_principal;
     use fabro_types::{RunLifecycle, RunLinks, RunOrigin, RunStatus, RunTimestamps, WorkflowRef};
 
     use super::*;
@@ -413,7 +414,7 @@ mod tests {
             },
             automation:       None,
             repository:       None,
-            created_by:       None,
+            created_by:       test_principal(),
             origin:           RunOrigin::default(),
             labels:           HashMap::new(),
             lifecycle:        RunLifecycle {

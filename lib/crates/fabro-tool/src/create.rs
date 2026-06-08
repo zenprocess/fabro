@@ -506,6 +506,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use fabro_api::types;
+    use fabro_types::test_support::test_principal;
     use fabro_types::{
         EventEnvelope, Run, RunLifecycle, RunLinks, RunOrigin, RunProjection, RunStatus,
         RunTimestamps, WorkflowRef,
@@ -902,7 +903,7 @@ mod tests {
             },
             automation: None,
             repository: None,
-            created_by: None,
+            created_by: test_principal(),
             origin: RunOrigin::default(),
             labels: HashMap::new(),
             lifecycle: RunLifecycle {

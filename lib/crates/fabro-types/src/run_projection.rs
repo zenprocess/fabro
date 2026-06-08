@@ -681,6 +681,7 @@ mod title_tests {
 
     use chrono::Utc;
 
+    use crate::test_support::test_run_provenance;
     use crate::{AttrValue, Graph, RunId, RunProjection, RunSpec, WorkflowSettings};
 
     fn projection_with_goal(goal: Option<&str>) -> RunProjection {
@@ -700,7 +701,7 @@ mod title_tests {
             automation: None,
             source_directory: None,
             labels: HashMap::new(),
-            provenance: None,
+            provenance: test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
             git: None,
@@ -752,6 +753,7 @@ mod iter_stages_tests {
     use serde_json::json;
 
     use super::RunProjection;
+    use crate::test_support::test_run_provenance;
     use crate::{Graph, RunId, RunSpec, StageProjection, WorkflowSettings};
 
     fn seq(n: u32) -> NonZeroU32 {
@@ -770,7 +772,7 @@ mod iter_stages_tests {
                 automation:       None,
                 source_directory: None,
                 labels:           HashMap::default(),
-                provenance:       None,
+                provenance:       test_run_provenance(),
                 manifest_blob:    None,
                 definition_blob:  None,
                 git:              None,

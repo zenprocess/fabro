@@ -7,6 +7,14 @@ import { ToastProvider } from "../components/toast";
 import { CHILD_RUNS_LIST_PREFERENCES_STORAGE_KEY } from "../components/runs-list/preferences";
 import { setupReactTestEnv } from "../lib/test-utils";
 
+const TEST_PRINCIPAL = {
+  kind:        "user" as const,
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token" as const,
+  avatar_url:  null,
+};
+
 class MemoryStorage {
   values = new Map<string, string>();
 
@@ -35,7 +43,7 @@ function run(id: string, repo = "qlty/fabro", workflow = "release"): Run {
     workflow:         { slug: workflow, name: workflow, graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: repo, origin_url: null, provider: "github" },
-    created_by:       null,
+    created_by:       TEST_PRINCIPAL,
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

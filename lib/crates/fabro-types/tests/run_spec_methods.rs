@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use fabro_types::graph::Graph;
 use fabro_types::run::{DirtyStatus, GitContext, PreRunPushOutcome, RunSpec};
 use fabro_types::settings::{ProjectNamespace, WorkflowNamespace};
-use fabro_types::{WorkflowSettings, fixtures};
+use fabro_types::{WorkflowSettings, fixtures, test_support};
 
 fn sample_run_spec() -> RunSpec {
     let settings = WorkflowSettings {
@@ -27,7 +27,7 @@ fn sample_run_spec() -> RunSpec {
         automation: None,
         source_directory: Some("/Users/client/project".to_string()),
         labels: HashMap::from([("team".to_string(), "platform".to_string())]),
-        provenance: None,
+        provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         definition_blob: None,
         git: Some(GitContext {

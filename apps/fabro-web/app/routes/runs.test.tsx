@@ -12,6 +12,14 @@ import {
 } from "./runs";
 import { summarizeBatchLifecycleAction } from "../components/runs-list/batch-lifecycle";
 
+const TEST_PRINCIPAL = {
+  kind:        "user" as const,
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token" as const,
+  avatar_url:  null,
+};
+
 function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
   const status =
     column === "blocked"
@@ -34,7 +42,7 @@ function boardRun(id: string, column: BoardColumn, questionText?: string): Run {
     workflow:         { slug: "test", name: "Test", graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       { name: "repo", origin_url: null, provider: "unknown" },
-    created_by:       null,
+    created_by:       TEST_PRINCIPAL,
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

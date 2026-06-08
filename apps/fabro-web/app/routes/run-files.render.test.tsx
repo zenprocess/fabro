@@ -18,6 +18,14 @@ const virtualizerCalls: any[] = [];
 const providerCalls: any[] = [];
 const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
 
+const TEST_PRINCIPAL = {
+  kind:        "user" as const,
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token" as const,
+  avatar_url:  null,
+};
+
 mock.module("@pierre/diffs/react", () => ({
   MultiFileDiff: (props: any) => {
     multiFileDiffCalls.push(props);
@@ -51,7 +59,7 @@ mock.module("../lib/queries", () => ({
       workflow:         { slug: "default", name: "Default", graph_name: null, node_count: 0, edge_count: 0 },
       automation:       null,
       repository:       { name: "fabro", origin_url: null, provider: "unknown" },
-      created_by:       null,
+      created_by:       TEST_PRINCIPAL,
       origin:           { kind: "api" },
       labels:           {},
       lifecycle:        {

@@ -39,6 +39,14 @@ type CapturedRequest = {
 
 const originalAdapter = generatedAxios.defaults.adapter;
 
+const TEST_PRINCIPAL = {
+  kind:        "user" as const,
+  identity:    { issuer: "fabro:test", subject: "test-user" },
+  login:       "test",
+  auth_method: "dev_token" as const,
+  avatar_url:  null,
+};
+
 function makeRun(status: RunStatus, archived = false): Run {
   return {
     id:               "run-1",
@@ -47,7 +55,7 @@ function makeRun(status: RunStatus, archived = false): Run {
     workflow:         { slug: "fix_build", name: "Fix Build", graph_name: null, node_count: 0, edge_count: 0 },
     automation:       null,
     repository:       null,
-    created_by:       null,
+    created_by:       TEST_PRINCIPAL,
     origin:           { kind: "api" },
     labels:           {},
     lifecycle:        {

@@ -736,7 +736,7 @@ mod tests {
             workflow_slug: Some("metadata".to_string()),
             automation: None,
             db_prefix: None,
-            provenance: None,
+            provenance: fabro_types::test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
             fork_source_ref: None,

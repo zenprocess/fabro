@@ -470,6 +470,7 @@ fn active_run_from(
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
+    use fabro_types::test_support::test_run_provenance;
     use fabro_types::{
         AttrValue, FailureReason, Graph, RunControlAction, RunSpec, RunStatus, StageId,
         SuccessReason, WorkflowSettings,
@@ -542,7 +543,7 @@ mod tests {
             automation: None,
             source_directory: Some(format!("/tmp/{label}")),
             labels: std::collections::HashMap::from([("team".to_string(), "infra".to_string())]),
-            provenance: None,
+            provenance: test_run_provenance(),
             manifest_blob: None,
             definition_blob: None,
             git: Some(fabro_types::GitContext {
@@ -601,6 +602,7 @@ mod tests {
                 "run_dir": format!("/tmp/{label}"),
                 "git": run_spec.git,
                 "labels": run_spec.labels,
+                "provenance": run_spec.provenance,
             }),
         ))
         .await
@@ -626,6 +628,7 @@ mod tests {
                 "run_dir": format!("/tmp/{label}"),
                 "git": run_spec.git,
                 "labels": run_spec.labels,
+                "provenance": run_spec.provenance,
                 "parent_id": parent_id,
             }),
         ))
@@ -1300,6 +1303,7 @@ mod tests {
                     "run_dir": "/tmp/run-2",
                     "git": run_spec["git"],
                     "labels": run_spec["labels"],
+                    "provenance": run_spec["provenance"],
                 },
             }))
             .unwrap(),

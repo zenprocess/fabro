@@ -931,6 +931,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::test_run_provenance;
     use crate::{
         AuthMethod, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId, WorkflowSettings,
         fixtures,
@@ -1017,7 +1018,8 @@ mod tests {
                 "graph": graph,
                 "labels": {},
                 "run_dir": "/tmp/run",
-                "source_directory": "/tmp/run"
+                "source_directory": "/tmp/run",
+                "provenance": test_run_provenance()
             }
         });
 
@@ -1038,6 +1040,7 @@ mod tests {
                 "labels": {},
                 "run_dir": "/tmp/run",
                 "source_directory": "/tmp/run",
+                "provenance": test_run_provenance(),
                 "manifest_blob": RunBlobId::new(br#"{"version":1}"#).to_string()
             }
         });
