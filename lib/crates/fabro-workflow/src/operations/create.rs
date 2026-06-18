@@ -430,7 +430,7 @@ mod tests {
 
     use super::*;
     use crate::operations::{ValidateInput, validate};
-    use crate::pipeline::types::TEMPLATE_UNDEFINED_VARIABLE_RULE;
+    use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
     use crate::workflow_bundle::BundledWorkflow;
     fn memory_store() -> Arc<Database> {
         Arc::new(Database::new(
@@ -495,6 +495,36 @@ mod tests {
         assert_eq!(validated.graph().name, "Test");
         assert!(validated.graph().find_start_node().is_some());
         assert!(validated.graph().find_exit_node().is_some());
+    }
+
+    #[test]
+    fn validate_rejects_goal_self_reference() {
+        // A goal can't reference itself; a prompt can reference the goal.
+        let dot = r#"digraph Test {
+            graph [goal="Refine {{ goal }}"]
+            start [shape=Mdiamond]
+            work [prompt="Work on {{ goal }}"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#;
+        let validated = validate_dot(dot, WorkflowSettings::default());
+
+        assert!(
+            validated.has_errors(),
+            "goal self-reference should fail validation"
+        );
+        let self_ref: Vec<_> = validated
+            .diagnostics()
+            .iter()
+            .filter(|d| d.rule == GOAL_SELF_REFERENCE_RULE)
+            .collect();
+        assert_eq!(
+            self_ref.len(),
+            1,
+            "expected one goal self-reference diagnostic, got: {:?}",
+            validated.diagnostics()
+        );
+        assert_eq!(self_ref[0].severity, Severity::Error);
     }
 
     #[test]
