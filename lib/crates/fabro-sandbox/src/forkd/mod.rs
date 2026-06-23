@@ -1,12 +1,12 @@
 //! Forkd Firecracker microVM sandbox implementation.
 //!
-//! One long-lived VM per sandbox:
-//! - Created in `initialize()` via `POST /vms`.
-//! - Destroyed in `cleanup()` via `DELETE /vms/{name}`.
+//! One long-lived sandbox per run:
+//! - Created in `initialize()` via `POST /v1/sandboxes`.
+//! - Destroyed in `cleanup()` via `DELETE /v1/sandboxes/{id}`.
 //! - All file I/O goes through exec (base64 round-trips for binary safety).
-//! - Controller URL and bearer token are never hardcoded — they come from
-//!   `FORKD_URL` / `FORKD_TOKEN` environment variables resolved at provider
-//!   construction time.
+//! - Controller URL, bearer token, and snapshot tag are never hardcoded —
+//!   they come from `FORKD_URL` / `FORKD_TOKEN` / `FORKD_SNAPSHOT_TAG`
+//!   environment variables resolved at provider construction time.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +36,9 @@ pub(crate) const REPOS_ROOT: &str = "/home/fabro/repos";
 /// Provider name string for event payloads.
 const PROVIDER: &str = "forkd";
 
+/// Default snapshot tag used when `FORKD_SNAPSHOT_TAG` is not set.
+pub const DEFAULT_SNAPSHOT_TAG: &str = "zen-gate-base";
+
 /// Maximum number of retry attempts for transient HTTP failures (5xx / connect).
 const HTTP_RETRY_LIMIT: u32 = 3;
 /// Initial backoff before the first retry.
@@ -55,7 +58,7 @@ pub struct ForkdConfig {
     /// Bearer token for the forkd controller API.
     /// NEVER include the real value in log output — use `[redacted]`.
     pub forkd_token: String,
-    /// Per-sandbox runtime settings (image, memory, network, skip_clone).
+    /// Per-sandbox runtime settings (snapshot_tag, skip_clone, etc.).
     pub settings:    ForkdSettings,
 }
 
@@ -85,28 +88,53 @@ impl Default for ForkdConfig {
 // forkd REST API request/response shapes (forkd 0.5.2)
 // ---------------------------------------------------------------------------
 
+/// `POST /v1/sandboxes` request body.
 #[derive(Debug, Serialize)]
-struct CreateVmRequest {
-    name:    String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image:   Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kernel:  Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mem_mib: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    network: Option<String>,
+struct CreateSandboxRequest {
+    snapshot_tag: String,
 }
 
+/// A single sandbox entry returned inside the array from `POST /v1/sandboxes`.
+#[derive(Debug, Deserialize)]
+struct SandboxEntry {
+    id: String,
+    /// The snapshot tag that was actually used by the server (may differ from
+    /// the requested tag if the server resolved an alias).
+    #[serde(default)]
+    snapshot_tag: Option<String>,
+}
+
+/// Defensive response shape for `POST /v1/sandboxes`.
+///
+/// The forkd 0.5.2 spec returns a JSON array; the untagged enum lets us also
+/// accept a bare object in case of a single-element regression in the server.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CreateSandboxResponse {
+    Array(Vec<SandboxEntry>),
+    Single(SandboxEntry),
+}
+
+impl CreateSandboxResponse {
+    fn into_first(self) -> Option<SandboxEntry> {
+        match self {
+            Self::Array(mut v) => {
+                if v.is_empty() { None } else { Some(v.remove(0)) }
+            }
+            Self::Single(entry) => Some(entry),
+        }
+    }
+}
+
+/// `POST /v1/sandboxes/{id}/exec` request body.
+///
+/// forkd exec is ARGV-ONLY — there is no `working_dir`, `env`, or `command`
+/// string field.  Callers that need cwd/env must fold them into the argv via
+/// `["sh", "-lc", "cd <dir> && export K=V; <cmd>"]`.
 #[derive(Debug, Serialize)]
 struct ExecRequest {
-    command:     String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    working_dir: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout_ms:  Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    env:         Option<HashMap<String, String>>,
+    args:         Vec<String>,
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,10 +151,13 @@ struct ExecResponse {
 /// A sandbox backed by a single Firecracker microVM managed via forkd.
 pub struct ForkdSandbox {
     config:           ForkdConfig,
-    vm_name:          String,
     run_id:           Option<RunId>,
     clone_origin_url: Option<String>,
     clone_branch:     Option<String>,
+    /// The server-assigned sandbox id, populated after a successful `create_sandbox()`.
+    sandbox_id:       OnceCell<String>,
+    /// The snapshot tag reported by the server (may differ from the requested tag).
+    active_snapshot:  OnceCell<String>,
     /// Populated after a successful `initialize()`.
     initialized:      OnceCell<bool>,
     origin_url:       OnceCell<String>,
@@ -142,30 +173,22 @@ impl ForkdSandbox {
         clone_origin_url: Option<String>,
         clone_branch: Option<String>,
     ) -> Self {
-        let vm_name = if let Some(ref id) = run_id {
-            format!("fabro-{id}")
-        } else {
-            format!(
-                "fabro-{}-{:04x}",
-                chrono::Utc::now().format("%Y%m%d-%H%M%S"),
-                rand::rng().random_range(0..0x10000u32),
-            )
-        };
         Self {
             config,
-            vm_name,
             run_id,
             clone_origin_url,
             clone_branch,
-            initialized:    OnceCell::new(),
-            origin_url:     OnceCell::new(),
-            event_callback: None,
+            sandbox_id:      OnceCell::new(),
+            active_snapshot: OnceCell::new(),
+            initialized:     OnceCell::new(),
+            origin_url:      OnceCell::new(),
+            event_callback:  None,
         }
     }
 
-    /// The name of the VM that will be (or was) created.
-    pub fn vm_name(&self) -> &str {
-        &self.vm_name
+    /// The server-assigned sandbox id (available after `initialize()`).
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.get().map(String::as_str)
     }
 
     /// Attach a callback that receives [`SandboxEvent`]s.
@@ -187,7 +210,7 @@ impl ForkdSandbox {
     fn http_client(&self) -> crate::Result<reqwest::Client> {
         reqwest::Client::builder()
             // Hard cap on individual HTTP requests to the forkd controller.
-            // Exec calls use a per-request timeout via ExecRequest.timeout_ms;
+            // Exec calls use a per-request timeout via ExecRequest.timeout_secs;
             // this is a safety net for connect + response-header receipt.
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -205,27 +228,62 @@ impl ForkdSandbox {
         status.is_server_error()
     }
 
-    /// Execute a shell command in the VM.  Returns the raw `ExecResponse`
+    /// Build the argv for a shell-wrapped command that folds cwd and env vars
+    /// into a single `sh -lc` invocation.
+    ///
+    /// forkd exec is argv-only; working_dir and env must be inlined here.
+    /// Env key names are validated: only `[A-Za-z_][A-Za-z0-9_]*` are accepted
+    /// to prevent injection via malicious key names.
+    fn build_exec_argv(
+        command: &str,
+        working_dir: &str,
+        env_vars: Option<&HashMap<String, String>>,
+    ) -> Vec<String> {
+        let mut shell_body = format!("cd {} && ", shell_quote(working_dir));
+
+        if let Some(vars) = env_vars {
+            let mut sorted: Vec<(&String, &String)> = vars.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.as_str());
+            for (key, value) in sorted {
+                // Safety: skip env keys that are not valid identifier names to
+                // prevent shell injection via a crafted key.
+                if key.chars().enumerate().all(|(i, c)| {
+                    if i == 0 { c.is_ascii_alphabetic() || c == '_' }
+                    else { c.is_ascii_alphanumeric() || c == '_' }
+                }) {
+                    shell_body.push_str(&format!("export {}={} && ", key, shell_quote(value)));
+                } else {
+                    tracing::warn!(key, "forkd: skipping env var with non-identifier key");
+                }
+            }
+        }
+
+        shell_body.push_str(command);
+
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            shell_body,
+        ]
+    }
+
+    /// Execute an argv inside the sandbox.  Returns the raw `ExecResponse`
     /// so the caller decides how to interpret exit code / output.
     ///
     /// Transient HTTP errors (connect failures and 5xx responses) are retried
     /// up to `HTTP_RETRY_LIMIT` times with exponential back-off.
-    async fn exec_in_vm(
+    async fn exec_in_sandbox(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
+        args: Vec<String>,
+        timeout_secs: u64,
     ) -> crate::Result<ExecResponse> {
-        let client = self.http_client()?;
-        let url = format!("{}/vms/{}/exec", self.config.forkd_url, self.vm_name);
+        let id = self.sandbox_id.get().ok_or_else(|| {
+            crate::Error::message("forkd sandbox not yet initialized (no sandbox id)")
+        })?;
 
-        let body = ExecRequest {
-            command:     command.to_string(),
-            working_dir: working_dir.map(str::to_string),
-            timeout_ms,
-            env:         env_vars.cloned(),
-        };
+        let client = self.http_client()?;
+        let url = format!("{}/v1/sandboxes/{}/exec", self.config.forkd_url, id);
+        let body = ExecRequest { args, timeout_secs };
 
         let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
         let mut attempt = 0u32;
@@ -279,31 +337,33 @@ impl ForkdSandbox {
         }
     }
 
-    /// Create the VM via `POST /vms`.
+    /// A convenience wrapper used internally for simple shell commands that do
+    /// not need cwd/env folding (e.g. mkdir, clone, base64 reads/writes).
+    ///
+    /// Uses `sh -lc` with a default cwd of `/` so the caller can use absolute
+    /// paths without worrying about the initial working directory.
+    async fn exec_shell(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> crate::Result<ExecResponse> {
+        let args = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            command.to_string(),
+        ];
+        self.exec_in_sandbox(args, timeout_secs).await
+    }
+
+    /// Create the sandbox via `POST /v1/sandboxes`.
     ///
     /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
-    async fn create_vm(&self) -> crate::Result<()> {
+    /// On success, stores the server-assigned sandbox id in `self.sandbox_id`.
+    async fn create_sandbox(&self) -> crate::Result<()> {
         let client = self.http_client()?;
-        let url = format!("{}/vms", self.config.forkd_url);
-
-        let snap = self.config.settings.snapshot.as_ref();
-        let network_str = self
-            .config
-            .settings
-            .network
-            .as_ref()
-            .map(|n| match n {
-                crate::config::ForkdNetwork::Block => "block".to_string(),
-                crate::config::ForkdNetwork::AllowAll => "allow_all".to_string(),
-                crate::config::ForkdNetwork::AllowList(_) => "allow_all".to_string(), // list enforced by iptables inside VM
-            });
-
-        let body = CreateVmRequest {
-            name:    self.vm_name.clone(),
-            image:   snap.and_then(|s| s.image.clone()),
-            kernel:  snap.and_then(|s| s.kernel.clone()),
-            mem_mib: snap.and_then(|s| s.mem_mib),
-            network: network_str,
+        let url = format!("{}/v1/sandboxes", self.config.forkd_url);
+        let body = CreateSandboxRequest {
+            snapshot_tag: self.config.settings.snapshot_tag.clone(),
         };
 
         let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
@@ -317,13 +377,32 @@ impl ForkdSandbox {
                 .await;
 
             match result {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    let parsed = resp
+                        .json::<CreateSandboxResponse>()
+                        .await
+                        .map_err(|e| crate::Error::context("Failed to parse forkd create response", e))?;
+
+                    let entry = parsed.into_first().ok_or_else(|| {
+                        crate::Error::message("forkd create returned empty array")
+                    })?;
+
+                    self.sandbox_id
+                        .set(entry.id)
+                        .map_err(|_| crate::Error::message("forkd sandbox_id already set (double-init?)"))?;
+
+                    if let Some(tag) = entry.snapshot_tag {
+                        let _ = self.active_snapshot.set(tag);
+                    }
+
+                    return Ok(());
+                }
                 Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
                     let status = resp.status();
                     tracing::warn!(
                         attempt,
                         status = status.as_u16(),
-                        "forkd create_vm transient error; retrying"
+                        "forkd create_sandbox transient error; retrying"
                     );
                     attempt += 1;
                     sleep(backoff).await;
@@ -333,32 +412,39 @@ impl ForkdSandbox {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
                     return Err(crate::Error::message(format!(
-                        "forkd create VM returned {status}: {text}"
+                        "forkd create sandbox returned {status}: {text}"
                     )));
                 }
                 Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
                     tracing::warn!(
                         attempt,
                         error = %e,
-                        "forkd create_vm connect error; retrying"
+                        "forkd create_sandbox connect error; retrying"
                     );
                     attempt += 1;
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context("forkd create VM HTTP request failed", e));
+                    return Err(crate::Error::context("forkd create sandbox HTTP request failed", e));
                 }
             }
         }
     }
 
-    /// Delete the VM via `DELETE /vms/{name}`.
+    /// Delete the sandbox via `DELETE /v1/sandboxes/{id}`.
     ///
+    /// 404 is treated as "already gone" and returns `Ok(())`.
     /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
-    async fn delete_vm(&self) -> crate::Result<()> {
+    async fn delete_sandbox(&self) -> crate::Result<()> {
+        let id = match self.sandbox_id.get() {
+            Some(id) => id,
+            // Never initialized — nothing to delete.
+            None => return Ok(()),
+        };
+
         let client = self.http_client()?;
-        let url = format!("{}/vms/{}", self.config.forkd_url, self.vm_name);
+        let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
         let mut attempt = 0u32;
@@ -370,6 +456,7 @@ impl ForkdSandbox {
                 .await;
 
             match result {
+                // 404 means the sandbox is already gone — idempotent success.
                 Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(()),
                 Ok(resp) if resp.status().is_success() => return Ok(()),
                 Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
@@ -377,7 +464,7 @@ impl ForkdSandbox {
                     tracing::warn!(
                         attempt,
                         status = status.as_u16(),
-                        "forkd delete_vm transient error; retrying"
+                        "forkd delete_sandbox transient error; retrying"
                     );
                     attempt += 1;
                     sleep(backoff).await;
@@ -387,21 +474,21 @@ impl ForkdSandbox {
                     let status = resp.status();
                     let text = resp.text().await.unwrap_or_default();
                     return Err(crate::Error::message(format!(
-                        "forkd delete VM returned {status}: {text}"
+                        "forkd delete sandbox returned {status}: {text}"
                     )));
                 }
                 Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
                     tracing::warn!(
                         attempt,
                         error = %e,
-                        "forkd delete_vm connect error; retrying"
+                        "forkd delete_sandbox connect error; retrying"
                     );
                     attempt += 1;
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context("forkd delete VM HTTP request failed", e));
+                    return Err(crate::Error::context("forkd delete sandbox HTTP request failed", e));
                 }
             }
         }
@@ -417,9 +504,7 @@ impl ForkdSandbox {
 
         // Ensure parent directory exists.
         let mkdir_cmd = format!("mkdir -p {}", shell_quote(WORKING_DIRECTORY));
-        let mkdir_resp = self
-            .exec_in_vm(&mkdir_cmd, Some(30_000), None, None)
-            .await?;
+        let mkdir_resp = self.exec_shell(&mkdir_cmd, 30).await?;
         if mkdir_resp.exit_code != Some(0) {
             return Err(crate::Error::message(format!(
                 "forkd mkdir failed (exit {:?}): {}",
@@ -444,9 +529,7 @@ impl ForkdSandbox {
             )
         };
 
-        let clone_resp = self
-            .exec_in_vm(&clone_cmd, Some(300_000), None, None)
-            .await?;
+        let clone_resp = self.exec_shell(&clone_cmd, 300).await?;
 
         if clone_resp.exit_code != Some(0) {
             let err = crate::Error::message(format!(
@@ -492,8 +575,8 @@ impl Sandbox for ForkdSandbox {
             provider: PROVIDER.into(),
         });
 
-        // Create the VM.
-        self.create_vm().await.map_err(|err| {
+        // Create the sandbox (POST /v1/sandboxes).
+        self.create_sandbox().await.map_err(|err| {
             let duration_ms = elapsed_ms(start);
             self.emit(SandboxEvent::InitializeFailed {
                 provider:    PROVIDER.into(),
@@ -528,15 +611,9 @@ impl Sandbox for ForkdSandbox {
         self.emit(SandboxEvent::Ready {
             provider:    PROVIDER.into(),
             duration_ms,
-            name:        Some(self.vm_name.clone()),
+            name:        self.sandbox_id.get().cloned(),
             cpu:         None,
-            memory:      self
-                .config
-                .settings
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.mem_mib)
-                .map(|m| f64::from(m) / 1024.0),
+            memory:      None,
             url:         None,
         });
 
@@ -549,7 +626,7 @@ impl Sandbox for ForkdSandbox {
             provider: PROVIDER.into(),
         });
 
-        match self.delete_vm().await {
+        match self.delete_sandbox().await {
             Ok(()) => {
                 let duration_ms = elapsed_ms(start);
                 self.emit(SandboxEvent::CleanupCompleted {
@@ -585,10 +662,14 @@ impl Sandbox for ForkdSandbox {
             .map(|d| self.resolve_path(d))
             .unwrap_or_else(|| WORKING_DIRECTORY.to_string());
 
+        // forkd exec is argv-only; fold cwd and env into sh -lc.
+        let args = Self::build_exec_argv(command, &effective_dir, env_vars);
+
+        // Convert ms to whole seconds (ceiling), minimum 1 second.
+        let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
+
         let start = Instant::now();
-        let resp = self
-            .exec_in_vm(command, Some(timeout_ms), Some(&effective_dir), env_vars)
-            .await?;
+        let resp = self.exec_in_sandbox(args, timeout_secs).await?;
 
         let duration_ms = elapsed_ms(start);
         let exit_code = resp.exit_code;
@@ -624,7 +705,7 @@ impl Sandbox for ForkdSandbox {
             "base64 -w 0 {}",
             shell_quote(&abs_path)
         );
-        let resp = self.exec_in_vm(&cmd, Some(60_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 60).await?;
 
         if resp.exit_code != Some(0) {
             return Err(crate::Error::message(format!(
@@ -650,9 +731,7 @@ impl Sandbox for ForkdSandbox {
             .unwrap_or_default();
         if !parent.is_empty() {
             let mkdir_cmd = format!("mkdir -p {}", shell_quote(&parent));
-            let mkdir_resp = self
-                .exec_in_vm(&mkdir_cmd, Some(10_000), None, None)
-                .await?;
+            let mkdir_resp = self.exec_shell(&mkdir_cmd, 10).await?;
             if mkdir_resp.exit_code != Some(0) {
                 return Err(crate::Error::message(format!(
                     "forkd write_file mkdir failed: {}",
@@ -666,7 +745,7 @@ impl Sandbox for ForkdSandbox {
             shell_quote(&encoded),
             shell_quote(&abs_path)
         );
-        let resp = self.exec_in_vm(&cmd, Some(30_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 30).await?;
         if resp.exit_code != Some(0) {
             return Err(crate::Error::message(format!(
                 "forkd write_file failed (exit {:?}): {}",
@@ -680,7 +759,7 @@ impl Sandbox for ForkdSandbox {
     async fn delete_file(&self, path: &str) -> crate::Result<()> {
         let abs_path = self.resolve_path(path);
         let cmd = format!("rm -f {}", shell_quote(&abs_path));
-        let resp = self.exec_in_vm(&cmd, Some(10_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 10).await?;
         if resp.exit_code != Some(0) {
             return Err(crate::Error::message(format!(
                 "forkd delete_file failed (exit {:?}): {}",
@@ -694,7 +773,7 @@ impl Sandbox for ForkdSandbox {
     async fn file_exists(&self, path: &str) -> crate::Result<bool> {
         let abs_path = self.resolve_path(path);
         let cmd = format!("test -e {}", shell_quote(&abs_path));
-        let resp = self.exec_in_vm(&cmd, Some(10_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 10).await?;
         Ok(resp.exit_code == Some(0))
     }
 
@@ -711,7 +790,7 @@ impl Sandbox for ForkdSandbox {
             shell_quote(&abs_path),
             max_depth
         );
-        let resp = self.exec_in_vm(&cmd, Some(30_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 30).await?;
         if resp.exit_code != Some(0) && resp.exit_code != Some(1) {
             return Err(crate::Error::message(format!(
                 "forkd list_directory failed (exit {:?}): {}",
@@ -782,9 +861,7 @@ impl Sandbox for ForkdSandbox {
             .unwrap_or_default();
         if !parent.is_empty() {
             let mkdir_cmd = format!("mkdir -p {}", shell_quote(&parent));
-            let mkdir_resp = self
-                .exec_in_vm(&mkdir_cmd, Some(10_000), None, None)
-                .await?;
+            let mkdir_resp = self.exec_shell(&mkdir_cmd, 10).await?;
             if mkdir_resp.exit_code != Some(0) {
                 return Err(crate::Error::message(format!(
                     "forkd upload_file_from_local mkdir failed: {}",
@@ -798,7 +875,7 @@ impl Sandbox for ForkdSandbox {
             shell_quote(&encoded),
             shell_quote(&abs_path)
         );
-        let resp = self.exec_in_vm(&cmd, Some(60_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 60).await?;
         if resp.exit_code != Some(0) {
             return Err(crate::Error::message(format!(
                 "forkd upload_file_from_local failed (exit {:?}): {}",
@@ -837,7 +914,7 @@ impl Sandbox for ForkdSandbox {
         args.push(shell_quote(&abs_path));
 
         let cmd = args.join(" ");
-        let resp = self.exec_in_vm(&cmd, Some(60_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 60).await?;
 
         // Exit code 1 means no matches (not an error).
         if resp.exit_code != Some(0) && resp.exit_code != Some(1) {
@@ -854,9 +931,7 @@ impl Sandbox for ForkdSandbox {
             grep_args.push(shell_quote(&abs_path));
 
             let grep_cmd = grep_args.join(" ");
-            let grep_resp = self
-                .exec_in_vm(&grep_cmd, Some(60_000), None, None)
-                .await?;
+            let grep_resp = self.exec_shell(&grep_cmd, 60).await?;
             let stdout = grep_resp.stdout.unwrap_or_default();
             return Ok(stdout
                 .lines()
@@ -889,7 +964,7 @@ impl Sandbox for ForkdSandbox {
             shell_quote(&base),
             find_filter
         );
-        let resp = self.exec_in_vm(&cmd, Some(30_000), None, None).await?;
+        let resp = self.exec_shell(&cmd, 30).await?;
         let stdout = resp.stdout.unwrap_or_default();
         Ok(stdout
             .lines()
@@ -915,15 +990,18 @@ impl Sandbox for ForkdSandbox {
     }
 
     fn sandbox_info(&self) -> String {
-        format!("forkd:{}", self.vm_name)
+        match self.sandbox_id.get() {
+            Some(id) => format!("forkd:{id}"),
+            None     => "forkd:(uninitialized)".to_string(),
+        }
     }
 
     fn snapshot_info(&self) -> Option<String> {
-        self.config
-            .settings
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.image.clone())
+        // Prefer the server-reported active snapshot; fall back to what was requested.
+        self.active_snapshot
+            .get()
+            .cloned()
+            .or_else(|| Some(self.config.settings.snapshot_tag.clone()))
     }
 
     fn origin_url(&self) -> Option<&str> {

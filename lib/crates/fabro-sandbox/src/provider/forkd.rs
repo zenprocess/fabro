@@ -68,7 +68,7 @@ impl SandboxProvider for ForkdSandboxProvider {
 
     async fn list(&self) -> crate::Result<Vec<SandboxInfo>> {
         let client = self.http_client()?;
-        let url = format!("{}/vms", self.config.forkd_url);
+        let url = format!("{}/v1/sandboxes", self.config.forkd_url);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
         let mut attempt = 0u32;
@@ -112,18 +112,15 @@ impl SandboxProvider for ForkdSandboxProvider {
             .await
             .map_err(|e| crate::Error::context("Failed to parse forkd VM list", e))?;
 
-        // forkd 0.5.2 returns { "vms": [ { "name": "...", "status": "...", ... } ] }
-        let arr = vms
-            .get("vms")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // forkd 0.5.2 returns a top-level JSON array of sandbox objects, each
+        // carrying an "id" field.
+        let arr = vms.as_array().cloned().unwrap_or_default();
 
         let sandboxes = arr
             .into_iter()
             .filter_map(|vm| {
-                let name = vm.get("name")?.as_str()?.to_string();
-                Some(details::forkd::forkd_info_from_name(&name))
+                let id = vm.get("id")?.as_str()?.to_string();
+                Some(details::forkd::forkd_info_from_name(&id))
             })
             .collect();
 
@@ -132,7 +129,7 @@ impl SandboxProvider for ForkdSandboxProvider {
 
     async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>> {
         let client = self.http_client()?;
-        let url = format!("{}/vms/{}", self.config.forkd_url, id);
+        let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
         let mut attempt = 0u32;
@@ -195,18 +192,19 @@ impl SandboxProvider for ForkdSandboxProvider {
         };
 
         let sandbox = ForkdSandbox::new(merged_config, run_id, clone_origin_url, clone_branch);
-        // Capture the VM name before initialize() so we can report it on success.
-        let name = sandbox.vm_name().to_string();
-        // Actually provision the microVM (and optionally clone the repo) before
-        // returning.  Without this call the VM never exists and all subsequent
-        // operations on the returned SandboxInfo would fail.
+        // Provision the microVM first; forkd assigns the sandbox id, which we
+        // then report. Without initialize() the VM never exists and all
+        // subsequent operations on the returned SandboxInfo would fail.
         sandbox.initialize().await?;
-        Ok(details::forkd::forkd_info_from_name(&name))
+        let id = sandbox.sandbox_id().ok_or_else(|| {
+            crate::Error::message("forkd sandbox id missing after initialize")
+        })?;
+        Ok(details::forkd::forkd_info_from_name(id))
     }
 
     async fn delete(&self, id: &str) -> crate::Result<()> {
         let client = self.http_client()?;
-        let url = format!("{}/vms/{}", self.config.forkd_url, id);
+        let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
         let mut attempt = 0u32;

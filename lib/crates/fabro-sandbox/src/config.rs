@@ -159,15 +159,41 @@ pub enum ForkdNetwork {
 /// [`crate::forkd::ForkdConfig`] and is resolved from environment variables
 /// at provider construction time — it is not part of this per-run slice.
 #[cfg(feature = "forkd")]
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ForkdSettings {
-    /// VM image, kernel, memory, and package settings.
+    /// forkd snapshot tag to boot from (e.g. `"zen-gate-base"`).
+    /// Resolved from `FORKD_SNAPSHOT_TAG` env var; default `"zen-gate-base"`.
+    #[serde(default = "ForkdSettings::default_snapshot_tag")]
+    pub snapshot_tag:       String,
+    /// Legacy VM image/kernel/memory settings — retained for deserialization
+    /// backward compatibility.  Not sent to the forkd 0.5.2 API.
     pub snapshot:           Option<ForkdSnapshotSettings>,
-    /// Network isolation policy for the guest VM.
+    /// Legacy network isolation policy — retained for deserialization backward
+    /// compatibility.  Not sent to the forkd 0.5.2 API.
     pub network:            Option<ForkdNetwork>,
     /// Skip the repository clone step during `initialize()`.
     #[serde(default)]
     pub skip_clone:         bool,
     /// Auto-stop interval in minutes (`None` means no auto-stop).
     pub auto_stop_minutes:  Option<i32>,
+}
+
+#[cfg(feature = "forkd")]
+impl ForkdSettings {
+    fn default_snapshot_tag() -> String {
+        crate::forkd::DEFAULT_SNAPSHOT_TAG.to_string()
+    }
+}
+
+#[cfg(feature = "forkd")]
+impl Default for ForkdSettings {
+    fn default() -> Self {
+        Self {
+            snapshot_tag:      Self::default_snapshot_tag(),
+            snapshot:          None,
+            network:           None,
+            skip_clone:        false,
+            auto_stop_minutes: None,
+        }
+    }
 }
