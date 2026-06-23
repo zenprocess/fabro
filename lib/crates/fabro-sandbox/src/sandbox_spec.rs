@@ -192,7 +192,7 @@ impl SandboxSpec {
                 RunSandboxInstance {
                     provider: self.provider(),
                     image:    None,
-                    snapshot: None,
+                    snapshot: Some(config.settings.snapshot_tag.clone()),
                     runtime:  RunSandboxRuntime {
                         id,
                         working_directory: working_directory.clone(),
