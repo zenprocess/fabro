@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -20,6 +20,7 @@ use fabro_util::time::elapsed_ms;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ForkdSettings;
@@ -35,6 +36,11 @@ pub(crate) const REPOS_ROOT: &str = "/home/fabro/repos";
 /// Provider name string for event payloads.
 const PROVIDER: &str = "forkd";
 
+/// Maximum number of retry attempts for transient HTTP failures (5xx / connect).
+const HTTP_RETRY_LIMIT: u32 = 3;
+/// Initial backoff before the first retry.
+const HTTP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+
 // ---------------------------------------------------------------------------
 // Public config type (re-exported by lib.rs)
 // ---------------------------------------------------------------------------
@@ -42,14 +48,27 @@ const PROVIDER: &str = "forkd";
 /// Server-level connectivity for a forkd controller, plus per-sandbox runtime
 /// settings.  The URL and token are resolved from environment variables and
 /// must never be hardcoded.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ForkdConfig {
     /// Base URL of the forkd controller, e.g. `http://127.0.0.1:8889`.
     pub forkd_url:   String,
     /// Bearer token for the forkd controller API.
+    /// NEVER include the real value in log output — use `[redacted]`.
     pub forkd_token: String,
     /// Per-sandbox runtime settings (image, memory, network, skip_clone).
     pub settings:    ForkdSettings,
+}
+
+// Manual Debug implementation that redacts the bearer token so it never
+// appears in tracing output, panic messages, or error chains.
+impl std::fmt::Debug for ForkdConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForkdConfig")
+            .field("forkd_url", &self.forkd_url)
+            .field("forkd_token", &"[redacted]")
+            .field("settings", &self.settings)
+            .finish()
+    }
 }
 
 impl Default for ForkdConfig {
@@ -167,6 +186,11 @@ impl ForkdSandbox {
 
     fn http_client(&self) -> crate::Result<reqwest::Client> {
         reqwest::Client::builder()
+            // Hard cap on individual HTTP requests to the forkd controller.
+            // Exec calls use a per-request timeout via ExecRequest.timeout_ms;
+            // this is a safety net for connect + response-header receipt.
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| crate::Error::context("Failed to build HTTP client for forkd", e))
     }
@@ -175,8 +199,17 @@ impl ForkdSandbox {
         resolve_path(path, WORKING_DIRECTORY)
     }
 
+    /// Returns `true` if an HTTP status code is a transient server-side error
+    /// that is safe to retry (5xx range).
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status.is_server_error()
+    }
+
     /// Execute a shell command in the VM.  Returns the raw `ExecResponse`
     /// so the caller decides how to interpret exit code / output.
+    ///
+    /// Transient HTTP errors (connect failures and 5xx responses) are retried
+    /// up to `HTTP_RETRY_LIMIT` times with exponential back-off.
     async fn exec_in_vm(
         &self,
         command: &str,
@@ -194,28 +227,61 @@ impl ForkdSandbox {
             env:         env_vars.cloned(),
         };
 
-        let resp = client
-            .post(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context("forkd exec HTTP request failed", e))?;
+        let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .post(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .json(&body)
+                .send()
+                .await;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd exec returned {status}: {text}"
-            )));
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<ExecResponse>()
+                        .await
+                        .map_err(|e| crate::Error::context("Failed to parse forkd exec response", e));
+                }
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd exec transient error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd exec returned {status}: {text}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "forkd exec connect error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context("forkd exec HTTP request failed", e));
+                }
+            }
         }
-
-        resp.json::<ExecResponse>()
-            .await
-            .map_err(|e| crate::Error::context("Failed to parse forkd exec response", e))
     }
 
     /// Create the VM via `POST /vms`.
+    ///
+    /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
     async fn create_vm(&self) -> crate::Result<()> {
         let client = self.http_client()?;
         let url = format!("{}/vms", self.config.forkd_url);
@@ -240,49 +306,105 @@ impl ForkdSandbox {
             network: network_str,
         };
 
-        let resp = client
-            .post(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context("forkd create VM HTTP request failed", e))?;
+        let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .post(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .json(&body)
+                .send()
+                .await;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd create VM returned {status}: {text}"
-            )));
+            match result {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd create_vm transient error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd create VM returned {status}: {text}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "forkd create_vm connect error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context("forkd create VM HTTP request failed", e));
+                }
+            }
         }
-
-        Ok(())
     }
 
     /// Delete the VM via `DELETE /vms/{name}`.
+    ///
+    /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
     async fn delete_vm(&self) -> crate::Result<()> {
         let client = self.http_client()?;
         let url = format!("{}/vms/{}", self.config.forkd_url, self.vm_name);
 
-        let resp = client
-            .delete(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context("forkd delete VM HTTP request failed", e))?;
+        let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .delete(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .send()
+                .await;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+            match result {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(()),
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd delete_vm transient error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd delete VM returned {status}: {text}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "forkd delete_vm connect error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context("forkd delete VM HTTP request failed", e));
+                }
+            }
         }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd delete VM returned {status}: {text}"
-            )));
-        }
-
-        Ok(())
     }
 
     /// Clone a git repository into the VM working directory.
@@ -470,9 +592,12 @@ impl Sandbox for ForkdSandbox {
 
         let duration_ms = elapsed_ms(start);
         let exit_code = resp.exit_code;
+        // When forkd returns no exit code the process was killed, OOM-killed, or
+        // timed out by the controller.  We approximate using TimedOut; a future
+        // forkd API version may surface a richer termination reason.
         let termination = match exit_code {
             Some(_) => CommandTermination::Exited,
-            None => CommandTermination::Exited,
+            None => CommandTermination::TimedOut,
         };
 
         Ok(ExecResult {
@@ -643,8 +768,45 @@ impl Sandbox for ForkdSandbox {
         let bytes = tokio::fs::read(local_path)
             .await
             .map_err(|e| crate::Error::context("forkd upload_file_from_local read failed", e))?;
-        let content = String::from_utf8_lossy(&bytes);
-        self.write_file(remote_path, &content).await
+        // Binary-safe: base64-encode raw bytes and decode inside the VM, mirroring
+        // how read_file_bytes works in reverse.  String::from_utf8_lossy is
+        // deliberately avoided — it silently corrupts any non-UTF-8 byte sequence
+        // (e.g. compiled binaries, images, zip archives).
+        let abs_path = self.resolve_path(remote_path);
+        let encoded = BASE64.encode(&bytes);
+
+        // Ensure parent directory exists.
+        let parent = std::path::Path::new(&abs_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !parent.is_empty() {
+            let mkdir_cmd = format!("mkdir -p {}", shell_quote(&parent));
+            let mkdir_resp = self
+                .exec_in_vm(&mkdir_cmd, Some(10_000), None, None)
+                .await?;
+            if mkdir_resp.exit_code != Some(0) {
+                return Err(crate::Error::message(format!(
+                    "forkd upload_file_from_local mkdir failed: {}",
+                    mkdir_resp.stderr.unwrap_or_default()
+                )));
+            }
+        }
+
+        let cmd = format!(
+            "echo {} | base64 -d > {}",
+            shell_quote(&encoded),
+            shell_quote(&abs_path)
+        );
+        let resp = self.exec_in_vm(&cmd, Some(60_000), None, None).await?;
+        if resp.exit_code != Some(0) {
+            return Err(crate::Error::message(format!(
+                "forkd upload_file_from_local failed (exit {:?}): {}",
+                resp.exit_code,
+                resp.stderr.unwrap_or_default()
+            )));
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -710,10 +872,22 @@ impl Sandbox for ForkdSandbox {
         let base = path
             .map(|p| self.resolve_path(p))
             .unwrap_or_else(|| WORKING_DIRECTORY.to_string());
+        // Use `-name` for patterns without a directory separator (e.g. `*.rs`,
+        // `Cargo.toml`) so they match at any depth without a spurious `*/` prefix
+        // that would require at least one intermediate directory and would miss
+        // files directly inside `base`.
+        //
+        // Use `-path` only when the caller supplies a path-qualified pattern
+        // (e.g. `src/*.rs`), anchoring it to `<base>/` so the search is rooted.
+        let find_filter = if pattern.contains('/') {
+            format!("-path {}", shell_quote(&format!("{base}/{pattern}")))
+        } else {
+            format!("-name {}", shell_quote(pattern))
+        };
         let cmd = format!(
-            r#"find {} -path {} -print 2>/dev/null"#,
+            "find {} {} -print 2>/dev/null",
             shell_quote(&base),
-            shell_quote(&format!("*/{pattern}"))
+            find_filter
         );
         let resp = self.exec_in_vm(&cmd, Some(30_000), None, None).await?;
         let stdout = resp.stdout.unwrap_or_default();
