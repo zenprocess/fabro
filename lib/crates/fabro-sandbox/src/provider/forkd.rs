@@ -1,9 +1,16 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use fabro_types::{SandboxInfo, SandboxProviderKind};
+use tokio::time::sleep;
 
 use super::{SandboxCreateSpec, SandboxProvider};
 use crate::forkd::{ForkdConfig, ForkdSandbox};
 use crate::details;
+
+/// Retry limit for transient HTTP failures (5xx / connect) in provider calls.
+const PROVIDER_RETRY_LIMIT: u32 = 3;
+const PROVIDER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 
 /// A [`SandboxProvider`] that creates Firecracker microVMs via a forkd
 /// controller.  The controller URL and bearer token are resolved once at
@@ -42,8 +49,14 @@ impl ForkdSandboxProvider {
 
     fn http_client(&self) -> crate::Result<reqwest::Client> {
         reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| crate::Error::context("Failed to build HTTP client for forkd", e))
+    }
+
+    fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+        status.is_server_error()
     }
 }
 
@@ -56,20 +69,43 @@ impl SandboxProvider for ForkdSandboxProvider {
     async fn list(&self) -> crate::Result<Vec<SandboxInfo>> {
         let client = self.http_client()?;
         let url = format!("{}/vms", self.config.forkd_url);
-        let resp = client
-            .get(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context("Failed to list forkd VMs", e))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd list VMs returned {status}: {body}"
-            )));
-        }
+        let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        let resp = loop {
+            let result = client
+                .get(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(attempt, status = status.as_u16(), "forkd list transient error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd list VMs returned {status}: {body}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < PROVIDER_RETRY_LIMIT => {
+                    tracing::warn!(attempt, error = %e, "forkd list connect error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context("Failed to list forkd VMs", e));
+                }
+            }
+        };
 
         let vms: serde_json::Value = resp
             .json()
@@ -97,25 +133,46 @@ impl SandboxProvider for ForkdSandboxProvider {
     async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>> {
         let client = self.http_client()?;
         let url = format!("{}/vms/{}", self.config.forkd_url, id);
-        let resp = client
-            .get(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context(format!("Failed to get forkd VM '{id}'"), e))?;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd get VM '{id}' returned {status}: {body}"
-            )));
-        }
+        let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .get(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .send()
+                .await;
 
-        Ok(Some(details::forkd::forkd_info_from_name(id)))
+            match result {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                Ok(resp) if resp.status().is_success() => {
+                    return Ok(Some(details::forkd::forkd_info_from_name(id)));
+                }
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(attempt, status = status.as_u16(), "forkd get transient error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd get VM '{id}' returned {status}: {body}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < PROVIDER_RETRY_LIMIT => {
+                    tracing::warn!(attempt, error = %e, "forkd get connect error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context(format!("Failed to get forkd VM '{id}'"), e));
+                }
+            }
+        }
     }
 
     async fn create(&self, spec: SandboxCreateSpec) -> crate::Result<SandboxInfo> {
@@ -138,32 +195,58 @@ impl SandboxProvider for ForkdSandboxProvider {
         };
 
         let sandbox = ForkdSandbox::new(merged_config, run_id, clone_origin_url, clone_branch);
+        // Capture the VM name before initialize() so we can report it on success.
         let name = sandbox.vm_name().to_string();
+        // Actually provision the microVM (and optionally clone the repo) before
+        // returning.  Without this call the VM never exists and all subsequent
+        // operations on the returned SandboxInfo would fail.
+        sandbox.initialize().await?;
         Ok(details::forkd::forkd_info_from_name(&name))
     }
 
     async fn delete(&self, id: &str) -> crate::Result<()> {
         let client = self.http_client()?;
         let url = format!("{}/vms/{}", self.config.forkd_url, id);
-        let resp = client
-            .delete(&url)
-            .bearer_auth(&self.config.forkd_token)
-            .send()
-            .await
-            .map_err(|e| crate::Error::context(format!("Failed to delete forkd VM '{id}'"), e))?;
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            // Already gone — treat as success.
-            return Ok(());
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(crate::Error::message(format!(
-                "forkd delete VM '{id}' returned {status}: {body}"
-            )));
-        }
+        let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .delete(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .send()
+                .await;
 
-        Ok(())
+            match result {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    // Already gone — treat as success.
+                    return Ok(());
+                }
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(attempt, status = status.as_u16(), "forkd delete transient error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(crate::Error::message(format!(
+                        "forkd delete VM '{id}' returned {status}: {body}"
+                    )));
+                }
+                Err(e) if e.is_connect() && attempt < PROVIDER_RETRY_LIMIT => {
+                    tracing::warn!(attempt, error = %e, "forkd delete connect error; retrying");
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(crate::Error::context(format!("Failed to delete forkd VM '{id}'"), e));
+                }
+            }
+        }
     }
 }
