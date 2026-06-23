@@ -6,7 +6,7 @@ use tokio::time::sleep;
 
 use super::{SandboxCreateSpec, SandboxProvider};
 use crate::forkd::{ForkdConfig, ForkdSandbox};
-use crate::details;
+use crate::{Sandbox, details};
 
 /// Retry limit for transient HTTP failures (5xx / connect) in provider calls.
 const PROVIDER_RETRY_LIMIT: u32 = 3;
