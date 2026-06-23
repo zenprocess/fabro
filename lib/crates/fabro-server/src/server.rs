@@ -72,6 +72,8 @@ use fabro_sandbox::{
     DaytonaSandboxProvider, DockerSandboxProvider, LocalSandboxProvider, Sandbox, SandboxProvider,
     SandboxProviderRegistry,
 };
+#[cfg(feature = "forkd")]
+use fabro_sandbox::ForkdSandboxProvider;
 use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
 use fabro_slack::config::{
     SlackCredentialResolution,
@@ -2259,6 +2261,9 @@ fn build_sandbox_provider_registry(
             http_client,
         )));
     }
+
+    #[cfg(feature = "forkd")]
+    providers.push(Arc::new(ForkdSandboxProvider::from_env()));
 
     SandboxProviderRegistry::new(providers)
 }
