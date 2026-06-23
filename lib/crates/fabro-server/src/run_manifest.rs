@@ -711,6 +711,11 @@ fn environment_capability_warnings(resolved_run: &RunNamespace) -> Vec<String> {
                 warnings.push("daytona provider ignores cwd".to_string());
             }
         }
+        EnvironmentProvider::Forkd => {
+            if environment.cwd.is_some() {
+                warnings.push("forkd provider ignores cwd".to_string());
+            }
+        }
     }
     warnings
 }

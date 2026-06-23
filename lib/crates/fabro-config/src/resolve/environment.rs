@@ -243,5 +243,7 @@ fn validate_provider_capabilities(
             }
         }
         EnvironmentProvider::Daytona => {}
+        // Forkd microVMs are full VMs and can enforce any network mode.
+        EnvironmentProvider::Forkd => {}
     }
 }

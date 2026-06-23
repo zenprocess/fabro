@@ -57,6 +57,17 @@ preserve = false
 stop_on_terminal = true
 "#;
 
+const FORKD_DEFAULT_ENVIRONMENT_TOML: &str = r#"provider = "forkd"
+
+[resources]
+cpu = 2
+memory = "4GB"
+
+[lifecycle]
+preserve = false
+stop_on_terminal = true
+"#;
+
 const LOCAL_ENVIRONMENT_TOML: &str = r#"provider = "local"
 "#;
 
@@ -292,6 +303,7 @@ pub fn seed_default_environment(
     let content = match provider {
         EnvironmentProvider::Docker => DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Daytona => DAYTONA_DEFAULT_ENVIRONMENT_TOML,
+        EnvironmentProvider::Forkd => FORKD_DEFAULT_ENVIRONMENT_TOML,
         EnvironmentProvider::Local => LOCAL_ENVIRONMENT_TOML,
     };
     let path = dir.join(format!("{DEFAULT_ENVIRONMENT_ID}.toml"));
