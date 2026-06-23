@@ -20,7 +20,7 @@ use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment,
-    local_working_directory_from_environment,
+    forkd_config_from_environment, local_working_directory_from_environment,
 };
 use fabro_sandbox::redact::redact_auth_url;
 use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
@@ -648,6 +648,11 @@ fn resolve_docker_config(settings: &RunNamespace) -> DockerSandboxOptions {
     docker_config_from_environment(&settings.environment, !settings.clone.enabled)
 }
 
+#[cfg(feature = "forkd")]
+fn resolve_forkd_config(settings: &RunNamespace) -> fabro_sandbox::ForkdConfig {
+    forkd_config_from_environment(&settings.environment, !settings.clone.enabled)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GitRemoteRefCheck {
     origin_url: String,
@@ -656,7 +661,9 @@ struct GitRemoteRefCheck {
 
 fn clone_disabled_for_provider(provider: SandboxProviderKind, resolved_run: &RunNamespace) -> bool {
     match provider {
-        SandboxProviderKind::Docker | SandboxProviderKind::Daytona => !resolved_run.clone.enabled,
+        SandboxProviderKind::Docker | SandboxProviderKind::Daytona | SandboxProviderKind::Forkd => {
+            !resolved_run.clone.enabled
+        }
         SandboxProviderKind::Local => false,
     }
 }
@@ -908,6 +915,23 @@ fn preflight_sandbox_spec(
                 clone_branch,
                 api_key: daytona_api_key,
             }
+        }
+        #[cfg(feature = "forkd")]
+        SandboxProviderKind::Forkd => {
+            let mut config = resolve_forkd_config(resolved_run);
+            config.settings.skip_clone = true;
+            SandboxSpec::Forkd {
+                config: Box::new(config),
+                run_id: None,
+                clone_origin_url,
+                clone_branch,
+            }
+        }
+        #[cfg(not(feature = "forkd"))]
+        SandboxProviderKind::Forkd => {
+            return Err(fabro_sandbox::Error::message(
+                "Forkd sandbox support is not enabled",
+            ));
         }
     })
 }
