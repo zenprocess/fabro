@@ -11,6 +11,8 @@ use fabro_types::settings::run::{EnvironmentNetworkMode, RunEnvironmentSettings}
 #[cfg(feature = "forkd")]
 use crate::config::{ForkdNetwork, ForkdSettings, ForkdSnapshotSettings};
 #[cfg(feature = "forkd")]
+use crate::forkd::DEFAULT_SNAPSHOT_TAG;
+#[cfg(feature = "forkd")]
 use crate::forkd::ForkdConfig;
 
 #[cfg(feature = "daytona")]
@@ -150,10 +152,18 @@ pub fn forkd_config_from_environment(
         }
     };
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Forkd config resolves snapshot tag from the process environment."
+    )]
+    let snapshot_tag = std::env::var("FORKD_SNAPSHOT_TAG")
+        .unwrap_or_else(|_| DEFAULT_SNAPSHOT_TAG.to_string());
+
     ForkdConfig {
         forkd_url,
         forkd_token,
         settings: ForkdSettings {
+            snapshot_tag,
             snapshot:          Some(snapshot),
             network:           Some(network),
             skip_clone,

@@ -40,6 +40,9 @@ pub fn seeded_catalog_layer() -> MergeMap<EnvironmentLayer> {
     let local: EnvironmentLayer = toml::from_str(LOCAL_ENVIRONMENT_TOML)
         .expect("built-in local environment seed should parse");
     catalog.insert(RESERVED_LOCAL_ID.to_string(), local);
+    let forkd: EnvironmentLayer = toml::from_str(FORKD_DEFAULT_ENVIRONMENT_TOML)
+        .expect("built-in forkd environment seed should parse");
+    catalog.insert("forkd".to_string(), forkd);
     MergeMap::from(catalog)
 }
 
