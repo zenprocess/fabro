@@ -121,3 +121,53 @@ pub struct DaytonaSnapshotSettings {
     pub disk:       Option<i32>,
     pub dockerfile: Option<DockerfileSource>,
 }
+
+// ---------------------------------------------------------------------------
+// Forkd microVM sandbox configuration types
+// ---------------------------------------------------------------------------
+
+/// Per-VM image and resource settings for a Forkd sandbox.
+#[cfg(feature = "forkd")]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ForkdSnapshotSettings {
+    /// OCI image name for the microVM rootfs, e.g. "python:3.12-slim".
+    pub image:          Option<String>,
+    /// Path to the vmlinux kernel blob on the forkd host; resolved from
+    /// `FORKD_KERNEL` env var when absent.
+    pub kernel:         Option<String>,
+    /// Guest memory in MiB; the forkd controller default is 1536.
+    pub mem_mib:        Option<u32>,
+    /// Comma-separated list of extra apt packages to install at VM boot.
+    pub extra_packages: Option<String>,
+}
+
+/// Network isolation mode for a Forkd microVM.
+#[cfg(feature = "forkd")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ForkdNetwork {
+    /// Block all outbound traffic (default).
+    Block,
+    /// Allow all outbound traffic.
+    AllowAll,
+    /// Allow only the specified CIDR ranges.
+    AllowList(Vec<String>),
+}
+
+/// Per-sandbox runtime configuration passed in `SandboxCreateSpec::Forkd`.
+///
+/// Server-level connectivity (`forkd_url`, `forkd_token`) lives on
+/// [`crate::forkd::ForkdConfig`] and is resolved from environment variables
+/// at provider construction time — it is not part of this per-run slice.
+#[cfg(feature = "forkd")]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ForkdSettings {
+    /// VM image, kernel, memory, and package settings.
+    pub snapshot:           Option<ForkdSnapshotSettings>,
+    /// Network isolation policy for the guest VM.
+    pub network:            Option<ForkdNetwork>,
+    /// Skip the repository clone step during `initialize()`.
+    #[serde(default)]
+    pub skip_clone:         bool,
+    /// Auto-stop interval in minutes (`None` means no auto-stop).
+    pub auto_stop_minutes:  Option<i32>,
+}

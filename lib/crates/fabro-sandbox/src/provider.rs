@@ -2,6 +2,8 @@
 pub mod daytona;
 #[cfg(feature = "docker")]
 pub mod docker;
+#[cfg(feature = "forkd")]
+pub mod forkd;
 
 use std::sync::Arc;
 
@@ -21,6 +23,8 @@ use futures::future::join_all;
 use crate::daytona::DaytonaConfig;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandboxOptions;
+#[cfg(feature = "forkd")]
+use crate::config::ForkdSettings;
 
 pub enum SandboxCreateSpec {
     Local,
@@ -40,6 +44,22 @@ pub enum SandboxCreateSpec {
         clone_origin_url: Option<String>,
         clone_branch:     Option<String>,
         api_key:          Option<String>,
+    },
+    /// Create a Forkd Firecracker microVM sandbox.
+    ///
+    /// The forkd controller URL and bearer token are resolved at provider
+    /// construction time from `FORKD_URL` / `FORKD_TOKEN` — they are not
+    /// part of this per-run spec.
+    #[cfg(feature = "forkd")]
+    Forkd {
+        /// Per-run VM settings (image, kernel, memory, network, skip_clone).
+        config:           Box<ForkdSettings>,
+        /// Optional run identifier; used to name the VM "fabro-{run_id}".
+        run_id:           Option<RunId>,
+        /// Git repository to clone on `initialize()`.
+        clone_origin_url: Option<String>,
+        /// Branch override for the initial clone.
+        clone_branch:     Option<String>,
     },
 }
 
