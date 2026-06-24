@@ -126,7 +126,7 @@ fn manifest_path_is_within_root(path: &ManifestPath, root: &ManifestPath) -> boo
 pub struct FileInliningTransform {
     current_dir:   PathBuf,
     resolver:      Arc<dyn FileResolver>,
-    inputs:        HashMap<String, toml::Value>,
+    context:       TemplateContext,
     source_name:   Option<String>,
     source_text:   Option<String>,
     goal_override: Option<String>,
@@ -139,7 +139,7 @@ impl FileInliningTransform {
         Self {
             current_dir,
             resolver,
-            inputs: HashMap::new(),
+            context: TemplateContext::new(),
             source_name: None,
             source_text: None,
             goal_override: None,
@@ -150,12 +150,12 @@ impl FileInliningTransform {
     #[must_use]
     pub fn with_template_options(
         mut self,
-        inputs: HashMap<String, toml::Value>,
+        context: TemplateContext,
         source_name: Option<String>,
         source_text: Option<String>,
         render_mode: RenderMode,
     ) -> Self {
-        self.inputs = inputs;
+        self.context = context;
         self.source_name = source_name;
         self.source_text = source_text;
         self.render_mode = render_mode;
@@ -165,6 +165,13 @@ impl FileInliningTransform {
     #[must_use]
     pub fn with_goal_override(mut self, goal: Option<String>) -> Self {
         self.goal_override = goal;
+        self
+    }
+
+    /// Run-scoped `{{ vars.* }}` available to prompts and the goal.
+    #[must_use]
+    pub fn with_vars(mut self, vars: HashMap<String, String>) -> Self {
+        self.context = self.context.with_vars(vars);
         self
     }
 
@@ -183,9 +190,7 @@ impl FileInliningTransform {
             // pass owns canonical goal validation diagnostics.
             None => graph.goal().to_string(),
         };
-        let ctx = TemplateContext::new()
-            .with_goal(resolved_goal)
-            .with_inputs(self.inputs.clone());
+        let ctx = self.context.clone().with_goal(resolved_goal);
 
         for (node_id, node) in &mut graph.nodes {
             // `prompt` is an importable template: MiniJinja-render the value,
@@ -248,7 +253,7 @@ impl FileInliningTransform {
         let Some(AttrValue::String(goal)) = graph.attrs.get("goal") else {
             return Ok(());
         };
-        let ctx = TemplateContext::for_input_scan(self.inputs.clone());
+        let ctx = self.context.clone().with_goal("{{ goal }}");
         let target = TemplateRenderTarget::graph_attr(self.source_name.clone(), "goal")
             .with_source_origin(self.source_text.as_deref(), goal)
             .with_template_store(template_render_store(
