@@ -1017,7 +1017,7 @@ mod run_agent_mcps {
     //! Layer + resolver tests for `[run.agent.mcps]`: same-key replacement
     //! across layers (`StickyMap`) and honoring `enabled = false`.
 
-    use fabro_types::settings::run::McpTransport;
+    use fabro_types::settings::run::{McpTransport, ResolvedMcpEntry};
 
     use crate::SettingsLayer;
     use crate::layers::Combine;
@@ -1028,8 +1028,9 @@ mod run_agent_mcps {
             .expect("fixture should parse via SettingsLayer")
     }
 
-    fn stdio_command(transport: &McpTransport) -> &[String] {
-        match transport {
+    fn stdio_command(entry: &ResolvedMcpEntry) -> &[String] {
+        let server = entry.as_resolved().expect("expected resolved inline entry");
+        match &server.transport {
             McpTransport::Stdio { command, .. } => command,
             other => panic!("expected stdio transport, got {other:?}"),
         }
@@ -1071,7 +1072,7 @@ command = ["extra-server"]
 
         // Same-key `fs` is replaced by the higher layer; different-key `extra`
         // is additive and inherited from the lower layer.
-        assert_eq!(stdio_command(&mcps["fs"].transport), &[
+        assert_eq!(stdio_command(&mcps["fs"]), &[
             "fs-server".to_string(),
             "--workflow".to_string()
         ],);
