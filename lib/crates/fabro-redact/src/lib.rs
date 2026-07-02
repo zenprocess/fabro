@@ -8,9 +8,13 @@ mod entropy;
 mod gitleaks;
 mod jsonl;
 mod safe_url;
+mod secret_registry;
 
 pub use jsonl::{redact_json_value, redact_jsonl_line};
 pub use safe_url::{DisplaySafeUrl, DisplaySafeUrlError};
+pub use secret_registry::SecretRedactor;
+
+pub(crate) const REDACTION_MARKER: &str = "REDACTED";
 
 /// Redact a URL string for log or error output.
 ///
@@ -41,7 +45,14 @@ pub struct Region {
 pub fn redact_string(s: &str) -> String {
     let mut regions = entropy::find_entropy_regions(s);
     regions.extend(gitleaks::find_gitleaks_regions(s));
+    redact_regions(s, regions)
+}
 
+/// Replace each region of `s` with [`REDACTION_MARKER`].
+///
+/// Regions may be unsorted and overlapping; they are sorted by start and
+/// overlapping regions are merged so the union is redacted as a single marker.
+pub(crate) fn redact_regions(s: &str, mut regions: Vec<Region>) -> String {
     if regions.is_empty() {
         return s.to_string();
     }
@@ -65,7 +76,7 @@ pub fn redact_string(s: &str) -> String {
     let mut prev = 0;
     for r in &merged {
         result.push_str(&s[prev..r.start]);
-        result.push_str("REDACTED");
+        result.push_str(REDACTION_MARKER);
         prev = r.end;
     }
     result.push_str(&s[prev..]);
