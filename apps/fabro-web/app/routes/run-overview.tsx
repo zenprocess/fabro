@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ApiError } from "../lib/api-client";
-import { useRun, useRunGraph, useRunStages } from "../lib/queries";
+import { useRun, useRunGraph, useRunGraphSource, useRunStages } from "../lib/queries";
 import { FloatingTooltip } from "../components/floating-tooltip";
 import { RunSummaryPanel } from "../components/run-summary-panel";
 import { StagePopover } from "../components/stage-popover";
@@ -24,9 +24,20 @@ export const handle = { wide: true, fullHeight: true };
 
 type Direction = "LR" | "TB";
 
+// Mirrors fabro-graphviz's RANKDIR_RE (lib/crates/fabro-graphviz/src/render.rs) —
+// keep the accepted `rankdir=` syntax in sync with that regex.
+const RANKDIR_RE = /rankdir\s*=\s*(\w+)/;
+
+function parseSourceDirection(source: string | undefined): Direction | undefined {
+  const value = source?.match(RANKDIR_RE)?.[1];
+  return value === "LR" || value === "TB" ? value : undefined;
+}
+
 export default function RunOverview() {
   const { id } = useParams();
-  const [direction, setDirection] = useState<Direction>("LR");
+  const [direction, setDirection] = useState<Direction | undefined>(undefined);
+  const sourceQuery = useRunGraphSource(id, direction === undefined);
+  const activeDirection = direction ?? parseSourceDirection(sourceQuery.data ?? undefined) ?? "TB";
   const stagesQuery = useRunStages(id);
   const graphQuery = useRunGraph(id, direction);
   const runQuery = useRun(id);
@@ -127,7 +138,7 @@ export default function RunOverview() {
         ) : graphSvg ? (
           <div className="graph-svg relative flex min-h-0 flex-1 flex-col rounded-md border border-line bg-panel-alt">
             <GraphToolbar
-              direction={direction}
+              direction={activeDirection}
               setDirection={setDirection}
               fitToWindow={fitToWindow}
               zoomIndex={zoomIndex}
