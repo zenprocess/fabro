@@ -5,10 +5,13 @@
 # =============================================================================
 #
 # WHY THIS EXISTS (grounded in the build-speed findings)
-#   * dellsrv is NATIVE amd64 Linux. The Mac worker compiles under
-#     `docker run --platform linux/amd64` on OrbStack = QEMU emulation, a large
-#     hidden cost. Running the identical build natively on dellsrv is the single
-#     biggest, zero-code win — this script drops the emulation.
+#   * The Mac (Intel Xeon W-3235 — x86_64, so --platform linux/amd64 is NATIVE,
+#     no QEMU; an earlier revision of this header claimed emulation, which was
+#     wrong for this box) still pays two real costs building locally: the build
+#     pins the operator's workstation (observed: OrbStack at 1673% CPU / 27 GB),
+#     and it re-resolves toolchains every run. dellsrv is a build TIER: identical
+#     amd64 output, off the operator's machine, with persistent cargo-chef +
+#     sccache caches on the daemon.
 #   * dellsrv has Docker 29.1.3 but NO host cargo/rustc. So we build inside a
 #     container (docker/Dockerfile.chef), NOT with a native host toolchain. We
 #     deliberately do not install rustup/mold/sccache onto the live infra box.
@@ -86,7 +89,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)"
 IMAGE_TAG="${IMAGE_TAG:-build-speed-$SHORT_SHA}"
 
-REMOTE_DIR="/data/fabro-build/${TARGET}"   # /data has 1.4T free on dellsrv
+# Remote build dir. Default is a path under the ssh user's HOME (a relative path
+# resolves against the remote login home for mkdir/rsync/cd alike) so the build
+# works as a non-root user. Override with FABRO_REMOTE_BUILD_DIR for a bespoke
+# volume. NOTE: /data on dellsrv is root:root (non-writable by the build user),
+# so it is NOT the default — using it silently failed the rsync with mkdir EACCES.
+REMOTE_DIR="${FABRO_REMOTE_BUILD_DIR:-fabro-build}/${TARGET}"
 REMOTE_SECRET=""                            # set later if S3 enabled
 
 log()  { printf '\033[1;34m[build-on-dellsrv]\033[0m %s\n' "$*"; }
@@ -164,7 +172,7 @@ else
 fi
 
 # --------------------------------- build -------------------------------------
-# Native amd64 (NO --platform, so no OrbStack/QEMU emulation). Peak memory is
+# Native amd64 (NO --platform needed on the amd64 host). Peak memory is
 # bounded by CARGO_BUILD_JOBS (the real lever on this RAM-bound box) rather than
 # `docker build --memory`, which BuildKit does not enforce per RUN step. The
 # MEMORY var is advisory; operators needing a hard cgroup cap should run

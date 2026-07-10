@@ -15,7 +15,7 @@ Four independent speedups, stackable, plus one structural win:
 
 | # | Lever | Where | Effect |
 |---|-------|-------|--------|
-| 0 | **Native amd64** (drop OrbStack `--platform` QEMU emulation) | `scripts/build-on-dellsrv.sh` | Biggest, zero-code win: the Mac worker compiles `--platform linux/amd64` under QEMU; dellsrv is native amd64. |
+| 0 | **Builder tier: off the Mac** | `scripts/build-on-dellsrv.sh` | The Mac is an Intel Xeon (x86_64) so `--platform linux/amd64` is native, NOT QEMU (earlier revision of this row was wrong) — but local builds pin the operator's workstation (observed 1673% CPU / 27 GB in OrbStack) and rebuild toolchains each run. dellsrv gives identical native amd64 output, off-machine, with persistent chef/sccache caches. |
 | 1 | **cargo-chef** | `docker/Dockerfile.chef` | Dependency compile becomes a cached Docker layer; source-only edits skip the ~819-crate dep build. |
 | 2 | **sccache → MinIO S3** | `Dockerfile.chef` + `build-on-dellsrv.sh` | Per-`rustc`-unit compile cache, shared across runs/hosts via `store-api.zp.digital`. |
 | 3 | **mold** linker | baked into the builder image | Faster link step for the musl/gnu artifact. |
@@ -127,8 +127,12 @@ change rebuilds fast.
 These are **estimates from the mechanics**, to be confirmed in the Verify phase
 on dellsrv (no build was run while authoring these files):
 
-- **Native amd64 vs Mac QEMU**: commonly 3–5× on the raw compile, just from
-  dropping emulation. Biggest single win, zero code.
+- **Off-machine + persistent caches vs ad-hoc local docker builds**: the win is
+  NOT emulation removal (the Intel Mac is already native amd64) — it is (a) the
+  operator's workstation stays free, and (b) the dep layer + sccache persist
+  across runs (measured on dellsrv: cold cook 587s for ~800 dep crates; no-change
+  rebuild 6s via full layer cache-hit; code-only change keeps the dep cook fully
+  cached and rebuilds only workspace crates).
 - **cargo-chef, code-only edit**: up to ~5× — the dep-compile layer is cached, so
   only the workspace crates that changed recompile. Cold (deps changed) build
   gets no chef benefit by itself.

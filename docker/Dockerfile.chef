@@ -53,10 +53,16 @@ ARG MUSL_CROSS_TAG=x86_64-musl
 ARG CARGO_CHEF_VERSION=0.1.77
 ARG SCCACHE_VERSION=0.16.0
 ARG TARGET=x86_64-unknown-linux-musl
-# USE_MOLD=1 activates the mold linker inside the builder (safe here because the
-# image installs mold). Set to 0 if the musl-cross gcc rejects -fuse-ld=mold on
-# your base tag; the build still succeeds, just without the link-time speedup.
-ARG USE_MOLD=1
+# USE_MOLD=1 wires the mold linker via `-fuse-ld=mold`. DEFAULT 0, because the
+# current messense/rust-musl-cross:x86_64-musl tag ships mold 1.0.3 + an OLD
+# musl-cross gcc whose collect2 does NOT honour `-fuse-ld=mold` — it fails the
+# final link with `collect2: fatal error: cannot find 'ld'` (verified 2026-07-10;
+# `ld.mold` symlink is present but the toolchain can't resolve it). Plain linking
+# works, so USE_MOLD=0 is the safe default. mold buys only a few seconds on the
+# single final binary link anyway; the real speedup is cargo-chef + sccache. Set
+# USE_MOLD=1 only after bumping to a base tag with gcc >= 12.1 (bare -fuse-ld=mold)
+# or wiring `-B<mold-wrapper-dir>` for the old gcc.
+ARG USE_MOLD=0
 
 # -----------------------------------------------------------------------------
 # Stage 1: chef — toolchain base with cargo-chef, sccache and mold installed.
@@ -92,10 +98,16 @@ RUN cargo install --locked cargo-chef --version "${CARGO_CHEF_VERSION}"
 # Bake a builder-local cargo config that turns on sccache and (optionally) mold.
 #   * RUSTC_WRAPPER=sccache degrades gracefully to a LOCAL disk cache when no
 #     SCCACHE_* S3 env is present, so this stays safe without secrets.
-#   * mold is wired via rustflags on the musl triple. gcc >= 12.1 accepts a bare
-#     `-fuse-ld=mold` (must be on PATH; gcc rejects absolute paths). This lives
-#     in the IMAGE's CARGO_HOME, never in the repo's committed .cargo/config.toml
-#     (which must stay mold-free so the Mac and CI without mold don't break).
+#   * mold is wired via rustflags on a cfg(target_os="linux") table, NOT the
+#     concrete [target.<triple>] one: the rust-musl-cross base image already ships
+#     a [target.x86_64-unknown-linux-musl] table (setting `linker`), so appending a
+#     second concrete header is a TOML duplicate-key error that breaks EVERY cargo
+#     call (even the non-compiling `cargo chef prepare`). The cfg table is a distinct
+#     header, applies additively to the musl (linux) build, and leaves the base
+#     linker intact. gcc >= 12.1 accepts a bare `-fuse-ld=mold` (must be on PATH;
+#     gcc rejects absolute paths). This lives in the IMAGE's CARGO_HOME, never in
+#     the repo's committed .cargo/config.toml (which must stay mold-free so the Mac
+#     and CI without mold don't break).
 ENV RUSTC_WRAPPER=sccache \
     SCCACHE_DIR=/root/.cache/sccache
 RUN set -eux; \
@@ -103,7 +115,7 @@ RUN set -eux; \
     { \
       echo '# Injected by docker/Dockerfile.chef — builder-image only.'; \
       if [ "${USE_MOLD}" = "1" ]; then \
-        echo "[target.${TARGET}]"; \
+        echo "[target.'cfg(target_os = \"linux\")']"; \
         echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]"; \
       fi; \
     } >> "$CH/config.toml"; \
