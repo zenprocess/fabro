@@ -1,0 +1,167 @@
+# syntax=docker/dockerfile:1.9
+#
+# =============================================================================
+# Fabro accelerated builder — cargo-chef + sccache + mold
+# =============================================================================
+#
+# PURPOSE
+#   This is an ADDITIVE, greenfield builder image. It does NOT replace the
+#   root ./Dockerfile (which is runtime-only: it FROMs dhi-alpine-base and
+#   COPYs a *pre-built* static binary from tmp/docker-context/${TARGETARCH}/fabro).
+#   The actual Rust compile has historically happened outside that image via a
+#   plain `docker run rust ... cargo build`. This file is that compile, but
+#   layered with three cache/speed mechanisms so source-only edits rebuild in
+#   seconds instead of recompiling the full ~819-crate dependency closure.
+#
+#   Speedups stacked here (see docs/BUILD-SPEED.md for the full write-up):
+#     1. cargo-chef  — dependency compilation is a stable Docker layer that
+#                      only busts when Cargo.lock / manifests change.
+#     2. sccache     — per-rustc-unit compile cache; local by default, backed
+#                      by MinIO S3 when SCCACHE_* env is injected at build time.
+#     3. mold        — fast linker (opt-in via USE_MOLD build-arg; see notes).
+#
+# TARGET (grounded correction)
+#   The SHIPPED container binary is musl-static, NOT gnu. The root Dockerfile's
+#   header documents:
+#       tmp/docker-context/amd64/fabro  -> x86_64-unknown-linux-musl
+#       tmp/docker-context/arm64/fabro  -> aarch64-unknown-linux-musl
+#   So this builder defaults to x86_64-unknown-linux-musl and uses a musl-cross
+#   base image. (An earlier plan premise said "gnu" — it was wrong for the
+#   shipped artifact.) Override TARGET for aarch64 or a gnu dev build.
+#
+# CANONICAL BUILD COMMAND (from .github/workflows/release.yml)
+#   release.yml compiles the musl artifact with `cargo zigbuild --locked
+#   --target <triple> --release -p fabro-cli`. This builder uses plain
+#   `cargo build` (mold-linkable) instead of zigbuild, because zig ships its
+#   own lld-based linker and would ignore -fuse-ld=mold. The output binary is
+#   the same fabro-cli bin named `fabro`.
+#
+# BUILD (produces the musl binary at tmp/docker-context/amd64/fabro):
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.chef \
+#     --target export --output type=local,dest=tmp/docker-context/amd64 .
+#
+# BUILD with S3 sccache (creds sourced from Infisical MinIO — NEVER baked):
+#   ...  --secret id=sccache-env,src=/run/user/…/sccache.env  ...
+#   (scripts/build-on-dellsrv.sh wires this for you.)
+# =============================================================================
+
+# --- Version pins (bump deliberately; a version change busts sccache keys) ---
+#   Pinning the musl-cross base tag also pins the bundled Rust toolchain, which
+#   is what keeps cargo-chef layers and sccache cache entries valid across runs
+#   (fabro has no rust-toolchain.toml — see docs/BUILD-SPEED.md "follow-ons").
+ARG MUSL_CROSS_TAG=x86_64-musl
+ARG CARGO_CHEF_VERSION=0.1.77
+ARG SCCACHE_VERSION=0.16.0
+ARG TARGET=x86_64-unknown-linux-musl
+# USE_MOLD=1 activates the mold linker inside the builder (safe here because the
+# image installs mold). Set to 0 if the musl-cross gcc rejects -fuse-ld=mold on
+# your base tag; the build still succeeds, just without the link-time speedup.
+ARG USE_MOLD=1
+
+# -----------------------------------------------------------------------------
+# Stage 1: chef — toolchain base with cargo-chef, sccache and mold installed.
+#   messense/rust-musl-cross bundles the x86_64-unknown-linux-musl target and a
+#   musl-cross gcc, and pre-sets CC/AR/CARGO_TARGET_..._LINKER for musl-static.
+# -----------------------------------------------------------------------------
+FROM messense/rust-musl-cross:${MUSL_CROSS_TAG} AS chef
+ARG CARGO_CHEF_VERSION
+ARG SCCACHE_VERSION
+ARG TARGET
+ARG USE_MOLD
+WORKDIR /app
+
+# mold linker (apt candidate on Debian/Ubuntu bases; see BUILD-SPEED.md).
+# ca-certificates is needed so sccache can talk TLS to the MinIO S3 endpoint.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends mold ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+# sccache — install the prebuilt musl binary (no compile; mozilla/sccache
+# v0.16.0). URL/version per grounded findings.
+RUN curl -fsSL \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" \
+ && chmod +x /usr/local/bin/sccache \
+ && sccache --version
+
+# cargo-chef — pinned. Installed once into the base so planner/cooker stages
+# reuse it. (Compiled from source here; heavy, but the base is built rarely.)
+RUN cargo install --locked cargo-chef --version "${CARGO_CHEF_VERSION}"
+
+# Bake a builder-local cargo config that turns on sccache and (optionally) mold.
+#   * RUSTC_WRAPPER=sccache degrades gracefully to a LOCAL disk cache when no
+#     SCCACHE_* S3 env is present, so this stays safe without secrets.
+#   * mold is wired via rustflags on the musl triple. gcc >= 12.1 accepts a bare
+#     `-fuse-ld=mold` (must be on PATH; gcc rejects absolute paths). This lives
+#     in the IMAGE's CARGO_HOME, never in the repo's committed .cargo/config.toml
+#     (which must stay mold-free so the Mac and CI without mold don't break).
+ENV RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/root/.cache/sccache
+RUN set -eux; \
+    CH="${CARGO_HOME:-/root/.cargo}"; mkdir -p "$CH"; \
+    { \
+      echo '# Injected by docker/Dockerfile.chef — builder-image only.'; \
+      if [ "${USE_MOLD}" = "1" ]; then \
+        echo "[target.${TARGET}]"; \
+        echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]"; \
+      fi; \
+    } >> "$CH/config.toml"; \
+    cat "$CH/config.toml"
+
+# -----------------------------------------------------------------------------
+# Stage 2: planner — distill the dependency graph into recipe.json.
+#   recipe.json is a function of the manifests + Cargo.lock only, so it is
+#   stable across source-only edits and keeps the cook layer (stage 3) cached.
+# -----------------------------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 3: builder — cook deps (THE cache layer), then compile fabro-cli.
+#   `cargo chef cook` compiles ONLY the dependencies described by recipe.json.
+#   As long as recipe.json is byte-identical, this RUN is served from the Docker
+#   layer cache — the multi-minute dependency build is skipped entirely.
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+ARG TARGET
+# CARGO_BUILD_JOBS caps parallel rustc invocations. On the dellsrv builder this
+# is the MEMORY lever (the box's binding constraint is RAM — forkd reserves
+# ~16.6 GB — not CPU), letting the build coexist with the live gate.
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+COPY --from=planner /app/recipe.json recipe.json
+
+# Cook dependencies. sccache-env secret (if provided) points RUSTC_WRAPPER at
+# the MinIO S3 backend for cross-run/cross-host compile caching. Absent secret
+# => sccache uses its local disk cache. Cache mounts persist sccache + git deps
+# across builds on the same host.
+RUN --mount=type=secret,id=sccache-env \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    set -eux; \
+    if [ -f /run/secrets/sccache-env ]; then set -a; . /run/secrets/sccache-env; set +a; fi; \
+    cargo chef cook --release --target "${TARGET}" --recipe-path recipe.json; \
+    sccache --show-stats || true
+
+# Now copy the real source and build only fabro-cli. Because deps are already
+# compiled+cached above, this recompiles just the workspace crates that changed.
+COPY . .
+RUN --mount=type=secret,id=sccache-env \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    set -eux; \
+    if [ -f /run/secrets/sccache-env ]; then set -a; . /run/secrets/sccache-env; set +a; fi; \
+    cargo build --locked --release --target "${TARGET}" -p fabro-cli; \
+    sccache --show-stats || true; \
+    install -D "target/${TARGET}/release/fabro" /out/fabro
+
+# -----------------------------------------------------------------------------
+# Stage 4: export — a scratch stage that holds ONLY the binary, so
+#   `docker build --target export --output type=local,dest=tmp/docker-context/amd64`
+#   drops it exactly where the runtime ./Dockerfile expects
+#   (tmp/docker-context/${TARGETARCH}/fabro).
+# -----------------------------------------------------------------------------
+FROM scratch AS export
+COPY --from=builder /out/fabro /fabro
