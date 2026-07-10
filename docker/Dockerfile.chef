@@ -63,6 +63,13 @@ ARG TARGET=x86_64-unknown-linux-musl
 # USE_MOLD=1 only after bumping to a base tag with gcc >= 12.1 (bare -fuse-ld=mold)
 # or wiring `-B<mold-wrapper-dir>` for the old gcc.
 ARG USE_MOLD=0
+# FEATURES is the cargo --features list, applied IDENTICALLY to the chef cook
+# RUN and the final build RUN below (empty = default features only). Keep
+# these two in sync — a mismatch busts the whole point of the cook cache
+# layer (cook would compile a different dependency feature set than build
+# actually needs, or vice versa on the next run). Default empty: forkd (or any
+# other optional feature) is opt-in via `FEATURES=forkd`, never forced on.
+ARG FEATURES=""
 
 # -----------------------------------------------------------------------------
 # Stage 1: chef — toolchain base with cargo-chef, sccache and mold installed.
@@ -143,18 +150,21 @@ ARG TARGET
 # ~16.6 GB — not CPU), letting the build coexist with the live gate.
 ARG CARGO_BUILD_JOBS=4
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 
 # Cook dependencies. sccache-env secret (if provided) points RUSTC_WRAPPER at
 # the MinIO S3 backend for cross-run/cross-host compile caching. Absent secret
 # => sccache uses its local disk cache. Cache mounts persist sccache + git deps
-# across builds on the same host.
+# across builds on the same host. ${FEATURES:+--features "$FEATURES"} must
+# stay identical to the flag used in the build RUN below (cache-key
+# correctness — cooked deps must match what the real build asks cargo for).
 RUN --mount=type=secret,id=sccache-env \
     --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     set -eux; \
     if [ -f /run/secrets/sccache-env ]; then set -a; . /run/secrets/sccache-env; set +a; fi; \
-    cargo chef cook --release --target "${TARGET}" --recipe-path recipe.json; \
+    cargo chef cook --release --target "${TARGET}" ${FEATURES:+--features "$FEATURES"} --recipe-path recipe.json; \
     sccache --show-stats || true
 
 # Now copy the real source and build only fabro-cli. Because deps are already
@@ -165,7 +175,7 @@ RUN --mount=type=secret,id=sccache-env \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     set -eux; \
     if [ -f /run/secrets/sccache-env ]; then set -a; . /run/secrets/sccache-env; set +a; fi; \
-    cargo build --locked --release --target "${TARGET}" -p fabro-cli; \
+    cargo build --locked --release --target "${TARGET}" ${FEATURES:+--features "$FEATURES"} -p fabro-cli; \
     sccache --show-stats || true; \
     install -D "target/${TARGET}/release/fabro" /out/fabro
 

@@ -17,14 +17,19 @@
 #     deliberately do not install rustup/mold/sccache onto the live infra box.
 #   * dellsrv is the LIVE gate host: the forkd VMM permanently reserves ~16.6 GB
 #     of its 30 GB RAM. CPU is idle; MEMORY is the binding constraint. So the
-#     build is hard-capped (--memory, CARGO_BUILD_JOBS) to coexist with forkd.
+#     build caps CARGO_BUILD_JOBS (rustc unit parallelism) to coexist with
+#     forkd. `docker build --memory` does NOT exist on this host's BuildKit-
+#     native `docker build` (Docker 29.1.3) — passing it breaks the build
+#     outright (see BUILD note below) — so JOBS is the only real cap; MEMORY
+#     is not wired through to docker at all.
 #
 # WHAT IT DOES
 #   1. rsync the working tree to dellsrv (excludes target/ and .git).
 #   2. Optionally fetch MinIO/sccache creds from Infisical and hand them to the
 #      build as a BuildKit --secret (NEVER baked into the image or printed).
-#   3. `docker build` docker/Dockerfile.chef on dellsrv, memory/job capped,
-#      exporting the musl binary.
+#   3. `docker build` docker/Dockerfile.chef on dellsrv, job-capped (JOBS;
+#      MEMORY is not passed to docker — see BUILD note), exporting the musl
+#      binary.
 #   4. Copy the binary back to ./tmp/docker-context/<arch>/fabro (where the
 #      runtime ./Dockerfile expects it).
 #   5. Optionally build+push the runtime image to registry.zp.digital.
@@ -43,12 +48,25 @@
 #   scripts/build-on-dellsrv.sh                 # native build, local sccache, no push
 #   SCCACHE_S3=1 scripts/build-on-dellsrv.sh    # + MinIO S3 compile cache
 #   PUSH=1 IMAGE_TAG=dev scripts/build-on-dellsrv.sh   # + build & push runtime image
+#   FEATURES=forkd scripts/build-on-dellsrv.sh  # + cargo --features forkd (cook+build)
+#   VERIFY_GREP=abc123 scripts/build-on-dellsrv.sh  # fail unless the fetched
+#                                                    # binary contains this string
 #
 # OVERRIDABLE ENV (defaults shown)
 #   HOST=dellsrv                    ssh alias (see ~/.ssh/config)
 #   TARGET=x86_64-unknown-linux-musl   rust triple (musl = shipped artifact)
-#   MEMORY=6g                       hard memory cap so we coexist with forkd
+#   MEMORY=6g                       NOT passed to docker build — verified
+#                                    unsupported/harmful on this host's
+#                                    BuildKit-native `docker build` (Docker
+#                                    29.1.3; see BUILD note below). Kept as a
+#                                    documented no-op; JOBS is the real cap.
 #   JOBS=4                          CARGO_BUILD_JOBS (memory-bound, not CPU)
+#   FEATURES=<empty>                cargo --features, applied identically to the
+#                                    chef cook + final build steps (empty = default
+#                                    features only; NOT forced on by default, e.g.
+#                                    forkd is opt-in via FEATURES=forkd)
+#   VERIFY_GREP=<unset>             if set, the fetched binary must contain this
+#                                    string (grep -ac) or the script fails
 #   SCCACHE_S3=0                    1 = wire MinIO S3 sccache backend
 #   PUSH=0                          1 = build+push runtime image after compile
 #   REGISTRY=registry.zp.digital/zenprocess/fabro
@@ -64,6 +82,8 @@ HOST="${HOST:-dellsrv}"
 TARGET="${TARGET:-x86_64-unknown-linux-musl}"
 MEMORY="${MEMORY:-6g}"
 JOBS="${JOBS:-4}"
+FEATURES="${FEATURES:-}"
+VERIFY_GREP="${VERIFY_GREP:-}"
 SCCACHE_S3="${SCCACHE_S3:-0}"
 PUSH="${PUSH:-0}"
 REGISTRY="${REGISTRY:-registry.zp.digital/zenprocess/fabro}"
@@ -172,21 +192,47 @@ else
 fi
 
 # --------------------------------- build -------------------------------------
-# Native amd64 (NO --platform needed on the amd64 host). Peak memory is
-# bounded by CARGO_BUILD_JOBS (the real lever on this RAM-bound box) rather than
-# `docker build --memory`, which BuildKit does not enforce per RUN step. The
-# MEMORY var is advisory; operators needing a hard cgroup cap should run
-# buildkitd with a memory limit or use the legacy builder (loses cache mounts).
-log "building on $HOST: target=$TARGET arch=$ARCH jobs=$JOBS (advisory mem cap $MEMORY) ..."
+# Native amd64 (NO --platform needed on the amd64 host). MEMORY is NOT passed
+# to `docker build` — VERIFIED on dellsrv (Docker 29.1.3, BuildKit-native
+# `docker build`, no legacy builder): `docker build --memory 6g` does not
+# exist as a flag on this CLI/version, and passing it is actively HARMFUL —
+# the parser silently reinterprets "6g" as the build context path and fails
+# with `failed to stat 6g: no such file or directory` (the trailing `.`
+# context arg is shadowed). BuildKit's per-RUN memory limits are configured
+# on the buildkitd daemon (worker gc/memory settings), not via a CLI flag on
+# `docker build` itself. So CARGO_BUILD_JOBS (rustc unit parallelism) is the
+# ONLY real lever this script has over peak RSS on this RAM-bound box; MEMORY
+# stays as an operator-facing knob for documentation/intent only — tune JOBS
+# down if the build is actually getting squeezed alongside forkd.
+log "building on $HOST: target=$TARGET arch=$ARCH jobs=$JOBS (memory cap NOT passed to docker build — unsupported by this host's BuildKit CLI; tune JOBS instead) features='${FEATURES:-<default>}' ..."
 BUILD_START=$(date +%s)
 
 # REMOTE_SECRET is "" when SCCACHE_S3=0; the remote script adds --secret only if set.
+#
+# ssh does NOT preserve argv boundaries for the remote command: it joins
+# command + args into a SINGLE STRING (space-separated) that the remote shell
+# re-splits on IFS whitespace. An EMPTY positional argument therefore
+# vanishes entirely instead of surviving as one (still-empty) word, silently
+# shifting every argument after it — verified: `ssh host bash -s -- "a" ""
+# "c"` delivers "$1=a $2=c $3=" on the remote, not "$1=a $2= $3=c". Both
+# REMOTE_SECRET and FEATURES are commonly empty (SCCACHE_S3=0 / default
+# features are the common case), so passing them as raw positional args would
+# silently corrupt one into the other's slot. A non-empty sentinel sidesteps
+# the collapse; the remote script maps it back to "" before use.
+REMOTE_SECRET_ARG="${REMOTE_SECRET:-__none__}"
+FEATURES_ARG="${FEATURES:-__none__}"
 ssh "$HOST" bash -s -- \
-  "$REMOTE_DIR" "$TARGET" "$ARCH" "$JOBS" "${REMOTE_SECRET:-}" <<'REMOTE'
+  "$REMOTE_DIR" "$TARGET" "$ARCH" "$JOBS" "$REMOTE_SECRET_ARG" "$FEATURES_ARG" <<'REMOTE'
 set -euo pipefail
-REMOTE_DIR="$1"; TARGET="$2"; ARCH="$3"; JOBS="$4"; REMOTE_SECRET="${5:-}"
+REMOTE_DIR="$1"; TARGET="$2"; ARCH="$3"; JOBS="$4"
+REMOTE_SECRET="$5"; [ "$REMOTE_SECRET" = "__none__" ] && REMOTE_SECRET=""
+FEATURES="$6"; [ "$FEATURES" = "__none__" ] && FEATURES=""
 cd "$REMOTE_DIR"
 export DOCKER_BUILDKIT=1
+# SEC=() is a declared-but-empty array; a bare "${SEC[@]}" raises "unbound
+# variable" under `set -u` on bash <4.4 even though the array IS declared
+# (fixed upstream in bash 4.4, but nothing guarantees the remote host's bash
+# version). The ${SEC[@]+"${SEC[@]}"} guard sidesteps the bug on every bash.
 SEC=()
 [ -n "$REMOTE_SECRET" ] && SEC=(--secret "id=sccache-env,src=$REMOTE_SECRET")
 docker build \
@@ -194,11 +240,20 @@ docker build \
   --target export \
   --build-arg TARGET="$TARGET" \
   --build-arg CARGO_BUILD_JOBS="$JOBS" \
-  "${SEC[@]}" \
+  --build-arg FEATURES="$FEATURES" \
+  ${SEC[@]+"${SEC[@]}"} \
   --output "type=local,dest=tmp/docker-context/$ARCH" \
   .
 test -f "tmp/docker-context/$ARCH/fabro" || { echo "ERROR: binary not produced" >&2; exit 1; }
 ls -la "tmp/docker-context/$ARCH/fabro"
+# Exercise the binary here (still inside the already-`cd`'d remote session, so
+# $PWD is absolute) rather than in a separate top-level ssh call: `docker -v`
+# rejects a relative bind-mount source as an invalid named-volume name (it
+# doesn't resolve it against any cwd), and $REMOTE_DIR is relative to the ssh
+# login home by design (see the REMOTE_DIR comment above) — so this check has
+# to run where the path is already absolute.
+echo "[build-on-dellsrv] executing 'fabro --version' on $(hostname) (busybox container, static musl binary) ..."
+docker run --rm -v "$PWD/tmp/docker-context/$ARCH:/out:ro" busybox /out/fabro --version
 REMOTE
 
 BUILD_END=$(date +%s)
@@ -210,6 +265,31 @@ mkdir -p "$REPO_ROOT/tmp/docker-context/$ARCH"
 scp -q "$HOST:$REMOTE_DIR/tmp/docker-context/$ARCH/fabro" \
        "$REPO_ROOT/tmp/docker-context/$ARCH/fabro"
 chmod +x "$REPO_ROOT/tmp/docker-context/$ARCH/fabro"
+
+# ------------------------------ verify the binary -----------------------------
+# The fetched binary is linux/$ARCH; this script itself runs on macOS, so we
+# cannot just exec it locally to sanity-check the build actually worked.
+FETCHED="$REPO_ROOT/tmp/docker-context/$ARCH/fabro"
+
+FILE_INFO="$(file "$FETCHED" 2>/dev/null || echo unknown)"
+case "$FILE_INFO" in
+  *ELF*) log "file: $FILE_INFO" ;;
+  *) die "fetched binary at $FETCHED does not look like an ELF executable ($FILE_INFO)" ;;
+esac
+
+SIZE_BYTES="$(wc -c < "$FETCHED" | tr -d '[:space:]')"
+[ "$SIZE_BYTES" -gt 1000000 ] || die "fetched binary is suspiciously small (${SIZE_BYTES} bytes) — build likely produced a stub"
+log "binary size: ${SIZE_BYTES} bytes"
+
+SHA256="$(shasum -a 256 "$FETCHED" 2>/dev/null | awk '{print $1}')"
+log "sha256: $SHA256"
+
+if [ -n "$VERIFY_GREP" ]; then
+  MATCH_COUNT="$(grep -ac "$VERIFY_GREP" "$FETCHED" 2>/dev/null || true)"
+  MATCH_COUNT="${MATCH_COUNT:-0}"
+  [ "$MATCH_COUNT" -ge 1 ] || die "VERIFY_GREP='$VERIFY_GREP' not found in fetched binary (grep -ac = $MATCH_COUNT)"
+  log "VERIFY_GREP='$VERIFY_GREP' found ($MATCH_COUNT match(es))."
+fi
 
 # --------------------- optional: build + push runtime image ------------------
 if [ "$PUSH" = "1" ]; then
