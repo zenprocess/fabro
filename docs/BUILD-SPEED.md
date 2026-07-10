@@ -178,6 +178,13 @@ Common overrides (all have defaults):
 > LAN/DNS; `dellsrv.zp.digital` resolves to an in-network VIP). Run the script
 > from a shell that can reach the zp LAN.
 
+> **Web UI**: `rust_embed` compiles `lib/crates/fabro-spa/assets/` into the
+> binary at build time; release binaries have no on-disk fallback. If that
+> directory is empty when this script rsyncs the tree, the resulting binary
+> is API-only — `fabro server --web` refuses to start (`--web requires web UI
+> assets`). Run `cargo dev spa refresh` (needs bun) in the source tree first
+> if the built artifact must serve the web UI.
+
 ---
 
 ## sccache credentials (never baked, never printed)

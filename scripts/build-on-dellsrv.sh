@@ -52,6 +52,15 @@
 #   VERIFY_GREP=abc123 scripts/build-on-dellsrv.sh  # fail unless the fetched
 #                                                    # binary contains this string
 #
+# WEB UI
+#   rust_embed compiles lib/crates/fabro-spa/assets/ into the binary at build
+#   time; release binaries have NO on-disk fallback. If that directory is
+#   empty when this script rsyncs the tree (the common case — it's built by a
+#   separate step, not checked in populated), the resulting binary is
+#   API-only: `fabro server --web` refuses to start ("--web requires web UI
+#   assets"). Before running this script, run `cargo dev spa refresh` (needs
+#   bun) in the source tree if the built artifact must serve the web UI.
+#
 # OVERRIDABLE ENV (defaults shown)
 #   HOST=dellsrv                    ssh alias (see ~/.ssh/config)
 #   TARGET=x86_64-unknown-linux-musl   rust triple (musl = shipped artifact)
