@@ -83,6 +83,40 @@ fn manifest_run_defaults_from_toml(source: &str) -> fabro_config::RunLayer {
         .unwrap_or_default()
 }
 
+fn test_environment_store(
+    default_provider: Option<EnvironmentProvider>,
+    local_enabled: bool,
+) -> (tempfile::TempDir, EnvironmentStore) {
+    let temp = tempfile::tempdir().expect("environment store tempdir should be created");
+    let db_path = temp.path().join("fabro.sqlite3");
+    let pool = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("environment store setup runtime should build");
+        runtime.block_on(async move {
+            let database = fabro_db::Database::connect(db_path)
+                .await
+                .expect("test environment database should connect");
+            database
+                .migrate()
+                .await
+                .expect("test environment database should migrate");
+            if let Some(provider) = default_provider {
+                fabro_environment::seed_default_environment(database.pool(), provider)
+                    .await
+                    .expect("test default environment should seed");
+            }
+            database.clone_pool()
+        })
+    })
+    .join()
+    .expect("environment store setup thread should not panic");
+    let store = load_environment_store_blocking(pool, local_enabled)
+        .expect("test environment store should load");
+    (temp, store)
+}
+
 fn server_settings_from_toml(source: &str) -> ServerSettings {
     ServerSettingsBuilder::from_toml(source).expect("server settings should resolve")
 }
@@ -497,6 +531,7 @@ fn webhook_test_app(auth_mode: AuthMode) -> Router {
         |_| None,
     );
     state
+        .stores
         .vault
         .try_write()
         .expect("test vault should not be locked")
@@ -630,7 +665,8 @@ fn pair_test_target() -> PairTarget {
 async fn append_pair_transcript_fixture(state: &Arc<AppState>, run_id: RunId) -> PairId {
     let pair_id = "01HZX6M29F1CD5YYMHT1F5D7WQ".parse().unwrap();
     let run_store = state
-        .store
+        .stores
+        .runs
         .open_run(&run_id)
         .await
         .expect("test run should be openable");
@@ -1249,12 +1285,10 @@ id = "missing"
 
 #[test]
 fn system_sandbox_provider_uses_manifest_defaults() {
-    let temp = tempfile::tempdir().unwrap();
-    let environment_dir = temp.path().join("environments");
-    fabro_environment::seed_default_environment(&environment_dir, EnvironmentProvider::Daytona)
-        .expect("seed built-in environments");
-    let environment_store =
-        EnvironmentStore::load(&environment_dir, true).expect("environment store should load");
+    let (temp, environment_store) =
+        test_environment_store(Some(EnvironmentProvider::Daytona), true);
+    let mcp_server_store =
+        McpServerStore::load(temp.path().join("mcps")).expect("mcp server store should load");
     let source = r#"
 _version = 1
 
@@ -1264,6 +1298,7 @@ id = "default"
     let manifest_run_settings = resolve_manifest_run_settings_with_catalog(
         &run_manifest::manifest_run_defaults(Some(&manifest_run_defaults_from_toml(source))),
         &environment_store,
+        &mcp_server_store,
     );
 
     assert_eq!(system_sandbox_provider(&manifest_run_settings), "daytona");
@@ -1271,9 +1306,9 @@ id = "default"
 
 #[test]
 fn system_sandbox_provider_defaults_when_manifest_run_settings_do_not_resolve() {
-    let temp = tempfile::tempdir().unwrap();
-    let environment_store = EnvironmentStore::load(temp.path().join("environments"), true)
-        .expect("environment store should load");
+    let (temp, environment_store) = test_environment_store(None, true);
+    let mcp_server_store =
+        McpServerStore::load(temp.path().join("mcps")).expect("mcp server store should load");
     let source = r#"
 _version = 1
 
@@ -1283,6 +1318,7 @@ id = "missing"
     let manifest_run_settings = resolve_manifest_run_settings_with_catalog(
         &run_manifest::manifest_run_defaults(Some(&manifest_run_defaults_from_toml(source))),
         &environment_store,
+        &mcp_server_store,
     );
 
     assert_eq!(
@@ -1347,7 +1383,7 @@ async fn create_secret_stores_file_secret_outside_token_lookups() {
     assert_eq!(body["type"], "file");
     assert_eq!(body["description"], "Test certificate");
 
-    let vault = state.vault.read().await;
+    let vault = state.stores.vault.read().await;
     assert_eq!(
         vault.get_entry("/tmp/test.pem").unwrap().secret_type,
         SecretType::File
@@ -1391,7 +1427,7 @@ async fn create_secret_rejects_bootstrap_secret_names() {
             body["errors"][0]["detail"],
             format!("{name} is a bootstrap secret; configure it with process env or server.env")
         );
-        assert!(state.vault.read().await.get(name).is_none());
+        assert!(state.stores.vault.read().await.get(name).is_none());
     }
 }
 
@@ -1411,7 +1447,7 @@ async fn create_secret_allows_optional_vault_and_custom_secret_names() {
             .unwrap();
 
         assert_status!(response, StatusCode::OK).await;
-        assert_eq!(state.vault.read().await.get(name), Some(value));
+        assert_eq!(state.stores.vault.read().await.get(name), Some(value));
     }
 }
 
@@ -1504,11 +1540,19 @@ async fn create_secret_stores_valid_oauth_entries() {
 
     let response = app.oneshot(req).await.unwrap();
     assert_status!(response, StatusCode::OK).await;
-    let listed = state.vault.read().await.list();
+    let listed = state.stores.vault.read().await.list();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "OPENAI_CODEX");
     assert_eq!(listed[0].secret_type, SecretType::Oauth);
-    assert!(state.vault.read().await.get("OPENAI_CODEX").is_some());
+    assert!(
+        state
+            .stores
+            .vault
+            .read()
+            .await
+            .get("OPENAI_CODEX")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -1532,6 +1576,7 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
         },
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -1568,7 +1613,12 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
          snapshot and sandbox scopes."
     );
     assert_eq!(
-        state.vault.read().await.get(EnvVars::DAYTONA_API_KEY),
+        state
+            .stores
+            .vault
+            .read()
+            .await
+            .get(EnvVars::DAYTONA_API_KEY),
         Some("existing")
     );
     auth.assert_async().await;
@@ -1586,8 +1636,20 @@ async fn diagnostics_reports_under_scoped_daytona_api_key() {
     ])
     .await;
     let base_url = server.base_url();
+    let settings = fabro_config::ServerSettingsBuilder::from_toml(
+        r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.sandbox.providers.docker]
+enabled = false
+"#,
+    )
+    .expect("settings should parse");
     let state = test_app_state_with_env_lookup(
-        default_test_server_settings(),
+        settings,
         fabro_config::RunLayer::default(),
         5,
         move |name| match name {
@@ -1596,6 +1658,7 @@ async fn diagnostics_reports_under_scoped_daytona_api_key() {
         },
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -1608,24 +1671,24 @@ async fn diagnostics_reports_under_scoped_daytona_api_key() {
         .unwrap();
 
     let report = crate::diagnostics::run_all(&state).await;
-    let sandbox = report
+    let cloud_sandbox = report
         .sections
         .iter()
         .flat_map(|section| &section.checks)
-        .find(|check| check.name == "Sandbox")
-        .expect("sandbox check should be present");
+        .find(|check| check.name == "Cloud Sandbox")
+        .expect("cloud sandbox check should be present");
 
-    assert_eq!(sandbox.status, CheckStatus::Error);
+    assert_eq!(cloud_sandbox.status, CheckStatus::Error);
     assert_eq!(
-        sandbox.summary,
+        cloud_sandbox.summary,
         "Daytona API key is missing required scopes"
     );
     assert_eq!(
-        sandbox.details[0].text,
+        cloud_sandbox.details[0].text,
         "missing: write:snapshots, write:sandboxes"
     );
     assert_eq!(
-        sandbox.remediation.as_deref(),
+        cloud_sandbox.remediation.as_deref(),
         Some(
             "Regenerate the Daytona API key with scopes: write:snapshots, \
              delete:snapshots, write:sandboxes, delete:sandboxes, then \
@@ -1645,6 +1708,7 @@ async fn resolve_llm_client_reads_openai_token_from_vault() {
         |_| None,
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -1731,6 +1795,7 @@ async fn llm_source_configured_providers_reads_openai_token_from_vault() {
         |_| None,
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -1775,6 +1840,7 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
         .provider_base_url("openai", server.url("/v1"))
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -1816,7 +1882,7 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
 async fn list_secrets_includes_oauth_metadata() {
     let state = test_app_state();
     {
-        let mut vault = state.vault.write().await;
+        let mut vault = state.stores.vault.write().await;
         vault
             .set(
                 "OPENAI_CODEX",
@@ -1932,7 +1998,7 @@ async fn delete_secret_by_name_removes_file_secret() {
 
     let delete_response = app.oneshot(delete_req).await.unwrap();
     assert_status!(delete_response, StatusCode::NO_CONTENT).await;
-    assert!(state.vault.read().await.list().is_empty());
+    assert!(state.stores.vault.read().await.list().is_empty());
 }
 
 #[test]
@@ -1990,7 +2056,7 @@ fn slack_app_state_with_settings_and_secret_sources(
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        variables_path: vault_path.with_file_name("variables.json"),
+        db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
         vault_path,
         preloaded_vault: Some(vault),
         server_secrets: load_test_server_secrets(server_env_path, server_secret_env),
@@ -2121,7 +2187,7 @@ fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        variables_path: vault_path.with_file_name("variables.json"),
+        db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
         vault_path,
         preloaded_vault: Some(vault),
         server_secrets: load_test_server_secrets(
@@ -2254,6 +2320,7 @@ fn worker_command_forwards_github_app_private_key_from_vault() {
     let storage_dir = tempfile::tempdir().unwrap();
     let state = worker_command_test_state(storage_dir.path(), &["dev-token"], Some(TEST_DEV_TOKEN));
     state
+        .stores
         .vault
         .try_write()
         .expect("test vault should not be locked")
@@ -2485,7 +2552,7 @@ methods = ["dev-token"]
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        variables_path: vault_path.with_file_name("variables.json"),
+        db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
         vault_path,
         preloaded_vault: None,
         server_secrets: ServerSecrets::load(server_env_path, HashMap::new()).unwrap(),
@@ -2570,6 +2637,7 @@ fn build_app_state_migrates_legacy_vault_file_on_boot() {
         .expect("legacy vault should not prevent server boot");
 
     let vault = state
+        .stores
         .vault
         .try_read()
         .expect("test vault should not be locked");
@@ -2612,7 +2680,7 @@ fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        variables_path: vault_path.with_file_name("variables.json"),
+        db_pool: test_db_pool_for_vault_path(vault_path)?,
         vault_path: vault_path.to_path_buf(),
         preloaded_vault: None,
         server_secrets: load_test_server_secrets(
@@ -3135,7 +3203,8 @@ async fn system_repair_runs_lists_catalog_entries_without_projection() {
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = RunId::new();
     state
-        .store
+        .stores
+        .runs
         .catalog_index()
         .await
         .unwrap()
@@ -3220,6 +3289,7 @@ async fn create_run_without_explicit_title_returns_deterministic_then_updates_ge
         .env_lookup(|_| None)
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -3245,6 +3315,7 @@ async fn create_run_with_explicit_title_skips_generated_title_work() {
         .env_lookup(|_| None)
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -3261,7 +3332,8 @@ async fn create_run_with_explicit_title_skips_generated_title_work() {
 
     assert_eq!(
         state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&run_id, Utc::now())
             .await
             .unwrap()
@@ -3283,7 +3355,8 @@ async fn create_run_without_ready_llm_provider_skips_generated_title_work() {
 
     assert_eq!(
         state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&run_id, Utc::now())
             .await
             .unwrap()
@@ -3310,6 +3383,7 @@ async fn generated_title_failure_leaves_deterministic_title_unchanged() {
         .env_lookup(|_| None)
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -3324,7 +3398,8 @@ async fn generated_title_failure_leaves_deterministic_title_unchanged() {
 
     assert_eq!(
         state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&run_id, Utc::now())
             .await
             .unwrap()
@@ -3349,6 +3424,7 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
         .env_lookup(|_| None)
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -3372,7 +3448,8 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
 
     assert_eq!(
         state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&run_id, Utc::now())
             .await
             .unwrap()
@@ -3413,7 +3490,8 @@ async fn post_runs_create_regression_keeps_api_behavior_without_automation_metad
     assert!(body["automation"].is_null());
     assert_eq!(body["lifecycle"]["status"]["kind"], "submitted");
     let summary = state
-        .store
+        .stores
+        .runs
         .get_cached_summary(&run_id, Utc::now())
         .await
         .unwrap()
@@ -3448,7 +3526,8 @@ async fn create_run_from_manifest_helper_persists_without_automation_metadata() 
     assert_eq!(body["id"], run_id.to_string());
     assert!(body["automation"].is_null());
     let summary = state
-        .store
+        .stores
+        .runs
         .get_cached_summary(&run_id, Utc::now())
         .await
         .unwrap()
@@ -3495,7 +3574,8 @@ async fn create_run_from_manifest_helper_persists_automation_metadata() {
         automation.trigger_id.as_deref().unwrap()
     );
     let summary = state
-        .store
+        .stores
+        .runs
         .get_cached_summary(&run_id, Utc::now())
         .await
         .unwrap()
@@ -3573,7 +3653,8 @@ async fn mock_openai_title_response<'a>(
 async fn wait_for_run_title(state: &AppState, run_id: RunId, expected: &str) {
     for _ in 0..50 {
         let title = state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&run_id, Utc::now())
             .await
             .unwrap()
@@ -3598,7 +3679,7 @@ async fn wait_for_mock_hits(mock: &httpmock::Mock<'_>, expected: usize) {
 }
 
 async fn title_update_event_count(state: &AppState, run_id: RunId) -> usize {
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store
         .list_events()
         .await
@@ -3848,7 +3929,7 @@ async fn create_durable_run_with_events(
     run_id: RunId,
     events: &[workflow_event::Event],
 ) {
-    let run_store = state.store.create_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.create_run(&run_id).await.unwrap();
     if !matches!(
         events.first(),
         Some(workflow_event::Event::RunCreated { .. })
@@ -4093,7 +4174,7 @@ async fn create_slack_notification_run(
     graph_name: &str,
     workflow_slug: Option<&str>,
 ) -> fabro_store::RunDatabase {
-    let run_store = state.store.create_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.create_run(&run_id).await.unwrap();
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunCreated {
         run_id,
         title: None,
@@ -4665,7 +4746,7 @@ async fn persist_cancelled_run_status_ignores_already_terminal_runs() {
         .await
         .unwrap();
 
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     let projection = run_store.state().await.unwrap();
     assert_eq!(projection.status, RunStatus::Succeeded {
         reason: SuccessReason::Completed,
@@ -4744,7 +4825,7 @@ async fn append_scoped_stage_event(
     };
     let stored = fabro_workflow::event::to_run_event_at(&run_id, event, Utc::now(), Some(&scope));
     let payload = fabro_workflow::event::build_redacted_event_payload(&stored, &run_id).unwrap();
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store.append_event(&payload).await.unwrap();
 }
 
@@ -4952,7 +5033,7 @@ async fn list_run_stages_projects_running_stage_as_cancelled_after_cancelled_run
         },
     )
     .await;
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     workflow_event::append_event(
         &run_store,
         &run_id,
@@ -5306,7 +5387,7 @@ async fn run_billing_dedups_retried_nodes_and_sums_their_durations() {
 
     // Checkpoint records `verify` twice (once per visit) — this is what makes
     // the dedup necessary.
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     workflow_event::append_event(
         &run_store,
         &run_id,
@@ -5435,7 +5516,7 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     let mut latest_outcome: Outcome<Option<fabro_model::BilledModelUsage>> = Outcome::success();
     latest_outcome.usage = Some(success_usage);
     latest_outcome.timing = Some(fabro_types::StageTiming::wall_only(800));
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     workflow_event::append_event(
         &run_store,
         &run_id,
@@ -5852,7 +5933,7 @@ async fn append_raw_run_event(
     properties: serde_json::Value,
     node_id: Option<&str>,
 ) {
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     let payload = fabro_store::EventPayload::new(
         json!({
             "id": format!("evt-{seq_hint}"),
@@ -5869,7 +5950,7 @@ async fn append_raw_run_event(
 }
 
 async fn create_unreadable_durable_run(state: &Arc<AppState>, run_id: RunId) {
-    let run_store = state.store.create_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.create_run(&run_id).await.unwrap();
     append_default_run_created(&run_store, run_id).await;
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunRunnable {
         source: fabro_types::RunRunnableSource::StartRequested,
@@ -5959,11 +6040,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
     let vault_path = test_secret_store_path();
     let server_env_path = vault_path.with_file_name("server.env");
     let active_config_path = vault_path.with_file_name("settings.toml");
-    let environment_dir = active_config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("environments");
-    fabro_environment::seed_environments(&environment_dir).expect("test environments should seed");
+    let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
     let config = AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
             github_token_settings(),
@@ -5974,7 +6051,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        variables_path: vault_path.with_file_name("variables.json"),
+        db_pool,
         vault_path,
         preloaded_vault: None,
         server_secrets: load_test_server_secrets(server_env_path, HashMap::new()),
@@ -5991,6 +6068,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
     let state = build_app_state(config).expect("test app state should build");
     if let Some(token) = token {
         state
+            .stores
             .vault
             .try_write()
             .expect("test vault should not already be locked")
@@ -6025,6 +6103,7 @@ fn github_token_strategy_ignores_gh_token_alias() {
         _ => None,
     });
     state
+        .stores
         .vault
         .try_write()
         .expect("test vault should not already be locked")
@@ -6310,6 +6389,79 @@ async fn test_model_invalid_mode_returns_400() {
 }
 
 #[tokio::test]
+async fn test_provider_credentials_uses_app_state_catalog() {
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .header("authorization", "Bearer sk-test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl_test",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }));
+    });
+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
+        r#"
+[providers.acme]
+display_name = "Acme"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{}"
+priority = 120
+
+[providers.acme.auth]
+credentials = ["vault:ACME_API_KEY"]
+
+[models."acme-probe"]
+provider = "acme"
+api_id = "test-model"
+display_name = "Acme Probe"
+family = "acme"
+default = true
+probe = true
+
+[models."acme-probe".limits]
+context_window = 128000
+
+[models."acme-probe".features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        upstream.base_url()
+    ))
+    .expect("catalog fixture should parse");
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(default_test_server_settings(), RunLayer::default())
+        .max_concurrent_runs(5)
+        .llm_catalog_settings(llm_catalog_settings)
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/providers/acme/credentials/test"))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "api_key": "sk-test" }).to_string()))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["ok"], true);
+    completion.assert();
+}
+
+#[tokio::test]
 async fn list_models_filters_by_provider() {
     let app = test_app_with();
 
@@ -6339,6 +6491,7 @@ async fn list_models_marks_configured_true_when_provider_has_credential_material
         |_| None,
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -6533,6 +6686,7 @@ async fn list_providers_marks_configured_per_provider_and_omits_secrets() {
         |_| None,
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -6688,6 +6842,7 @@ async fn test_providers_successful_probe_returns_probe_model() {
         .provider_base_url("openai", server.url("/v1"))
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -6742,6 +6897,7 @@ async fn test_providers_auth_issue_returns_error_without_upstream_call() {
     credential.tokens.expires_at = Utc::now() - ChronoDuration::hours(1);
     credential.tokens.refresh_token = None;
     state
+        .stores
         .vault
         .write()
         .await
@@ -6815,6 +6971,7 @@ reasoning = false
         .llm_catalog_settings(llm_catalog_settings)
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -6933,7 +7090,7 @@ reasoning = false
         .llm_catalog_settings(llm_catalog_settings)
         .build();
     {
-        let mut vault = state.vault.write().await;
+        let mut vault = state.stores.vault.write().await;
         vault
             .set("ALPHA_API_KEY", "alpha-key", SecretType::Token, None)
             .unwrap();
@@ -6993,6 +7150,7 @@ async fn test_providers_response_does_not_leak_api_keys() {
         .provider_base_url("openai", server.url("/v1"))
         .build();
     state
+        .stores
         .vault
         .write()
         .await
@@ -7754,7 +7912,7 @@ async fn get_run_stage_command_log_returns_cas_slice() {
     let state = test_app_state_with_isolated_storage();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = RunId::new();
-    let run_store = state.store.create_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.create_run(&run_id).await.unwrap();
     append_default_run_created(&run_store, run_id).await;
     let output_blob = run_store
         .write_blob(&serde_json::to_vec("hello world").unwrap())
@@ -7818,7 +7976,7 @@ async fn get_run_stage_command_log_prefers_scratch_when_cas_ref_exists() {
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = RunId::new();
     let stage_id = StageId::new("script_node", 1);
-    let run_store = state.store.create_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.create_run(&run_id).await.unwrap();
     append_default_run_created(&run_store, run_id).await;
     let output_blob = run_store
         .write_blob(&serde_json::to_vec("cas log").unwrap())
@@ -8354,7 +8512,7 @@ async fn unlink_run_pull_request_appends_event_and_clears_projected_state() {
     assert!(state_body["pull_request"].is_null());
 
     let run_id = run_id.parse::<RunId>().unwrap();
-    let run_store = state.store.open_run_reader(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
     let events = run_store.list_events().await.unwrap();
     assert!(events.iter().any(|event| {
         event.event.event_name() == "pull_request.unlinked"
@@ -8488,6 +8646,7 @@ async fn create_run_pull_request_creates_and_persists_record() {
         llm_catalog_settings_with_provider_base_url("openai", llm.url("/v1")),
     );
     state
+        .stores
         .vault
         .write()
         .await
@@ -9000,9 +9159,9 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
         .parse::<RunId>()
         .unwrap();
 
-    state.store.warm_projection_cache().await.unwrap();
+    state.stores.runs.warm_projection_cache().await.unwrap();
 
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunRunnable {
         source: fabro_types::RunRunnableSource::StartRequested,
         actor:  None,
@@ -9318,7 +9477,7 @@ async fn create_run_persists_manifest_and_definition_blobs_without_bundle_file()
     let body = response_json!(response, StatusCode::CREATED).await;
     let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
 
-    let run_store = state.store.open_run_reader(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
     let events = run_store.list_events().await.unwrap();
     let created = events[0].event.to_value().unwrap();
     let submitted = events[1].event.to_value().unwrap();
@@ -9628,7 +9787,8 @@ async fn create_run_persists_run_spec() {
         .parse::<RunId>()
         .unwrap();
     let run_state = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id)
         .await
         .unwrap()
@@ -9686,7 +9846,8 @@ async fn create_run_keeps_missing_project_and_workflow_names_absent() {
     let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
 
     let run_state = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id)
         .await
         .unwrap()
@@ -9727,7 +9888,8 @@ async fn worker_token_accepts_run_scoped_routes_and_falls_back_to_user_jwt() {
     let other_run_id = create_run_with_bearer(&app, &user_jwt).await;
     let other_worker_token = issue_test_worker_token(&other_run_id);
     let blob_id = state
-        .store
+        .stores
+        .runs
         .open_run(&run_id)
         .await
         .unwrap()
@@ -9974,7 +10136,8 @@ async fn run_tool_worker_token_can_use_client_backend_routes_across_runs() {
 
     let created_child = create_run_with_bearer(&app, &run_tool_worker_token).await;
     let cached = state
-        .store
+        .stores
+        .runs
         .get_cached_run(&created_child)
         .await
         .unwrap()
@@ -10253,7 +10416,7 @@ async fn worker_token_controls_command_log_route() {
     let worker_token = issue_test_worker_token(&run_id);
     let other_run_id = create_run_with_bearer(&app, &user_jwt).await;
     let mismatched_worker_token = issue_test_worker_token(&other_run_id);
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     workflow_event::append_event(
         &run_store,
         &run_id,
@@ -10593,7 +10756,8 @@ async fn start_run_transitions_to_runnable() {
     assert_eq!(body["title"], "Test");
 
     let status = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id.parse::<RunId>().unwrap())
         .await
         .unwrap()
@@ -10790,7 +10954,7 @@ async fn patch_run_title_updates_active_and_archived_runs() {
     let patch_body = response_json!(patch_response, StatusCode::OK).await;
     assert_eq!(patch_body["title"], "Active title");
 
-    let run_store = state.store.open_run_reader(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
     let event_count = run_store.list_events().await.unwrap().len();
     let same_title_response = app
         .clone()
@@ -10808,7 +10972,8 @@ async fn patch_run_title_updates_active_and_archived_runs() {
     assert_eq!(same_title_body["title"], "Active title");
     assert_eq!(
         state
-            .store
+            .stores
+            .runs
             .open_run_reader(&run_id)
             .await
             .unwrap()
@@ -10820,7 +10985,7 @@ async fn patch_run_title_updates_active_and_archived_runs() {
         "same-title PATCH should not append an event"
     );
 
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     for event in [
         workflow_event::Event::RunRunnable {
             source: fabro_types::RunRunnableSource::StartRequested,
@@ -11005,7 +11170,8 @@ async fn resume_cancelled_run_with_checkpoint_transitions_to_runnable() {
     assert_eq!(body["timing"], serde_json::Value::Null);
 
     let state = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id)
         .await
         .unwrap()
@@ -11037,7 +11203,8 @@ async fn retry_failed_run_creates_and_queues_new_run() {
     ])
     .await;
     let source_events_before = state
-        .store
+        .stores
+        .runs
         .open_run(&source_run_id)
         .await
         .unwrap()
@@ -11065,7 +11232,7 @@ async fn retry_failed_run_creates_and_queues_new_run() {
     assert_eq!(body["created_by"]["login"], "dev");
     assert_eq!(run_json_status(&body)["kind"], "runnable");
 
-    let source_store = state.store.open_run(&source_run_id).await.unwrap();
+    let source_store = state.stores.runs.open_run(&source_run_id).await.unwrap();
     assert_eq!(
         source_store.list_events().await.unwrap().len(),
         source_events_before
@@ -11078,7 +11245,8 @@ async fn retry_failed_run_creates_and_queues_new_run() {
     );
 
     let new_state = state
-        .store
+        .stores
+        .runs
         .open_run(&new_run_id)
         .await
         .unwrap()
@@ -11129,7 +11297,8 @@ async fn retry_succeeded_run_creates_and_queues_new_run() {
     ])
     .await;
     let source_events_before = state
-        .store
+        .stores
+        .runs
         .open_run(&source_run_id)
         .await
         .unwrap()
@@ -11155,7 +11324,7 @@ async fn retry_succeeded_run_creates_and_queues_new_run() {
     assert_eq!(body["retried_from"], source_run_id.to_string());
     assert_eq!(run_json_status(&body)["kind"], "runnable");
 
-    let source_store = state.store.open_run(&source_run_id).await.unwrap();
+    let source_store = state.stores.runs.open_run(&source_run_id).await.unwrap();
     assert_eq!(
         source_store.list_events().await.unwrap().len(),
         source_events_before
@@ -11168,7 +11337,8 @@ async fn retry_succeeded_run_creates_and_queues_new_run() {
     );
 
     let new_state = state
-        .store
+        .stores
+        .runs
         .open_run(&new_run_id)
         .await
         .unwrap()
@@ -13536,7 +13706,8 @@ level = "debug"
             .expect("run_dir should be recorded")
     };
     let run_spec = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id)
         .await
         .unwrap()
@@ -13629,7 +13800,7 @@ async fn cancel_runnable_run_succeeds() {
         "cancelled run should preserve the failed lifecycle status"
     );
 
-    let run_store = state.store.open_run_reader(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
     let status = run_store.state().await.unwrap().status;
     assert_eq!(status, RunStatus::Failed {
         reason: FailureReason::Cancelled,
@@ -13662,7 +13833,14 @@ async fn cancel_run_overwrites_pending_pause_request() {
     let body = response_json!(response, StatusCode::OK).await;
     assert_eq!(run_json_pending_control(&body).as_str(), Some("cancel"));
 
-    let summary = state.store.runs().find(&run_id).await.unwrap().unwrap();
+    let summary = state
+        .stores
+        .runs
+        .runs()
+        .find(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         summary.lifecycle.pending_control,
         Some(RunControlAction::Cancel)
@@ -13792,7 +13970,14 @@ async fn pause_run_rejects_when_control_is_already_pending() {
     let response = app.oneshot(req).await.unwrap();
     assert_status!(response, StatusCode::CONFLICT).await;
 
-    let summary = state.store.runs().find(&run_id).await.unwrap().unwrap();
+    let summary = state
+        .stores
+        .runs
+        .runs()
+        .find(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         summary.lifecycle.pending_control,
         Some(RunControlAction::Cancel)
@@ -13914,7 +14099,14 @@ async fn pause_run_immediately_pauses_blocked_run() {
     );
     assert_eq!(run_json_pending_control(&body), &serde_json::Value::Null);
 
-    let summary = state.store.runs().find(&run_id).await.unwrap().unwrap();
+    let summary = state
+        .stores
+        .runs
+        .runs()
+        .find(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(summary.lifecycle.status, RunStatus::Paused {
         prior_block: Some(BlockedReason::HumanInputRequired),
     });
@@ -13947,7 +14139,14 @@ async fn unpause_run_sets_pending_control() {
     assert_eq!(run_json_status(&body)["kind"], "runnable");
     assert_eq!(run_json_pending_control(&body).as_str(), Some("unpause"));
 
-    let summary = state.store.runs().find(&run_id).await.unwrap().unwrap();
+    let summary = state
+        .stores
+        .runs
+        .runs()
+        .find(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         summary.lifecycle.pending_control,
         Some(RunControlAction::Unpause)
@@ -14025,7 +14224,14 @@ async fn unpause_run_returns_blocked_when_human_gate_is_still_unresolved() {
     );
     assert_eq!(run_json_pending_control(&body), &serde_json::Value::Null);
 
-    let summary = state.store.runs().find(&run_id).await.unwrap().unwrap();
+    let summary = state
+        .stores
+        .runs
+        .runs()
+        .find(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(summary.lifecycle.status, RunStatus::Blocked {
         blocked_reason: BlockedReason::HumanInputRequired,
     });
@@ -14065,7 +14271,8 @@ async fn startup_reconciliation_marks_inflight_runs_terminal() {
     assert_eq!(reconciled, 2);
 
     let run_1 = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&fixtures::RUN_1)
         .await
         .unwrap()
@@ -14075,7 +14282,8 @@ async fn startup_reconciliation_marks_inflight_runs_terminal() {
     assert_eq!(run_1.status, RunStatus::Submitted);
 
     let run_2 = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&fixtures::RUN_2)
         .await
         .unwrap()
@@ -14088,7 +14296,8 @@ async fn startup_reconciliation_marks_inflight_runs_terminal() {
     });
 
     let run_3 = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&fixtures::RUN_3)
         .await
         .unwrap()
@@ -14208,7 +14417,8 @@ async fn shutdown_active_workers_terminates_process_groups() {
     assert!(!fabro_proc::process_group_alive(worker_process_id));
 
     let run_state = state
-        .store
+        .stores
+        .runs
         .open_run_reader(&run_id)
         .await
         .unwrap()
@@ -14309,7 +14519,7 @@ id = "local"
     });
     drop(runs);
 
-    let run_store = state.store.open_run_reader(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
 
     let mut status_record = None;
     for _ in 0..50 {
@@ -15148,7 +15358,7 @@ async fn list_runs_includes_live_metadata_from_run_state() {
         .await
         .parse::<RunId>()
         .unwrap();
-    let run_store = state.store.open_run(&run_id).await.unwrap();
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     for event in [
         workflow_event::Event::RunStarting,
         workflow_event::Event::RunRunning,
@@ -15233,7 +15443,7 @@ async fn list_runs_page_limit_preserves_metadata_for_paged_items() {
         .unwrap();
 
     for (run_id, sandbox_id) in [(first_run_id, "sb-first"), (second_run_id, "sb-second")] {
-        let run_store = state.store.open_run(&run_id).await.unwrap();
+        let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
         for event in [
             workflow_event::Event::RunStarting,
             workflow_event::Event::RunRunning,

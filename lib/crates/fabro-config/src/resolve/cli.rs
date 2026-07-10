@@ -12,7 +12,7 @@ pub fn resolve_cli(layer: &CliLayer, errors: &mut Vec<ResolveError>) -> CliNames
         auth:    CliAuthSettings {
             strategy: layer.auth.as_ref().and_then(|auth| auth.strategy),
         },
-        exec:    resolve_exec(layer.exec.as_ref()),
+        exec:    resolve_exec(layer.exec.as_ref(), errors),
         output:  CliOutputSettings {
             format:    layer
                 .output
@@ -62,7 +62,7 @@ fn resolve_target(
     }
 }
 
-fn resolve_exec(exec: Option<&CliExecLayer>) -> CliExecSettings {
+fn resolve_exec(exec: Option<&CliExecLayer>, errors: &mut Vec<ResolveError>) -> CliExecSettings {
     let exec = exec.expect("defaults.toml should provide cli.exec defaults");
 
     let model = exec.model.as_ref();
@@ -85,22 +85,11 @@ fn resolve_exec(exec: Option<&CliExecLayer>) -> CliExecSettings {
         },
         agent:              CliExecAgentSettings {
             permissions: exec.agent.as_ref().and_then(|agent| agent.permissions),
-            mcps:        exec
-                .agent
-                .as_ref()
-                .map(|agent| {
-                    agent
-                        .mcps
-                        .iter()
-                        .map(|(name, entry)| {
-                            (
-                                name.clone(),
-                                super::run::resolve_mcp_entry(name.as_str(), entry),
-                            )
-                        })
-                        .collect()
+            mcps:        exec.agent.as_ref().and_then(|agent| {
+                (!agent.mcps.is_empty()).then(|| {
+                    super::run::resolve_enabled_mcps(&agent.mcps, "cli.exec.agent.mcps", errors)
                 })
-                .unwrap_or_default(),
+            }),
         },
     }
 }

@@ -1,19 +1,22 @@
 //! Interpolation for config strings.
 //!
 //! An [`InterpString`] field may contain narrow `{{ <namespace>.NAME }}`
-//! tokens — no template logic — drawn from the four [`Namespace`]s: `env`,
-//! `vars`, `secrets`, and `inputs`. Which namespaces actually resolve is
-//! scope-determined by the caller through [`ResolveCtx`]: server-scope
-//! settings provide `env` (and eventually `secrets`), run-scope settings
-//! additionally provide `vars` and `inputs`. A token whose namespace is not
-//! available in the resolution context fails loudly instead of passing
-//! through as literal text.
+//! tokens — no template logic. Three [`Namespace`]s resolve here: `env`,
+//! `vars`, and `secrets`. `inputs` is **template-only**: it is a
+//! recognized namespace so an `{{ inputs.* }}` token fails loudly with a clear
+//! message instead of passing through as literal text, but it never resolves
+//! in an `InterpString` field — it belongs in prompts and goals. Which of the
+//! resolvable namespaces actually apply is scope-determined by the caller
+//! through [`ResolveCtx`]: server-scope settings provide `env` (and eventually
+//! `secrets`), run-scope settings additionally provide `vars`. A token whose
+//! namespace is not available in the resolution context fails loudly.
 //!
-//! Resolution timing is split: `vars`/`inputs` substitute early (server-side,
-//! at run creation) via [`InterpString::substitute_with`], while
-//! `env`/`secrets` resolve late, at consumption time in the process that owns
-//! the value, via [`InterpString::resolve_with`]. Provenance tracking lets
-//! outward-facing renderers redact env- and secret-sourced values uniformly.
+//! Resolution timing is split: `vars` substitutes early (server-side, at run
+//! creation) via [`InterpString::substitute_with`], while `env`/`secrets`
+//! resolve late, at consumption time in the process that owns
+//! the value, via [`InterpString::resolve_with`]. Declared-secret values are
+//! intended to be registered into a per-run exact-value redactor where secrets
+//! resolve; sensitivity is not tracked on resolved strings.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -114,7 +117,6 @@ pub struct ResolveCtx<'a> {
     env:     Option<LookupFn<'a>>,
     vars:    Option<LookupFn<'a>>,
     secrets: Option<LookupFn<'a>>,
-    inputs:  Option<LookupFn<'a>>,
 }
 
 type LookupFn<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
@@ -143,18 +145,16 @@ impl<'a> ResolveCtx<'a> {
         self
     }
 
-    #[must_use]
-    pub fn with_inputs(mut self, lookup: impl FnMut(&str) -> Option<String> + 'a) -> Self {
-        self.inputs = Some(Box::new(lookup));
-        self
-    }
-
     fn lookup_for(&mut self, namespace: Namespace) -> Option<&mut LookupFn<'a>> {
         match namespace {
             Namespace::Env => self.env.as_mut(),
             Namespace::Vars => self.vars.as_mut(),
             Namespace::Secrets => self.secrets.as_mut(),
-            Namespace::Inputs => self.inputs.as_mut(),
+            // `inputs` is template-only: an `InterpString` resolve context
+            // never provides it, so an `{{ inputs.* }}` token is always
+            // unavailable here. `substitute_with` still preserves the token so a
+            // goal (an `InterpString` that feeds a template) can forward it.
+            Namespace::Inputs => None,
         }
     }
 }
@@ -284,10 +284,8 @@ impl InterpString {
     /// rather than pass through as literal text. A lookup miss fails with
     /// [`ResolveErrorKind::Missing`] — there is no fallback to the raw
     /// source.
-    pub fn resolve_with(&self, ctx: &mut ResolveCtx<'_>) -> Result<Resolved, ResolveError> {
+    pub fn resolve_with(&self, ctx: &mut ResolveCtx<'_>) -> Result<String, ResolveError> {
         let mut value = String::new();
-        let mut env_names = Vec::new();
-        let mut secret_names = Vec::new();
         for seg in &self.segments {
             match seg {
                 Segment::Literal(text) => value.push_str(text),
@@ -299,19 +297,11 @@ impl InterpString {
                         return Err(ResolveError::missing(*namespace, name));
                     };
                     value.push_str(&resolved);
-                    match namespace {
-                        Namespace::Env => env_names.push(name.clone()),
-                        Namespace::Secrets => secret_names.push(name.clone()),
-                        Namespace::Vars | Namespace::Inputs => {}
-                    }
                 }
             }
         }
 
-        Ok(Resolved {
-            value,
-            provenance: Provenance::from_names(env_names, secret_names),
-        })
+        Ok(value)
     }
 
     /// Substitute tokens for the namespaces `ctx` provides, preserving tokens
@@ -348,7 +338,7 @@ impl InterpString {
     /// `lookup` should return the current value for a given env var name (or
     /// `None` if unset). Tokens in any other namespace fail with
     /// [`ResolveErrorKind::Unavailable`].
-    pub fn resolve<F>(&self, lookup: F) -> Result<Resolved, ResolveError>
+    pub fn resolve<F>(&self, lookup: F) -> Result<String, ResolveError>
     where
         F: FnMut(&str) -> Option<String>,
     {
@@ -362,15 +352,14 @@ impl InterpString {
         clippy::disallowed_methods,
         reason = "intentional raw-source fallback so a missing env var surfaces as a \
                   recognizable diagnostic; slated for hard-error semantics in the \
-                  interpolation unification (D3)"
+                  interpolation cleanup"
     )]
     #[must_use]
     pub fn resolve_or_source<F>(&self, lookup: F) -> String
     where
         F: FnMut(&str) -> Option<String>,
     {
-        self.resolve(lookup)
-            .map_or_else(|_| self.as_source(), |resolved| resolved.value)
+        self.resolve(lookup).unwrap_or_else(|_| self.as_source())
     }
 
     /// Substitute only `{{ vars.* }}` tokens while preserving all other
@@ -427,40 +416,6 @@ impl From<&str> for InterpString {
     }
 }
 
-/// The outcome of a successful interpolation resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resolved {
-    pub value:      String,
-    pub provenance: Provenance,
-}
-
-/// Provenance metadata for resolved config values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Provenance {
-    /// No env var or secret contributed to this value.
-    Literal,
-    /// One or more env vars and/or secrets contributed to this value. Used by
-    /// outward-facing renderers to redact sensitive-sourced values uniformly.
-    /// `vars`/`inputs` are non-sensitive and do not mark a value as sourced.
-    Sourced {
-        env_names:    Vec<String>,
-        secret_names: Vec<String>,
-    },
-}
-
-impl Provenance {
-    fn from_names(env_names: Vec<String>, secret_names: Vec<String>) -> Self {
-        if env_names.is_empty() && secret_names.is_empty() {
-            Self::Literal
-        } else {
-            Self::Sourced {
-                env_names,
-                secret_names,
-            }
-        }
-    }
-}
-
 /// An error from resolving or substituting interpolation tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
@@ -506,12 +461,22 @@ impl fmt::Display for ResolveError {
                 "{noun} {:?} referenced by {{{{ {namespace}.{} }}}} is not set",
                 self.name, self.name
             ),
-            ResolveErrorKind::Unavailable => write!(
-                f,
-                "{noun} {:?} referenced by {{{{ {namespace}.{} }}}} is not supported in this \
-                 interpolation context",
-                self.name, self.name
-            ),
+            ResolveErrorKind::Unavailable => match namespace {
+                // `inputs` is template-only: it never resolves in an
+                // `InterpString` field. Point the user at where it works.
+                Namespace::Inputs => write!(
+                    f,
+                    "{{{{ inputs.{} }}}} is only available in prompts and goals, not in other \
+                     config fields",
+                    self.name
+                ),
+                _ => write!(
+                    f,
+                    "{noun} {:?} referenced by {{{{ {namespace}.{} }}}} is not supported in \
+                     this interpolation context",
+                    self.name, self.name
+                ),
+            },
         }
     }
 }
@@ -605,8 +570,7 @@ mod tests {
     fn resolve_literal_string() {
         let s = InterpString::parse("static");
         let resolved = s.resolve(lookup_from(&[])).unwrap();
-        assert_eq!(resolved.value, "static");
-        assert_eq!(resolved.provenance, Provenance::Literal);
+        assert_eq!(resolved, "static");
     }
 
     #[test]
@@ -615,18 +579,14 @@ mod tests {
         let resolved = s
             .resolve(lookup_from(&[("API_KEY", "secret-123")]))
             .unwrap();
-        assert_eq!(resolved.value, "secret-123");
-        assert_eq!(resolved.provenance, Provenance::Sourced {
-            env_names:    vec!["API_KEY".into()],
-            secret_names: vec![],
-        });
+        assert_eq!(resolved, "secret-123");
     }
 
     #[test]
     fn resolve_substring() {
         let s = InterpString::parse("Bearer {{ env.TOKEN }}");
         let resolved = s.resolve(lookup_from(&[("TOKEN", "abc")])).unwrap();
-        assert_eq!(resolved.value, "Bearer abc");
+        assert_eq!(resolved, "Bearer abc");
     }
 
     #[test]
@@ -635,11 +595,7 @@ mod tests {
         let resolved = s
             .resolve(lookup_from(&[("USER", "root"), ("HOST", "example.com")]))
             .unwrap();
-        assert_eq!(resolved.value, "root@example.com");
-        assert_eq!(resolved.provenance, Provenance::Sourced {
-            env_names:    vec!["USER".into(), "HOST".into()],
-            secret_names: vec![],
-        });
+        assert_eq!(resolved, "root@example.com");
     }
 
     #[test]
@@ -659,8 +615,7 @@ mod tests {
     fn unterminated_token_treated_as_literal() {
         let s = InterpString::parse("{{ env.OPEN");
         let resolved = s.resolve(lookup_from(&[])).unwrap();
-        assert_eq!(resolved.value, "{{ env.OPEN");
-        assert_eq!(resolved.provenance, Provenance::Literal);
+        assert_eq!(resolved, "{{ env.OPEN");
     }
 
     #[test]
@@ -676,7 +631,7 @@ mod tests {
             let s = InterpString::parse(raw);
             assert!(s.is_literal(), "{raw} should stay literal");
             let resolved = s.resolve(lookup_from(&[])).unwrap();
-            assert_eq!(resolved.value, raw);
+            assert_eq!(resolved, raw);
         }
     }
 
@@ -727,11 +682,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(resolved.value, "https://us-east-1.example.com");
-        assert_eq!(resolved.provenance, Provenance::Sourced {
-            env_names:    vec!["REGION".into()],
-            secret_names: vec![],
-        });
+        assert_eq!(resolved, "https://us-east-1.example.com");
     }
 
     #[test]
@@ -787,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_secrets_tracks_provenance() {
+    fn resolve_with_substitutes_secrets_and_env() {
         let s = InterpString::parse("Bearer {{ secrets.API_KEY }} via {{ env.PROXY }}");
 
         let resolved = s
@@ -798,23 +749,25 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(resolved.value, "Bearer vault-value via proxy.internal");
-        assert_eq!(resolved.provenance, Provenance::Sourced {
-            env_names:    vec!["PROXY".into()],
-            secret_names: vec!["API_KEY".into()],
-        });
+        assert_eq!(resolved, "Bearer vault-value via proxy.internal");
     }
 
     #[test]
-    fn resolve_with_inputs_substitutes_without_provenance() {
+    fn resolve_with_rejects_inputs_as_template_only() {
+        // `inputs` is template-only. An `{{ inputs.* }}` token never resolves
+        // in an `InterpString` field — it fails loudly, pointing the
+        // user at prompts and goals.
         let s = InterpString::parse("run-{{ inputs.ticket-id }}");
 
-        let resolved = s
-            .resolve_with(&mut ResolveCtx::new().with_inputs(lookup_from(&[("ticket-id", "1234")])))
-            .unwrap();
+        let err = s.resolve_with(&mut ResolveCtx::new()).unwrap_err();
 
-        assert_eq!(resolved.value, "run-1234");
-        assert_eq!(resolved.provenance, Provenance::Literal);
+        assert_eq!(err.namespace, Namespace::Inputs);
+        assert_eq!(err.kind, ResolveErrorKind::Unavailable);
+        assert!(
+            err.to_string()
+                .contains("only available in prompts and goals"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]

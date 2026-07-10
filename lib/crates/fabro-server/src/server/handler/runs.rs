@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use tokio::fs;
 use tracing::info;
 
 use super::super::{
-    AppState, DeleteRunOutcome, ListResponse, PaginationParams, RunExecutionMode,
+    AppState, DeleteRunOutcome, ListResponse, PaginationParams, RunExecutionMode, VariableError,
     answer_from_request, api_question_from_pending_interview, default_page_limit,
     delete_run_internal, load_pending_interview, managed_run, paginate_items, parse_run_id_path,
     parse_stage_id_path, reject_if_archived, submit_pending_interview_answer, workflow_event,
@@ -242,7 +242,12 @@ async fn link_run_parent(
         }
     };
     let _parent_link_guard = state.parent_link_lock.lock().await;
-    let child = match state.store.get_cached_summary(&child_id, Utc::now()).await {
+    let child = match state
+        .stores
+        .runs
+        .get_cached_summary(&child_id, Utc::now())
+        .await
+    {
         Ok(Some(summary)) => summary,
         Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -264,7 +269,7 @@ async fn link_run_parent(
             .into_response();
     }
 
-    let Ok(run_store) = state.store.open_run(&child_id).await else {
+    let Ok(run_store) = state.stores.runs.open_run(&child_id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
     if let Err(err) = workflow_event::append_event(
@@ -288,7 +293,12 @@ async fn unlink_run_parent(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let _parent_link_guard = state.parent_link_lock.lock().await;
-    let child = match state.store.get_cached_summary(&child_id, Utc::now()).await {
+    let child = match state
+        .stores
+        .runs
+        .get_cached_summary(&child_id, Utc::now())
+        .await
+    {
         Ok(Some(summary)) => summary,
         Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -304,7 +314,7 @@ async fn unlink_run_parent(
             .into_response();
     };
 
-    let Ok(run_store) = state.store.open_run(&child_id).await else {
+    let Ok(run_store) = state.stores.runs.open_run(&child_id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
     if let Err(err) = workflow_event::append_event(
@@ -337,7 +347,8 @@ async fn validate_parent_link(
             return Err(ApiError::bad_request("Parent link would create a cycle."));
         }
         let summary = state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&current_id, Utc::now())
             .await
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -353,7 +364,12 @@ async fn validate_parent_link(
 }
 
 async fn updated_run_response(state: &AppState, run_id: &RunId) -> Response {
-    match state.store.get_cached_summary(run_id, Utc::now()).await {
+    match state
+        .stores
+        .runs
+        .get_cached_summary(run_id, Utc::now())
+        .await
+    {
         Ok(Some(summary)) => (
             StatusCode::OK,
             Json(state.decorate_run_summary(summary).await),
@@ -372,7 +388,8 @@ async fn list_runs(
     ExtraQuery(params): ExtraQuery<ListRunsParams>,
 ) -> Response {
     let entries = match state
-        .store
+        .stores
+        .runs
         .list_cached_runs(
             &fabro_store::ListRunsQuery {
                 parent_id: params.parent_id,
@@ -462,7 +479,8 @@ async fn resolve_run(
     Query(query): Query<ResolveRunQuery>,
 ) -> Response {
     let runs = match state
-        .store
+        .stores
+        .runs
         .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
         .await
     {
@@ -540,7 +558,7 @@ async fn update_run(
         Ok(title) => title,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
-    let current = match state.store.get_cached_summary(&id, Utc::now()).await {
+    let current = match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
         Ok(Some(summary)) => summary,
         Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -556,7 +574,7 @@ async fn update_run(
             .into_response();
     }
 
-    let run_store = match state.store.open_run(&id).await {
+    let run_store = match state.stores.runs.open_run(&id).await {
         Ok(run_store) => run_store,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -573,7 +591,7 @@ async fn update_run(
         return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
 
-    match state.store.get_cached_summary(&id, Utc::now()).await {
+    match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
         Ok(Some(summary)) => (
             StatusCode::OK,
             Json(state.decorate_run_summary(summary).await),
@@ -637,15 +655,24 @@ pub(crate) async fn create_run_from_manifest(
     } = request;
     let manifest_run_defaults = state.manifest_run_defaults();
     let manifest_environment_defaults = state.environment_store().catalog_layer();
+    let manifest_mcp_server_catalog = state.mcp_server_store().catalog_settings();
     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
         manifest_run_defaults.as_ref(),
         manifest_environment_defaults.as_ref(),
+        &manifest_mcp_server_catalog,
         &manifest,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
-    if let Err(err) = substitute_run_variables(&state, &mut prepared.settings).await {
+    let vars = match snapshot_run_variables(&state).await {
+        Ok(vars) => vars,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
@@ -691,6 +718,7 @@ pub(crate) async fn create_run_from_manifest(
         ready_provider_ids.clone(),
         provenance,
         web_url.clone(),
+        vars,
     );
     create_input.run_id = Some(run_id);
     create_input.submitted_manifest_bytes = Some(submitted_manifest_bytes);
@@ -698,7 +726,7 @@ pub(crate) async fn create_run_from_manifest(
 
     let storage_root = state.server_storage_dir();
     let created = match Box::pin(operations::create(
-        state.store.as_ref(),
+        state.stores.runs.as_ref(),
         create_input,
         storage_root,
         catalog,
@@ -719,7 +747,8 @@ pub(crate) async fn create_run_from_manifest(
     };
     let created_at = created.run_id.created_at();
     let summary = match state
-        .store
+        .stores
+        .runs
         .get_cached_summary(&created.run_id, Utc::now())
         .await
     {
@@ -810,7 +839,8 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
 
         let current = match task
             .state
-            .store
+            .stores
+            .runs
             .get_cached_summary(&task.run_id, Utc::now())
             .await
         {
@@ -824,7 +854,7 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
         if current.title != task.deterministic_title {
             return;
         }
-        let run_store = match task.state.store.open_run(&task.run_id).await {
+        let run_store = match task.state.stores.runs.open_run(&task.run_id).await {
             Ok(store) => store,
             Err(err) => {
                 tracing::debug!(run_id = %task.run_id, error = %err, "Failed to open run store for title update");
@@ -893,19 +923,32 @@ async fn run_preflight(
 ) -> Response {
     let manifest_run_defaults = state.manifest_run_defaults();
     let manifest_environment_defaults = state.environment_store().catalog_layer();
+    let manifest_mcp_server_catalog = state.mcp_server_store().catalog_settings();
     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
         manifest_run_defaults.as_ref(),
         manifest_environment_defaults.as_ref(),
+        &manifest_mcp_server_catalog,
         &req,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
-    if let Err(err) = substitute_run_variables(&state, &mut prepared.settings).await {
+    let vars = match snapshot_run_variables(&state).await {
+        Ok(vars) => vars,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
-    let mut validated = match run_manifest::validate_prepared_manifest(&prepared, state.catalog()) {
+    let mut validated = match run_manifest::validate_prepared_manifest_with_vars(
+        &prepared,
+        state.catalog(),
+        vars,
+    ) {
         Ok(validated) => validated,
         Err(WorkflowError::Parse(_)) => {
             return ApiError::bad_request("Validation failed").into_response();
@@ -930,19 +973,32 @@ async fn validate_run_manifest(
 ) -> Response {
     let manifest_run_defaults = state.manifest_run_defaults();
     let manifest_environment_defaults = state.environment_store().catalog_layer();
+    let manifest_mcp_server_catalog = state.mcp_server_store().catalog_settings();
     let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
         manifest_run_defaults.as_ref(),
         manifest_environment_defaults.as_ref(),
+        &manifest_mcp_server_catalog,
         &req,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
-    if let Err(err) = substitute_run_variables(&state, &mut prepared.settings).await {
+    let vars = match snapshot_run_variables(&state).await {
+        Ok(vars) => vars,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
-    let validated = match run_manifest::validate_prepared_manifest(&prepared, state.catalog()) {
+    let validated = match run_manifest::validate_prepared_manifest_with_vars(
+        &prepared,
+        state.catalog(),
+        vars,
+    ) {
         Ok(validated) => validated,
         Err(WorkflowError::Parse(_)) => {
             return ApiError::bad_request("Validation failed").into_response();
@@ -956,21 +1012,26 @@ async fn validate_run_manifest(
         .into_response()
 }
 
-async fn substitute_run_variables(
+async fn snapshot_run_variables(
     state: &AppState,
+) -> Result<HashMap<String, String>, VariableError> {
+    state.stores.variables.value_map().await
+}
+
+fn substitute_run_variables(
+    variables: &HashMap<String, String>,
     settings: &mut WorkflowSettings,
 ) -> Result<(), ResolveError> {
-    let variables = state.variables.read().await;
     settings
         .run
-        .substitute_variables(|name| variables.get_value(name).map(str::to_string))
+        .substitute_variables(|name| variables.get(name).cloned())
 }
 
 async fn get_run_status(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.store.get_cached_summary(&id, Utc::now()).await {
+    match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
         Ok(Some(run)) => {
             (StatusCode::OK, Json(state.decorate_run_summary(run).await)).into_response()
         }
@@ -990,7 +1051,7 @@ async fn get_run_settings(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let cached = match state.store.get_cached_run(&id).await {
+    let cached = match state.stores.runs.get_cached_run(&id).await {
         Ok(Some(cached)) => cached,
         Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -1009,7 +1070,7 @@ async fn get_questions(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.store.get_cached_run(&id).await {
+    match state.stores.runs.get_cached_run(&id).await {
         Ok(Some(cached)) => {
             let questions = cached
                 .projection
@@ -1054,7 +1115,7 @@ async fn get_run_state(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.store.get_cached_run(&id).await {
+    match state.stores.runs.get_cached_run(&id).await {
         Ok(Some(cached)) => Json((*cached.projection).clone()).into_response(),
         Ok(None) => ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -1067,7 +1128,7 @@ async fn get_run_logs(
     RequireRunScoped(id): RequireRunScoped,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if state.store.open_run_reader(&id).await.is_err() {
+    if state.stores.runs.open_run_reader(&id).await.is_err() {
         return ApiError::not_found("Run not found.").into_response();
     }
 
@@ -1094,7 +1155,7 @@ async fn get_run_stage_context_window(
         Ok(stage_id) => stage_id,
         Err(response) => return response,
     };
-    let cached = match state.store.get_cached_run(&id).await {
+    let cached = match state.stores.runs.get_cached_run(&id).await {
         Ok(Some(cached)) => cached,
         Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
@@ -1154,7 +1215,7 @@ async fn get_run_stage_command_log(
         return ApiError::bad_request("limit must be greater than 0").into_response();
     }
     let limit = query.limit.min(MAX_COMMAND_LOG_LIMIT);
-    let Ok(run_store) = state.store.open_run_reader(&id).await else {
+    let Ok(run_store) = state.stores.runs.open_run_reader(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
     let run_state = match run_store.state().await {
