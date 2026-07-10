@@ -849,9 +849,7 @@ pub(crate) mod forkd {
 
     /// Build minimal `SandboxDetails` for a forkd sandbox from its persisted
     /// runtime record.
-    pub(super) fn forkd_details(
-        record: &RunSandboxInstance,
-    ) -> fabro_types::SandboxDetails {
+    pub(super) fn forkd_details(record: &RunSandboxInstance) -> fabro_types::SandboxDetails {
         fabro_types::SandboxDetails {
             sandbox:      record.clone(),
             state:        SandboxState::Running,

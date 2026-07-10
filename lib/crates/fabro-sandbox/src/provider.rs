@@ -19,12 +19,12 @@ use fabro_types::{
 use fabro_util::error::collect_chain;
 use futures::future::join_all;
 
+#[cfg(feature = "forkd")]
+use crate::config::ForkdSettings;
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaConfig;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandboxOptions;
-#[cfg(feature = "forkd")]
-use crate::config::ForkdSettings;
 
 pub enum SandboxCreateSpec {
     Local,

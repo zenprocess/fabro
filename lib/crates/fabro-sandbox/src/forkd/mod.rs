@@ -4,9 +4,9 @@
 //! - Created in `initialize()` via `POST /v1/sandboxes`.
 //! - Destroyed in `cleanup()` via `DELETE /v1/sandboxes/{id}`.
 //! - All file I/O goes through exec (base64 round-trips for binary safety).
-//! - Controller URL, bearer token, and snapshot tag are never hardcoded —
-//!   they come from `FORKD_URL` / `FORKD_TOKEN` / `FORKD_SNAPSHOT_TAG`
-//!   environment variables resolved at provider construction time.
+//! - Controller URL, bearer token, and snapshot tag are never hardcoded — they
+//!   come from `FORKD_URL` / `FORKD_TOKEN` / `FORKD_SNAPSHOT_TAG` environment
+//!   variables resolved at provider construction time.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,7 +39,8 @@ const PROVIDER: &str = "forkd";
 /// Default snapshot tag used when `FORKD_SNAPSHOT_TAG` is not set.
 pub const DEFAULT_SNAPSHOT_TAG: &str = "zen-gate-base";
 
-/// Maximum number of retry attempts for transient HTTP failures (5xx / connect).
+/// Maximum number of retry attempts for transient HTTP failures (5xx /
+/// connect).
 const HTTP_RETRY_LIMIT: u32 = 3;
 /// Initial backoff before the first retry.
 const HTTP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -99,10 +100,10 @@ impl ForkdConfig {
     )]
     #[must_use]
     pub fn from_env() -> Self {
-        let forkd_url = std::env::var("FORKD_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
-        let forkd_token = std::env::var("FORKD_TOKEN")
-            .unwrap_or_else(|_| "forkd-local-token".to_string());
+        let forkd_url =
+            std::env::var("FORKD_URL").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
+        let forkd_token =
+            std::env::var("FORKD_TOKEN").unwrap_or_else(|_| "forkd-local-token".to_string());
         let snapshot_tag = std::env::var("FORKD_SNAPSHOT_TAG")
             .unwrap_or_else(|_| DEFAULT_SNAPSHOT_TAG.to_string());
         Self {
@@ -129,7 +130,7 @@ struct CreateSandboxRequest {
 /// A single sandbox entry returned inside the array from `POST /v1/sandboxes`.
 #[derive(Debug, Deserialize)]
 struct SandboxEntry {
-    id: String,
+    id:           String,
     /// The snapshot tag that was actually used by the server (may differ from
     /// the requested tag if the server resolved an alias).
     #[serde(default)]
@@ -151,7 +152,11 @@ impl CreateSandboxResponse {
     fn into_first(self) -> Option<SandboxEntry> {
         match self {
             Self::Array(mut v) => {
-                if v.is_empty() { None } else { Some(v.remove(0)) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
             }
             Self::Single(entry) => Some(entry),
         }
@@ -186,9 +191,11 @@ pub struct ForkdSandbox {
     run_id:           Option<RunId>,
     clone_origin_url: Option<String>,
     clone_branch:     Option<String>,
-    /// The server-assigned sandbox id, populated after a successful `create_sandbox()`.
+    /// The server-assigned sandbox id, populated after a successful
+    /// `create_sandbox()`.
     sandbox_id:       OnceCell<String>,
-    /// The snapshot tag reported by the server (may differ from the requested tag).
+    /// The snapshot tag reported by the server (may differ from the requested
+    /// tag).
     active_snapshot:  OnceCell<String>,
     /// Populated after a successful `initialize()`.
     initialized:      OnceCell<bool>,
@@ -210,11 +217,11 @@ impl ForkdSandbox {
             run_id,
             clone_origin_url,
             clone_branch,
-            sandbox_id:      OnceCell::new(),
+            sandbox_id: OnceCell::new(),
             active_snapshot: OnceCell::new(),
-            initialized:     OnceCell::new(),
-            origin_url:      OnceCell::new(),
-            event_callback:  None,
+            initialized: OnceCell::new(),
+            origin_url: OnceCell::new(),
+            event_callback: None,
         }
     }
 
@@ -280,8 +287,11 @@ impl ForkdSandbox {
                 // Safety: skip env keys that are not valid identifier names to
                 // prevent shell injection via a crafted key.
                 if key.chars().enumerate().all(|(i, c)| {
-                    if i == 0 { c.is_ascii_alphabetic() || c == '_' }
-                    else { c.is_ascii_alphanumeric() || c == '_' }
+                    if i == 0 {
+                        c.is_ascii_alphabetic() || c == '_'
+                    } else {
+                        c.is_ascii_alphanumeric() || c == '_'
+                    }
                 }) {
                     shell_body.push_str(&format!("export {}={} && ", key, shell_quote(value)));
                 } else {
@@ -292,11 +302,7 @@ impl ForkdSandbox {
 
         shell_body.push_str(command);
 
-        vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            shell_body,
-        ]
+        vec!["sh".to_string(), "-lc".to_string(), shell_body]
     }
 
     /// Execute an argv inside the sandbox.  Returns the raw `ExecResponse`
@@ -329,12 +335,13 @@ impl ForkdSandbox {
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    return resp
-                        .json::<ExecResponse>()
-                        .await
-                        .map_err(|e| crate::Error::context("Failed to parse forkd exec response", e));
+                    return resp.json::<ExecResponse>().await.map_err(|e| {
+                        crate::Error::context("Failed to parse forkd exec response", e)
+                    });
                 }
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT =>
+                {
                     let status = resp.status();
                     tracing::warn!(
                         attempt,
@@ -374,16 +381,8 @@ impl ForkdSandbox {
     ///
     /// Uses `sh -lc` with a default cwd of `/` so the caller can use absolute
     /// paths without worrying about the initial working directory.
-    async fn exec_shell(
-        &self,
-        command: &str,
-        timeout_secs: u64,
-    ) -> crate::Result<ExecResponse> {
-        let args = vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            command.to_string(),
-        ];
+    async fn exec_shell(&self, command: &str, timeout_secs: u64) -> crate::Result<ExecResponse> {
+        let args = vec!["sh".to_string(), "-lc".to_string(), command.to_string()];
         self.exec_in_sandbox(args, timeout_secs).await
     }
 
@@ -410,18 +409,17 @@ impl ForkdSandbox {
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    let parsed = resp
-                        .json::<CreateSandboxResponse>()
-                        .await
-                        .map_err(|e| crate::Error::context("Failed to parse forkd create response", e))?;
+                    let parsed = resp.json::<CreateSandboxResponse>().await.map_err(|e| {
+                        crate::Error::context("Failed to parse forkd create response", e)
+                    })?;
 
                     let entry = parsed.into_first().ok_or_else(|| {
                         crate::Error::message("forkd create returned empty array")
                     })?;
 
-                    self.sandbox_id
-                        .set(entry.id)
-                        .map_err(|_| crate::Error::message("forkd sandbox_id already set (double-init?)"))?;
+                    self.sandbox_id.set(entry.id).map_err(|_| {
+                        crate::Error::message("forkd sandbox_id already set (double-init?)")
+                    })?;
 
                     if let Some(tag) = entry.snapshot_tag {
                         let _ = self.active_snapshot.set(tag);
@@ -429,7 +427,9 @@ impl ForkdSandbox {
 
                     return Ok(());
                 }
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT =>
+                {
                     let status = resp.status();
                     tracing::warn!(
                         attempt,
@@ -458,7 +458,10 @@ impl ForkdSandbox {
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context("forkd create sandbox HTTP request failed", e));
+                    return Err(crate::Error::context(
+                        "forkd create sandbox HTTP request failed",
+                        e,
+                    ));
                 }
             }
         }
@@ -491,7 +494,9 @@ impl ForkdSandbox {
                 // 404 means the sandbox is already gone — idempotent success.
                 Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(()),
                 Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT =>
+                {
                     let status = resp.status();
                     tracing::warn!(
                         attempt,
@@ -520,7 +525,10 @@ impl ForkdSandbox {
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context("forkd delete sandbox HTTP request failed", e));
+                    return Err(crate::Error::context(
+                        "forkd delete sandbox HTTP request failed",
+                        e,
+                    ));
                 }
             }
         }
@@ -579,7 +587,7 @@ impl ForkdSandbox {
 
         let duration_ms = elapsed_ms(start);
         self.emit(SandboxEvent::GitCloneCompleted {
-            url:         origin_url.to_string(),
+            url: origin_url.to_string(),
             duration_ms,
         });
 
@@ -611,9 +619,9 @@ impl Sandbox for ForkdSandbox {
         self.create_sandbox().await.map_err(|err| {
             let duration_ms = elapsed_ms(start);
             self.emit(SandboxEvent::InitializeFailed {
-                provider:    PROVIDER.into(),
-                error:       err.to_string(),
-                causes:      err.causes(),
+                provider: PROVIDER.into(),
+                error: err.to_string(),
+                causes: err.causes(),
                 duration_ms,
             });
             err
@@ -627,9 +635,9 @@ impl Sandbox for ForkdSandbox {
                     .map_err(|err| {
                         let duration_ms = elapsed_ms(start);
                         self.emit(SandboxEvent::InitializeFailed {
-                            provider:    PROVIDER.into(),
-                            error:       err.to_string(),
-                            causes:      err.causes(),
+                            provider: PROVIDER.into(),
+                            error: err.to_string(),
+                            causes: err.causes(),
                             duration_ms,
                         });
                         err
@@ -641,12 +649,12 @@ impl Sandbox for ForkdSandbox {
         let _ = self.initialized.set(true);
         let duration_ms = elapsed_ms(start);
         self.emit(SandboxEvent::Ready {
-            provider:    PROVIDER.into(),
+            provider: PROVIDER.into(),
             duration_ms,
-            name:        self.sandbox_id.get().cloned(),
-            cpu:         None,
-            memory:      None,
-            url:         None,
+            name: self.sandbox_id.get().cloned(),
+            cpu: None,
+            memory: None,
+            url: None,
         });
 
         Ok(())
@@ -733,10 +741,7 @@ impl Sandbox for ForkdSandbox {
         let abs_path = self.resolve_path(path);
         // base64-encode the file so we can round-trip binary safely through the
         // exec response (which is a JSON string).
-        let cmd = format!(
-            "base64 -w 0 {}",
-            shell_quote(&abs_path)
-        );
+        let cmd = format!("base64 -w 0 {}", shell_quote(&abs_path));
         let resp = self.exec_shell(&cmd, 60).await?;
 
         if resp.exit_code != Some(0) {
@@ -850,7 +855,7 @@ impl Sandbox for ForkdSandbox {
                     size_str.parse::<u64>().ok()
                 };
                 Some(DirEntry {
-                    name:  name.to_string(),
+                    name: name.to_string(),
                     is_dir,
                     size,
                 })
@@ -965,10 +970,7 @@ impl Sandbox for ForkdSandbox {
             let grep_cmd = grep_args.join(" ");
             let grep_resp = self.exec_shell(&grep_cmd, 60).await?;
             let stdout = grep_resp.stdout.unwrap_or_default();
-            return Ok(stdout
-                .lines()
-                .map(str::to_string)
-                .collect());
+            return Ok(stdout.lines().map(str::to_string).collect());
         }
 
         let stdout = resp.stdout.unwrap_or_default();
@@ -1024,7 +1026,7 @@ impl Sandbox for ForkdSandbox {
     fn sandbox_info(&self) -> String {
         match self.sandbox_id.get() {
             Some(id) => format!("forkd:{id}"),
-            None     => "forkd:(uninitialized)".to_string(),
+            None => "forkd:(uninitialized)".to_string(),
         }
     }
 
@@ -1048,16 +1050,11 @@ impl Sandbox for ForkdSandbox {
         &self,
         intent: &crate::GitSetupIntent,
     ) -> crate::Result<Option<crate::GitRunInfo>> {
-        crate::setup_git_via_exec(self, intent)
-            .await
-            .map(Some)
+        crate::setup_git_via_exec(self, intent).await.map(Some)
     }
 
     fn resume_setup_commands(&self, run_branch: &str) -> Vec<String> {
-        vec![format!(
-            "git checkout {}",
-            shell_quote(run_branch)
-        )]
+        vec![format!("git checkout {}", shell_quote(run_branch))]
     }
 
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {

@@ -69,9 +69,16 @@ impl SandboxProvider for ForkdSandboxProvider {
 
             match result {
                 Ok(resp) if resp.status().is_success() => break resp,
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status())
+                        && attempt < PROVIDER_RETRY_LIMIT =>
+                {
                     let status = resp.status();
-                    tracing::warn!(attempt, status = status.as_u16(), "forkd list transient error; retrying");
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd list transient error; retrying"
+                    );
                     attempt += 1;
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -133,9 +140,16 @@ impl SandboxProvider for ForkdSandboxProvider {
                 Ok(resp) if resp.status().is_success() => {
                     return Ok(Some(details::forkd::forkd_info_from_name(id)));
                 }
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status())
+                        && attempt < PROVIDER_RETRY_LIMIT =>
+                {
                     let status = resp.status();
-                    tracing::warn!(attempt, status = status.as_u16(), "forkd get transient error; retrying");
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd get transient error; retrying"
+                    );
                     attempt += 1;
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -154,7 +168,10 @@ impl SandboxProvider for ForkdSandboxProvider {
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context(format!("Failed to get forkd VM '{id}'"), e));
+                    return Err(crate::Error::context(
+                        format!("Failed to get forkd VM '{id}'"),
+                        e,
+                    ));
                 }
             }
         }
@@ -184,9 +201,9 @@ impl SandboxProvider for ForkdSandboxProvider {
         // then report. Without initialize() the VM never exists and all
         // subsequent operations on the returned SandboxInfo would fail.
         sandbox.initialize().await?;
-        let id = sandbox.sandbox_id().ok_or_else(|| {
-            crate::Error::message("forkd sandbox id missing after initialize")
-        })?;
+        let id = sandbox
+            .sandbox_id()
+            .ok_or_else(|| crate::Error::message("forkd sandbox id missing after initialize"))?;
         Ok(details::forkd::forkd_info_from_name(id))
     }
 
@@ -209,9 +226,16 @@ impl SandboxProvider for ForkdSandboxProvider {
                     return Ok(());
                 }
                 Ok(resp) if resp.status().is_success() => return Ok(()),
-                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < PROVIDER_RETRY_LIMIT => {
+                Ok(resp)
+                    if Self::is_retryable_status(resp.status())
+                        && attempt < PROVIDER_RETRY_LIMIT =>
+                {
                     let status = resp.status();
-                    tracing::warn!(attempt, status = status.as_u16(), "forkd delete transient error; retrying");
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd delete transient error; retrying"
+                    );
                     attempt += 1;
                     sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -230,7 +254,10 @@ impl SandboxProvider for ForkdSandboxProvider {
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                 }
                 Err(e) => {
-                    return Err(crate::Error::context(format!("Failed to delete forkd VM '{id}'"), e));
+                    return Err(crate::Error::context(
+                        format!("Failed to delete forkd VM '{id}'"),
+                        e,
+                    ));
                 }
             }
         }

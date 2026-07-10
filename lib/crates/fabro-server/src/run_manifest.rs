@@ -18,12 +18,12 @@ use fabro_graphviz::render::apply_direction;
 use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
 use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::daytona::DaytonaConfig;
+#[cfg(feature = "forkd")]
+use fabro_sandbox::from_environment::forkd_config_from_environment;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment,
     local_working_directory_from_environment,
 };
-#[cfg(feature = "forkd")]
-use fabro_sandbox::from_environment::forkd_config_from_environment;
 use fabro_sandbox::redact::redact_auth_url;
 use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
 use fabro_static::EnvVars;
