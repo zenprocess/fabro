@@ -436,12 +436,7 @@ async fn create_ssh_access(
                 }
             }
         }
-        SandboxProviderKind::Forkd => ApiError::new(
-            StatusCode::CONFLICT,
-            "Sandbox provider does not support access commands.",
-        )
-        .into_response(),
-        SandboxProviderKind::Local => ApiError::new(
+        SandboxProviderKind::Forkd | SandboxProviderKind::Local => ApiError::new(
             StatusCode::CONFLICT,
             "Sandbox provider does not support access commands.",
         )
