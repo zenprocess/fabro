@@ -27,24 +27,12 @@ impl ForkdSandboxProvider {
         Self { config }
     }
 
-    /// Build a provider by reading `FORKD_URL` and `FORKD_TOKEN` from the
-    /// process environment (the same resolution that
-    /// [`crate::from_environment::forkd_config_from_environment`] performs for
-    /// a full [`RunEnvironmentSettings`]).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "ForkdSandboxProvider::from_env resolves server-level credentials from the process environment."
-    )]
+    /// Build a provider by reading `FORKD_URL`, `FORKD_TOKEN`, and
+    /// `FORKD_SNAPSHOT_TAG` from the process environment (the same
+    /// resolution that [`ForkdConfig::from_env`] and
+    /// [`crate::from_environment::forkd_config_from_environment`] perform).
     pub fn from_env() -> Self {
-        let forkd_url = std::env::var("FORKD_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
-        let forkd_token = std::env::var("FORKD_TOKEN")
-            .unwrap_or_else(|_| "forkd-local-token".to_string());
-        Self::new(ForkdConfig {
-            forkd_url,
-            forkd_token,
-            settings: Default::default(),
-        })
+        Self::new(ForkdConfig::from_env())
     }
 
     fn http_client(&self) -> crate::Result<reqwest::Client> {

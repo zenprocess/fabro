@@ -84,6 +84,38 @@ impl Default for ForkdConfig {
     }
 }
 
+impl ForkdConfig {
+    /// Build a `ForkdConfig` by reading `FORKD_URL`, `FORKD_TOKEN`, and
+    /// `FORKD_SNAPSHOT_TAG` from the process environment.
+    ///
+    /// Use this wherever a full `RunEnvironmentSettings` is not available
+    /// (provider construction, sandbox reconnect) instead of
+    /// [`ForkdConfig::default`] — the default's URL/token are placeholders
+    /// for local development only and must never be used to talk to a real
+    /// forkd controller.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Forkd config resolves server-level credentials from the process environment."
+    )]
+    #[must_use]
+    pub fn from_env() -> Self {
+        let forkd_url = std::env::var("FORKD_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
+        let forkd_token = std::env::var("FORKD_TOKEN")
+            .unwrap_or_else(|_| "forkd-local-token".to_string());
+        let snapshot_tag = std::env::var("FORKD_SNAPSHOT_TAG")
+            .unwrap_or_else(|_| DEFAULT_SNAPSHOT_TAG.to_string());
+        Self {
+            forkd_url,
+            forkd_token,
+            settings: ForkdSettings {
+                snapshot_tag,
+                ..ForkdSettings::default()
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // forkd REST API request/response shapes (forkd 0.5.2)
 // ---------------------------------------------------------------------------

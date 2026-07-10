@@ -111,7 +111,7 @@ pub async fn reconnect_for_run_with_callback(
         #[cfg(feature = "forkd")]
         SandboxProviderKind::Forkd => {
             let mut sandbox = ForkdSandbox::new(
-                crate::forkd::ForkdConfig::default(),
+                crate::forkd::ForkdConfig::from_env(),
                 run_id,
                 runtime.clone_origin_url.clone(),
                 runtime.clone_branch.clone(),
