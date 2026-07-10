@@ -927,6 +927,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                 "include": []
               },
               "checkpoint": {
+                "commit_timeout_ms": 30000,
                 "exclude_globs": [],
                 "skip_git_hooks": false
               },
@@ -995,7 +996,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
               },
               "notifications": {},
               "prepare": {
-                "commands": [],
+                "steps": [],
                 "timeout_ms": 300000
               },
               "pull_request": null,

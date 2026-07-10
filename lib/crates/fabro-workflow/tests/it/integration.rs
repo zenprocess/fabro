@@ -4684,7 +4684,7 @@ async fn import_e2e_through_engine() {
         file_resolver:     Some(std::sync::Arc::new(
             fabro_workflow::file_resolver::FilesystemFileResolver::new(None),
         )),
-        inputs:            std::collections::HashMap::new(),
+        template_context:  fabro_template::TemplateContext::new(),
         source_name:       None,
         render_mode:       fabro_workflow::operations::RenderMode::Strict,
         custom_transforms: vec![],
@@ -8906,7 +8906,13 @@ async fn hook_config_merge_run_overrides_by_name() {
     let merged = server_hooks.merge(run_hooks);
     assert_eq!(merged.hooks.len(), 1);
     // Run config wins — command should be "exit 0"
-    assert_eq!(merged.hooks[0].command.as_deref(), Some("exit 0"));
+    assert_eq!(
+        merged.hooks[0]
+            .command
+            .as_ref()
+            .map(fabro_hooks::InterpString::as_source),
+        Some("exit 0".to_string())
+    );
 
     // Verify it actually works end-to-end
     let engine = engine_with_hooks(merged.hooks);

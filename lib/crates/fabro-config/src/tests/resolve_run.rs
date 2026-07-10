@@ -647,7 +647,7 @@ name = "sonnet"
         }
         other => panic!("expected file goal, got {other:?}"),
     }
-    // run.working_dir is demoted (D11): the env token stays literal text.
+    // run.working_dir is demoted: the env token stays literal text.
     assert_eq!(
         settings.working_dir.as_deref(),
         Some("{{ env.FABRO_WORKDIR }}")
@@ -917,8 +917,8 @@ fabro_tools = true
     }
 }
 
-mod run_checkpoint_skip_git_hooks {
-    //! Layer + resolver tests for `[run.checkpoint] skip_git_hooks`.
+mod run_checkpoint {
+    //! Layer + resolver tests for `[run.checkpoint]`.
 
     use crate::SettingsLayer;
     use crate::layers::Combine;
@@ -955,6 +955,31 @@ skip_git_hooks = true
     }
 
     #[test]
+    fn resolves_commit_timeout_default_when_omitted() {
+        let settings = super::workflow_settings_from_layer(SettingsLayer::default())
+            .expect("empty settings should resolve")
+            .run;
+
+        assert_eq!(settings.checkpoint.commit_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn resolves_commit_timeout_when_set() {
+        let settings = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.checkpoint]
+commit_timeout = "10m"
+"#,
+        )
+        .expect("settings should resolve")
+        .run;
+
+        assert_eq!(settings.checkpoint.commit_timeout_ms, 600_000);
+    }
+
+    #[test]
     fn higher_layer_false_overrides_lower_layer_true() {
         let workflow = parse_settings(
             r"
@@ -979,6 +1004,33 @@ skip_git_hooks = true
             .run;
 
         assert!(!settings.checkpoint.skip_git_hooks);
+    }
+
+    #[test]
+    fn higher_layer_commit_timeout_overrides_lower_layer() {
+        let workflow = parse_settings(
+            r#"
+_version = 1
+
+[run.checkpoint]
+commit_timeout = "10m"
+"#,
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.checkpoint]
+commit_timeout = "30s"
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let settings = super::workflow_settings_from_layer(merged)
+            .expect("merged settings should resolve")
+            .run;
+
+        assert_eq!(settings.checkpoint.commit_timeout_ms, 600_000);
     }
 
     #[test]
@@ -1010,5 +1062,271 @@ exclude_globs = ["**/lower/**"]
 
         assert_eq!(settings.checkpoint.exclude_globs, vec!["**/lower/**"]);
         assert!(settings.checkpoint.skip_git_hooks);
+    }
+}
+
+mod run_agent_mcps {
+    //! Layer + resolver tests for `[run.agent.mcps]`: same-key replacement
+    //! across layers (`StickyMap`) and honoring `enabled = false`.
+
+    use std::collections::HashMap;
+
+    use fabro_types::settings::run::{
+        McpHttpProtocol, McpServerSettings, McpTransport, ResolvedMcpEntry,
+    };
+
+    use crate::layers::Combine;
+    use crate::tests::seeded_environment_catalog;
+    use crate::{RunLayer, SettingsLayer, WorkflowSettingsBuilder};
+
+    fn parse_settings(source: &str) -> SettingsLayer {
+        source
+            .parse::<SettingsLayer>()
+            .expect("fixture should parse via SettingsLayer")
+    }
+
+    fn stdio_command(entry: &ResolvedMcpEntry) -> &[String] {
+        let server = entry.as_resolved().expect("expected resolved inline entry");
+        match &server.transport {
+            McpTransport::Stdio { command, .. } => command,
+            other => panic!("expected stdio transport, got {other:?}"),
+        }
+    }
+
+    fn mcp_catalog() -> HashMap<String, McpServerSettings> {
+        HashMap::from([("sentry".to_string(), McpServerSettings {
+            name: "sentry".to_string(),
+            transport: McpTransport::Http {
+                protocol: McpHttpProtocol::default(),
+                url:      "https://sentry.example.com/mcp".to_string(),
+                headers:  HashMap::from([(
+                    "Authorization".to_string(),
+                    "{{ secrets.SENTRY_TOKEN }}".to_string(),
+                )]),
+            },
+            ..McpServerSettings::default()
+        })])
+    }
+
+    #[test]
+    fn higher_layer_replaces_same_key_mcp_entry() {
+        // Both layers define `[run.agent.mcps.fs]`; the higher (workflow)
+        // layer's entry must win wholesale via StickyMap same-key replacement.
+        let workflow = parse_settings(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+command = ["fs-server", "--workflow"]
+"#,
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+command = ["fs-server", "--user"]
+
+[run.agent.mcps.extra]
+type = "stdio"
+command = ["extra-server"]
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let mcps = super::workflow_settings_from_layer(merged)
+            .expect("merged settings should resolve")
+            .run
+            .agent
+            .mcps;
+
+        // Same-key `fs` is replaced by the higher layer; different-key `extra`
+        // is additive and inherited from the lower layer.
+        assert_eq!(stdio_command(&mcps["fs"]), &[
+            "fs-server".to_string(),
+            "--workflow".to_string()
+        ],);
+        assert!(mcps.contains_key("extra"));
+    }
+
+    #[test]
+    fn inline_entry_with_enabled_false_is_skipped() {
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+command = ["fs-server"]
+
+[run.agent.mcps.disabled]
+type = "stdio"
+enabled = false
+command = ["never-launched"]
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert!(mcps.contains_key("fs"));
+        assert!(
+            !mcps.contains_key("disabled"),
+            "explicit `enabled = false` should drop the inline MCP entry"
+        );
+    }
+
+    #[test]
+    fn absent_enabled_keeps_inline_entry() {
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+command = ["fs-server"]
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert!(
+            mcps.contains_key("fs"),
+            "an entry without `enabled` defaults to enabled"
+        );
+    }
+
+    #[test]
+    fn catalog_reference_resolves_from_server_catalog() {
+        let settings = WorkflowSettingsBuilder::new()
+            .server_manifest_defaults(RunLayer::default(), seeded_environment_catalog())
+            .server_mcp_catalog(mcp_catalog())
+            .workflow_toml(
+                r#"
+_version = 1
+
+[run.agent.mcps.error_tracker]
+id = "sentry"
+"#,
+            )
+            .expect("settings should parse")
+            .build()
+            .expect("settings should resolve");
+
+        let server = settings.run.agent.mcps["error_tracker"]
+            .as_resolved()
+            .expect("catalog reference should resolve to a concrete server");
+        assert_eq!(server.name, "sentry");
+        match &server.transport {
+            McpTransport::Http { url, headers, .. } => {
+                assert_eq!(url, "https://sentry.example.com/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("{{ secrets.SENTRY_TOKEN }}")
+                );
+            }
+            other => panic!("expected HTTP catalog transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disabled_catalog_reference_is_skipped_without_lookup() {
+        let settings = WorkflowSettingsBuilder::new()
+            .server_manifest_defaults(RunLayer::default(), seeded_environment_catalog())
+            .workflow_toml(
+                r#"
+_version = 1
+
+[run.agent.mcps.optional]
+id = "missing"
+enabled = false
+"#,
+            )
+            .expect("settings should parse")
+            .build()
+            .expect("disabled reference should not require a catalog entry");
+
+        assert!(!settings.run.agent.mcps.contains_key("optional"));
+    }
+
+    #[test]
+    fn missing_catalog_reference_is_a_resolve_error() {
+        let err = WorkflowSettingsBuilder::new()
+            .server_manifest_defaults(RunLayer::default(), seeded_environment_catalog())
+            .workflow_toml(
+                r#"
+_version = 1
+
+[run.agent.mcps.missing]
+id = "missing"
+"#,
+            )
+            .expect("settings should parse")
+            .build()
+            .expect_err("missing catalog entry should fail resolution");
+
+        assert!(
+            err.to_string().contains("unknown MCP server: missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn catalog_reference_serializes_without_transport_tag() {
+        let settings = parse_settings(
+            r#"
+_version = 1
+
+[run.agent.mcps.error_tracker]
+id = "sentry"
+"#,
+        );
+        let entry = &settings.run.unwrap().agent.unwrap().mcps["error_tracker"];
+        let value = serde_json::to_value(entry).expect("MCP reference should serialize");
+
+        assert_eq!(value, serde_json::json!({ "id": "sentry" }));
+    }
+
+    #[test]
+    fn higher_layer_disable_shadows_lower_layer_entry() {
+        // Lower layer enables `fs`; higher layer redefines the same key with
+        // `enabled = false`. StickyMap replacement means the disabled entry
+        // wins and the server is dropped from the resolved map.
+        let workflow = parse_settings(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+enabled = false
+command = ["fs-server"]
+"#,
+        );
+        let user = parse_settings(
+            r#"
+_version = 1
+
+[run.agent.mcps.fs]
+type = "stdio"
+command = ["fs-server"]
+"#,
+        );
+        let merged = workflow.combine(user);
+
+        let mcps = super::workflow_settings_from_layer(merged)
+            .expect("merged settings should resolve")
+            .run
+            .agent
+            .mcps;
+
+        assert!(
+            !mcps.contains_key("fs"),
+            "a higher-layer `enabled = false` should shadow and disable the lower-layer entry"
+        );
     }
 }

@@ -25,7 +25,7 @@ pub use cli::{
     CliLoggingSettings, CliNamespace, CliOutputSettings, CliTargetSettings, CliUpdatesSettings,
 };
 pub use duration::{Duration, ParseDurationError};
-pub use interp::{InterpString, Provenance, ResolveCtx, ResolveError, ResolveErrorKind, Resolved};
+pub use interp::{InterpString, ResolveCtx, ResolveError, ResolveErrorKind};
 pub use model_ref::{
     AmbiguousModelRef, ModelRef, ModelRegistry, ParseModelRefError, ResolvedModelRef,
 };
@@ -37,12 +37,12 @@ pub use run::{
     ArtifactsSettings, DockerfileSource, EnvironmentImageSettings, EnvironmentLifecycleSettings,
     EnvironmentNetworkMode, EnvironmentNetworkSettings, EnvironmentProvider,
     EnvironmentResourcesSettings, EnvironmentSettings, GitAuthorSettings, HookDefinition, HookType,
-    InterviewProviderSettings, McpServerSettings, McpTransport, NotificationProviderSettings,
-    NotificationRouteSettings, PullRequestSettings, RunAgentSettings, RunCheckpointSettings,
-    RunEnvironmentSettings, RunExecutionSettings, RunGitSettings, RunGoal,
-    RunIntegrationsGithubSettings, RunIntegrationsSettings, RunInterviewsSettings,
-    RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings, RunScmSettings,
-    ScmGitHubSettings, TlsMode,
+    InterviewProviderSettings, McpServerRef, McpServerSettings, McpTransport,
+    NotificationProviderSettings, NotificationRouteSettings, PreparedStep, PullRequestSettings,
+    ResolvedMcpEntry, RunAgentSettings, RunCheckpointSettings, RunEnvironmentSettings,
+    RunExecutionSettings, RunGitSettings, RunGoal, RunIntegrationsGithubSettings,
+    RunIntegrationsSettings, RunInterviewsSettings, RunModelControls, RunModelSettings,
+    RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 pub use server::{
     GithubIntegrationSettings, IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings,

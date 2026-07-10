@@ -3,7 +3,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use fabro_types::ManifestPath;
-use fabro_util::env::Env;
 use miette::{LabeledSpan, NamedSource, SourceCode, SourceSpan};
 use minijinja::value::{Object, Value};
 use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior};
@@ -48,11 +47,21 @@ pub struct TemplateErrorLocation {
     pub span_len:    Option<usize>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TemplateContext {
     goal:   Option<String>,
-    inputs: HashMap<String, toml::Value>,
-    env:    Option<Value>,
+    inputs: Value,
+    vars:   Value,
+}
+
+impl Default for TemplateContext {
+    fn default() -> Self {
+        Self {
+            goal:   None,
+            inputs: Value::from_serialize(HashMap::<String, toml::Value>::new()),
+            vars:   Value::from_serialize(HashMap::<String, String>::new()),
+        }
+    }
 }
 
 impl TemplateContext {
@@ -69,7 +78,14 @@ impl TemplateContext {
 
     #[must_use]
     pub fn with_inputs(mut self, inputs: HashMap<String, toml::Value>) -> Self {
-        self.inputs = inputs;
+        self.inputs = Value::from_serialize(inputs);
+        self
+    }
+
+    /// Run-scoped `{{ vars.* }}` available to prompts and goals.
+    #[must_use]
+    pub fn with_vars(mut self, vars: HashMap<String, String>) -> Self {
+        self.vars = Value::from_serialize(vars);
         self
     }
 
@@ -81,35 +97,11 @@ impl TemplateContext {
         Self::new().with_goal("{{ goal }}").with_inputs(inputs)
     }
 
-    #[must_use]
-    pub fn with_env_lookup<E>(mut self, env: &E) -> Self
-    where
-        E: Env + Clone + Send + Sync + fmt::Debug + 'static,
-    {
-        self.env = Some(Value::from_object(EnvLookup {
-            env:       env.clone(),
-            allowlist: None,
-        }));
-        self
-    }
-
-    #[must_use]
-    pub fn with_env_lookup_allowed<E>(mut self, env: &E, allowlist: &[String]) -> Self
-    where
-        E: Env + Clone + Send + Sync + fmt::Debug + 'static,
-    {
-        self.env = Some(Value::from_object(EnvLookup {
-            env:       env.clone(),
-            allowlist: Some(allowlist.to_vec()),
-        }));
-        self
-    }
-
     fn into_value(self) -> Value {
         let goal = self.goal.map(Value::from);
-        let inputs = Value::from_serialize(self.inputs);
-        let env = self.env;
-        Value::from_object(RenderContext { goal, inputs, env })
+        let inputs = self.inputs;
+        let vars = self.vars;
+        Value::from_object(RenderContext { goal, inputs, vars })
     }
 }
 
@@ -117,7 +109,7 @@ impl TemplateContext {
 struct RenderContext {
     goal:   Option<Value>,
     inputs: Value,
-    env:    Option<Value>,
+    vars:   Value,
 }
 
 impl Object for RenderContext {
@@ -125,30 +117,9 @@ impl Object for RenderContext {
         match key {
             "goal" => self.goal.clone(),
             "inputs" => Some(self.inputs.clone()),
-            "env" => self.env.clone(),
+            "vars" => Some(self.vars.clone()),
             _ => None,
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EnvLookup<E> {
-    env:       E,
-    allowlist: Option<Vec<String>>,
-}
-
-impl<E> Object for EnvLookup<E>
-where
-    E: Env + Send + Sync + fmt::Debug + 'static,
-{
-    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
-        if let Some(allowlist) = &self.allowlist {
-            if !allowlist.iter().any(|allowed| allowed == key) {
-                return None;
-            }
-        }
-
-        self.env.var(key).ok().map(Value::from)
     }
 }
 
@@ -788,7 +759,6 @@ fn reject_loader_dependent_string(name: Option<&str>, template: &str) -> Result<
 mod tests {
     use std::collections::HashMap;
 
-    use fabro_util::env::TestEnv;
     use fabro_util::error;
     use toml::map::Map;
 
@@ -835,6 +805,30 @@ mod tests {
     }
 
     #[test]
+    fn renders_vars_variable() {
+        let ctx = TemplateContext::new().with_vars(HashMap::from([(
+            "SERVICE".to_string(),
+            "billing".to_string(),
+        )]));
+
+        let rendered = render("Service: {{ vars.SERVICE }}", &ctx).unwrap();
+
+        assert_eq!(rendered, "Service: billing");
+    }
+
+    #[test]
+    fn unknown_vars_member_is_strict_error() {
+        let ctx = TemplateContext::new().with_vars(HashMap::from([(
+            "SERVICE".to_string(),
+            "billing".to_string(),
+        )]));
+
+        let err = render("{{ vars.MISSING }}", &ctx).unwrap_err();
+
+        assert!(err.to_string().to_lowercase().contains("undefined"));
+    }
+
+    #[test]
     fn renders_typed_input_values() {
         let ctx = TemplateContext::new().with_inputs(HashMap::from([
             ("enabled".to_string(), toml::Value::Boolean(true)),
@@ -863,39 +857,6 @@ mod tests {
         let rendered = render("Repo {{ inputs.repo.name }}", &ctx).unwrap();
 
         assert_eq!(rendered, "Repo fabro");
-    }
-
-    #[test]
-    fn renders_env_variable() {
-        let env = TestEnv(HashMap::from([(
-            "API_KEY".to_string(),
-            "secret".to_string(),
-        )]));
-        let ctx = TemplateContext::new().with_env_lookup(&env);
-
-        let rendered = render("{{ env.API_KEY }}", &ctx).unwrap();
-
-        assert_eq!(rendered, "secret");
-    }
-
-    #[test]
-    fn renders_allowlisted_env_variable() {
-        let env = TestEnv(HashMap::from([("TOKEN".to_string(), "abc123".to_string())]));
-        let ctx = TemplateContext::new().with_env_lookup_allowed(&env, &["TOKEN".to_string()]);
-
-        let rendered = render("Bearer {{ env.TOKEN }}", &ctx).unwrap();
-
-        assert_eq!(rendered, "Bearer abc123");
-    }
-
-    #[test]
-    fn rejects_non_allowlisted_env_variable() {
-        let env = TestEnv(HashMap::from([("SECRET".to_string(), "shh".to_string())]));
-        let ctx = TemplateContext::new().with_env_lookup_allowed(&env, &[]);
-
-        let err = render("{{ env.SECRET }}", &ctx).unwrap_err();
-
-        assert!(matches!(err, TemplateError::UndefinedVariable { .. }));
     }
 
     #[test]
