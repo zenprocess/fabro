@@ -35,8 +35,8 @@ impl ForkdSandboxProvider {
         Self::new(ForkdConfig::from_env())
     }
 
-    fn http_client(&self) -> crate::Result<reqwest::Client> {
-        reqwest::Client::builder()
+    fn http_client() -> crate::Result<reqwest::Client> {
+        fabro_http::HttpClientBuilder::new()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(15))
             .build()
@@ -55,7 +55,7 @@ impl SandboxProvider for ForkdSandboxProvider {
     }
 
     async fn list(&self) -> crate::Result<Vec<SandboxInfo>> {
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes", self.config.forkd_url);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
@@ -123,7 +123,7 @@ impl SandboxProvider for ForkdSandboxProvider {
     }
 
     async fn get(&self, id: &str) -> crate::Result<Option<SandboxInfo>> {
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;
@@ -208,7 +208,7 @@ impl SandboxProvider for ForkdSandboxProvider {
     }
 
     async fn delete(&self, id: &str) -> crate::Result<()> {
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = PROVIDER_RETRY_INITIAL_BACKOFF;

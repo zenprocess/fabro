@@ -163,13 +163,19 @@ pub fn forkd_config_from_environment(
     let forkd_token =
         std::env::var("FORKD_TOKEN").unwrap_or_else(|_| "forkd-local-token".to_string());
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "environment memory limits are configured well within u32 MiB range"
+    )]
+    let mem_mib = settings
+        .resources
+        .memory
+        .map(|size| (size.as_bytes() / (1024 * 1024)) as u32);
+
     let snapshot = ForkdSnapshotSettings {
-        image:          settings.image.docker.clone(),
-        kernel:         None, // resolved from FORKD_KERNEL by ForkdConfig::effective_kernel()
-        mem_mib:        settings
-            .resources
-            .memory
-            .map(|size| (size.as_bytes() / (1024 * 1024)) as u32),
+        image: settings.image.docker.clone(),
+        kernel: None, // resolved from FORKD_KERNEL by ForkdConfig::effective_kernel()
+        mem_mib,
         extra_packages: None,
     };
 

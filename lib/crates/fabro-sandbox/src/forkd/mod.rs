@@ -9,6 +9,7 @@
 //!   variables resolved at provider construction time.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fabro_types::{CommandTermination, RunId};
 use fabro_util::time::elapsed_ms;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -188,6 +189,10 @@ struct ExecResponse {
 /// A sandbox backed by a single Firecracker microVM managed via forkd.
 pub struct ForkdSandbox {
     config:           ForkdConfig,
+    #[expect(
+        dead_code,
+        reason = "kept for parity with the run correlation Docker/Daytona sandboxes store on self; forkd sandboxes are not yet labeled or looked up by run_id"
+    )]
     run_id:           Option<RunId>,
     clone_origin_url: Option<String>,
     clone_branch:     Option<String>,
@@ -246,18 +251,18 @@ impl ForkdSandbox {
         }
     }
 
-    fn http_client(&self) -> crate::Result<reqwest::Client> {
-        reqwest::Client::builder()
+    fn http_client() -> crate::Result<reqwest::Client> {
+        fabro_http::HttpClientBuilder::new()
             // Hard cap on individual HTTP requests to the forkd controller.
             // Exec calls use a per-request timeout via ExecRequest.timeout_secs;
             // this is a safety net for connect + response-header receipt.
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_mins(2))
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| crate::Error::context("Failed to build HTTP client for forkd", e))
     }
 
-    fn resolve_path(&self, path: &str) -> String {
+    fn resolve_path(path: &str) -> String {
         resolve_path(path, WORKING_DIRECTORY)
     }
 
@@ -293,7 +298,7 @@ impl ForkdSandbox {
                         c.is_ascii_alphanumeric() || c == '_'
                     }
                 }) {
-                    shell_body.push_str(&format!("export {}={} && ", key, shell_quote(value)));
+                    let _ = write!(shell_body, "export {}={} && ", key, shell_quote(value));
                 } else {
                     tracing::warn!(key, "forkd: skipping env var with non-identifier key");
                 }
@@ -319,7 +324,7 @@ impl ForkdSandbox {
             crate::Error::message("forkd sandbox not yet initialized (no sandbox id)")
         })?;
 
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes/{}/exec", self.config.forkd_url, id);
         let body = ExecRequest { args, timeout_secs };
 
@@ -391,7 +396,7 @@ impl ForkdSandbox {
     /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
     /// On success, stores the server-assigned sandbox id in `self.sandbox_id`.
     async fn create_sandbox(&self) -> crate::Result<()> {
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes", self.config.forkd_url);
         let body = CreateSandboxRequest {
             snapshot_tag: self.config.settings.snapshot_tag.clone(),
@@ -472,13 +477,12 @@ impl ForkdSandbox {
     /// 404 is treated as "already gone" and returns `Ok(())`.
     /// Transient HTTP errors are retried up to `HTTP_RETRY_LIMIT` times.
     async fn delete_sandbox(&self) -> crate::Result<()> {
-        let id = match self.sandbox_id.get() {
-            Some(id) => id,
-            // Never initialized — nothing to delete.
-            None => return Ok(()),
+        // Never initialized — nothing to delete.
+        let Some(id) = self.sandbox_id.get() else {
+            return Ok(());
         };
 
-        let client = self.http_client()?;
+        let client = Self::http_client()?;
         let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, id);
 
         let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
@@ -616,7 +620,7 @@ impl Sandbox for ForkdSandbox {
         });
 
         // Create the sandbox (POST /v1/sandboxes).
-        self.create_sandbox().await.map_err(|err| {
+        self.create_sandbox().await.inspect_err(|err| {
             let duration_ms = elapsed_ms(start);
             self.emit(SandboxEvent::InitializeFailed {
                 provider: PROVIDER.into(),
@@ -624,7 +628,6 @@ impl Sandbox for ForkdSandbox {
                 causes: err.causes(),
                 duration_ms,
             });
-            err
         })?;
 
         // Clone the repository if requested.
@@ -632,7 +635,7 @@ impl Sandbox for ForkdSandbox {
             if let Some(ref origin_url) = self.clone_origin_url {
                 self.clone_repo(origin_url, self.clone_branch.as_deref())
                     .await
-                    .map_err(|err| {
+                    .inspect_err(|err| {
                         let duration_ms = elapsed_ms(start);
                         self.emit(SandboxEvent::InitializeFailed {
                             provider: PROVIDER.into(),
@@ -640,7 +643,6 @@ impl Sandbox for ForkdSandbox {
                             causes: err.causes(),
                             duration_ms,
                         });
-                        err
                     })?;
                 let _ = self.origin_url.set(origin_url.clone());
             }
@@ -698,15 +700,14 @@ impl Sandbox for ForkdSandbox {
         env_vars: Option<&HashMap<String, String>>,
         _cancel_token: Option<CancellationToken>,
     ) -> crate::Result<ExecResult> {
-        let effective_dir = working_dir
-            .map(|d| self.resolve_path(d))
-            .unwrap_or_else(|| WORKING_DIRECTORY.to_string());
+        let effective_dir =
+            working_dir.map_or_else(|| WORKING_DIRECTORY.to_string(), Self::resolve_path);
 
         // forkd exec is argv-only; fold cwd and env into sh -lc.
         let args = Self::build_exec_argv(command, &effective_dir, env_vars);
 
         // Convert ms to whole seconds (ceiling), minimum 1 second.
-        let timeout_secs = ((timeout_ms + 999) / 1000).max(1);
+        let timeout_secs = timeout_ms.div_ceil(1000).max(1);
 
         let start = Instant::now();
         let resp = self.exec_in_sandbox(args, timeout_secs).await?;
@@ -738,7 +739,7 @@ impl Sandbox for ForkdSandbox {
     // ------------------------------------------------------------------
 
     async fn read_file_bytes(&self, path: &str) -> crate::Result<Vec<u8>> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         // base64-encode the file so we can round-trip binary safely through the
         // exec response (which is a JSON string).
         let cmd = format!("base64 -w 0 {}", shell_quote(&abs_path));
@@ -759,7 +760,7 @@ impl Sandbox for ForkdSandbox {
     }
 
     async fn write_file(&self, path: &str, content: &str) -> crate::Result<()> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         let encoded = BASE64.encode(content.as_bytes());
         // Ensure parent directory exists.
         let parent = std::path::Path::new(&abs_path)
@@ -794,7 +795,7 @@ impl Sandbox for ForkdSandbox {
     }
 
     async fn delete_file(&self, path: &str) -> crate::Result<()> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         let cmd = format!("rm -f {}", shell_quote(&abs_path));
         let resp = self.exec_shell(&cmd, 10).await?;
         if resp.exit_code != Some(0) {
@@ -808,7 +809,7 @@ impl Sandbox for ForkdSandbox {
     }
 
     async fn file_exists(&self, path: &str) -> crate::Result<bool> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         let cmd = format!("test -e {}", shell_quote(&abs_path));
         let resp = self.exec_shell(&cmd, 10).await?;
         Ok(resp.exit_code == Some(0))
@@ -819,11 +820,11 @@ impl Sandbox for ForkdSandbox {
         path: &str,
         depth: Option<usize>,
     ) -> crate::Result<Vec<DirEntry>> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         let max_depth = depth.unwrap_or(1);
         // Output format: TYPE SIZE NAME per line (TYPE is 'f' or 'd')
         let cmd = format!(
-            r#"find {} -maxdepth {} -printf '%y %s %P\n' 2>/dev/null | tail -n +2"#,
+            r"find {} -maxdepth {} -printf '%y %s %P\n' 2>/dev/null | tail -n +2",
             shell_quote(&abs_path),
             max_depth
         );
@@ -871,7 +872,7 @@ impl Sandbox for ForkdSandbox {
         local_path: &Path,
     ) -> crate::Result<()> {
         let bytes = self.read_file_bytes(remote_path).await?;
-        tokio::fs::write(local_path, &bytes)
+        fs::write(local_path, &bytes)
             .await
             .map_err(|e| crate::Error::context("forkd download_file_to_local write failed", e))
     }
@@ -881,14 +882,14 @@ impl Sandbox for ForkdSandbox {
         local_path: &Path,
         remote_path: &str,
     ) -> crate::Result<()> {
-        let bytes = tokio::fs::read(local_path)
+        let bytes = fs::read(local_path)
             .await
             .map_err(|e| crate::Error::context("forkd upload_file_from_local read failed", e))?;
         // Binary-safe: base64-encode raw bytes and decode inside the VM, mirroring
         // how read_file_bytes works in reverse.  String::from_utf8_lossy is
         // deliberately avoided — it silently corrupts any non-UTF-8 byte sequence
         // (e.g. compiled binaries, images, zip archives).
-        let abs_path = self.resolve_path(remote_path);
+        let abs_path = Self::resolve_path(remote_path);
         let encoded = BASE64.encode(&bytes);
 
         // Ensure parent directory exists.
@@ -933,7 +934,7 @@ impl Sandbox for ForkdSandbox {
         path: &str,
         options: &GrepOptions,
     ) -> crate::Result<Vec<String>> {
-        let abs_path = self.resolve_path(path);
+        let abs_path = Self::resolve_path(path);
         let mut args = vec!["rg".to_string(), "--line-number".to_string()];
 
         if options.case_insensitive {
@@ -978,9 +979,7 @@ impl Sandbox for ForkdSandbox {
     }
 
     async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base = path
-            .map(|p| self.resolve_path(p))
-            .unwrap_or_else(|| WORKING_DIRECTORY.to_string());
+        let base = path.map_or_else(|| WORKING_DIRECTORY.to_string(), Self::resolve_path);
         // Use `-name` for patterns without a directory separator (e.g. `*.rs`,
         // `Cargo.toml`) so they match at any depth without a spurious `*/` prefix
         // that would require at least one intermediate directory and would miss
@@ -1015,7 +1014,7 @@ impl Sandbox for ForkdSandbox {
         WORKING_DIRECTORY
     }
 
-    fn platform(&self) -> &str {
+    fn platform(&self) -> &'static str {
         "linux"
     }
 

@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "forkd")]
+use crate::forkd::DEFAULT_SNAPSHOT_TAG;
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct DaytonaSettings {
     pub auto_stop_interval: Option<i32>,
@@ -181,7 +184,7 @@ pub struct ForkdSettings {
 #[cfg(feature = "forkd")]
 impl ForkdSettings {
     fn default_snapshot_tag() -> String {
-        crate::forkd::DEFAULT_SNAPSHOT_TAG.to_string()
+        DEFAULT_SNAPSHOT_TAG.to_string()
     }
 }
 

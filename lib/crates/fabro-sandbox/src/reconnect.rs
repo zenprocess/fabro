@@ -13,7 +13,7 @@ use crate::daytona::DaytonaSandbox;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandbox;
 #[cfg(feature = "forkd")]
-use crate::forkd::ForkdSandbox;
+use crate::forkd::{ForkdConfig, ForkdSandbox};
 use crate::local::LocalSandbox;
 
 /// Reconnect to a sandbox from a saved record.
@@ -111,7 +111,7 @@ pub async fn reconnect_for_run_with_callback(
         #[cfg(feature = "forkd")]
         SandboxProviderKind::Forkd => {
             let mut sandbox = ForkdSandbox::new(
-                crate::forkd::ForkdConfig::from_env(),
+                ForkdConfig::from_env(),
                 run_id,
                 runtime.clone_origin_url.clone(),
                 runtime.clone_branch.clone(),
