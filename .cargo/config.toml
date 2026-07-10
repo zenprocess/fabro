@@ -7,3 +7,53 @@ t = "test -- --format terse"
 # pays ~900ms of system-proxy lookup overhead per process, which pushes tests
 # past the 3s nextest kill threshold under parallel load.
 FABRO_HTTP_PROXY_POLICY = "disabled"
+
+# =============================================================================
+# Build-speed opt-ins (added by platform/build-speed — see docs/BUILD-SPEED.md)
+# =============================================================================
+#
+# Everything below is intentionally INERT (commented / env-driven) so it never
+# changes the default build on the Mac, in CI, or on any host that lacks mold /
+# sccache. Turn each on explicitly.
+#
+# -----------------------------------------------------------------------------
+# 1) sccache (compile cache) — OPT-IN via env, never committed as always-on.
+# -----------------------------------------------------------------------------
+# Enable per-shell without touching this file:
+#
+#     export RUSTC_WRAPPER=sccache      # cargo >= 1.40
+#     # (S3/MinIO backend is configured purely via SCCACHE_* env — see
+#     #  docs/BUILD-SPEED.md; with no SCCACHE_BUCKET set, sccache falls back to
+#     #  a local ~/.cache/sccache directory, which is still a speedup.)
+#     sccache --show-stats             # verify hits
+#
+# It is left out of [env] on purpose: hard-coding RUSTC_WRAPPER here would make
+# `cargo` fail for any contributor who does not have sccache installed.
+#
+# -----------------------------------------------------------------------------
+# 2) mold (fast linker) — DISABLED here by design; the builder image injects it.
+# -----------------------------------------------------------------------------
+# GROUNDING: the shipped artifact is musl (root ./Dockerfile COPYs an
+# x86_64-unknown-linux-musl binary); the release workflow also produces a gnu
+# artifact. gcc >= 12.1 accepts a bare `-fuse-ld=mold` (mold must be on PATH;
+# gcc rejects an ABSOLUTE path, so use `mold`, not `/usr/bin/mold`).
+#
+# These blocks are COMMENTED OUT on purpose. An always-on mold linker here would
+# break every host without mold — the Mac dev loop and the CI gnu/musl runners
+# (CI links musl via cargo-zigbuild, which ignores -fuse-ld anyway). Instead,
+# docker/Dockerfile.chef bakes the same rustflags into the BUILDER image's
+# CARGO_HOME so mold accelerates the dellsrv builds without infecting the repo.
+#
+# To use mold in a LOCAL Linux dev build: install mold, then uncomment the
+# triple you are building (keep them in sync with the builder image):
+#
+#     # local gnu dev build (x86_64):
+#     # [target.x86_64-unknown-linux-gnu]
+#     # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+#     # shipped musl artifact (x86_64) — matches Dockerfile.chef's TARGET:
+#     # [target.x86_64-unknown-linux-musl]
+#     # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# (A cfg-wide `[target.'cfg(target_os = "linux")']` table would cover both gnu
+# and musl in one block, but still only when mold is present.)
