@@ -90,22 +90,31 @@ impl ThinkStrip {
                             self.state = StripState::Outside;
                         }
                     } else {
-                        // Hold back only the smallest suffix of `pending`
-                        // that could still match the opening tag (a proper
-                        // prefix of `<think>`). This bounds the visible delay
-                        // for ordinary text while still detecting a split
-                        // boundary like `"<thi"` + `"nk>..."`.
+                        // No full opener yet. Split `pending` into the bytes we
+                        // could commit now and the ambiguous tail (a proper
+                        // prefix of `<think>`) that must be retained across the
+                        // chunk boundary.
                         let hold = prefix_match_len(self.pending.as_bytes(), THINK_OPEN);
-                        if hold < self.pending.len() {
-                            let drain_to = self.pending.len() - hold;
-                            visible.push_str(&self.pending[..drain_to]);
-                            self.pending.drain(..drain_to);
-                            // Visible content has been emitted — disable the
-                            // prefix strip permanently so any later `<think>`
-                            // token (literal occurrence in normal text) passes
-                            // through unchanged.
-                            self.state = StripState::Outside;
+                        let drain_to = self.pending.len() - hold;
+                        if self.pending[..drain_to].chars().all(char::is_whitespace) {
+                            // Everything before the ambiguous tail is leading
+                            // whitespace, so a `<think>` opener could still
+                            // legitimately follow. Retain the whole buffer
+                            // (whitespace + partial opener) and stay in
+                            // `Prefix`: emitting the whitespace now would be
+                            // wrong if the opener completes, since whitespace
+                            // before the reasoning prefix is dropped rather
+                            // than surfaced.
+                            break;
                         }
+                        // Non-whitespace visible text precedes the (possible)
+                        // opener, which permanently disqualifies the prefix
+                        // strip. Emit everything — including the tail, now just
+                        // literal text — and switch to pass-through so any
+                        // later `<think>` token passes through unchanged.
+                        visible.push_str(&self.pending);
+                        self.pending.clear();
+                        self.state = StripState::Outside;
                         break;
                     }
                 }
@@ -671,6 +680,50 @@ mod think_strip_tests {
         let (visible, reasoning) = run_strip(&["<thi", "nk>secret</think>ok"]);
         assert_eq!(visible, "ok");
         assert_eq!(reasoning, "secret");
+    }
+
+    #[test]
+    fn think_opener_one_byte_per_delta() {
+        // Case (a): the opener arrives one byte at a time. Each partial
+        // opener is the whole buffer (`hold == pending.len()`), so it must be
+        // retained until `<think>` completes.
+        let (visible, reasoning) =
+            run_strip(&["<", "t", "h", "i", "n", "k", ">", "hidden</think>shown"]);
+        assert_eq!(visible, "shown");
+        assert_eq!(reasoning, "hidden");
+    }
+
+    #[test]
+    fn partial_opener_then_nonmatch_flushes_as_visible() {
+        // Case (b): "<thi" is a partial opener, but the next byte makes it
+        // "<this" — a proven non-match. The held partial must flush as
+        // visible content, not be swallowed.
+        let (visible, reasoning) = run_strip(&["<thi", "s is text"]);
+        assert_eq!(visible, "<this is text");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn think_split_with_leading_whitespace_is_stripped() {
+        // Case (c): a leading newline/space precedes a `<think>` opener that
+        // is itself split across the delta boundary. The whitespace must NOT
+        // trigger a premature switch to pass-through; the opener must still be
+        // recognised across the boundary and the reasoning stripped. This is
+        // the case that exercises the `0 < hold < pending.len()` Prefix branch
+        // where the drained bytes are whitespace — the bug the fix targets.
+        let (visible, reasoning) = run_strip(&[" <thi", "nk>secret</think>ok"]);
+        assert_eq!(visible, "ok");
+        assert_eq!(reasoning, "secret");
+    }
+
+    #[test]
+    fn think_all_delimiters_split_across_deltas() {
+        // Case (d): content, opener, closer, and answer are each fragmented
+        // across delta boundaries — the maximal-split reasoning flow.
+        let (visible, reasoning) =
+            run_strip(&["<thi", "nk>rea", "soning</thi", "nk>ans", "wer"]);
+        assert_eq!(visible, "answer");
+        assert_eq!(reasoning, "reasoning");
     }
 
     #[test]
