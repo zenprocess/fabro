@@ -266,12 +266,19 @@ impl ForkdSandbox {
     /// forkd exec is argv-only; working_dir and env must be inlined here.
     /// Env key names are validated: only `[A-Za-z_][A-Za-z0-9_]*` are accepted
     /// to prevent injection via malicious key names.
+    ///
+    /// The leading `cd` is guarded with `2>/dev/null || true` so a missing
+    /// workspace (e.g. when `[run.clone] enabled = false`) does not surface a
+    /// `sh: 1: cd: can't cd to ...` error on every command. When the directory
+    /// exists the cd succeeds and the rest of the chain runs as before; when
+    /// it is absent the cd is silently skipped and the chained command still
+    /// runs (its exit code is preserved).
     fn build_exec_argv(
         command: &str,
         working_dir: &str,
         env_vars: Option<&HashMap<String, String>>,
     ) -> Vec<String> {
-        let mut shell_body = format!("cd {} && ", shell_quote(working_dir));
+        let mut shell_body = format!("cd {} 2>/dev/null || true && ", shell_quote(working_dir));
 
         if let Some(vars) = env_vars {
             let mut sorted: Vec<(&String, &String)> = vars.iter().collect();
@@ -1062,5 +1069,73 @@ impl Sandbox for ForkdSandbox {
 
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
         crate::git_push_via_exec(self, refspec).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    use super::ForkdSandbox;
+
+    #[test]
+    fn build_exec_argv_guards_cd_with_silent_fallback() {
+        let argv = ForkdSandbox::build_exec_argv("echo hi", "/home/fabro/workspace", None);
+        // `sh -lc <body>` — the body must wrap `cd` in a silent-fallback chain
+        // so a missing workspace directory does not surface
+        // `sh: 1: cd: can't cd to ...` to the command output.
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-lc");
+        assert!(
+            argv[2].contains("cd '/home/fabro/workspace' 2>/dev/null || true && echo hi"),
+            "unexpected wrapped shell body: {}",
+            argv[2],
+        );
+    }
+
+    #[test]
+    fn build_exec_argv_preserves_env_export_chain_with_guard() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let argv = ForkdSandbox::build_exec_argv("ls", "/home/fabro/workspace", Some(&env));
+        let body = &argv[2];
+        // The `cd` guard sits before the env exports so exports only run when
+        // either the directory change succeeded or was skipped silently.
+        assert!(
+            body.contains(
+                "cd '/home/fabro/workspace' 2>/dev/null || true && export FOO='bar' && ls",
+            ),
+            "unexpected wrapped shell body: {body}",
+        );
+    }
+
+    #[test]
+    fn wrapped_command_with_absent_workspace_emits_no_cd_error_and_preserves_exit_code() {
+        // Use a path under /tmp that we know does not exist (random suffix).
+        let missing = format!("/tmp/fabro-forkd-missing-{}", std::process::id());
+        assert!(
+            std::path::Path::new(&missing).is_dir() == false,
+            "test precondition: {missing} must not exist",
+        );
+
+        let argv = ForkdSandbox::build_exec_argv("exit 7", &missing, None);
+        let output = Command::new(&argv[0])
+            .arg(&argv[1])
+            .arg(&argv[2])
+            .output()
+            .expect("sh -lc should run the wrapped body");
+
+        // The cd failure must be silenced — no `can't cd` text in either stream.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("can't cd") && !stdout.contains("can't cd"),
+            "expected silenced cd error, got stdout={stdout:?} stderr={stderr:?}",
+        );
+
+        // The chained command's exit code must be preserved through the guard.
+        assert_eq!(output.status.code(), Some(7));
     }
 }
