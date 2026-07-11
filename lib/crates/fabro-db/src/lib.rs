@@ -36,6 +36,7 @@ impl Database {
             .connect_with(options)
             .await
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
+        set_private_permissions(path).await?;
 
         Ok(Self { pool })
     }
@@ -62,4 +63,18 @@ impl Database {
     pub fn clone_pool(&self) -> DbPool {
         self.pool.clone()
     }
+}
+
+#[cfg(unix)]
+async fn set_private_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("setting private SQLite permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn set_private_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
