@@ -1,6 +1,6 @@
 //! Response decoding: Chat Completions body → canonical `Response`.
 
-use super::translate::{self, map_finish_reason};
+use super::translate::{self, map_finish_reason, strip_think_prefix};
 use super::wire::{ApiResponse, ApiUsage};
 use crate::codec::CodecCtx;
 use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind};
@@ -36,7 +36,23 @@ pub(super) fn decode_response(
     }
     if let Some(text) = &choice.message.content {
         if !text.is_empty() {
-            content_parts.push(ContentPart::text(text));
+            // Defensive fallback for reasoning models that emit their
+            // `<think>...</think>` block inline in `content` rather than
+            // on a dedicated `reasoning_content` channel (minimax,
+            // kimi/zai/glm/deepseek reasoning variants). The strip is
+            // prefix-only: any `<think>` token after visible text is
+            // preserved verbatim.
+            let (visible, reasoning) = strip_think_prefix(text);
+            if !reasoning.is_empty() {
+                content_parts.push(ContentPart::Thinking(ThinkingData {
+                    text:      reasoning,
+                    signature: None,
+                    redacted:  false,
+                }));
+            }
+            if !visible.is_empty() {
+                content_parts.push(ContentPart::text(&visible));
+            }
         }
     }
     if let Some(tool_calls) = &choice.message.tool_calls {

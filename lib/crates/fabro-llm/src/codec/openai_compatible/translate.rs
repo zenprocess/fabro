@@ -6,6 +6,187 @@ use crate::types::{
     Role, ToolChoice, ToolDefinition,
 };
 
+// --- <think> prefix stripping (defensive fallback for reasoning models) ---
+//
+// Some `OpenAI`-compatible reasoning models (minimax, kimi/zai/glm/deepseek
+// reasoning variants) emit their `<think>...</think>` block INLINE in the
+// `content` stream instead of using a separate `reasoning_content` channel.
+// This dialect has no first-class reasoning channel for that case, so the
+// leading reasoning prefix is stripped from the visible assistant content
+// and surfaced into `ContentPart::Thinking` (the existing reasoning slot)
+// via the caller's existing accumulation. To stay safe against accidental
+// matches in normal content, the prefix is only treated as reasoning when it
+// appears at the very start of the assistant content (allowing leading
+// whitespace); any `<think>` token that appears after visible text has been
+// emitted is preserved verbatim.
+
+/// Opening delimiter for the inline reasoning prefix.
+const THINK_OPEN: &str = "<think>";
+/// Closing delimiter for the inline reasoning prefix.
+const THINK_CLOSE: &str = "</think>";
+
+/// State machine for the prefix-only `<think>` stripper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripState {
+    /// Initial state. Looking for a leading `<think>` (after optional
+    /// whitespace). As soon as any non-whitespace visible text is emitted,
+    /// transition to [`Self::Outside`] permanently.
+    Prefix,
+    /// Pass-through: every byte, including any `<think>` token, is emitted as
+    /// visible content.
+    Outside,
+    /// Inside a reasoning block. Captured bytes feed the reasoning buffer
+    /// until `</think>` is found.
+    Inside,
+}
+
+/// Stateful `<think>` prefix stripper that holds a small tail buffer so a
+/// boundary that straddles two `process` calls is still classified correctly.
+///
+/// Reasoning text is captured internally and can be retrieved via
+/// [`Self::into_reasoning`]. The visible text returned by [`Self::process`] is
+/// always safe to surface as assistant output.
+#[derive(Debug)]
+pub(super) struct ThinkStrip {
+    state:     StripState,
+    pending:   String,
+    reasoning: String,
+}
+
+impl ThinkStrip {
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self {
+            state:     StripState::Prefix,
+            pending:   String::new(),
+            reasoning: String::new(),
+        }
+    }
+
+    /// Feed `chunk` and return any text safe to surface as visible assistant
+    /// output. Reasoning bytes are appended to the internal buffer.
+    pub(super) fn process(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+        self.pending.push_str(chunk);
+        let mut visible = String::new();
+        loop {
+            match self.state {
+                StripState::Prefix => {
+                    if let Some(idx) = self.pending.find(THINK_OPEN) {
+                        // Only treat `<think>` as the reasoning prefix when it
+                        // appears at the start (with optional leading
+                        // whitespace). Any non-whitespace text before it is
+                        // visible content and disables the strip permanently.
+                        let prefix_is_whitespace =
+                            self.pending[..idx].chars().all(char::is_whitespace);
+                        if prefix_is_whitespace {
+                            self.pending.drain(..idx + THINK_OPEN.len());
+                            self.state = StripState::Inside;
+                        } else {
+                            visible.push_str(&self.pending);
+                            self.pending.clear();
+                            self.state = StripState::Outside;
+                        }
+                    } else {
+                        // Hold back only the smallest suffix of `pending`
+                        // that could still match the opening tag (a proper
+                        // prefix of `<think>`). This bounds the visible delay
+                        // for ordinary text while still detecting a split
+                        // boundary like `"<thi"` + `"nk>..."`.
+                        let hold = prefix_match_len(self.pending.as_bytes(), THINK_OPEN);
+                        if hold < self.pending.len() {
+                            let drain_to = self.pending.len() - hold;
+                            visible.push_str(&self.pending[..drain_to]);
+                            self.pending.drain(..drain_to);
+                            // Visible content has been emitted — disable the
+                            // prefix strip permanently so any later `<think>`
+                            // token (literal occurrence in normal text) passes
+                            // through unchanged.
+                            self.state = StripState::Outside;
+                        }
+                        break;
+                    }
+                }
+                StripState::Outside => {
+                    visible.push_str(&self.pending);
+                    self.pending.clear();
+                    break;
+                }
+                StripState::Inside => {
+                    if let Some(idx) = self.pending.find(THINK_CLOSE) {
+                        self.reasoning.push_str(&self.pending[..idx]);
+                        self.pending.drain(..idx + THINK_CLOSE.len());
+                        self.state = StripState::Outside;
+                        // Loop again: Outside will flush any remaining visible
+                        // bytes (e.g. the newline that follows `</think>`).
+                    } else {
+                        let hold = prefix_match_len(self.pending.as_bytes(), THINK_CLOSE);
+                        if hold < self.pending.len() {
+                            let drain_to = self.pending.len() - hold;
+                            self.reasoning.push_str(&self.pending[..drain_to]);
+                            self.pending.drain(..drain_to);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        visible
+    }
+
+    /// Flush any bytes still held in the tail buffer. Returns the visible
+    /// tail; bytes held while in [`StripState::Inside`] are appended to
+    /// reasoning (covers an unclosed `<think>` from a truncated stream).
+    pub(super) fn finish(&mut self) -> String {
+        let remaining = std::mem::take(&mut self.pending);
+        match self.state {
+            StripState::Prefix | StripState::Outside => remaining,
+            StripState::Inside => {
+                self.reasoning.push_str(&remaining);
+                String::new()
+            }
+        }
+    }
+
+    /// Take any reasoning captured so far, leaving an empty buffer behind.
+    pub(super) fn take_reasoning(&mut self) -> String {
+        std::mem::take(&mut self.reasoning)
+    }
+
+    /// Returns `true` if the stripper is holding bytes (in either reasoning
+    /// or the tail buffer) that should be flushed by `finish()`. Used by the
+    /// streaming decoder to decide whether to synthesise a `Finish` event
+    /// for a stream that ended without `[DONE]` and without visible text.
+    pub(super) fn has_pending(&self) -> bool {
+        !self.reasoning.is_empty() || !self.pending.is_empty()
+    }
+}
+
+/// Returns the length of the longest proper prefix of `pattern` that is a
+/// suffix of `suffix`, capped at `pattern.len() - 1` (a full match is the
+/// caller's job to handle). Used to bound how many bytes the stripper
+/// holds back while waiting to see if the next chunk completes a delimiter.
+fn prefix_match_len(suffix: &[u8], pattern: &str) -> usize {
+    let pattern = pattern.as_bytes();
+    let cap = suffix.len().min(pattern.len().saturating_sub(1));
+    (1..=cap)
+        .rev()
+        .find(|&n| suffix[suffix.len() - n..] == pattern[..n])
+        .unwrap_or(0)
+}
+
+/// One-shot helper for the non-streaming decode path. Splits `text` into
+/// `(visible, reasoning)` using the same prefix-only rule as [`ThinkStrip`].
+pub(super) fn strip_think_prefix(text: &str) -> (String, String) {
+    let mut strip = ThinkStrip::new();
+    let mut visible = strip.process(text);
+    let tail = strip.finish();
+    visible.push_str(&tail);
+    (visible, strip.take_reasoning())
+}
+
 /// In-band cost (OpenRouter) is authoritative billing data; the client's
 /// catalog estimate never overwrites it.
 pub(super) fn authoritative_cost_source(cost_usd: Option<f64>) -> Option<CostSource> {
@@ -413,5 +594,113 @@ mod tests {
             translated[0].content.as_deref(),
             Some("Check this: [Audio content not supported by this provider]")
         );
+    }
+}
+
+// --- think_strip tests ---
+
+#[cfg(test)]
+mod think_strip_tests {
+    use super::{strip_think_prefix, ThinkStrip};
+
+    /// Drive `strip` with a list of chunk boundaries and join the visible
+    /// output across calls. Mirrors how the streaming decoder calls
+    /// `process` once per `delta.content` arrival.
+    fn run_strip(chunks: &[&str]) -> (String, String) {
+        let mut strip = ThinkStrip::new();
+        let mut visible = String::new();
+        for chunk in chunks {
+            visible.push_str(&strip.process(chunk));
+        }
+        let tail = strip.finish();
+        visible.push_str(&tail);
+        (visible, strip.take_reasoning())
+    }
+
+    #[test]
+    fn no_think_passthrough() {
+        let (visible, reasoning) = run_strip(&["Hello world"]);
+        assert_eq!(visible, "Hello world");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn think_then_visible_answer() {
+        let (visible, reasoning) =
+            run_strip(&["<think>reasoning</think>\nThe answer"]);
+        assert_eq!(visible, "\nThe answer");
+        assert_eq!(reasoning, "reasoning");
+    }
+
+    #[test]
+    fn multi_delta_think_prefix() {
+        // Observed live: `<think>` opens in delta 1, the reasoning text and
+        // closing tag straddle later deltas, and the visible answer arrives
+        // after the closing tag.
+        let (visible, reasoning) = run_strip(&[
+            "<think>\nThe user",
+            " said hello</think>",
+            "\n\nThe answer is 42.",
+        ]);
+        assert_eq!(visible, "\n\nThe answer is 42.");
+        assert_eq!(reasoning, "\nThe user said hello");
+    }
+
+    #[test]
+    fn unclosed_think_is_captured_as_reasoning() {
+        let (visible, reasoning) = run_strip(&["<think>never closed"]);
+        assert_eq!(visible, "");
+        assert_eq!(reasoning, "never closed");
+    }
+
+    #[test]
+    fn mid_content_literal_think_is_not_stripped() {
+        // A normal response that happens to contain the literal token
+        // `<think>` after some visible text must pass through unchanged.
+        let (visible, reasoning) =
+            run_strip(&["Here is how you write <think> in plain text"]);
+        assert_eq!(visible, "Here is how you write <think> in plain text");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn think_split_across_two_deltas() {
+        // `<think>` straddles the boundary between two deltas — the strip
+        // must hold the tail back so the opening tag is recognised. Combined
+        // string is `<think>secret</think>ok`.
+        let (visible, reasoning) = run_strip(&["<thi", "nk>secret</think>ok"]);
+        assert_eq!(visible, "ok");
+        assert_eq!(reasoning, "secret");
+    }
+
+    #[test]
+    fn leading_whitespace_before_think_is_still_treated_as_prefix() {
+        let (visible, reasoning) =
+            run_strip(&["\n <think>plan</think>\ndo it"]);
+        assert_eq!(visible, "\ndo it");
+        assert_eq!(reasoning, "plan");
+    }
+
+    #[test]
+    fn visible_text_then_later_think_stays_literal() {
+        let (visible, reasoning) =
+            run_strip(&["hello ", "<think> should not trigger"]);
+        assert_eq!(visible, "hello <think> should not trigger");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn empty_input_produces_empty_output() {
+        let (visible, reasoning) = run_strip(&[""]);
+        assert_eq!(visible, "");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn non_streaming_helper_matches_stateful_path() {
+        let input = "<think>\nstep 1\nstep 2</think>\nFinal answer.";
+        let (visible, reasoning) = strip_think_prefix(input);
+        assert_eq!(visible, "\nFinal answer.");
+        assert_eq!(reasoning, "\nstep 1\nstep 2");
     }
 }
