@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -313,7 +312,7 @@ fn parse_legacy_entries(
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, Error> {
-    let backup_path = legacy_backup_path(source_path, Utc::now());
+    let backup_path = fabro_db::legacy_backup_path(source_path, "variables.json", Utc::now());
     fs::rename(source_path, &backup_path)
         .await
         .map_err(|source| Error::LegacyBackup {
@@ -322,15 +321,6 @@ async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, Erro
             source,
         })?;
     Ok(backup_path)
-}
-
-fn legacy_backup_path(source_path: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_path
-        .file_name()
-        .map_or_else(|| OsString::from("variables.json"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_path.with_file_name(file_name)
 }
 
 fn row_count(count: usize) -> Result<i64, Error> {
@@ -354,11 +344,9 @@ fn variable_from_row(row: &SqliteRow) -> Result<Variable, Error> {
 }
 
 fn parse_timestamp(name: &str, column: &'static str, value: &str) -> Result<DateTime<Utc>, Error> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|source| Error::Timestamp {
-            name: name.to_string(),
-            column,
-            source,
-        })
+    fabro_db::parse_rfc3339(value).map_err(|source| Error::Timestamp {
+        name: name.to_string(),
+        column,
+        source,
+    })
 }

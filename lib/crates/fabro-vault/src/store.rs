@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
-use fabro_db::{Database, DbPool};
+use fabro_db::{Database, DbPool, ImportReport};
 use fabro_types::{OAuthCredential, SecretMetadata, SecretType};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
@@ -88,15 +87,6 @@ pub enum SecretStoreError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportReport {
-    pub source_path:   PathBuf,
-    pub backup_path:   PathBuf,
-    pub imported_rows: usize,
-    pub skipped_rows:  usize,
-    pub secret_names:  Vec<String>,
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretStoreWrite {
     pub name:        String,
@@ -125,6 +115,10 @@ pub struct SecretStore {
 pub struct SecretSnapshot(Vault);
 
 impl SecretSnapshot {
+    /// Converts the snapshot into a path-less in-memory [`Vault`]. Mutations to
+    /// the returned vault are never persisted; callers that need durable writes
+    /// must go through [`SecretStore`] (see `SqlVaultCredentialSource`'s
+    /// before/after diffing for the OAuth refresh write-back).
     #[must_use]
     pub fn into_vault(self) -> Vault {
         self.0
@@ -167,6 +161,19 @@ impl SecretStore {
         database.migrate().await?;
         import_legacy_json_once(database.pool(), legacy_secrets_path).await?;
         Ok(Self::new(database.clone_pool()))
+    }
+
+    /// Like [`SecretStore::open`], but returns a point-in-time snapshot of the
+    /// store instead of the store itself.
+    pub async fn open_snapshot(
+        sqlite_path: impl AsRef<Path>,
+        legacy_secrets_path: impl AsRef<Path>,
+    ) -> anyhow::Result<SecretSnapshot> {
+        let snapshot = Self::open(sqlite_path, legacy_secrets_path)
+            .await?
+            .snapshot()
+            .await?;
+        Ok(snapshot)
     }
 
     pub async fn get(&self, name: &str) -> Result<Option<SecretEntry>, SecretStoreError> {
@@ -402,14 +409,14 @@ pub async fn import_legacy_json_once(
         backup_path,
         imported_rows: imported_names.len(),
         skipped_rows,
-        secret_names: imported_names,
+        names: imported_names,
     };
     info!(
         source_path = %report.source_path.display(),
         backup_path = %report.backup_path.display(),
         imported_rows = report.imported_rows,
         skipped_rows = report.skipped_rows,
-        secret_names = ?report.secret_names,
+        secret_names = ?report.names,
         "Imported legacy secrets JSON into SQLite"
     );
     Ok(Some(report))
@@ -495,13 +502,11 @@ fn parse_timestamp(
     column: &'static str,
     value: &str,
 ) -> Result<DateTime<Utc>, SecretStoreError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|source| SecretStoreError::Timestamp {
-            name: name.to_string(),
-            column,
-            source,
-        })
+    fabro_db::parse_rfc3339(value).map_err(|source| SecretStoreError::Timestamp {
+        name: name.to_string(),
+        column,
+        source,
+    })
 }
 
 fn validate_oauth_json(value: &str) -> Result<(), serde_json::Error> {
@@ -531,7 +536,7 @@ fn validate_stored_name(name: &str, secret_type: SecretType) -> Result<(), Secre
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, SecretStoreError> {
-    let backup_path = legacy_backup_path(source_path, Utc::now());
+    let backup_path = fabro_db::legacy_backup_path(source_path, "secrets.json", Utc::now());
     fs::rename(source_path, &backup_path)
         .await
         .map_err(|source| SecretStoreError::LegacyBackup {
@@ -540,13 +545,4 @@ async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, Secr
             source,
         })?;
     Ok(backup_path)
-}
-
-fn legacy_backup_path(source_path: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_path
-        .file_name()
-        .map_or_else(|| OsString::from("secrets.json"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_path.with_file_name(file_name)
 }

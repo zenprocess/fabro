@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use fabro_config::{
     EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer,
     EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap, StickyMap,
@@ -756,20 +755,11 @@ async fn existing_environment_ids(
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, EnvironmentStoreError> {
-    let backup_path = legacy_backup_path(source_dir, Utc::now());
+    let backup_path = fabro_db::legacy_backup_path(source_dir, "environments", Utc::now());
     fs::rename(source_dir, &backup_path)
         .await
         .map_err(|source| EnvironmentStoreError::io(&backup_path, source))?;
     Ok(backup_path)
-}
-
-fn legacy_backup_path(source_dir: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_dir
-        .file_name()
-        .map_or_else(|| OsString::from("environments"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_dir.with_file_name(file_name)
 }
 
 fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
