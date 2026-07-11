@@ -15,6 +15,9 @@ use fabro_types::{
 /// - `local` always returns a minimal record describing the host.
 /// - `docker` inspects the managed container through Bollard.
 /// - `daytona` reconnects to the SDK sandbox.
+/// - `forkd` cannot introspect its microVM after teardown; the caller passes
+///   `is_run_terminal` so the returned `state` reflects the actual lifecycle
+///   rather than always reporting `running`.
 #[allow(
     unused_variables,
     reason = "Feature-gated providers consume some parameters only when enabled."
@@ -24,6 +27,7 @@ pub async fn sandbox_details(
     daytona_api_key: Option<String>,
     daytona_organization_id: Option<String>,
     run_id: Option<RunId>,
+    is_run_terminal: bool,
 ) -> Result<SandboxDetails> {
     match record.provider {
         SandboxProviderKind::Local => Ok(local_details(record)),
@@ -42,7 +46,7 @@ pub async fn sandbox_details(
             record.provider
         )),
         #[cfg(feature = "forkd")]
-        SandboxProviderKind::Forkd => Ok(forkd::forkd_details(record)),
+        SandboxProviderKind::Forkd => Ok(forkd::forkd_details(record, is_run_terminal)),
         #[cfg(not(feature = "forkd"))]
         SandboxProviderKind::Forkd => Err(anyhow::anyhow!(
             "Sandbox provider '{}' has no details implementation",
@@ -849,12 +853,24 @@ pub(crate) mod forkd {
 
     /// Build minimal `SandboxDetails` for a forkd sandbox from its persisted
     /// runtime record.
+    ///
+    /// forkd destroys its microVM at run completion, so introspection of a
+    /// terminal run is impossible — the caller passes the run's terminal
+    /// state directly and we surface it via [`SandboxState::Deleted`] instead
+    /// of the stale `running` value the persisted record would otherwise
+    /// project.
     pub(super) fn forkd_details(
         record: &RunSandboxInstance,
+        is_run_terminal: bool,
     ) -> fabro_types::SandboxDetails {
+        let state = if is_run_terminal {
+            SandboxState::Deleted
+        } else {
+            SandboxState::Running
+        };
         fabro_types::SandboxDetails {
             sandbox:      record.clone(),
-            state:        SandboxState::Running,
+            state,
             native_state: None,
             region:       None,
             web_url:      None,
@@ -869,6 +885,51 @@ pub(crate) mod forkd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "forkd")]
+    use fabro_types::{RunSandboxRuntime, SandboxProviderKind};
+
+    #[cfg(feature = "forkd")]
+    fn forkd_record() -> RunSandboxInstance {
+        RunSandboxInstance {
+            provider: SandboxProviderKind::Forkd,
+            image:    None,
+            snapshot: None,
+            runtime:  RunSandboxRuntime {
+                id:                "vm-abc123".to_string(),
+                working_directory: "/home/fabro/workspace".to_string(),
+                repo_cloned:       Some(true),
+                clone_origin_url:  None,
+                clone_branch:      None,
+                workspace_root:    None,
+                repos_root:        None,
+                primary_repo_path: None,
+                primary_repo_link: None,
+            },
+        }
+    }
+
+    #[cfg(feature = "forkd")]
+    #[test]
+    fn forkd_details_reports_running_when_run_is_active() {
+        let details = forkd::forkd_details(&forkd_record(), false);
+        assert_eq!(details.state, SandboxState::Running);
+        assert_eq!(details.sandbox.runtime.id, "vm-abc123");
+    }
+
+    #[cfg(feature = "forkd")]
+    #[test]
+    fn forkd_details_reports_deleted_when_run_is_terminal() {
+        let details = forkd::forkd_details(&forkd_record(), true);
+        assert_eq!(details.state, SandboxState::Deleted);
+        // The runtime record is still surfaced so the UI can show provenance,
+        // only the state arm flips to reflect post-teardown reality.
+        assert_eq!(details.sandbox.runtime.id, "vm-abc123");
+        assert_eq!(
+            details.sandbox.runtime.working_directory,
+            "/home/fabro/workspace"
+        );
+    }
 
     #[test]
     fn local_details_returns_running_with_no_metadata() {

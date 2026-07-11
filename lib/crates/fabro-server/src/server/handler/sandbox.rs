@@ -105,13 +105,32 @@ async fn retrieve_run_sandbox(
         Ok(id) => id,
         Err(response) => return response,
     };
+    // Resolve the terminal flag from the run's persisted status before
+    // loading the sandbox record so forkd's stale `running` projection is
+    // corrected to a terminal SandboxState variant when the run has reached
+    // a terminal outcome (forkd tears down its microVM at that point).
+    let is_run_terminal = match state.stores.runs.open_run_reader(&id).await {
+        Ok(reader) => match reader.state().await {
+            Ok(projection) => projection.is_terminal(),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
     let record = match load_run_sandbox_instance(&state, &id).await {
         Ok(record) => record,
         Err(response) => return response,
     };
     let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
     let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
-    match sandbox_details(&record, daytona_api_key, daytona_organization_id, Some(id)).await {
+    match sandbox_details(
+        &record,
+        daytona_api_key,
+        daytona_organization_id,
+        Some(id),
+        is_run_terminal,
+    )
+    .await
+    {
         Ok(details) => Json::<SandboxDetails>(details).into_response(),
         Err(err) => {
             let detail = format!("{err:#}");
