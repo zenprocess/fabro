@@ -116,6 +116,23 @@ impl ForkdConfig {
     }
 }
 
+/// Real liveness of a forkd microVM, as reported by `GET /v1/sandboxes/{id}`.
+///
+/// Deliberately coarse and defensive: only a definite `200` (alive) or a
+/// `404`/`410` (gone) is trusted. Every other outcome — a transient error that
+/// survives retries, a connect failure, a timeout, or a status endpoint the
+/// controller does not implement (`405`/`501`) — collapses to
+/// [`Unknown`](Self::Unknown), which callers MUST NOT interpret as "deleted".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkdSandboxStatus {
+    /// Controller returned `2xx` — the microVM is reachable and alive.
+    Alive,
+    /// Controller returned `404`/`410` — the microVM is definitively gone.
+    Gone,
+    /// Liveness is indeterminate; treat as still-present, never as deleted.
+    Unknown,
+}
+
 // ---------------------------------------------------------------------------
 // forkd REST API request/response shapes (forkd 0.5.2)
 // ---------------------------------------------------------------------------
@@ -528,6 +545,86 @@ impl ForkdSandbox {
                 }
                 Err(e) => {
                     return Err(crate::Error::context("forkd delete sandbox HTTP request failed", e));
+                }
+            }
+        }
+    }
+
+    /// Query `GET /v1/sandboxes/{id}` for the real liveness of the microVM
+    /// identified by `sandbox_id`.
+    ///
+    /// Uses the same bearer-auth and transient-retry policy as the other forkd
+    /// client calls ([`HTTP_RETRY_LIMIT`], [`Self::is_retryable_status`]).
+    ///
+    /// This method never returns an error: any failure to obtain a definite
+    /// answer — a transient status that survives retries, a connect/timeout
+    /// failure, or a status endpoint the controller does not implement
+    /// (`405`/`501`) — collapses to [`ForkdSandboxStatus::Unknown`] so callers
+    /// can default to a safe, non-destructive interpretation. Correct even
+    /// against a forkd controller that has no `GET /v1/sandboxes/{id}` endpoint
+    /// yet: it simply never reports `Gone` until the controller truly says so.
+    pub async fn get_sandbox_status(&self, sandbox_id: &str) -> ForkdSandboxStatus {
+        let client = match self.http_client() {
+            Ok(client) => client,
+            Err(_) => return ForkdSandboxStatus::Unknown,
+        };
+        let url = format!("{}/v1/sandboxes/{}", self.config.forkd_url, sandbox_id);
+
+        let mut backoff = HTTP_RETRY_INITIAL_BACKOFF;
+        let mut attempt = 0u32;
+        loop {
+            let result = client
+                .get(&url)
+                .bearer_auth(&self.config.forkd_token)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => return ForkdSandboxStatus::Alive,
+                Ok(resp)
+                    if resp.status() == reqwest::StatusCode::NOT_FOUND
+                        || resp.status() == reqwest::StatusCode::GONE =>
+                {
+                    return ForkdSandboxStatus::Gone;
+                }
+                Ok(resp) if Self::is_retryable_status(resp.status()) && attempt < HTTP_RETRY_LIMIT => {
+                    let status = resp.status();
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "forkd get_sandbox_status transient error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                // Any other status (e.g. 405/501 endpoint-unsupported, or an
+                // unexpected 4xx) is indeterminate — never a false "gone".
+                Ok(resp) => {
+                    tracing::debug!(
+                        status = resp.status().as_u16(),
+                        "forkd get_sandbox_status: indeterminate status; treating liveness as unknown"
+                    );
+                    return ForkdSandboxStatus::Unknown;
+                }
+                Err(e) if e.is_connect() && attempt < HTTP_RETRY_LIMIT => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "forkd get_sandbox_status connect error; retrying"
+                    );
+                    attempt += 1;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+                // Connect failure after retries, a timeout, or any other
+                // transport error — liveness cannot be determined.
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "forkd get_sandbox_status: request failed; treating liveness as unknown"
+                    );
+                    return ForkdSandboxStatus::Unknown;
                 }
             }
         }
@@ -1077,7 +1174,114 @@ mod tests {
     use std::collections::HashMap;
     use std::process::Command;
 
-    use super::ForkdSandbox;
+    use super::{ForkdConfig, ForkdSandbox, ForkdSandboxStatus};
+    use crate::config::ForkdSettings;
+
+    fn config_for(base_url: &str) -> ForkdConfig {
+        ForkdConfig {
+            forkd_url:   base_url.to_string(),
+            forkd_token: "forkd-test-token".to_string(),
+            settings:    ForkdSettings::default(),
+        }
+    }
+
+    fn sandbox_for(base_url: &str) -> ForkdSandbox {
+        ForkdSandbox::new(config_for(base_url), None, None, None)
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_status_maps_200_to_alive() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/v1/sandboxes/vm-alive")
+                    .header("authorization", "Bearer forkd-test-token");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({ "id": "vm-alive" }));
+            })
+            .await;
+
+        let status = sandbox_for(&server.base_url())
+            .get_sandbox_status("vm-alive")
+            .await;
+
+        assert_eq!(status, ForkdSandboxStatus::Alive);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_status_maps_404_to_gone() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/v1/sandboxes/vm-gone");
+                then.status(404);
+            })
+            .await;
+
+        let status = sandbox_for(&server.base_url())
+            .get_sandbox_status("vm-gone")
+            .await;
+
+        assert_eq!(status, ForkdSandboxStatus::Gone);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_status_maps_410_to_gone() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/v1/sandboxes/vm-gone-410");
+                then.status(410);
+            })
+            .await;
+
+        let status = sandbox_for(&server.base_url())
+            .get_sandbox_status("vm-gone-410")
+            .await;
+
+        assert_eq!(status, ForkdSandboxStatus::Gone);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_status_maps_unsupported_endpoint_to_unknown() {
+        // A controller that has no GET /v1/sandboxes/{id} route yet answers
+        // 501/405; that must never be read as "gone".
+        for code in [405u16, 501u16] {
+            let server = httpmock::MockServer::start_async().await;
+            server
+                .mock_async(|when, then| {
+                    when.method(httpmock::Method::GET)
+                        .path("/v1/sandboxes/vm-unsupported");
+                    then.status(code);
+                })
+                .await;
+
+            let status = sandbox_for(&server.base_url())
+                .get_sandbox_status("vm-unsupported")
+                .await;
+
+            assert_eq!(
+                status,
+                ForkdSandboxStatus::Unknown,
+                "status {code} must map to Unknown, never Gone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_status_maps_network_error_to_unknown() {
+        // No server listening on this port → connect error → Unknown (never Gone).
+        let status = sandbox_for("http://127.0.0.1:1")
+            .get_sandbox_status("vm-unreachable")
+            .await;
+        assert_eq!(status, ForkdSandboxStatus::Unknown);
+    }
 
     #[test]
     fn build_exec_argv_guards_cd_with_silent_fallback() {
@@ -1088,8 +1292,16 @@ mod tests {
         assert_eq!(argv.len(), 3);
         assert_eq!(argv[0], "sh");
         assert_eq!(argv[1], "-lc");
+        // `shell_quote` (shlex) only quotes when a value needs it, so a plain
+        // path is emitted unquoted. Assert the cd-guard structure rather than a
+        // fixed quoting form.
         assert!(
-            argv[2].contains("cd '/home/fabro/workspace' 2>/dev/null || true && echo hi"),
+            argv[2].starts_with("cd /home/fabro/workspace 2>/dev/null || true &&"),
+            "unexpected wrapped shell body: {}",
+            argv[2],
+        );
+        assert!(
+            argv[2].ends_with("&& echo hi"),
             "unexpected wrapped shell body: {}",
             argv[2],
         );
@@ -1103,9 +1315,10 @@ mod tests {
         let body = &argv[2];
         // The `cd` guard sits before the env exports so exports only run when
         // either the directory change succeeded or was skipped silently.
+        // `shell_quote` (shlex) leaves values without special chars unquoted.
         assert!(
             body.contains(
-                "cd '/home/fabro/workspace' 2>/dev/null || true && export FOO='bar' && ls",
+                "cd /home/fabro/workspace 2>/dev/null || true && export FOO=bar && ls",
             ),
             "unexpected wrapped shell body: {body}",
         );

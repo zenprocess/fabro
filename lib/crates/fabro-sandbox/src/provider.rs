@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[cfg(any(feature = "docker", feature = "daytona"))]
 use fabro_github::GitHubCredentials;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "forkd"))]
 use fabro_types::RunId;
 use fabro_types::{
     SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderKind,

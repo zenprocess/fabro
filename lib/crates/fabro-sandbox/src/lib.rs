@@ -7,7 +7,7 @@ pub mod provider;
 pub mod sandbox;
 pub mod sandbox_spec;
 
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "forkd"))]
 mod clone_source;
 
 #[cfg(any(feature = "docker", feature = "daytona", test))]
