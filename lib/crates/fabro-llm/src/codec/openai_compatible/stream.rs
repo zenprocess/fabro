@@ -176,9 +176,22 @@ impl StreamState {
         self.finished = true;
         let mut events = Vec::new();
 
-        // Flush any reasoning held in the tail buffer (covers an unclosed
-        // `<think>` from a truncated stream).
-        let _tail = self.think_strip.finish();
+        // Flush any bytes held in the tail buffer (covers an unclosed
+        // `<think>` from a truncated stream). Bytes held while inside a
+        // reasoning block are merged into `accumulated_reasoning` below via
+        // `take_reasoning`; any other tail is real visible output (leading
+        // whitespace and/or a partial `<think` opener that never completed)
+        // and must be surfaced, mirroring the non-streaming
+        // `strip_think_prefix` path.
+        let tail = self.think_strip.finish();
+        if !tail.is_empty() {
+            if !self.text_started {
+                self.text_started = true;
+                events.push(StreamEvent::TextStart { text_id: None });
+            }
+            self.accumulated_text.push_str(&tail);
+            events.push(StreamEvent::text_delta(&tail, None));
+        }
 
         // End text segment if it was started.
         if self.text_started {
@@ -516,11 +529,17 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    fn content_chunk(content: &str) -> StreamChunk {
-        chunk_from(&format!(
+    /// Raw SSE `data:` JSON payload for a single-content-delta chunk, for
+    /// tests that drive the decoder through `on_event` directly.
+    fn content_chunk_json(content: &str) -> String {
+        format!(
             r#"{{"id":"c1","model":"m1","choices":[{{"delta":{{"content":{content}}},"finish_reason":null}}]}}"#,
             content = serde_json::Value::String(content.to_string()),
-        ))
+        )
+    }
+
+    fn content_chunk(content: &str) -> StreamChunk {
+        chunk_from(&content_chunk_json(content))
     }
 
     #[test]
@@ -591,6 +610,69 @@ mod tests {
                     .reasoning()
                     .expect("unclosed think should still surface as reasoning");
                 assert_eq!(reasoning, "never closed");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_bare_partial_think_opener_is_surfaced_as_visible_tail() {
+        // A stream whose entire content is a partial `<think` opener that
+        // never completes (and never closes) must not silently drop those
+        // bytes: `finish_events()` flushes the tail buffer as visible text,
+        // matching non-streaming `strip_think_prefix` on identical input.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  &content_chunk_json("<think"),
+            })
+            .unwrap();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  "[DONE]",
+            })
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "TextStart + TextDelta (tail) + TextEnd + Finish, got {events:?}"
+        );
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        match &events[1] {
+            StreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "<think"),
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+        assert!(matches!(events[2], StreamEvent::TextEnd { .. }));
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "<think");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_whitespace_only_content_parity() {
+        // Whitespace-only content held in the `Prefix` state's tail buffer
+        // is real visible output (no `<think>` opener ever arrived) and must
+        // be surfaced verbatim, matching non-streaming decode of the same
+        // content.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .process_chunk(&content_chunk("   "))
+            .unwrap_or_default();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state.finish_events();
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "   ");
             }
             other => panic!("Expected Finish, got {other:?}"),
         }
