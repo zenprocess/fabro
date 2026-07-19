@@ -314,7 +314,7 @@ impl SandboxSpec {
     }
 }
 
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "forkd"))]
 fn runtime_layout_metadata(
     repo_cloned: Option<bool>,
     clone_origin_url: Option<&str>,

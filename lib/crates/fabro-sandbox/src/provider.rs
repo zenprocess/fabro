@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[cfg(any(feature = "docker", feature = "daytona"))]
 use fabro_github::GitHubCredentials;
-#[cfg(any(feature = "docker", feature = "daytona"))]
+#[cfg(any(feature = "docker", feature = "daytona", feature = "forkd"))]
 use fabro_types::RunId;
 use fabro_types::{
     SandboxInfo, SandboxListMeta, SandboxListResponse, SandboxProviderKind,
@@ -19,12 +19,12 @@ use fabro_types::{
 use fabro_util::error::collect_chain;
 use futures::future::join_all;
 
+#[cfg(feature = "forkd")]
+use crate::config::ForkdSettings;
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaConfig;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandboxOptions;
-#[cfg(feature = "forkd")]
-use crate::config::ForkdSettings;
 
 pub enum SandboxCreateSpec {
     Local,

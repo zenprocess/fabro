@@ -9,21 +9,21 @@ use fabro_types::settings::ResolveError;
 #[cfg(feature = "daytona")]
 use fabro_types::settings::run::DockerfileSource as ResolvedDockerfileSource;
 use fabro_types::settings::run::{EnvironmentNetworkMode, RunEnvironmentSettings};
-#[cfg(feature = "forkd")]
-use crate::config::{ForkdNetwork, ForkdSettings, ForkdSnapshotSettings};
-#[cfg(feature = "forkd")]
-use crate::forkd::DEFAULT_SNAPSHOT_TAG;
-#[cfg(feature = "forkd")]
-use crate::forkd::ForkdConfig;
 
 #[cfg(feature = "daytona")]
 use crate::config::{
     DaytonaNetwork, DaytonaSnapshotSettings, DockerfileSource as SandboxDockerfileSource,
 };
+#[cfg(feature = "forkd")]
+use crate::config::{ForkdNetwork, ForkdSettings, ForkdSnapshotSettings};
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaConfig;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandboxOptions;
+#[cfg(feature = "forkd")]
+use crate::forkd::DEFAULT_SNAPSHOT_TAG;
+#[cfg(feature = "forkd")]
+use crate::forkd::ForkdConfig;
 
 #[cfg(feature = "daytona")]
 #[must_use]
@@ -154,14 +154,14 @@ pub fn forkd_config_from_environment(
         clippy::disallowed_methods,
         reason = "Forkd config resolves server-level credentials from the process environment."
     )]
-    let forkd_url = std::env::var("FORKD_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
+    let forkd_url =
+        std::env::var("FORKD_URL").unwrap_or_else(|_| "http://127.0.0.1:8889".to_string());
     #[expect(
         clippy::disallowed_methods,
         reason = "Forkd config resolves server-level credentials from the process environment."
     )]
-    let forkd_token = std::env::var("FORKD_TOKEN")
-        .unwrap_or_else(|_| "forkd-local-token".to_string());
+    let forkd_token =
+        std::env::var("FORKD_TOKEN").unwrap_or_else(|_| "forkd-local-token".to_string());
 
     let snapshot = ForkdSnapshotSettings {
         image:          settings.image.docker.clone(),
@@ -185,16 +185,16 @@ pub fn forkd_config_from_environment(
         clippy::disallowed_methods,
         reason = "Forkd config resolves snapshot tag from the process environment."
     )]
-    let snapshot_tag = std::env::var("FORKD_SNAPSHOT_TAG")
-        .unwrap_or_else(|_| DEFAULT_SNAPSHOT_TAG.to_string());
+    let snapshot_tag =
+        std::env::var("FORKD_SNAPSHOT_TAG").unwrap_or_else(|_| DEFAULT_SNAPSHOT_TAG.to_string());
 
     ForkdConfig {
         forkd_url,
         forkd_token,
         settings: ForkdSettings {
             snapshot_tag,
-            snapshot:          Some(snapshot),
-            network:           Some(network),
+            snapshot: Some(snapshot),
+            network: Some(network),
             skip_clone,
             auto_stop_minutes: settings
                 .lifecycle
