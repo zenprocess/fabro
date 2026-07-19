@@ -106,9 +106,10 @@ async fn retrieve_run_sandbox(
         Err(response) => return response,
     };
     // Resolve the terminal flag from the run's persisted status before
-    // loading the sandbox record so forkd's stale `running` projection is
-    // corrected to a terminal SandboxState variant when the run has reached
-    // a terminal outcome (forkd tears down its microVM at that point).
+    // loading the sandbox record. A terminal run does NOT imply the forkd
+    // microVM is gone (e.g. --preserve-sandbox keeps it alive), so this flag
+    // only tells forkd_details to query the controller for real liveness;
+    // Deleted is reported solely on a controller-confirmed teardown.
     let is_run_terminal = match state.stores.runs.open_run_reader(&id).await {
         Ok(reader) => match reader.state().await {
             Ok(projection) => projection.is_terminal(),
