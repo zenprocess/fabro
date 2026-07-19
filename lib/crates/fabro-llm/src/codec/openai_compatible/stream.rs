@@ -3,7 +3,7 @@
 //! Byte reading and `data:` framing live in the transport; this decoder is fed
 //! already-stripped payloads (including the `[DONE]` sentinel) via `on_event`.
 
-use super::translate::{map_finish_reason, parse_tool_arguments};
+use super::translate::{map_finish_reason, parse_tool_arguments, ThinkStrip};
 use super::wire::{AccumulatedToolCall, StreamChunk};
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
 use crate::error::Error;
@@ -31,6 +31,13 @@ pub(super) struct StreamState {
     /// In-band USD cost from the usage chunk (OpenRouter), surfaced as
     /// authoritative on the final response.
     cost_usd:              Option<f64>,
+    /// Stateful `<think>...</think>` prefix stripper. Applied to every
+    /// `delta.content` chunk on this codec because some reasoning models
+    /// (minimax, kimi/zai/glm/deepseek reasoning variants) emit their
+    /// reasoning inline in the content stream rather than on a dedicated
+    /// `reasoning_content` channel. Stripped reasoning is appended to
+    /// `accumulated_reasoning` (the existing `ContentPart::Thinking` slot).
+    think_strip:           ThinkStrip,
 }
 
 impl StreamState {
@@ -50,6 +57,7 @@ impl StreamState {
             finished: false,
             rate_limit,
             cost_usd: None,
+            think_strip: ThinkStrip::new(),
         }
     }
 
@@ -93,15 +101,20 @@ impl StreamState {
             }
         }
 
-        // Handle text content delta.
+        // Handle text content delta. The stripper is always active on this
+        // codec; it is a no-op for models that do not emit a leading
+        // `<think>` reasoning prefix.
         if let Some(content) = &delta.content {
             if !content.is_empty() {
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::TextStart { text_id: None });
+                let visible = self.think_strip.process(content);
+                if !visible.is_empty() {
+                    if !self.text_started {
+                        self.text_started = true;
+                        events.push(StreamEvent::TextStart { text_id: None });
+                    }
+                    self.accumulated_text.push_str(&visible);
+                    events.push(StreamEvent::text_delta(&visible, None));
                 }
-                self.accumulated_text.push_str(content);
-                events.push(StreamEvent::text_delta(content, None));
             }
         }
 
@@ -163,12 +176,38 @@ impl StreamState {
         self.finished = true;
         let mut events = Vec::new();
 
+        // Flush any bytes held in the tail buffer (covers an unclosed
+        // `<think>` from a truncated stream). Bytes held while inside a
+        // reasoning block are merged into `accumulated_reasoning` below via
+        // `take_reasoning`; any other tail is real visible output (leading
+        // whitespace and/or a partial `<think` opener that never completed)
+        // and must be surfaced, mirroring the non-streaming
+        // `strip_think_prefix` path.
+        let tail = self.think_strip.finish();
+        if !tail.is_empty() {
+            if !self.text_started {
+                self.text_started = true;
+                events.push(StreamEvent::TextStart { text_id: None });
+            }
+            self.accumulated_text.push_str(&tail);
+            events.push(StreamEvent::text_delta(&tail, None));
+        }
+
         // End text segment if it was started.
         if self.text_started {
             events.push(StreamEvent::TextEnd { text_id: None });
         }
 
         let mut content_parts = Vec::new();
+
+        // Merge any inline `<think>...</think>` reasoning captured by the
+        // stripper into the same accumulation as the provider's proper
+        // `reasoning_content` channel. Both are surfaced as a single
+        // `ContentPart::Thinking` in the final response.
+        let stripped = self.think_strip.take_reasoning();
+        if !stripped.is_empty() {
+            self.accumulated_reasoning.push_str(&stripped);
+        }
 
         // Include reasoning/thinking content if present (Kimi, etc.).
         if !self.accumulated_reasoning.is_empty() {
@@ -254,8 +293,14 @@ impl StreamDecoder for StreamState {
     fn finish(&mut self) -> Vec<StreamEvent> {
         // Stream ended without `[DONE]`. Some providers (e.g. Minimax) omit the
         // sentinel; emit accumulated finish events if we have content and
-        // haven't already finished.
-        if !self.finished && (self.text_started || !self.tool_calls.is_empty()) {
+        // haven't already finished. Also fire when the `<think>` stripper
+        // captured reasoning that would otherwise be lost (e.g. a truncated
+        // stream that opened a reasoning block but never closed it).
+        if !self.finished
+            && (self.text_started
+                || !self.tool_calls.is_empty()
+                || self.think_strip.has_pending())
+        {
             self.finish_events()
         } else {
             Vec::new()
@@ -475,5 +520,216 @@ mod tests {
             }
             other => panic!("Expected Finish, got {other:?}"),
         }
+    }
+
+    // --- think-strip integration tests (streaming path) ---
+
+    /// Parse a JSON string into a `StreamChunk` for the streaming tests.
+    fn chunk_from(json: &str) -> StreamChunk {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Raw SSE `data:` JSON payload for a single-content-delta chunk, for
+    /// tests that drive the decoder through `on_event` directly.
+    fn content_chunk_json(content: &str) -> String {
+        format!(
+            r#"{{"id":"c1","model":"m1","choices":[{{"delta":{{"content":{content}}},"finish_reason":null}}]}}"#,
+            content = serde_json::Value::String(content.to_string()),
+        )
+    }
+
+    fn content_chunk(content: &str) -> StreamChunk {
+        chunk_from(&content_chunk_json(content))
+    }
+
+    #[test]
+    fn stream_strips_multi_delta_think_prefix() {
+        // Reproduces the live minimax emission pattern: `<think>` opens in
+        // delta 1, the reasoning body and closing tag straddle later
+        // deltas, and the visible answer arrives after the closing tag.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let e1 = state
+            .process_chunk(&content_chunk("<think>\nThe user"))
+            .unwrap_or_default();
+        assert!(
+            e1.is_empty(),
+            "no visible events while inside the think prefix, got {e1:?}"
+        );
+
+        let e2 = state
+            .process_chunk(&content_chunk(" said hello</think>"))
+            .unwrap_or_default();
+        assert!(
+            e2.is_empty(),
+            "still no visible events until after the close tag, got {e2:?}"
+        );
+
+        let e3 = state
+            .process_chunk(&content_chunk("\n\nThe answer is 42."))
+            .expect("visible answer chunk should produce events");
+        assert_eq!(e3.len(), 2, "TextStart + one TextDelta, got {e3:?}");
+        assert!(matches!(e3[0], StreamEvent::TextStart { .. }));
+        match &e3[1] {
+            StreamEvent::TextDelta { delta, .. } => {
+                assert_eq!(delta, "\n\nThe answer is 42.");
+            }
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+
+        let events = state.finish_events();
+        assert_eq!(events.len(), 2, "TextEnd + Finish, got {events:?}");
+        assert!(matches!(events[0], StreamEvent::TextEnd { .. }));
+        match &events[1] {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "\n\nThe answer is 42.");
+                let reasoning = response
+                    .reasoning()
+                    .expect("stripped reasoning should be surfaced");
+                assert_eq!(reasoning, "\nThe user said hello");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_unclosed_think_is_captured_as_reasoning() {
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let events = state
+            .process_chunk(&content_chunk("<think>never closed"))
+            .unwrap_or_default();
+        assert!(events.is_empty(), "no visible events, got {events:?}");
+
+        // Stream ends without `[DONE]`; the decoder's `finish()` path
+        // synthesises a `Finish` when content started.
+        let finish = state.finish();
+        match finish.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "");
+                let reasoning = response
+                    .reasoning()
+                    .expect("unclosed think should still surface as reasoning");
+                assert_eq!(reasoning, "never closed");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_bare_partial_think_opener_is_surfaced_as_visible_tail() {
+        // A stream whose entire content is a partial `<think` opener that
+        // never completes (and never closes) must not silently drop those
+        // bytes: `finish_events()` flushes the tail buffer as visible text,
+        // matching non-streaming `strip_think_prefix` on identical input.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  &content_chunk_json("<think"),
+            })
+            .unwrap();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  "[DONE]",
+            })
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "TextStart + TextDelta (tail) + TextEnd + Finish, got {events:?}"
+        );
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        match &events[1] {
+            StreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "<think"),
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+        assert!(matches!(events[2], StreamEvent::TextEnd { .. }));
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "<think");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_whitespace_only_content_parity() {
+        // Whitespace-only content held in the `Prefix` state's tail buffer
+        // is real visible output (no `<think>` opener ever arrived) and must
+        // be surfaced verbatim, matching non-streaming decode of the same
+        // content.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .process_chunk(&content_chunk("   "))
+            .unwrap_or_default();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state.finish_events();
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "   ");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_no_think_passthrough_is_unchanged() {
+        let mut state = test_state("openai-compatible", "gpt-4");
+        let events = state.process_chunk(&content_chunk("Hello world")).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        match &events[1] {
+            StreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "Hello world"),
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_mid_content_literal_think_is_not_stripped() {
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let e1 = state
+            .process_chunk(&content_chunk("Here is how you write <think>"))
+            .expect("chunk 1 should emit events (visible text before <think>)");
+        let e2 = state
+            .process_chunk(&content_chunk(" in plain text"))
+            .expect("chunk 2 should emit a TextDelta");
+
+        // Both deltas contain visible text — the literal `<think>` must
+        // pass through and be surfaced verbatim.
+        let combined: String = e1
+            .iter()
+            .chain(e2.iter())
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(combined, "Here is how you write <think> in plain text");
+        assert!(
+            state.accumulated_reasoning.is_empty(),
+            "no reasoning should be captured, got {:?}",
+            state.accumulated_reasoning
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_deltas_are_unaffected_by_stripper() {
+        // Tool-call deltas never go through the content channel, but
+        // make sure the stripper does not interfere with mixed chunks.
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let chunk = chunk_from(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fn1","arguments":"{\"k"}}]},"finish_reason":null}]}"#,
+        );
+        let events = state.process_chunk(&chunk).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
+        assert!(state.accumulated_text.is_empty());
+        assert!(state.accumulated_reasoning.is_empty());
     }
 }
