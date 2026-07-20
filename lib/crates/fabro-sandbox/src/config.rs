@@ -164,18 +164,18 @@ pub struct ForkdSettings {
     /// forkd snapshot tag to boot from (e.g. `"zen-gate-base"`).
     /// Resolved from `FORKD_SNAPSHOT_TAG` env var; default `"zen-gate-base"`.
     #[serde(default = "ForkdSettings::default_snapshot_tag")]
-    pub snapshot_tag:       String,
+    pub snapshot_tag:      String,
     /// Legacy VM image/kernel/memory settings — retained for deserialization
     /// backward compatibility.  Not sent to the forkd 0.5.2 API.
-    pub snapshot:           Option<ForkdSnapshotSettings>,
+    pub snapshot:          Option<ForkdSnapshotSettings>,
     /// Legacy network isolation policy — retained for deserialization backward
     /// compatibility.  Not sent to the forkd 0.5.2 API.
-    pub network:            Option<ForkdNetwork>,
+    pub network:           Option<ForkdNetwork>,
     /// Skip the repository clone step during `initialize()`.
     #[serde(default)]
-    pub skip_clone:         bool,
+    pub skip_clone:        bool,
     /// Auto-stop interval in minutes (`None` means no auto-stop).
-    pub auto_stop_minutes:  Option<i32>,
+    pub auto_stop_minutes: Option<i32>,
 }
 
 #[cfg(feature = "forkd")]

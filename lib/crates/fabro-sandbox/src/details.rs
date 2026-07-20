@@ -15,6 +15,9 @@ use fabro_types::{
 /// - `local` always returns a minimal record describing the host.
 /// - `docker` inspects the managed container through Bollard.
 /// - `daytona` reconnects to the SDK sandbox.
+/// - `forkd` queries the controller for real microVM liveness once the run is
+///   terminal (`is_run_terminal`), so a preserved-but-alive box still reports
+///   `running` and only a controller-confirmed teardown reports `deleted`.
 #[allow(
     unused_variables,
     reason = "Feature-gated providers consume some parameters only when enabled."
@@ -24,6 +27,7 @@ pub async fn sandbox_details(
     daytona_api_key: Option<String>,
     daytona_organization_id: Option<String>,
     run_id: Option<RunId>,
+    is_run_terminal: bool,
 ) -> Result<SandboxDetails> {
     match record.provider {
         SandboxProviderKind::Local => Ok(local_details(record)),
@@ -42,7 +46,7 @@ pub async fn sandbox_details(
             record.provider
         )),
         #[cfg(feature = "forkd")]
-        SandboxProviderKind::Forkd => Ok(forkd::forkd_details(record)),
+        SandboxProviderKind::Forkd => Ok(forkd::forkd_details(record, is_run_terminal).await),
         #[cfg(not(feature = "forkd"))]
         SandboxProviderKind::Forkd => Err(anyhow::anyhow!(
             "Sandbox provider '{}' has no details implementation",
@@ -822,7 +826,7 @@ pub(crate) mod forkd {
         SandboxState, SandboxTimestamps,
     };
 
-    use crate::forkd::WORKING_DIRECTORY;
+    use crate::forkd::{ForkdConfig, ForkdSandbox, ForkdSandboxStatus, WORKING_DIRECTORY};
 
     /// Build a minimal [`SandboxInfo`] for a named forkd VM.
     ///
@@ -849,26 +853,147 @@ pub(crate) mod forkd {
 
     /// Build minimal `SandboxDetails` for a forkd sandbox from its persisted
     /// runtime record.
-    pub(super) fn forkd_details(
+    ///
+    /// A terminal run does NOT imply a torn-down microVM: `ForkdSandbox::stop`
+    /// is the trait-default no-op and teardown only happens on the run-DELETION
+    /// path (`cleanup()` / `DELETE /v1/sandboxes/{id}`). A run that finished
+    /// with `--preserve-sandbox` (`stop_on_terminal = false`) therefore
+    /// leaves the microVM alive. Rather than assume a stale lifecycle, we
+    /// query the forkd controller for real liveness and surface the actual
+    /// state — so the UI keeps offering ssh/terminal for a box that is
+    /// still reachable.
+    pub(super) async fn forkd_details(
         record: &RunSandboxInstance,
+        is_run_terminal: bool,
     ) -> fabro_types::SandboxDetails {
+        let state = resolve_forkd_state(record, is_run_terminal).await;
         fabro_types::SandboxDetails {
-            sandbox:      record.clone(),
-            state:        SandboxState::Running,
+            sandbox: record.clone(),
+            state,
             native_state: None,
-            region:       None,
-            web_url:      None,
-            resources:    SandboxResources::default(),
-            network:      SandboxNetwork::unknown(),
-            labels:       BTreeMap::new(),
-            timestamps:   SandboxTimestamps::default(),
+            region: None,
+            web_url: None,
+            resources: SandboxResources::default(),
+            network: SandboxNetwork::unknown(),
+            labels: BTreeMap::new(),
+            timestamps: SandboxTimestamps::default(),
         }
+    }
+
+    /// Resolve the reported [`SandboxState`] for a forkd run.
+    ///
+    /// A non-terminal run's microVM is definitionally in active use, so we skip
+    /// the network round-trip and report `Running`. Only once the run is
+    /// terminal do we ask the controller whether the (possibly preserved)
+    /// microVM is still alive.
+    async fn resolve_forkd_state(
+        record: &RunSandboxInstance,
+        is_run_terminal: bool,
+    ) -> SandboxState {
+        if !is_run_terminal {
+            return SandboxState::Running;
+        }
+        let sandbox = ForkdSandbox::new(ForkdConfig::from_env(), None, None, None);
+        let status = sandbox
+            .get_sandbox_status(forkd_sandbox_id(&record.runtime.id))
+            .await;
+        state_for_liveness(status)
+    }
+
+    /// Map controller-reported liveness to a control-plane [`SandboxState`].
+    ///
+    /// [`ForkdSandboxStatus::Unknown`] is the safe fallback for an unreachable
+    /// or status-less controller: it reports `Running` and NEVER a false
+    /// `Deleted`, so ssh/terminal stay available until forkd truly says the box
+    /// is gone.
+    pub(super) fn state_for_liveness(status: ForkdSandboxStatus) -> SandboxState {
+        match status {
+            ForkdSandboxStatus::Alive | ForkdSandboxStatus::Unknown => SandboxState::Running,
+            ForkdSandboxStatus::Gone => SandboxState::Deleted,
+        }
+    }
+
+    /// The persisted `runtime.id` carries the `forkd:` provider prefix
+    /// (`ForkdSandbox::sandbox_info` shape); strip it to recover the raw
+    /// controller id used in `/v1/sandboxes/{id}` URLs.
+    pub(super) fn forkd_sandbox_id(runtime_id: &str) -> &str {
+        runtime_id.strip_prefix("forkd:").unwrap_or(runtime_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "forkd")]
+    use fabro_types::{RunSandboxRuntime, SandboxProviderKind};
+
     use super::*;
+
+    #[cfg(feature = "forkd")]
+    fn forkd_record() -> RunSandboxInstance {
+        RunSandboxInstance {
+            provider: SandboxProviderKind::Forkd,
+            image:    None,
+            snapshot: None,
+            runtime:  RunSandboxRuntime {
+                id:                "vm-abc123".to_string(),
+                working_directory: "/home/fabro/workspace".to_string(),
+                repo_cloned:       Some(true),
+                clone_origin_url:  None,
+                clone_branch:      None,
+                workspace_root:    None,
+                repos_root:        None,
+                primary_repo_path: None,
+                primary_repo_link: None,
+            },
+        }
+    }
+
+    #[cfg(feature = "forkd")]
+    #[tokio::test]
+    async fn forkd_details_reports_running_when_run_is_active() {
+        // A non-terminal run never queries the controller — its microVM is in
+        // active use — so this resolves to Running without any network I/O.
+        let details = forkd::forkd_details(&forkd_record(), false).await;
+        assert_eq!(details.state, SandboxState::Running);
+        assert_eq!(details.sandbox.runtime.id, "vm-abc123");
+        assert_eq!(
+            details.sandbox.runtime.working_directory,
+            "/home/fabro/workspace"
+        );
+    }
+
+    #[cfg(feature = "forkd")]
+    #[test]
+    fn forkd_liveness_maps_to_state() {
+        use fabro_types::SandboxState;
+
+        use crate::forkd::ForkdSandboxStatus;
+
+        // A terminal run whose forkd GET says the box is reachable -> Running.
+        assert_eq!(
+            forkd::state_for_liveness(ForkdSandboxStatus::Alive),
+            SandboxState::Running
+        );
+        // ...says the box is gone (404/410) -> Deleted.
+        assert_eq!(
+            forkd::state_for_liveness(ForkdSandboxStatus::Gone),
+            SandboxState::Deleted
+        );
+        // ...cannot answer (error / unsupported endpoint / timeout) -> NOT
+        // Deleted; we default to Running so ssh/terminal stay available.
+        let unknown = forkd::state_for_liveness(ForkdSandboxStatus::Unknown);
+        assert_ne!(unknown, SandboxState::Deleted);
+        assert_eq!(unknown, SandboxState::Running);
+    }
+
+    #[cfg(feature = "forkd")]
+    #[test]
+    fn forkd_sandbox_id_strips_provider_prefix() {
+        // Persisted runtime.id carries the `forkd:` prefix (sandbox_info shape).
+        assert_eq!(forkd::forkd_sandbox_id("forkd:vm-abc123"), "vm-abc123");
+        // Already-raw ids pass through unchanged.
+        assert_eq!(forkd::forkd_sandbox_id("vm-abc123"), "vm-abc123");
+    }
 
     #[test]
     fn local_details_returns_running_with_no_metadata() {
