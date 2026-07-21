@@ -297,6 +297,18 @@ impl ForkdSandbox {
     /// exists the cd succeeds and the rest of the chain runs as before; when
     /// it is absent the cd is silently skipped and the chained command still
     /// runs (its exit code is preserved).
+    ///
+    /// Guest-shell contract: the interpreter is POSIX `sh`
+    /// (dash/BusyBox-class), **not** bash. Bash-isms — `PIPESTATUS`,
+    /// arrays, `[[ ... ]]`, `local` in some builds — are unavailable, so a
+    /// folded body must not depend on them. A multi-statement `command`
+    /// (`a; b; c`) is appended verbatim after the `&&` guard, so only the
+    /// first statement is chained to the guard and the exit code seen by
+    /// the caller is that of the last statement. The full stdout of every
+    /// statement must survive: the controller shim is required to read both
+    /// streams to EOF *after* the process exits (a shim that reads
+    /// one stream before `wait()` truncates multi-statement output — the class
+    /// of defect that produced empty-output/false-fail gate verdicts).
     fn build_exec_argv(
         command: &str,
         working_dir: &str,
@@ -1346,5 +1358,38 @@ mod tests {
 
         // The chained command's exit code must be preserved through the guard.
         assert_eq!(output.status.code(), Some(7));
+    }
+
+    #[test]
+    fn build_exec_argv_multi_statement_captures_all_output_and_final_exit_code() {
+        // Regression guard for the gate's multi-statement capture class of bug:
+        // a `a; b; c` command must fold into a single `sh -lc` body, and running
+        // that body must emit EVERY statement's stdout while reporting the LAST
+        // statement's exit code. Runs under POSIX `sh` (no bash-isms) to match
+        // the guest-shell contract.
+        let argv = ForkdSandbox::build_exec_argv(
+            "echo one; echo two; echo three; exit 3",
+            "/home/fabro/workspace",
+            None,
+        );
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-lc");
+
+        let output = Command::new(&argv[0])
+            .arg(&argv[1])
+            .arg(&argv[2])
+            .output()
+            .expect("sh -lc should run the folded multi-statement body");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // All three statements' output must be present — none truncated.
+        for line in ["one", "two", "three"] {
+            assert!(
+                stdout.contains(line),
+                "multi-statement stdout dropped {line:?}: got {stdout:?}",
+            );
+        }
+        // Exit code is that of the final statement, not the guard.
+        assert_eq!(output.status.code(), Some(3));
     }
 }
