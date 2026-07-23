@@ -3,7 +3,7 @@
 //! Byte reading and `data:` framing live in the transport; this decoder is fed
 //! already-stripped payloads (including the `[DONE]` sentinel) via `on_event`.
 
-use super::translate::{map_finish_reason, parse_tool_arguments, ThinkStrip};
+use super::translate::{ThinkStrip, map_finish_reason, parse_tool_arguments};
 use super::wire::{AccumulatedToolCall, StreamChunk};
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
 use crate::error::Error;
@@ -297,9 +297,7 @@ impl StreamDecoder for StreamState {
         // captured reasoning that would otherwise be lost (e.g. a truncated
         // stream that opened a reasoning block but never closed it).
         if !self.finished
-            && (self.text_started
-                || !self.tool_calls.is_empty()
-                || self.think_strip.has_pending())
+            && (self.text_started || !self.tool_calls.is_empty() || self.think_strip.has_pending())
         {
             self.finish_events()
         } else {
