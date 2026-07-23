@@ -14,40 +14,182 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::{GateBackend, GateOutput};
 use crate::types::{Acceptance, TaskSpec, Verdict};
 
-// ---------------------------------------------------------------------------
-// ForkdController — REAL, T3, score/read path only
-// ---------------------------------------------------------------------------
+const FORKD_TOKEN_FILE: &str = "/home/vvladescu/fabro-run/.forkd-token";
 
-/// The real forkd hermetic gate controller at `dellsrv:8891`. The
-/// scorer **never** activates / reconfigures / restarts / re-baselines
-/// the controller: it only POSTs to its existing `gate-run` /
-/// `forkd-exec` endpoints and parses the JSON response.
-///
-/// Per `CONTRACTS.md` §1, the controller is unreachable from this
-/// worktree (sandbox egress boundary). The scorer is fully wired
-/// against the response shape so the orchestrator can drive the live
-/// canary from a host that *can* reach the controller.
+/// Resolve the forkd bearer token without exposing its value in errors/logs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync scorer binary: one-shot environment lookup for forkd auth"
+)]
+pub fn forkd_token() -> Result<String> {
+    if let Ok(token) = std::env::var("FORKD_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    match std::fs::read_to_string(FORKD_TOKEN_FILE) {
+        Ok(contents) => {
+            let token = contents.trim().to_string();
+            if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read forkd token file {FORKD_TOKEN_FILE}"));
+        }
+    }
+
+    bail!("forkd token unavailable: set FORKD_TOKEN or provide {FORKD_TOKEN_FILE}")
+}
+
+/// The real forkd controller at `dellsrv:8891`. The scorer only uses the
+/// existing score/read path: it creates a `zen-gate-base` sandbox, executes
+/// the apply-and-acceptance pipeline, and deletes that sandbox. It never
+/// activates, reconfigures, restarts, or re-baselines the controller or its
+/// golden rootfs.
 pub struct ForkdController {
     /// The controller endpoint, e.g. `http://dellsrv:8891`.
     endpoint: String,
     /// HTTP client from `fabro-http::blocking_http_client()` (sync,
     /// to fit the synchronous `GateBackend` trait).
     client:   fabro_http::BlockingHttpClient,
+    token:    String,
 }
 
 impl ForkdController {
     pub fn new(endpoint: &str) -> Result<Self> {
         let client = fabro_http::blocking_http_client().context("build forkd http client")?;
+        let token = forkd_token()?;
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             client,
+            token,
+        })
+    }
+
+    fn create_sandbox(&self) -> Result<String> {
+        let url = format!("{}/v1/sandboxes", self.endpoint);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({"snapshot_tag": "zen-gate-base"}))
+            .send()
+            .with_context(|| format!("forkd POST {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("forkd sandbox create returned non-2xx (status={status})");
+        }
+        let parsed: serde_json::Value = response
+            .json()
+            .with_context(|| format!("parse forkd sandbox create response from {url}"))?;
+        parsed
+            .get("id")
+            .or_else(|| parsed.get("sandbox_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("forkd sandbox create response missing `id`"))
+    }
+
+    fn exec_sandbox(&self, sandbox_id: &str, args: &[String]) -> Result<(i32, String)> {
+        let url = format!("{}/v1/sandboxes/{sandbox_id}/exec", self.endpoint);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({"args": args}))
+            .send()
+            .with_context(|| format!("forkd POST {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("forkd sandbox exec returned non-2xx (status={status})");
+        }
+        let parsed: serde_json::Value = response
+            .json()
+            .with_context(|| format!("parse forkd sandbox exec response from {url}"))?;
+        let exit_code = parsed
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| anyhow!("forkd sandbox exec response missing `exit_code`"))?;
+        let exit_code = i32::try_from(exit_code)
+            .map_err(|_| anyhow!("forkd sandbox exec `exit_code` is out of range"))?;
+        let stdout = parsed
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("forkd sandbox exec response missing `stdout`"))?
+            .to_string();
+        Ok((exit_code, stdout))
+    }
+
+    fn delete_sandbox(&self, sandbox_id: &str) -> Result<()> {
+        let url = format!("{}/v1/sandboxes/{sandbox_id}", self.endpoint);
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .with_context(|| format!("forkd DELETE {url}"))?;
+        if !response.status().is_success() {
+            bail!(
+                "forkd sandbox delete returned non-2xx (status={})",
+                response.status()
+            );
+        }
+        Ok(())
+    }
+
+    fn acceptance_script(acceptance: &Acceptance, diff: &str) -> String {
+        let diff_b64 = BASE64_STANDARD.encode(diff);
+        let acceptance = match acceptance {
+            Acceptance::ShellCommand { command } => command.clone(),
+            Acceptance::DiffMustMatch { pattern } => {
+                let pattern_b64 = BASE64_STANDARD.encode(pattern);
+                format!(
+                    "printf %s '{pattern_b64}' | base64 -d > /tmp/route.pattern; if grep -Eq -f /tmp/route.pattern /tmp/route.diff; then printf '%s\\n' 'matched'; else printf '%s\\n' 'did NOT match'; exit 1; fi"
+                )
+            }
+        };
+        // ASSUMPTION: zen-gate-base exec CWD is the repo root
+        format!(
+            "set -e; exec 2>&1; printf %s '{diff_b64}' | base64 -d > /tmp/route.diff; git apply --3way --whitespace=nowarn /tmp/route.diff; {acceptance} 2>&1"
+        )
+    }
+
+    fn score_in_sandbox(
+        &self,
+        task: &TaskSpec,
+        route_diff: &str,
+        sandbox_id: &str,
+    ) -> Result<GateOutput> {
+        let args = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            Self::acceptance_script(&task.acceptance, route_diff),
+        ];
+        let (exit_code, stdout) = self.exec_sandbox(sandbox_id, &args)?;
+        let gate_log = stdout.replace(&self.token, "[REDACTED]");
+        Ok(GateOutput {
+            verdict: if exit_code == 0 {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            gate_log: gate_log.clone(),
+            backend: "forkd".to_string(),
+            score: Some(if exit_code == 0 { 1.0 } else { 0.0 }),
+            valset_hash: None,
         })
     }
 }
@@ -58,67 +200,12 @@ impl GateBackend for ForkdController {
     }
 
     fn score(&self, task: &TaskSpec, route_diff: &str) -> Result<GateOutput> {
-        // Per the P0 spec: POST the diff to the controller's gate-run
-        // endpoint and parse the `verdict` + `gate_log` response. The
-        // endpoint path is `gate-run` (the operator-confirmed path
-        // should replace this when the orchestrator drives the live
-        // canary; the contract is the response shape, not the path).
-        let url = format!("{}/gate-run", self.endpoint);
-        let body = serde_json::json!({
-            "task_id": task.task_id,
-            "base_ref": task.base_ref,
-            "diff": route_diff,
-            "ts": Utc::now().to_rfc3339(),
-        });
-        debug!(url = %url, "forkd POST gate-run");
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .with_context(|| format!("forkd POST {url}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .with_context(|| format!("forkd read body from {url}"))?;
-        if !status.is_success() {
-            bail!(
-                "forkd returned non-2xx (status={status}, body={})",
-                String::from_utf8_lossy(&bytes)
-            );
+        let sandbox_id = self.create_sandbox()?;
+        let result = self.score_in_sandbox(task, route_diff, &sandbox_id);
+        if let Err(error) = self.delete_sandbox(&sandbox_id) {
+            warn!(sandbox_id = %sandbox_id, error = %error, "forkd sandbox cleanup failed");
         }
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "forkd returned invalid JSON: {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })?;
-        let verdict_str = parsed
-            .get("verdict")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("forkd response missing `verdict`"))?;
-        let verdict = match verdict_str {
-            "pass" => Verdict::Pass,
-            "fail" => Verdict::Fail,
-            other => bail!("forkd verdict was {other:?}, expected \"pass\"|\"fail\""),
-        };
-        let gate_log = parsed
-            .get("gate_log")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("forkd response missing `gate_log`"))?
-            .to_string();
-        let score = parsed.get("score").and_then(serde_json::Value::as_f64);
-        let valset_hash = parsed
-            .get("valset_hash")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        Ok(GateOutput {
-            verdict,
-            gate_log,
-            backend: "forkd".to_string(),
-            score,
-            valset_hash,
-        })
+        result
     }
 }
 
