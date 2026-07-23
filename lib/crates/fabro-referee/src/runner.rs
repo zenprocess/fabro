@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::decision_log::find_decision;
 use crate::emit::{append_jsonl, write_markdown_summary};
 use crate::gate::GateBackend;
-use crate::types::{GateOutput, Route, RunRow, TaskSpec, Tier};
+use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier};
 
 /// What the runner emits for one task.
 #[derive(Debug, Clone)]
@@ -100,6 +100,7 @@ pub fn run(
 /// read.
 pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput) -> RunRow {
     RunRow {
+        schema_version: CURRENT_SCHEMA_VERSION,
         run_id:         run_id.to_string(),
         task_id:        task.task_id.clone(),
         ts:             Utc::now(),
@@ -154,7 +155,6 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
     ]
 }
 
-#[cfg(feature = "test-support")]
 #[cfg(test)]
 mod tests {
     use super::*;

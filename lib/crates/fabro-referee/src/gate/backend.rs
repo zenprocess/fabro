@@ -127,9 +127,11 @@ impl GateBackend for ForkdController {
 // ---------------------------------------------------------------------------
 
 /// The hermetic local gate. Applies the diff in a throwaway git
-/// checkout seeded from `valset_root`, runs the task's closed-form
-/// acceptance, captures combined stdout/stderr as `gate_log`, and
-/// returns `Pass` iff the acceptance exited 0. Never fakes a pass.
+/// checkout **seeded from `valset_root` at `base_ref`** (so the diff
+/// is scored against the real repo content, not against an empty
+/// tree), runs the task's closed-form acceptance, captures combined
+/// stdout/stderr as `gate_log`, and returns `Pass` iff the acceptance
+/// exited 0. Never fakes a pass.
 ///
 /// This is the *fallback* backend the P0 spec mandates: it has the
 /// same return shape as `ForkdController` so the runner emits the
@@ -142,24 +144,220 @@ pub struct HermeticLocal {
     valset_root: PathBuf,
 }
 
+/// Short-lived pipe thread: drain `reader` into `writer` in the
+/// background. Both processes involved are local; the thread lives
+/// only as long as the pipe. Declared at module scope (rather than
+/// inline in `archive_seed`) so the items-after-statements lint
+/// stays quiet and we can document the disallowed-method
+/// expectation in one place.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync scorer binary: short-lived pipe thread is intentional; no Tokio runtime here"
+)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "sync scorer binary: Read/Write trait bounds here; no Tokio runtime here"
+)]
+fn pump_between<R, W>(mut reader: R, mut writer: W) -> std::thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: std::io::Write + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut writer);
+    })
+}
+
 impl HermeticLocal {
     pub fn new(valset_root: PathBuf) -> Self {
         Self { valset_root }
     }
 
-    /// Apply `diff` in a throwaway checkout rooted at `valset_root`.
-    /// Returns the path to the checkout and the captured diff-apply
-    /// log. If the diff fails to apply, the function returns a
-    /// `GateOutput { verdict: Fail, .. }` rather than an error — the
-    /// runner still wants the row in the sink, with the failure
-    /// captured in `gate_log`.
+    /// Run `cmd` (consumed) and bail with stderr captured if it exits
+    /// non-zero. Logs the invocation + verdict to `log`. Returns
+    /// Ok(()) on success, Err on non-zero exit (which the caller is
+    /// expected to convert into a `Verdict::Fail` row, never panic).
+    ///
+    /// `cmd` is mutated by `.output()` so we need `mut cmd: Command`.
+    fn must_run(label: &str, log: &mut String, mut cmd: Command) -> std::io::Result<()> {
+        let _ = writeln!(log, "[hermetic] {label}: {cmd:?}");
+        let out = cmd.output()?;
+        if !out.status.success() {
+            let _ = writeln!(
+                log,
+                "[hermetic] {label} failed (status={}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr),
+            );
+            let status = out.status;
+            let msg = format!("{label} exit={status}");
+            return Err(std::io::Error::other(msg));
+        }
+        Ok(())
+    }
+
+    /// Build an owned `Command` (the chained builder methods return
+    /// `&mut Command`, so we have to construct it inside a block to
+    /// hand the caller the owned value).
     #[expect(
         clippy::disallowed_methods,
-        reason = "sync scorer binary: git subprocesses via std::process::Command are intentional; no Tokio runtime"
+        reason = "sync scorer binary: std::process::Command is intentional; no Tokio runtime here"
     )]
-    fn apply_diff(task: &TaskSpec, diff: &str, workdir: &Path) -> (bool, String) {
+    fn owned_cmd(program: &str) -> Command {
+        Command::new(program)
+    }
+
+    /// Seed `workdir` from `valset_root` at `base_ref`, hermetically
+    /// (no network). Prefers `git -C <valset_root> archive <base_ref> |
+    /// tar -x -C <workdir>` when `valset_root` is itself a git repo —
+    /// that pins the seed content to the exact tree at `base_ref`.
+    /// Falls back to a recursive copy (skipping `valset_root/.git`)
+    /// when no git history is available, so test fixtures that are
+    /// plain directories still work.
+    ///
+    /// The default `base_ref == "HEAD"` resolves against the
+    /// valset_root's git history; for the canary use case (valset_root
+    /// == "." with a clean working tree at HEAD) both paths agree.
+    fn seed_workdir(valset_root: &Path, base_ref: &str, workdir: &Path, log: &mut String) -> bool {
+        let has_git = valset_root.join(".git").exists();
+        if has_git {
+            // Preferred path: git archive at base_ref piped to tar -x.
+            // Both git archive and tar are local operations; no network.
+            match Self::archive_seed(valset_root, base_ref, workdir) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        log,
+                        "[hermetic] seeded workdir from {}@{} (git archive)",
+                        valset_root.display(),
+                        base_ref
+                    );
+                    return true;
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        log,
+                        "[hermetic] git-archive seed failed: {e}; falling back to recursive copy"
+                    );
+                    // Fall through to the copy fallback below.
+                }
+            }
+        }
+        Self::copy_seed(valset_root, workdir, log)
+    }
+
+    /// `git -C <valset_root> archive <base_ref>` piped into
+    /// `tar -x -C <workdir>`. Returns Err on any non-zero exit or
+    /// spawn failure (with combined stderr captured).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sync scorer binary: git archive + tar subprocs are intentional; no Tokio runtime here"
+    )]
+    fn archive_seed(valset_root: &Path, base_ref: &str, workdir: &Path) -> std::io::Result<()> {
+        let mut archive = Command::new("git")
+            .arg("-C")
+            .arg(valset_root)
+            .args(["archive", base_ref])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut tar = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(workdir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // Pump git archive's stdout → tar's stdin so we never buffer
+        // a potentially-large archive entirely in memory. Use a
+        // dedicated thread for the pump; both processes are local and
+        // short-lived so the join is cheap.
+        let archive_stdout = archive
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("git archive stdout"))?;
+        let tar_stdin = tar
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("tar stdin"))?;
+        let pump = pump_between(archive_stdout, tar_stdin);
+        let archive_status = archive.wait()?;
+        let _ = pump.join();
+        let tar_status = tar.wait()?;
+        if !archive_status.success() {
+            return Err(std::io::Error::other(format!(
+                "git archive exit={archive_status}"
+            )));
+        }
+        if !tar_status.success() {
+            return Err(std::io::Error::other(format!("tar exit={tar_status}")));
+        }
+        Ok(())
+    }
+
+    /// Recursive-copy fallback seeder. Walks `valset_root` and mirrors
+    /// its contents into `workdir`, skipping `valset_root/.git` so we
+    /// don't drag a parent repo history into the throwaway checkout.
+    fn copy_seed(valset_root: &Path, workdir: &Path, log: &mut String) -> bool {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "sync scorer binary: walk + copy + symlink are intentional; no Tokio runtime here"
+        )]
+        fn walk(src: &Path, dst: &Path) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let ft = entry.file_type()?;
+                let from = entry.path();
+                let to = dst.join(entry.file_name());
+                if ft.is_dir() {
+                    if from.file_name().and_then(|s| s.to_str()) == Some(".git") {
+                        continue;
+                    }
+                    std::fs::create_dir_all(&to)?;
+                    walk(&from, &to)?;
+                } else if ft.is_file() {
+                    std::fs::copy(&from, &to)?;
+                } else if ft.is_symlink() {
+                    let target = std::fs::read_link(&from)?;
+                    std::os::unix::fs::symlink(&target, &to).ok();
+                }
+            }
+            Ok(())
+        }
+        match walk(valset_root, workdir) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "[hermetic] seeded workdir from {} (recursive copy)",
+                    valset_root.display()
+                );
+                true
+            }
+            Err(e) => {
+                let _ = writeln!(log, "[hermetic] copy-seed failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Apply `diff` in a throwaway checkout seeded from
+    /// `valset_root` at `base_ref`. Returns `(applied, log)`. If the
+    /// diff fails to apply (or the seed/seed-commit fails), returns
+    /// `(false, log)` — the runner converts that into a `Verdict::Fail`
+    /// row rather than an error, so the row is still emitted with the
+    /// failure captured in `gate_log`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sync scorer binary: git subprocesses via std::process::Command are intentional; no Tokio runtime here"
+    )]
+    fn apply_diff(
+        task: &TaskSpec,
+        diff: &str,
+        valset_root: &Path,
+        workdir: &Path,
+    ) -> (bool, String) {
         let mut log = String::new();
-        // Step 1: git init + commit the valset_root state.
+        // Step 1: git init the throwaway workdir.
         let init = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(workdir)
@@ -180,35 +378,92 @@ impl HermeticLocal {
             _ => {}
         }
         // Configure a local user (git refuses to commit otherwise).
-        let _ = Command::new("git")
-            .args(["config", "user.email", "referee@local"])
-            .arg(workdir)
-            .output();
-        let _ = Command::new("git")
-            .args(["config", "user.name", "Referee"])
-            .arg(workdir)
-            .output();
-        // Add the valset_root contents.
-        let add = Command::new("git")
+        // Both are now hard-required: non-zero exit is treated as a
+        // hard failure (previously silently dropped). We use `-C
+        // <workdir>` to scope the config to the throwaway checkout
+        // (the original implementation passed the workdir as a
+        // positional arg, which `git config` does not recognize and
+        // silently fell back to the parent repo's config — that
+        // surfaced here under sandbox-network-boundary enforcement
+        // with a `lock config file ... Operation not permitted` error).
+        let cfg_email = {
+            let mut c = Self::owned_cmd("git");
+            c.arg("-C").arg(workdir);
+            c.args(["config", "user.email", "referee@local"]);
+            c
+        };
+        if let Err(e) = Self::must_run("git config user.email", &mut log, cfg_email) {
+            let _ = writeln!(log, "[hermetic] git config user.email failed: {e}");
+            return (false, log);
+        }
+        let cfg_name = {
+            let mut c = Self::owned_cmd("git");
+            c.arg("-C").arg(workdir);
+            c.args(["config", "user.name", "Referee"]);
+            c
+        };
+        if let Err(e) = Self::must_run("git config user.name", &mut log, cfg_name) {
+            let _ = writeln!(log, "[hermetic] git config user.name failed: {e}");
+            return (false, log);
+        }
+        // Step 2: seed the workdir from valset_root at base_ref.
+        if !Self::seed_workdir(valset_root, &task.base_ref, workdir, &mut log) {
+            return (false, log);
+        }
+        // Commit the seeded tree as the base commit so `git apply` has
+        // a real reference tree to apply the route diff against.
+        // Non-zero exit (including "nothing to commit") is now a hard
+        // failure with stderr captured.
+        let add_out = Command::new("git")
             .arg("-C")
             .arg(workdir)
             .args(["add", "-A"])
             .output();
-        if let Err(e) = add {
-            let _ = writeln!(log, "[hermetic] git add failed: {e}");
+        let add_out = match add_out {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = writeln!(log, "[hermetic] git add spawn failed: {e}");
+                return (false, log);
+            }
+        };
+        if !add_out.status.success() {
+            let _ = writeln!(
+                log,
+                "[hermetic] git add failed (status={}): {}",
+                add_out.status,
+                String::from_utf8_lossy(&add_out.stderr),
+            );
             return (false, log);
         }
-        let commit = Command::new("git")
+        let commit_out = Command::new("git")
             .arg("-C")
             .arg(workdir)
-            .args(["commit", "-q", "-m", "valset"])
+            .args([
+                "commit",
+                "-q",
+                "-m",
+                "valset (seed from valset_root@base_ref)",
+                "--allow-empty",
+            ])
             .output();
-        if let Err(e) = commit {
-            let _ = writeln!(log, "[hermetic] git commit failed: {e}");
+        let commit_out = match commit_out {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = writeln!(log, "[hermetic] git commit spawn failed: {e}");
+                return (false, log);
+            }
+        };
+        if !commit_out.status.success() {
+            let _ = writeln!(
+                log,
+                "[hermetic] git commit failed (status={}): {}",
+                commit_out.status,
+                String::from_utf8_lossy(&commit_out.stderr),
+            );
             return (false, log);
         }
-        // Step 2: apply the diff. The diff is captured from the
-        // orchestrator's worktree; git apply with --3way is forgiving.
+        // Step 3: apply the route diff on top of the seeded base.
+        // git apply with --3way is forgiving about whitespace.
         let mut child = match Command::new("git")
             .arg("-C")
             .arg(workdir)
@@ -224,13 +479,15 @@ impl HermeticLocal {
                 return (false, log);
             }
         };
-        let Some(stdin) = child.stdin.as_mut() else {
-            let _ = writeln!(log, "[hermetic] git apply child stdin unavailable");
-            return (false, log);
-        };
-        if let Err(e) = stdin.write_all(diff.as_bytes()) {
-            let _ = writeln!(log, "[hermetic] write diff stdin failed: {e}");
-            return (false, log);
+        {
+            let Some(stdin) = child.stdin.as_mut() else {
+                let _ = writeln!(log, "[hermetic] git apply child stdin unavailable");
+                return (false, log);
+            };
+            if let Err(e) = stdin.write_all(diff.as_bytes()) {
+                let _ = writeln!(log, "[hermetic] write diff stdin failed: {e}");
+                return (false, log);
+            }
         }
         let apply_out = match child.wait_with_output() {
             Ok(o) => o,
@@ -263,7 +520,7 @@ impl HermeticLocal {
     /// caller maps non-zero exit 1:1 to `Verdict::Fail`.
     #[expect(
         clippy::disallowed_methods,
-        reason = "sync scorer binary: acceptance subprocess via std::process::Command is intentional; no Tokio runtime"
+        reason = "sync scorer binary: acceptance subprocess via std::process::Command is intentional; no Tokio runtime here"
     )]
     fn run_acceptance(task: &TaskSpec, route_diff: &str, workdir: &Path) -> (i32, String) {
         let mut log = String::new();
@@ -348,24 +605,32 @@ impl GateBackend for HermeticLocal {
         let mut gate_log = String::new();
         let _ = writeln!(
             gate_log,
-            "[hermetic] begin task={} diff_bytes={} valset_root={}",
+            "[hermetic] begin task={} diff_bytes={} valset_root={} base_ref={}",
             task.task_id,
             route_diff.len(),
             self.valset_root.display(),
+            task.base_ref,
         );
-        let (applied, apply_log) = Self::apply_diff(task, route_diff, &tmp);
+        let (applied, apply_log) = Self::apply_diff(task, route_diff, &self.valset_root, &tmp);
         gate_log.push_str(&apply_log);
         if !applied {
             // Drop the tempdir. Best-effort.
             let _ = std::fs::remove_dir_all(&tmp);
-            gate_log.push_str("[hermetic] verdict=FAIL (diff did not apply)\n");
+            gate_log.push_str(
+                "[hermetic] verdict=FAIL (diff did not apply against seeded valset_root)\n",
+            );
             info!(task = %task.task_id, "hermetic: diff did not apply");
+            // valsethash is ONLY recorded after a successful apply+seed:
+            // a FAIL row carries the failure reason in gate_log with no
+            // misleading hash (the hash would imply the diff had been
+            // scored against the real repo when in fact it never reached
+            // the acceptance step).
             return Ok(GateOutput {
                 verdict: Verdict::Fail,
                 gate_log,
                 backend: "hermetic".to_string(),
                 score: Some(0.0),
-                valset_hash: Some(Self::compute_valset_hash(task, route_diff)),
+                valset_hash: None,
             });
         }
         let (exit_code, accept_log) = Self::run_acceptance(task, route_diff, &tmp);
@@ -373,9 +638,13 @@ impl GateBackend for HermeticLocal {
         let _ = std::fs::remove_dir_all(&tmp);
         let verdict = if exit_code == 0 {
             Verdict::Pass
+            // valset_hash now lives on the Pass AND the Fail-from-acceptance
+            // rows — both happen after a successful seed+apply, so the
+            // hash reflects what was actually scored.
         } else {
             Verdict::Fail
         };
+        let valset_hash = Some(Self::compute_valset_hash(task, route_diff));
         let _ = writeln!(
             gate_log,
             "[hermetic] verdict={verdict} (acceptance exit={exit_code})",
@@ -390,7 +659,7 @@ impl GateBackend for HermeticLocal {
             gate_log,
             backend: "hermetic".to_string(),
             score: Some(if exit_code == 0 { 1.0 } else { 0.0 }),
-            valset_hash: Some(Self::compute_valset_hash(task, route_diff)),
+            valset_hash,
         })
     }
 }
@@ -401,6 +670,18 @@ mod tests {
 
     use super::*;
     use crate::types::Acceptance;
+
+    /// Synchronous file write for test fixtures. Lives at module
+    /// scope so the disallowed-methods lint only needs to be silenced
+    /// in one place, and to dodge the "items after statements"
+    /// lint that forbids defining helpers inline after `let`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "synchronous test fixture write; no Tokio runtime here"
+    )]
+    fn write_file(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
 
     fn diff_match_task(pattern: &str) -> TaskSpec {
         TaskSpec {
@@ -436,5 +717,91 @@ mod tests {
         let (code, log) = HermeticLocal::run_acceptance(&task, diff, &PathBuf::from("."));
         assert_eq!(code, 1, "pattern absent from diff must fail; log={log}");
         assert!(log.contains("did NOT match"));
+    }
+
+    /// SAFETY-CRITICAL regression: a diff that *modifies* an existing
+    /// file in `valset_root` must apply and score correctly. Before the
+    /// fix, the throwaway workdir was seeded from EMPTY, so any
+    /// modify-existing-file diff failed to apply (or, with `--3way`,
+    /// silently miscompared against an absent base) — a Pass then meant
+    /// only "git could synthesize a new file", not "the diff solved
+    /// the task against the real repo".
+    #[test]
+    fn hermetic_local_modifies_existing_file_against_seeded_valset_root() {
+        // Build a one-file valset in a unique tempdir. We seed the
+        // HermeticLocal against THIS directory (not the current
+        // worktree) so the test is hermetic and self-contained.
+        let valset_root =
+            std::env::temp_dir().join(format!("fabro-referee-valset-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&valset_root).unwrap();
+        let existing_file = "EXISTING.md";
+        let existing_contents = "line one\nline two\nline three\n";
+        write_file(&valset_root.join(existing_file), existing_contents);
+
+        // A diff that MODIFIES the existing file: changes line two's
+        // content. Single-line format string (no `\` continuation,
+        // which strips leading whitespace and silently invalidates
+        // the leading-space context markers git apply requires).
+        let modified_diff = format!(
+            "--- a/{existing_file}\n+++ b/{existing_file}\n@@ -1,3 +1,3 @@\n line one\n-line two\n+LINE TWO MODIFIED\n line three\n"
+        );
+
+        // Acceptance: only pass if line TWO carries the marker text.
+        // The acceptance runs in the *seeded* workdir (which holds
+        // EXISTING.md after the apply succeeded), proving the diff
+        // landed against the REAL tree, not an empty one.
+        let task_pass = TaskSpec {
+            task_id:           "T-modify-existing".to_string(),
+            spec_ref:          None,
+            difficulty_bucket: None,
+            prompt_path:       valset_root
+                .join(existing_file)
+                .to_string_lossy()
+                .to_string(),
+            project_path:      valset_root.to_string_lossy().to_string(),
+            base_ref:          "HEAD".to_string(),
+            acceptance:        Acceptance::ShellCommand {
+                command: format!("grep -F 'LINE TWO MODIFIED' {existing_file}"),
+            },
+        };
+        let backend = HermeticLocal::new(valset_root.clone());
+        let out = backend.score(&task_pass, &modified_diff).unwrap();
+        assert_eq!(
+            out.verdict,
+            Verdict::Pass,
+            "modify-existing-file diff against seeded valset_root MUST pass; log={}",
+            out.gate_log
+        );
+        assert!(
+            out.gate_log.contains("git apply ok"),
+            "gate_log must show the apply step succeeded; got={}",
+            out.gate_log
+        );
+        assert!(
+            out.valset_hash.is_some(),
+            "valset_hash must be recorded on a Pass row (applied cleanly)"
+        );
+
+        // Negative path: a diff that does NOT carry the marker in
+        // the seeded file must FAIL the acceptance (grep exit 1).
+        // This proves the seed was real: if the workdir were empty,
+        // applying a modify-existing-file diff could not have
+        // produced a tree to grep against in the first place.
+        let wrong_diff = format!(
+            "--- a/{existing_file}\n+++ b/{existing_file}\n@@ -1,3 +1,3 @@\n line one\n-line two\n+something else entirely\n line three\n"
+        );
+        let out_fail = backend.score(&task_pass, &wrong_diff).unwrap();
+        assert_eq!(
+            out_fail.verdict,
+            Verdict::Fail,
+            "diff against the seeded file that does NOT add the marker MUST fail"
+        );
+        assert!(
+            out_fail.valset_hash.is_some(),
+            "valset_hash IS recorded after successful seed+apply; only the diff-did-not-apply branch omits it"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&valset_root);
     }
 }

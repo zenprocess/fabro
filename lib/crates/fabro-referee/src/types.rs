@@ -140,6 +140,13 @@ pub struct GateOutput {
 /// One JSONL row — one route, one task, one scored gate-log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRow {
+    /// Schema version of this row. Starts at 1. The zeninfra
+    /// episode-store sink version-gates harvest on this field so a
+    /// future shape change does not silently re-land older rows.
+    /// Bump on backwards-incompatible changes; additive fields
+    /// (Option / serde-default) only need a comment.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub run_id:         String,
     pub task_id:        String,
     pub ts:             DateTime<Utc>,
@@ -174,8 +181,17 @@ pub struct RunRow {
     pub session_id:     Option<String>,
 }
 
+/// Current schema version. Bump on backwards-incompatible row-shape
+/// changes.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
+}
+
 impl RunRow {
-    /// Convenience constructor for tests.
+    /// Convenience constructor for tests. Always emits the current
+    /// schema version so the row shape stays forward-compatible.
     pub fn new(
         run_id: &str,
         task_id: &str,
@@ -187,6 +203,7 @@ impl RunRow {
         gate_log: &str,
     ) -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
             ts: Utc::now(),
