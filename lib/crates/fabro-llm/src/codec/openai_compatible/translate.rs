@@ -610,7 +610,7 @@ mod tests {
 
 #[cfg(test)]
 mod think_strip_tests {
-    use super::{strip_think_prefix, ThinkStrip};
+    use super::{ThinkStrip, strip_think_prefix};
 
     /// Drive `strip` with a list of chunk boundaries and join the visible
     /// output across calls. Mirrors how the streaming decoder calls
@@ -635,8 +635,7 @@ mod think_strip_tests {
 
     #[test]
     fn think_then_visible_answer() {
-        let (visible, reasoning) =
-            run_strip(&["<think>reasoning</think>\nThe answer"]);
+        let (visible, reasoning) = run_strip(&["<think>reasoning</think>\nThe answer"]);
         assert_eq!(visible, "\nThe answer");
         assert_eq!(reasoning, "reasoning");
     }
@@ -666,8 +665,7 @@ mod think_strip_tests {
     fn mid_content_literal_think_is_not_stripped() {
         // A normal response that happens to contain the literal token
         // `<think>` after some visible text must pass through unchanged.
-        let (visible, reasoning) =
-            run_strip(&["Here is how you write <think> in plain text"]);
+        let (visible, reasoning) = run_strip(&["Here is how you write <think> in plain text"]);
         assert_eq!(visible, "Here is how you write <think> in plain text");
         assert_eq!(reasoning, "");
     }
@@ -720,24 +718,21 @@ mod think_strip_tests {
     fn think_all_delimiters_split_across_deltas() {
         // Case (d): content, opener, closer, and answer are each fragmented
         // across delta boundaries — the maximal-split reasoning flow.
-        let (visible, reasoning) =
-            run_strip(&["<thi", "nk>rea", "soning</thi", "nk>ans", "wer"]);
+        let (visible, reasoning) = run_strip(&["<thi", "nk>rea", "soning</thi", "nk>ans", "wer"]);
         assert_eq!(visible, "answer");
         assert_eq!(reasoning, "reasoning");
     }
 
     #[test]
     fn leading_whitespace_before_think_is_still_treated_as_prefix() {
-        let (visible, reasoning) =
-            run_strip(&["\n <think>plan</think>\ndo it"]);
+        let (visible, reasoning) = run_strip(&["\n <think>plan</think>\ndo it"]);
         assert_eq!(visible, "\ndo it");
         assert_eq!(reasoning, "plan");
     }
 
     #[test]
     fn visible_text_then_later_think_stays_literal() {
-        let (visible, reasoning) =
-            run_strip(&["hello ", "<think> should not trigger"]);
+        let (visible, reasoning) = run_strip(&["hello ", "<think> should not trigger"]);
         assert_eq!(visible, "hello <think> should not trigger");
         assert_eq!(reasoning, "");
     }

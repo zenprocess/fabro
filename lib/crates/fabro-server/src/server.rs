@@ -68,6 +68,8 @@ use fabro_mcp_store::McpServerStore;
 use fabro_model::catalog::LlmCatalogSettings;
 use fabro_model::{BilledTokenCounts, Catalog, ModelRef, ModelTestMode, ProviderId};
 use fabro_redact::redact_jsonl_line;
+#[cfg(feature = "forkd")]
+use fabro_sandbox::ForkdSandboxProvider;
 use fabro_sandbox::daytona::{self, DaytonaSandbox};
 use fabro_sandbox::details::sandbox_details;
 use fabro_sandbox::reconnect::reconnect_for_run;
@@ -75,8 +77,6 @@ use fabro_sandbox::{
     DaytonaSandboxProvider, DockerSandboxProvider, LocalSandboxProvider, Sandbox, SandboxProvider,
     SandboxProviderRegistry,
 };
-#[cfg(feature = "forkd")]
-use fabro_sandbox::ForkdSandboxProvider;
 use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
 use fabro_slack::config::{
     SlackCredentialResolution,
