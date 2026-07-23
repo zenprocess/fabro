@@ -31,6 +31,7 @@ use fabro_referee::canary::{
     CANARY_TASK_ID, build_canary_task, canary_marker, green_canned_diff, red_canned_diff,
 };
 use fabro_referee::emit::default_sink_dir;
+use fabro_referee::gate::backend::forkd_token;
 use fabro_referee::gate::{BackendKind, GateBackend};
 use fabro_referee::runner::{run, two_tier_canary_routes};
 use fabro_referee::types::{Route, TaskSpec};
@@ -262,9 +263,11 @@ fn do_doctor(cli: &Cli, sink_dir: &Path, decision_log: Option<&Path>, backend_ki
 }
 
 fn check_endpoint(url: &str) -> Result<()> {
+    let token = forkd_token()?;
     let client = fabro_http::blocking_http_client().context("build doctor http client")?;
     let resp = client
         .get(format!("{}/health", url.trim_end_matches('/')))
+        .bearer_auth(token)
         .send()
         .with_context(|| format!("GET {url}/health"))?;
     if resp.status().is_success() {

@@ -14,40 +14,70 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use fabro_http::BlockingRequestBuilder;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::{GateBackend, GateOutput};
 use crate::types::{Acceptance, TaskSpec, Verdict};
 
-// ---------------------------------------------------------------------------
-// ForkdController — REAL, T3, score/read path only
-// ---------------------------------------------------------------------------
+const FORKD_TOKEN_FILE: &str = "/home/vvladescu/fabro-run/.forkd-token";
 
-/// The real forkd hermetic gate controller at `dellsrv:8891`. The
-/// scorer **never** activates / reconfigures / restarts / re-baselines
-/// the controller: it only POSTs to its existing `gate-run` /
-/// `forkd-exec` endpoints and parses the JSON response.
-///
-/// Per `CONTRACTS.md` §1, the controller is unreachable from this
-/// worktree (sandbox egress boundary). The scorer is fully wired
-/// against the response shape so the orchestrator can drive the live
-/// canary from a host that *can* reach the controller.
+/// Resolve the forkd bearer token without exposing its value in errors/logs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync scorer binary: one-shot environment lookup for forkd auth"
+)]
+pub fn forkd_token() -> Result<String> {
+    if let Ok(token) = std::env::var("FORKD_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    match std::fs::read_to_string(FORKD_TOKEN_FILE) {
+        Ok(contents) => {
+            let token = contents.trim().to_string();
+            if !token.is_empty() {
+                return Ok(token);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read forkd token file {FORKD_TOKEN_FILE}"));
+        }
+    }
+
+    bail!("forkd token unavailable: set FORKD_TOKEN or provide {FORKD_TOKEN_FILE}")
+}
+
+/// The real forkd controller at `dellsrv:8891`. The scorer only uses the
+/// existing score/read path: it creates a `zen-gate-base` sandbox, executes
+/// the apply-and-acceptance pipeline, and deletes that sandbox. It never
+/// activates, reconfigures, restarts, or re-baselines the controller or its
+/// golden rootfs.
 pub struct ForkdController {
     /// The controller endpoint, e.g. `http://dellsrv:8891`.
     endpoint: String,
     /// HTTP client from `fabro-http::blocking_http_client()` (sync,
     /// to fit the synchronous `GateBackend` trait).
     client:   fabro_http::BlockingHttpClient,
+    /// Bearer token resolved from the operator environment/file.
+    token:    String,
 }
 
 impl ForkdController {
+    /// Build a controller that authenticates every request with a bearer token
+    /// resolved via the shared [`forkd_token`] resolver. The token VALUE is
+    /// never logged, emitted in errors, or persisted.
     pub fn new(endpoint: &str) -> Result<Self> {
         let client = fabro_http::blocking_http_client().context("build forkd http client")?;
+        let token = forkd_token()?;
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             client,
+            token,
         })
     }
 }
@@ -58,37 +88,16 @@ impl GateBackend for ForkdController {
     }
 
     fn score(&self, task: &TaskSpec, route_diff: &str) -> Result<GateOutput> {
-        use std::fmt::Write as _;
         use std::time::Duration;
         // Real forkd gate-run: spin a hermetic microVM from the golden snapshot,
         // run the task's closed-form acceptance INSIDE it, and map the exit code
         // to a verdict. Never fakes a pass: any setup failure (unreadable target,
         // failed seed, failed diff-apply) FAILS THE GATE CLOSED rather than
         // letting an unrelated pre-existing file state satisfy the acceptance.
-        let token = std::env::var("FORKD_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let path = std::env::var("FORKD_TOKEN_FILE").unwrap_or_else(|_| {
-                    format!(
-                        "{}/fabro-run/.forkd-token",
-                        std::env::var("HOME").unwrap_or_default()
-                    )
-                });
-                std::fs::read_to_string(path)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-            });
         let base = self.endpoint.clone();
-        let req_timeout = Duration::from_secs(60);
-        let auth = |rb: reqwest::blocking::RequestBuilder| {
-            let rb = rb.timeout(req_timeout);
-            match &token {
-                Some(t) => rb.bearer_auth(t),
-                None => rb,
-            }
-        };
+        let token = self.token.as_str();
+        let req_timeout = Duration::from_mins(1);
+        let auth = |rb: BlockingRequestBuilder| rb.timeout(req_timeout).bearer_auth(token);
 
         // 1. create a sandbox from the golden snapshot.
         let create = auth(self.client.post(format!("{base}/v1/sandboxes")))
@@ -118,7 +127,7 @@ impl GateBackend for ForkdController {
             .ok_or_else(|| {
                 // The VM may have been created but we cannot address it for
                 // teardown without an id -> surface a possible orphan loudly.
-                eprintln!(
+                warn!(
                     "[forkd] WARNING: create-sandbox 2xx but no id in response; \
                      a sandbox may be orphaned: {}",
                     String::from_utf8_lossy(&cbytes)
@@ -162,11 +171,18 @@ impl GateBackend for ForkdController {
         };
 
         let mut gate_log = String::new();
-        // 2. run the acceptance; ? stays inside this closure so the sandbox is
-        //    always torn down afterwards. Setup failures fail CLOSED.
+        // 2. run the acceptance; ? stays inside this closure so the sandbox is always
+        //    torn down afterwards. Setup failures fail CLOSED.
         let outcome: Result<Verdict> = (|| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "sync scorer binary: optional host file seed for the sandbox"
+            )]
+            fn read_to_string(path: &str) -> std::io::Result<String> {
+                std::fs::read_to_string(path)
+            }
             match &task.acceptance {
-                crate::types::Acceptance::DiffMustMatch { pattern } => {
+                Acceptance::DiffMustMatch { pattern } => {
                     let re = regex::Regex::new(pattern)
                         .map_err(|e| anyhow!("bad diff_must_match regex {pattern}: {e}"))?;
                     let ok = re.is_match(route_diff);
@@ -177,14 +193,14 @@ impl GateBackend for ForkdController {
                     );
                     Ok(if ok { Verdict::Pass } else { Verdict::Fail })
                 }
-                crate::types::Acceptance::ShellCommand { command } => {
+                Acceptance::ShellCommand { command } => {
                     // Seed the acceptance target from the host IF it exists. An
                     // absent host file is fine -- the route diff may CREATE it --
                     // but a failed in-VM write fails CLOSED, and git-apply is
                     // enforced below so an unapplied diff can never pass on stale
                     // snapshot state. The path is single-quote-escaped like the
                     // content to avoid shell injection via prompt_path.
-                    match std::fs::read_to_string(&task.prompt_path) {
+                    match read_to_string(&task.prompt_path) {
                         Ok(content) => {
                             let esc = content.replace('\'', "'\\''");
                             let path_esc = task.prompt_path.replace('\'', "'\\''");
@@ -230,14 +246,18 @@ impl GateBackend for ForkdController {
                     // run the closed-form acceptance.
                     let (code, out, err) = exec(vec!["sh".into(), "-c".into(), command.clone()])?;
                     let _ = writeln!(gate_log, "[forkd] acceptance (exit={code}):\n{out}{err}");
-                    Ok(if code == 0 { Verdict::Pass } else { Verdict::Fail })
+                    Ok(if code == 0 {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    })
                 }
             }
         })();
 
         // 3. always delete the sandbox (best-effort); log teardown failure.
         if let Err(e) = auth(self.client.delete(format!("{base}/v1/sandboxes/{sid}"))).send() {
-            eprintln!("[forkd] WARNING: sandbox {sid} delete failed (possible orphan): {e}");
+            warn!(sandbox_id = %sid, error = %e, "[forkd] sandbox delete failed; possible orphan");
         }
 
         let verdict = outcome?;
@@ -249,7 +269,6 @@ impl GateBackend for ForkdController {
             valset_hash: None,
         })
     }
-
 }
 
 // ---------------------------------------------------------------------------
