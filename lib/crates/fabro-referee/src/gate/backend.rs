@@ -58,68 +58,198 @@ impl GateBackend for ForkdController {
     }
 
     fn score(&self, task: &TaskSpec, route_diff: &str) -> Result<GateOutput> {
-        // Per the P0 spec: POST the diff to the controller's gate-run
-        // endpoint and parse the `verdict` + `gate_log` response. The
-        // endpoint path is `gate-run` (the operator-confirmed path
-        // should replace this when the orchestrator drives the live
-        // canary; the contract is the response shape, not the path).
-        let url = format!("{}/gate-run", self.endpoint);
-        let body = serde_json::json!({
-            "task_id": task.task_id,
-            "base_ref": task.base_ref,
-            "diff": route_diff,
-            "ts": Utc::now().to_rfc3339(),
-        });
-        debug!(url = %url, "forkd POST gate-run");
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
+        use std::fmt::Write as _;
+        use std::time::Duration;
+        // Real forkd gate-run: spin a hermetic microVM from the golden snapshot,
+        // run the task's closed-form acceptance INSIDE it, and map the exit code
+        // to a verdict. Never fakes a pass: any setup failure (unreadable target,
+        // failed seed, failed diff-apply) FAILS THE GATE CLOSED rather than
+        // letting an unrelated pre-existing file state satisfy the acceptance.
+        let token = std::env::var("FORKD_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let path = std::env::var("FORKD_TOKEN_FILE").unwrap_or_else(|_| {
+                    format!(
+                        "{}/fabro-run/.forkd-token",
+                        std::env::var("HOME").unwrap_or_default()
+                    )
+                });
+                std::fs::read_to_string(path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        let base = self.endpoint.clone();
+        let req_timeout = Duration::from_secs(60);
+        let auth = |rb: reqwest::blocking::RequestBuilder| {
+            let rb = rb.timeout(req_timeout);
+            match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            }
+        };
+
+        // 1. create a sandbox from the golden snapshot.
+        let create = auth(self.client.post(format!("{base}/v1/sandboxes")))
+            .json(&serde_json::json!({ "snapshot_tag": "zen-gate-base" }))
             .send()
-            .with_context(|| format!("forkd POST {url}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .with_context(|| format!("forkd read body from {url}"))?;
-        if !status.is_success() {
+            .with_context(|| format!("forkd create sandbox @ {base}"))?;
+        let cstatus = create.status();
+        let cbytes = create.bytes().context("read create-sandbox body")?;
+        if !cstatus.is_success() {
             bail!(
-                "forkd returned non-2xx (status={status}, body={})",
-                String::from_utf8_lossy(&bytes)
+                "forkd create sandbox non-2xx (status={cstatus}, body={})",
+                String::from_utf8_lossy(&cbytes)
             );
         }
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+        let cjson: serde_json::Value = serde_json::from_slice(&cbytes).with_context(|| {
             format!(
-                "forkd returned invalid JSON: {}",
-                String::from_utf8_lossy(&bytes)
+                "create-sandbox invalid JSON: {}",
+                String::from_utf8_lossy(&cbytes)
             )
         })?;
-        let verdict_str = parsed
-            .get("verdict")
+        let sid = cjson
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|s| s.get("id"))
+            .or_else(|| cjson.get("id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("forkd response missing `verdict`"))?;
-        let verdict = match verdict_str {
-            "pass" => Verdict::Pass,
-            "fail" => Verdict::Fail,
-            other => bail!("forkd verdict was {other:?}, expected \"pass\"|\"fail\""),
-        };
-        let gate_log = parsed
-            .get("gate_log")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("forkd response missing `gate_log`"))?
+            .ok_or_else(|| {
+                // The VM may have been created but we cannot address it for
+                // teardown without an id -> surface a possible orphan loudly.
+                eprintln!(
+                    "[forkd] WARNING: create-sandbox 2xx but no id in response; \
+                     a sandbox may be orphaned: {}",
+                    String::from_utf8_lossy(&cbytes)
+                );
+                anyhow!(
+                    "create-sandbox: no sandbox id in {}",
+                    String::from_utf8_lossy(&cbytes)
+                )
+            })?
             .to_string();
-        let score = parsed.get("score").and_then(serde_json::Value::as_f64);
-        let valset_hash = parsed
-            .get("valset_hash")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+
+        // exec argv inside the sandbox -> (exit_code, stdout, stderr).
+        let exec = |argv: Vec<String>| -> Result<(i64, String, String)> {
+            let r = auth(self.client.post(format!("{base}/v1/sandboxes/{sid}/exec")))
+                .json(&serde_json::json!({ "args": argv }))
+                .send()
+                .with_context(|| format!("forkd exec in sandbox {sid}"))?;
+            let st = r.status();
+            let b = r.bytes().context("read exec body")?;
+            if !st.is_success() {
+                bail!(
+                    "forkd exec non-2xx (status={st}, body={})",
+                    String::from_utf8_lossy(&b)
+                );
+            }
+            let j: serde_json::Value = serde_json::from_slice(&b)
+                .with_context(|| format!("exec invalid JSON: {}", String::from_utf8_lossy(&b)))?;
+            Ok((
+                j.get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1),
+                j.get("stdout")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                j.get("stderr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        };
+
+        let mut gate_log = String::new();
+        // 2. run the acceptance; ? stays inside this closure so the sandbox is
+        //    always torn down afterwards. Setup failures fail CLOSED.
+        let outcome: Result<Verdict> = (|| {
+            match &task.acceptance {
+                crate::types::Acceptance::DiffMustMatch { pattern } => {
+                    let re = regex::Regex::new(pattern)
+                        .map_err(|e| anyhow!("bad diff_must_match regex {pattern}: {e}"))?;
+                    let ok = re.is_match(route_diff);
+                    let _ = writeln!(
+                        gate_log,
+                        "[forkd] diff_must_match /{pattern}/ -> {}",
+                        if ok { "match" } else { "no-match" }
+                    );
+                    Ok(if ok { Verdict::Pass } else { Verdict::Fail })
+                }
+                crate::types::Acceptance::ShellCommand { command } => {
+                    // Seed the acceptance target from the host IF it exists. An
+                    // absent host file is fine -- the route diff may CREATE it --
+                    // but a failed in-VM write fails CLOSED, and git-apply is
+                    // enforced below so an unapplied diff can never pass on stale
+                    // snapshot state. The path is single-quote-escaped like the
+                    // content to avoid shell injection via prompt_path.
+                    match std::fs::read_to_string(&task.prompt_path) {
+                        Ok(content) => {
+                            let esc = content.replace('\'', "'\\''");
+                            let path_esc = task.prompt_path.replace('\'', "'\\''");
+                            let (c, _o, e) = exec(vec![
+                                "sh".into(),
+                                "-c".into(),
+                                format!(
+                                    "mkdir -p \"$(dirname '{path_esc}')\" && printf '%s' '{esc}' > '{path_esc}'"
+                                ),
+                            ])?;
+                            if c != 0 {
+                                let _ = writeln!(
+                                    gate_log,
+                                    "[forkd] seed acceptance file FAILED exit={c}: {e}"
+                                );
+                                return Ok(Verdict::Fail);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                gate_log,
+                                "[forkd] acceptance target {} not seeded from host ({e}); \
+                                 relying on route diff / snapshot",
+                                task.prompt_path
+                            );
+                        }
+                    }
+                    // apply the route diff if present. If it does NOT apply, the
+                    // acceptance would run against an unpatched tree -> fail closed.
+                    if !route_diff.trim().is_empty() {
+                        let dsc = route_diff.replace('\'', "'\\''");
+                        let (dc, _do, de) = exec(vec![
+                            "sh".into(),
+                            "-c".into(),
+                            format!("printf '%s' '{dsc}' | git apply --whitespace=nowarn"),
+                        ])?;
+                        if dc != 0 {
+                            let _ = writeln!(gate_log, "[forkd] git apply FAILED exit={dc}: {de}");
+                            return Ok(Verdict::Fail);
+                        }
+                        let _ = writeln!(gate_log, "[forkd] git apply ok");
+                    }
+                    // run the closed-form acceptance.
+                    let (code, out, err) = exec(vec!["sh".into(), "-c".into(), command.clone()])?;
+                    let _ = writeln!(gate_log, "[forkd] acceptance (exit={code}):\n{out}{err}");
+                    Ok(if code == 0 { Verdict::Pass } else { Verdict::Fail })
+                }
+            }
+        })();
+
+        // 3. always delete the sandbox (best-effort); log teardown failure.
+        if let Err(e) = auth(self.client.delete(format!("{base}/v1/sandboxes/{sid}"))).send() {
+            eprintln!("[forkd] WARNING: sandbox {sid} delete failed (possible orphan): {e}");
+        }
+
+        let verdict = outcome?;
         Ok(GateOutput {
             verdict,
             gate_log,
             backend: "forkd".to_string(),
-            score,
-            valset_hash,
+            score: None,
+            valset_hash: None,
         })
     }
+
 }
 
 // ---------------------------------------------------------------------------
