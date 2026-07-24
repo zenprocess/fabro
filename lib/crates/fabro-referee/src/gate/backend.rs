@@ -845,7 +845,6 @@ mod tests {
             acceptance:        Acceptance::DiffMustMatch {
                 pattern: pattern.to_string(),
             },
-            synthetic:         false,
         }
     }
 
@@ -913,7 +912,6 @@ mod tests {
             acceptance:        Acceptance::ShellCommand {
                 command: format!("grep -F 'LINE TWO MODIFIED' {existing_file}"),
             },
-            synthetic:         false,
         };
         let backend = HermeticLocal::new(valset_root.clone());
         let out = backend.score(&task_pass, &modified_diff).unwrap();
