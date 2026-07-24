@@ -89,6 +89,18 @@ pub struct TaskSpec {
     pub base_ref:          String,
     /// The closed-form acceptance the gate runs.
     pub acceptance:        Acceptance,
+    /// `true` iff the source caller flagged this scoring invocation
+    /// as a synthetic proof / training test (NOT real fleet data).
+    /// Forwarded to [`RunRow::synthetic`] so downstream consumers
+    /// (zeninfra episode store, cal trainset) can filter non-operational
+    /// rows out of training data. Defaults to `false`.
+    ///
+    /// This is the **only** way to mark a row as synthetic — the script
+    /// / driver MUST plumb it through `TaskSpec` so the runner picks it
+    /// up. Untouched code paths default to `false`, which keeps the
+    /// existing real-fleet contract intact.
+    #[serde(default)]
+    pub synthetic:         bool,
 }
 
 /// One route = one tier attempt on the same task. Constructed by the
@@ -179,6 +191,18 @@ pub struct RunRow {
     /// The wrapper-decision-log session id (worktree dir name).
     #[serde(default)]
     pub session_id:     Option<String>,
+    /// `true` iff this row is a synthetic proof / training test
+    /// (NOT real fleet data). Downstream consumers (zeninfra
+    /// episode store, cal trainset) MUST filter `synthetic=true`
+    /// rows out of operational ground truth — an untagged
+    /// synthetic row would poison real training data downstream.
+    /// Defaults to `false` for real fleet rows.
+    ///
+    /// Provenance: set via `TaskSpec::synthetic` and forwarded by
+    /// `runner::make_row`. The CLI / dispatch script tags the
+    /// source task spec; the runner does not infer it.
+    #[serde(default)]
+    pub synthetic:      bool,
 }
 
 /// Current schema version. Bump on backwards-incompatible row-shape
@@ -220,6 +244,89 @@ impl RunRow {
             valset_hash: None,
             diff_stat: None,
             session_id: None,
+            synthetic: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_row_default_synthetic_is_false() {
+        // The real-fleet contract: a freshly constructed row is real
+        // fleet data unless the source caller explicitly flags it as
+        // a proof/test. `RunRow::new` must default to `synthetic: false`
+        // so existing real-fleet callers don't need updates.
+        let r = RunRow::new(
+            "run-x",
+            "T-task",
+            "mm",
+            "minimax",
+            "T-task-mm",
+            Verdict::Pass,
+            "fake",
+            "ok",
+        );
+        assert!(!r.synthetic);
+    }
+
+    #[test]
+    fn run_row_carries_synthetic_through_serde() {
+        // Downstream consumers (zeninfra episode store, cal trainset)
+        // filter on `synthetic` to drop non-operational rows. A row
+        // tagged `synthetic: true` MUST round-trip through serde with
+        // the flag preserved.
+        let mut r = RunRow::new(
+            "synthetic-1",
+            "T-task",
+            "mm",
+            "minimax",
+            "T-task-mm",
+            Verdict::Pass,
+            "hermetic",
+            "ok",
+        );
+        r.synthetic = true;
+        let line = serde_json::to_string(&r).unwrap();
+        let parsed: RunRow = serde_json::from_str(&line).unwrap();
+        assert!(parsed.synthetic, "synthetic flag MUST survive JSON round-trip");
+    }
+
+    #[test]
+    fn run_row_synthetic_defaults_to_false_when_missing_from_json() {
+        // The field is `#[serde(default)]` — older payloads (or hand-
+        // written fixtures) without the field must deserialize cleanly
+        // with `synthetic: false`. This guards against accidentally
+        // breaking the forward-compatible superset contract documented
+        // at the top of this module.
+        let json = r#"{
+            "run_id": "old-row",
+            "task_id": "T-task",
+            "ts": "2026-07-23T11:04:15.526898Z",
+            "route": "mm",
+            "tier": "minimax",
+            "harness": "claude-code",
+            "branch": "T-task-mm",
+            "verdict": "pass",
+            "gate_backend": "hermetic",
+            "gate_log": "ok"
+        }"#;
+        let parsed: RunRow = serde_json::from_str(json).unwrap();
+        assert!(!parsed.synthetic);
+    }
+
+    #[test]
+    fn task_spec_synthetic_defaults_to_false() {
+        let json = r#"{
+            "task_id": "T-x",
+            "prompt_path": "/tmp/p.md",
+            "project_path": ".",
+            "base_ref": "HEAD",
+            "acceptance": {"kind": "shell_command", "command": "true"}
+        }"#;
+        let parsed: TaskSpec = serde_json::from_str(json).unwrap();
+        assert!(!parsed.synthetic);
     }
 }

@@ -117,6 +117,7 @@ pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput)
         valset_hash:    gate.valset_hash.clone(),
         diff_stat:      route.diff_stat.clone(),
         session_id:     route.session_id.clone(),
+        synthetic:      task.synthetic,
     }
 }
 
@@ -172,6 +173,7 @@ mod tests {
             acceptance:        Acceptance::ShellCommand {
                 command: "true".to_string(),
             },
+            synthetic:         false,
         }
     }
 
@@ -190,5 +192,47 @@ mod tests {
         assert_eq!(fake.calls(), 2);
         // Verify verdicts are Pass (as programmed).
         assert!(res.rows.iter().all(|r| matches!(r.verdict, Verdict::Pass)));
+    }
+
+    #[test]
+    fn make_row_propagates_synthetic_from_task_spec() {
+        // The dispatch script tags the source task spec with
+        // `synthetic: true`; the runner must carry that flag through
+        // to the emitted `RunRow` so downstream consumers (zeninfra
+        // episode store, cal trainset) can filter non-operational
+        // rows out of training data.
+        let mut task = make_task();
+        task.synthetic = true;
+        let route = &two_tier_canary_routes("p0", "d".into(), "d".into())[0];
+        let gate = GateOutput {
+            verdict:     Verdict::Pass,
+            gate_log:    "ok".into(),
+            backend:     "fake".into(),
+            score:       Some(1.0),
+            valset_hash: None,
+        };
+        let row = make_row("synthetic-x", &task, route, &gate);
+        assert!(
+            row.synthetic,
+            "make_row MUST carry task.synthetic through to the row"
+        );
+    }
+
+    #[test]
+    fn make_row_default_synthetic_is_false() {
+        // Regression: a fresh `TaskSpec` (no synthetic flag set) must
+        // produce a non-synthetic row, so the real-fleet contract
+        // keeps working without any source-caller changes.
+        let task = make_task();
+        let route = &two_tier_canary_routes("p0", "d".into(), "d".into())[0];
+        let gate = GateOutput {
+            verdict:     Verdict::Pass,
+            gate_log:    "ok".into(),
+            backend:     "fake".into(),
+            score:       Some(1.0),
+            valset_hash: None,
+        };
+        let row = make_row("real-x", &task, route, &gate);
+        assert!(!row.synthetic);
     }
 }
