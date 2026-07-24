@@ -120,25 +120,28 @@ pub fn write_markdown_summary(sink_dir: &Path, run_id: &str, rows: &[RunRow]) ->
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let pass = rows.iter().filter(|r| r.verdict.is_pass()).count();
     let fail = rows.len() - pass;
+    let synthetic_count = rows.iter().filter(|r| r.synthetic).count();
     writeln!(f, "# Referee run `{run_id}`")?;
     writeln!(f)?;
     writeln!(
         f,
-        "**Routes:** {} ({} pass, {} fail)",
+        "**Routes:** {} ({} pass, {} fail) | **synthetic:** {}/{}",
         rows.len(),
         pass,
-        fail
+        fail,
+        synthetic_count,
+        rows.len(),
     )?;
     writeln!(f)?;
     writeln!(
         f,
-        "| task_id | route | tier | tier_resolved | verdict | gate_backend | session_id |"
+        "| task_id | route | tier | tier_resolved | verdict | gate_backend | session_id | synthetic |"
     )?;
-    writeln!(f, "|---|---|---|---|---|---|---|")?;
+    writeln!(f, "|---|---|---|---|---|---|---|---|")?;
     for r in rows {
         writeln!(
             f,
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             r.task_id,
             r.route,
             r.tier,
@@ -146,6 +149,7 @@ pub fn write_markdown_summary(sink_dir: &Path, run_id: &str, rows: &[RunRow]) ->
             r.verdict,
             r.gate_backend,
             r.session_id.as_deref().unwrap_or("?"),
+            if r.synthetic { "true" } else { "false" },
         )?;
     }
     writeln!(f)?;
