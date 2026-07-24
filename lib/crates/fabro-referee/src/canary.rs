@@ -63,6 +63,7 @@ pub fn build_canary_task(
         project_path: valset_root.to_string_lossy().to_string(),
         base_ref: "HEAD".to_string(),
         acceptance: Acceptance::ShellCommand { command },
+        synthetic: false,
     })
 }
 
