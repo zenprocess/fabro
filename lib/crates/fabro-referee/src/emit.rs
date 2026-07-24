@@ -286,4 +286,26 @@ mod tests {
         assert_eq!(body_b.lines().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn runrow_backward_compat_legacy_row_without_backfill_field() {
+        // A row written BEFORE the `backfill` field was added has no
+        // `backfill` key in its JSON. The deserializer MUST default
+        // the missing bool to `false` so legacy rows continue to
+        // parse after the additive change lands.
+        let legacy = r#"{"schema_version":1,"run_id":"legacy","task_id":"T-x","ts":"2026-07-23T10:00:00Z","route":"mm","tier":"minimax","tier_resolved":null,"decision_basis":null,"harness":"claude-code","branch":"foo","verdict":"pass","gate_backend":"hermetic","gate_log":"ok","score":null,"valset_hash":null,"diff_stat":null,"session_id":null}"#;
+        let parsed: RunRow = serde_json::from_str(legacy).unwrap();
+        assert!(
+            !parsed.backfill,
+            "missing backfill field MUST default to false"
+        );
+        assert_eq!(parsed.run_id, "legacy");
+        // And the re-serialized form MUST round-trip back to the
+        // same logical row (with backfill now present as `false`).
+        let re = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            re.contains("\"backfill\":false"),
+            "round-trip must include the field; got={re}"
+        );
+    }
 }
