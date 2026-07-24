@@ -243,6 +243,15 @@ pub struct RunRow {
     /// source task spec; the runner does not infer it.
     #[serde(default)]
     pub synthetic:      bool,
+    /// `true` when this row was produced by the retro-scoring
+    /// backfill driver replaying historical fleet attempts through
+    /// the hermetic gate. `false` for live/canary runs. The harvest
+    /// ETL filters on this field to distinguish operational signal
+    /// from retroactive labeling — backfill rows are kept out of the
+    /// trainset so they cannot inflate GEPA's policy optimization
+    /// with rows that did not represent a contemporaneous decision.
+    #[serde(default)]
+    pub backfill:       bool,
 }
 
 /// Current schema version. Bump on backwards-incompatible row-shape
@@ -289,6 +298,7 @@ impl RunRow {
             diff_stat: None,
             session_id: None,
             synthetic: false,
+            backfill: false,
         }
     }
 }
@@ -327,7 +337,10 @@ mod tests {
         r.synthetic = true;
         let line = serde_json::to_string(&r).unwrap();
         let parsed: RunRow = serde_json::from_str(&line).unwrap();
-        assert!(parsed.synthetic, "synthetic flag MUST survive JSON round-trip");
+        assert!(
+            parsed.synthetic,
+            "synthetic flag MUST survive JSON round-trip"
+        );
     }
 
     #[test]
