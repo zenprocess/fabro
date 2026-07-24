@@ -224,6 +224,15 @@ pub struct RunRow {
     /// The wrapper-decision-log session id (worktree dir name).
     #[serde(default)]
     pub session_id:     Option<String>,
+    /// `true` when this row was produced by the retro-scoring
+    /// backfill driver replaying historical fleet attempts through
+    /// the hermetic gate. `false` for live/canary runs. The harvest
+    /// ETL filters on this field to distinguish operational signal
+    /// from retroactive labeling — backfill rows are kept out of the
+    /// trainset so they cannot inflate GEPA's policy optimization
+    /// with rows that did not represent a contemporaneous decision.
+    #[serde(default)]
+    pub backfill:       bool,
 }
 
 /// Current schema version. Bump on backwards-incompatible row-shape
@@ -269,6 +278,7 @@ impl RunRow {
             valset_hash: None,
             diff_stat: None,
             session_id: None,
+            backfill: false,
         }
     }
 }
