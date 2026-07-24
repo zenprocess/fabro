@@ -192,6 +192,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+    use crate::types::CURRENT_SCHEMA_VERSION;
 
     fn sink_tmp() -> PathBuf {
         std::env::temp_dir().join(format!("fabro-referee-emit-{}", ulid::Ulid::new()))
@@ -259,8 +260,9 @@ mod tests {
         let parsed: RunRow = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed.gate_log, "second try");
         assert!(matches!(parsed.verdict, Verdict::Fail));
-        // The schema_version field must be present and equal to 1.
-        assert_eq!(parsed.schema_version, 1);
+        // The schema_version field must be present and equal to the
+        // current version (2 as of v2 — see `types.rs::CURRENT_SCHEMA_VERSION`).
+        assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
