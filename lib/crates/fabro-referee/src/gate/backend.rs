@@ -14,13 +14,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+<<<<<<< ours
 use fabro_http::BlockingRequestBuilder;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
+=======
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+use tracing::{debug, info, warn};
+>>>>>>> theirs
 
 use super::{GateBackend, GateOutput};
 use crate::types::{Acceptance, TaskSpec, Verdict};
 
+<<<<<<< ours
 const FORKD_TOKEN_FILE: &str = "/home/vvladescu/fabro-run/.forkd-token";
 
 /// Resolve the forkd bearer token without exposing its value in errors/logs.
@@ -57,12 +64,28 @@ pub fn forkd_token() -> Result<String> {
 /// the apply-and-acceptance pipeline, and deletes that sandbox. It never
 /// activates, reconfigures, restarts, or re-baselines the controller or its
 /// golden rootfs.
+=======
+// ---------------------------------------------------------------------------
+// ForkdController — REAL, T3, score/read path only
+// ---------------------------------------------------------------------------
+
+/// The real forkd hermetic gate controller at `dellsrv:8891`. The
+/// scorer **never** activates / reconfigures / restarts / re-baselines
+/// the controller: it only POSTs to its existing `gate-run` /
+/// `forkd-exec` endpoints and parses the JSON response.
+///
+/// Per `CONTRACTS.md` §1, the controller is unreachable from this
+/// worktree (sandbox egress boundary). The scorer is fully wired
+/// against the response shape so the orchestrator can drive the live
+/// canary from a host that *can* reach the controller.
+>>>>>>> theirs
 pub struct ForkdController {
     /// The controller endpoint, e.g. `http://dellsrv:8891`.
     endpoint: String,
     /// HTTP client from `fabro-http::blocking_http_client()` (sync,
     /// to fit the synchronous `GateBackend` trait).
     client:   fabro_http::BlockingHttpClient,
+<<<<<<< ours
     /// Bearer token resolved from the operator environment/file.
     token:    String,
 }
@@ -78,6 +101,16 @@ impl ForkdController {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             client,
             token,
+=======
+}
+
+impl ForkdController {
+    pub fn new(endpoint: &str) -> Result<Self> {
+        let client = fabro_http::blocking_http_client().context("build forkd http client")?;
+        Ok(Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            client,
+>>>>>>> theirs
         })
     }
 }
@@ -88,6 +121,7 @@ impl GateBackend for ForkdController {
     }
 
     fn score(&self, task: &TaskSpec, route_diff: &str) -> Result<GateOutput> {
+<<<<<<< ours
         use std::time::Duration;
         // Real forkd gate-run: spin a hermetic microVM from the golden snapshot,
         // run the task's closed-form acceptance INSIDE it, and map the exit code
@@ -261,12 +295,73 @@ impl GateBackend for ForkdController {
         }
 
         let verdict = outcome?;
+=======
+        // Per the P0 spec: POST the diff to the controller's gate-run
+        // endpoint and parse the `verdict` + `gate_log` response. The
+        // endpoint path is `gate-run` (the operator-confirmed path
+        // should replace this when the orchestrator drives the live
+        // canary; the contract is the response shape, not the path).
+        let url = format!("{}/gate-run", self.endpoint);
+        let body = serde_json::json!({
+            "task_id": task.task_id,
+            "base_ref": task.base_ref,
+            "diff": route_diff,
+            "ts": Utc::now().to_rfc3339(),
+        });
+        debug!(url = %url, "forkd POST gate-run");
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("forkd POST {url}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .with_context(|| format!("forkd read body from {url}"))?;
+        if !status.is_success() {
+            bail!(
+                "forkd returned non-2xx (status={status}, body={})",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "forkd returned invalid JSON: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })?;
+        let verdict_str = parsed
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("forkd response missing `verdict`"))?;
+        let verdict = match verdict_str {
+            "pass" => Verdict::Pass,
+            "fail" => Verdict::Fail,
+            other => bail!("forkd verdict was {other:?}, expected \"pass\"|\"fail\""),
+        };
+        let gate_log = parsed
+            .get("gate_log")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("forkd response missing `gate_log`"))?
+            .to_string();
+        let score = parsed.get("score").and_then(serde_json::Value::as_f64);
+        let valset_hash = parsed
+            .get("valset_hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+>>>>>>> theirs
         Ok(GateOutput {
             verdict,
             gate_log,
             backend: "forkd".to_string(),
+<<<<<<< ours
             score: None,
             valset_hash: None,
+=======
+            score,
+            valset_hash,
+>>>>>>> theirs
         })
     }
 }
@@ -276,11 +371,17 @@ impl GateBackend for ForkdController {
 // ---------------------------------------------------------------------------
 
 /// The hermetic local gate. Applies the diff in a throwaway git
+<<<<<<< ours
 /// checkout **seeded from `valset_root` at `base_ref`** (so the diff
 /// is scored against the real repo content, not against an empty
 /// tree), runs the task's closed-form acceptance, captures combined
 /// stdout/stderr as `gate_log`, and returns `Pass` iff the acceptance
 /// exited 0. Never fakes a pass.
+=======
+/// checkout seeded from `valset_root`, runs the task's closed-form
+/// acceptance, captures combined stdout/stderr as `gate_log`, and
+/// returns `Pass` iff the acceptance exited 0. Never fakes a pass.
+>>>>>>> theirs
 ///
 /// This is the *fallback* backend the P0 spec mandates: it has the
 /// same return shape as `ForkdController` so the runner emits the
@@ -293,6 +394,7 @@ pub struct HermeticLocal {
     valset_root: PathBuf,
 }
 
+<<<<<<< ours
 /// Short-lived pipe thread: drain `reader` into `writer` in the
 /// background. Both processes involved are local; the thread lives
 /// only as long as the pipe. Declared at module scope (rather than
@@ -317,11 +419,14 @@ where
     })
 }
 
+=======
+>>>>>>> theirs
 impl HermeticLocal {
     pub fn new(valset_root: PathBuf) -> Self {
         Self { valset_root }
     }
 
+<<<<<<< ours
     /// Run `cmd` (consumed) and bail with stderr captured if it exits
     /// non-zero. Logs the invocation + verdict to `log`. Returns
     /// Ok(()) on success, Err on non-zero exit (which the caller is
@@ -507,6 +612,21 @@ impl HermeticLocal {
     ) -> (bool, String) {
         let mut log = String::new();
         // Step 1: git init the throwaway workdir.
+=======
+    /// Apply `diff` in a throwaway checkout rooted at `valset_root`.
+    /// Returns the path to the checkout and the captured diff-apply
+    /// log. If the diff fails to apply, the function returns a
+    /// `GateOutput { verdict: Fail, .. }` rather than an error — the
+    /// runner still wants the row in the sink, with the failure
+    /// captured in `gate_log`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sync scorer binary: git subprocesses via std::process::Command are intentional; no Tokio runtime"
+    )]
+    fn apply_diff(task: &TaskSpec, diff: &str, workdir: &Path) -> (bool, String) {
+        let mut log = String::new();
+        // Step 1: git init + commit the valset_root state.
+>>>>>>> theirs
         let init = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(workdir)
@@ -527,6 +647,7 @@ impl HermeticLocal {
             _ => {}
         }
         // Configure a local user (git refuses to commit otherwise).
+<<<<<<< ours
         // Both are now hard-required: non-zero exit is treated as a
         // hard failure (previously silently dropped). We use `-C
         // <workdir>` to scope the config to the throwaway checkout
@@ -564,10 +685,23 @@ impl HermeticLocal {
         // Non-zero exit (including "nothing to commit") is now a hard
         // failure with stderr captured.
         let add_out = Command::new("git")
+=======
+        let _ = Command::new("git")
+            .args(["config", "user.email", "referee@local"])
+            .arg(workdir)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Referee"])
+            .arg(workdir)
+            .output();
+        // Add the valset_root contents.
+        let add = Command::new("git")
+>>>>>>> theirs
             .arg("-C")
             .arg(workdir)
             .args(["add", "-A"])
             .output();
+<<<<<<< ours
         let add_out = match add_out {
             Ok(o) => o,
             Err(e) => {
@@ -613,6 +747,23 @@ impl HermeticLocal {
         }
         // Step 3: apply the route diff on top of the seeded base.
         // git apply with --3way is forgiving about whitespace.
+=======
+        if let Err(e) = add {
+            let _ = writeln!(log, "[hermetic] git add failed: {e}");
+            return (false, log);
+        }
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["commit", "-q", "-m", "valset"])
+            .output();
+        if let Err(e) = commit {
+            let _ = writeln!(log, "[hermetic] git commit failed: {e}");
+            return (false, log);
+        }
+        // Step 2: apply the diff. The diff is captured from the
+        // orchestrator's worktree; git apply with --3way is forgiving.
+>>>>>>> theirs
         let mut child = match Command::new("git")
             .arg("-C")
             .arg(workdir)
@@ -628,6 +779,7 @@ impl HermeticLocal {
                 return (false, log);
             }
         };
+<<<<<<< ours
         {
             let Some(stdin) = child.stdin.as_mut() else {
                 let _ = writeln!(log, "[hermetic] git apply child stdin unavailable");
@@ -637,6 +789,15 @@ impl HermeticLocal {
                 let _ = writeln!(log, "[hermetic] write diff stdin failed: {e}");
                 return (false, log);
             }
+=======
+        let Some(stdin) = child.stdin.as_mut() else {
+            let _ = writeln!(log, "[hermetic] git apply child stdin unavailable");
+            return (false, log);
+        };
+        if let Err(e) = stdin.write_all(diff.as_bytes()) {
+            let _ = writeln!(log, "[hermetic] write diff stdin failed: {e}");
+            return (false, log);
+>>>>>>> theirs
         }
         let apply_out = match child.wait_with_output() {
             Ok(o) => o,
@@ -669,7 +830,11 @@ impl HermeticLocal {
     /// caller maps non-zero exit 1:1 to `Verdict::Fail`.
     #[expect(
         clippy::disallowed_methods,
+<<<<<<< ours
         reason = "sync scorer binary: acceptance subprocess via std::process::Command is intentional; no Tokio runtime here"
+=======
+        reason = "sync scorer binary: acceptance subprocess via std::process::Command is intentional; no Tokio runtime"
+>>>>>>> theirs
     )]
     fn run_acceptance(task: &TaskSpec, route_diff: &str, workdir: &Path) -> (i32, String) {
         let mut log = String::new();
@@ -754,6 +919,7 @@ impl GateBackend for HermeticLocal {
         let mut gate_log = String::new();
         let _ = writeln!(
             gate_log,
+<<<<<<< ours
             "[hermetic] begin task={} diff_bytes={} valset_root={} base_ref={}",
             task.task_id,
             route_diff.len(),
@@ -761,10 +927,19 @@ impl GateBackend for HermeticLocal {
             task.base_ref,
         );
         let (applied, apply_log) = Self::apply_diff(task, route_diff, &self.valset_root, &tmp);
+=======
+            "[hermetic] begin task={} diff_bytes={} valset_root={}",
+            task.task_id,
+            route_diff.len(),
+            self.valset_root.display(),
+        );
+        let (applied, apply_log) = Self::apply_diff(task, route_diff, &tmp);
+>>>>>>> theirs
         gate_log.push_str(&apply_log);
         if !applied {
             // Drop the tempdir. Best-effort.
             let _ = std::fs::remove_dir_all(&tmp);
+<<<<<<< ours
             gate_log.push_str(
                 "[hermetic] verdict=FAIL (diff did not apply against seeded valset_root)\n",
             );
@@ -774,12 +949,20 @@ impl GateBackend for HermeticLocal {
             // misleading hash (the hash would imply the diff had been
             // scored against the real repo when in fact it never reached
             // the acceptance step).
+=======
+            gate_log.push_str("[hermetic] verdict=FAIL (diff did not apply)\n");
+            info!(task = %task.task_id, "hermetic: diff did not apply");
+>>>>>>> theirs
             return Ok(GateOutput {
                 verdict: Verdict::Fail,
                 gate_log,
                 backend: "hermetic".to_string(),
                 score: Some(0.0),
+<<<<<<< ours
                 valset_hash: None,
+=======
+                valset_hash: Some(Self::compute_valset_hash(task, route_diff)),
+>>>>>>> theirs
             });
         }
         let (exit_code, accept_log) = Self::run_acceptance(task, route_diff, &tmp);
@@ -787,6 +970,7 @@ impl GateBackend for HermeticLocal {
         let _ = std::fs::remove_dir_all(&tmp);
         let verdict = if exit_code == 0 {
             Verdict::Pass
+<<<<<<< ours
             // valset_hash now lives on the Pass AND the Fail-from-acceptance
             // rows — both happen after a successful seed+apply, so the
             // hash reflects what was actually scored.
@@ -794,6 +978,11 @@ impl GateBackend for HermeticLocal {
             Verdict::Fail
         };
         let valset_hash = Some(Self::compute_valset_hash(task, route_diff));
+=======
+        } else {
+            Verdict::Fail
+        };
+>>>>>>> theirs
         let _ = writeln!(
             gate_log,
             "[hermetic] verdict={verdict} (acceptance exit={exit_code})",
@@ -808,7 +997,11 @@ impl GateBackend for HermeticLocal {
             gate_log,
             backend: "hermetic".to_string(),
             score: Some(if exit_code == 0 { 1.0 } else { 0.0 }),
+<<<<<<< ours
             valset_hash,
+=======
+            valset_hash: Some(Self::compute_valset_hash(task, route_diff)),
+>>>>>>> theirs
         })
     }
 }
@@ -820,6 +1013,7 @@ mod tests {
     use super::*;
     use crate::types::Acceptance;
 
+<<<<<<< ours
     /// Synchronous file write for test fixtures. Lives at module
     /// scope so the disallowed-methods lint only needs to be silenced
     /// in one place, and to dodge the "items after statements"
@@ -832,6 +1026,8 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+=======
+>>>>>>> theirs
     fn diff_match_task(pattern: &str) -> TaskSpec {
         TaskSpec {
             task_id:           "T-diff-match".to_string(),
@@ -867,6 +1063,7 @@ mod tests {
         assert_eq!(code, 1, "pattern absent from diff must fail; log={log}");
         assert!(log.contains("did NOT match"));
     }
+<<<<<<< ours
 
     /// SAFETY-CRITICAL regression: a diff that *modifies* an existing
     /// file in `valset_root` must apply and score correctly. Before the
@@ -953,4 +1150,6 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_dir_all(&valset_root);
     }
+=======
+>>>>>>> theirs
 }
