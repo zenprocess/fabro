@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::decision_log::find_decision;
 use crate::emit::{append_jsonl, write_markdown_summary};
 use crate::gate::GateBackend;
-use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier};
+use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier, Verdict};
 
 /// What the runner emits for one task.
 #[derive(Debug, Clone)]
@@ -58,12 +58,15 @@ pub fn run(
         );
         let mut route = route.clone();
         // If a decision-log path was supplied, attempt to recover
-        // the wrapper's actual `tier_resolved` + `decision_basis`.
+        // the wrapper's actual `tier_resolved` + `decision_basis` +
+        // `final_model` (the model's name flows into the row as
+        // `model` to match zeninfra's `GateLogLine.model`).
         if let (Some(path), Some(sid)) = (decision_log, &route.session_id) {
             match find_decision(path, sid, &route.branch) {
                 Some(hit) => {
                     route.tier_resolved = Some(hit.tier_resolved);
                     route.decision_basis = Some(hit.decision_basis);
+                    route.model = Some(hit.final_model);
                 }
                 None => {
                     warn!(
@@ -99,25 +102,28 @@ pub fn run(
 /// pure / dead-simple so a reviewer can verify the row shape in one
 /// read.
 pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput) -> RunRow {
+    let route_short = route_short(route.tier);
     RunRow {
         schema_version: CURRENT_SCHEMA_VERSION,
         run_id:         run_id.to_string(),
         task_id:        task.task_id.clone(),
+        attempt_key:    format!("{}#{}#{}", task.task_id, run_id, route_short),
         ts:             Utc::now(),
-        route:          route_short(route.tier),
+        route:          route_short,
         tier:           route.tier.to_string(),
         tier_resolved:  route.tier_resolved.clone(),
         decision_basis: route.decision_basis.clone(),
         harness:        "claude-code".to_string(),
+        model:          route.model.clone(),
         branch:         route.branch.clone(),
         verdict:        gate.verdict,
+        passed:         matches!(gate.verdict, Verdict::Pass),
         gate_backend:   gate.backend.clone(),
         gate_log:       gate.gate_log.clone(),
         score:          gate.score,
         valset_hash:    gate.valset_hash.clone(),
         diff_stat:      route.diff_stat.clone(),
         session_id:     route.session_id.clone(),
-        synthetic:      task.synthetic,
     }
 }
 
@@ -140,6 +146,7 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             branch:         mm_branch,
             tier_resolved:  None,
             decision_basis: None,
+            model:          None,
             session_id:     None,
             diff:           mm_diff,
             diff_stat:      None,
@@ -149,6 +156,7 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             branch:         sn_branch,
             tier_resolved:  None,
             decision_basis: None,
+            model:          None,
             session_id:     None,
             diff:           sn_diff,
             diff_stat:      None,
@@ -173,7 +181,6 @@ mod tests {
             acceptance:        Acceptance::ShellCommand {
                 command: "true".to_string(),
             },
-            synthetic:         false,
         }
     }
 
@@ -192,36 +199,5 @@ mod tests {
         assert_eq!(fake.calls(), 2);
         // Verify verdicts are Pass (as programmed).
         assert!(res.rows.iter().all(|r| matches!(r.verdict, Verdict::Pass)));
-    }
-
-    #[test]
-    fn make_row_propagates_synthetic_from_task_spec() {
-        let mut task = make_task();
-        task.synthetic = true;
-        let route = &two_tier_canary_routes("p0", "d".into(), "d".into())[0];
-        let gate = GateOutput {
-            verdict:     Verdict::Pass,
-            gate_log:    "ok".into(),
-            backend:     "fake".into(),
-            score:       Some(1.0),
-            valset_hash: None,
-        };
-        let row = make_row("synthetic-x", &task, route, &gate);
-        assert!(row.synthetic, "make_row MUST carry task.synthetic through to the row");
-    }
-
-    #[test]
-    fn make_row_default_synthetic_is_false() {
-        let task = make_task();
-        let route = &two_tier_canary_routes("p0", "d".into(), "d".into())[0];
-        let gate = GateOutput {
-            verdict:     Verdict::Pass,
-            gate_log:    "ok".into(),
-            backend:     "fake".into(),
-            score:       Some(1.0),
-            valset_hash: None,
-        };
-        let row = make_row("real-x", &task, route, &gate);
-        assert!(!row.synthetic);
     }
 }

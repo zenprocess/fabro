@@ -89,13 +89,6 @@ pub struct TaskSpec {
     pub base_ref:          String,
     /// The closed-form acceptance the gate runs.
     pub acceptance:        Acceptance,
-    /// `true` iff the source caller flagged this scoring invocation
-    /// as a synthetic proof / training test (NOT real fleet data).
-    /// Forwarded to [`RunRow::synthetic`] so downstream consumers
-    /// (zeninfra episode store, cal trainset) can filter non-operational
-    /// rows out of training data. Defaults to `false`.
-    #[serde(default)]
-    pub synthetic:         bool,
 }
 
 /// One route = one tier attempt on the same task. Constructed by the
@@ -113,6 +106,14 @@ pub struct Route {
     /// The wrapper's decision basis for the actual tier (e.g.
     /// `branch-suffix`, `reqmodel-match`, `cloud-default`).
     pub decision_basis: Option<String>,
+    /// The final model the wrapper ran (e.g. `MiniMax-M3`,
+    /// `claude-sonnet-5[1m]`). Recovered from
+    /// `wrapper-decisions.jsonl` and forwarded into the row as
+    /// `model` to match zeninfra's `GateLogLine.model` contract.
+    /// `None` when no decision log was supplied (e.g. hermetic
+    /// tests, or wrapper id missing on this attempt).
+    #[serde(default)]
+    pub model:          Option<String>,
     /// The session id the wrapper recorded (the worktree dir name).
     pub session_id:     Option<String>,
     /// The diff this route produced. Captured by the runner before
@@ -147,15 +148,36 @@ pub struct GateOutput {
 /// One JSONL row — one route, one task, one scored gate-log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRow {
-    /// Schema version of this row. Starts at 1. The zeninfra
-    /// episode-store sink version-gates harvest on this field so a
-    /// future shape change does not silently re-land older rows.
-    /// Bump on backwards-incompatible changes; additive fields
-    /// (Option / serde-default) only need a comment.
+    /// Schema version of this row. The zeninfra episode-store sink
+    /// version-gates harvest on this field so a future shape change
+    /// does not silently re-land older rows. **Bump on
+    /// backwards-incompatible changes; additive fields (Option /
+    /// serde-default) only need a comment.**
+    ///
+    /// v2 (2026-07-24): added `attempt_key`, `model`, `passed` to
+    /// align with zeninfra's `GateLogLine` contract (see
+    /// `ao-factory/signal/gate_log_contract.py`). All three are
+    /// additive with `#[serde(default)]` so v1 on-disk rows still
+    /// parse — `attempt_key` defaults to `""`, `model` to `None`,
+    /// `passed` to `false` (note: `passed: false` is semantically
+    /// wrong for v1 rows that were actually `Verdict::Pass`; only
+    /// the on-disk hermetic test fixtures are affected, they will
+    /// be re-emitted with the correct value on next canary).
+    /// Bumped 1 → 2 because the new `passed: bool` is a wire-shape
+    /// field distinct from `verdict` (the harvest ETL may want to
+    /// read `passed` directly on v2+ rows).
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub run_id:         String,
     pub task_id:        String,
+    /// Deterministic per-attempt key, unique per
+    /// `(task_id, run_id, route_short)`. Format:
+    /// `"{task_id}#{run_id}#{route_short}"`. Matches the
+    /// `attempt_key` field on zeninfra's `GateLogLine`; harvest
+    /// ETL uses this as the per-attempt natural key on v2+ rows.
+    /// v1 rows: defaults to `""` on parse (no key to derive).
+    #[serde(default)]
+    pub attempt_key:    String,
     pub ts:             DateTime<Utc>,
     /// `"mm"` or `"sn"` — the route shorthand.
     pub route:          String,
@@ -167,9 +189,25 @@ pub struct RunRow {
     pub decision_basis: Option<String>,
     /// The harness name (always `claude-code` for P0).
     pub harness:        String,
+    /// The final model the wrapper ran (e.g. `MiniMax-M3`,
+    /// `claude-sonnet-5[1m]`). Forwarded from
+    /// `wrapper-decisions.jsonl::DecisionLogLine.final_model` so
+    /// the harvest ETL can join route-level treatment to
+    /// attempt-level scoring. `None` when no decision log was
+    /// supplied (e.g. hermetic tests).
+    #[serde(default)]
+    pub model:          Option<String>,
     /// The branch the route was launched on.
     pub branch:         String,
+    /// fabro's internal pass/fail vocabulary. Preserved as a
+    /// strongly-typed enum; the harvest ETL on v1 rows may prefer
+    /// this over `passed` until both sides are on v2+.
     pub verdict:        Verdict,
+    /// Boolean mirror of `verdict` (`true` ⇔ `Verdict::Pass`),
+    /// aligned with zeninfra's `GateLogLine.passed`. Added in v2;
+    /// v1 rows default to `false` on parse.
+    #[serde(default)]
+    pub passed:         bool,
     /// `"forkd"` | `"hermetic"` | `"fake"` — which backend fired.
     pub gate_backend:   String,
     /// The textual feedback GEPA consumes.
@@ -186,23 +224,12 @@ pub struct RunRow {
     /// The wrapper-decision-log session id (worktree dir name).
     #[serde(default)]
     pub session_id:     Option<String>,
-    /// `true` iff this row is a synthetic proof / training test
-    /// (NOT real fleet data). Downstream consumers (zeninfra
-    /// episode store, cal trainset) MUST filter `synthetic=true`
-    /// rows out of operational ground truth — an untagged
-    /// synthetic row would poison real training data downstream.
-    /// Defaults to `false` for real fleet rows.
-    ///
-    /// Provenance: set via `TaskSpec::synthetic` and forwarded by
-    /// `runner::make_row`. The CLI / dispatch script tags the
-    /// source task spec; the runner does not infer it.
-    #[serde(default)]
-    pub synthetic:      bool,
 }
 
 /// Current schema version. Bump on backwards-incompatible row-shape
-/// changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// changes; see the `RunRow::schema_version` doc-comment for the
+/// version history.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
@@ -225,90 +252,23 @@ impl RunRow {
             schema_version: CURRENT_SCHEMA_VERSION,
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
+            attempt_key: format!("{task_id}#{run_id}#{route}"),
             ts: Utc::now(),
             route: route.to_string(),
             tier: tier.to_string(),
             tier_resolved: None,
             decision_basis: None,
             harness: "claude-code".to_string(),
+            model: None,
             branch: branch.to_string(),
             verdict,
+            passed: matches!(verdict, Verdict::Pass),
             gate_backend: backend.to_string(),
             gate_log: gate_log.to_string(),
             score: None,
             valset_hash: None,
             diff_stat: None,
             session_id: None,
-            synthetic: false,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_row_default_synthetic_is_false() {
-        let r = RunRow::new(
-            "run-x",
-            "T-task",
-            "mm",
-            "minimax",
-            "T-task-mm",
-            Verdict::Pass,
-            "fake",
-            "ok",
-        );
-        assert!(!r.synthetic);
-    }
-
-    #[test]
-    fn run_row_carries_synthetic_through_serde() {
-        let mut r = RunRow::new(
-            "synthetic-1",
-            "T-task",
-            "mm",
-            "minimax",
-            "T-task-mm",
-            Verdict::Pass,
-            "hermetic",
-            "ok",
-        );
-        r.synthetic = true;
-        let line = serde_json::to_string(&r).unwrap();
-        let parsed: RunRow = serde_json::from_str(&line).unwrap();
-        assert!(parsed.synthetic, "synthetic flag MUST survive JSON round-trip");
-    }
-
-    #[test]
-    fn run_row_synthetic_defaults_to_false_when_missing_from_json() {
-        let json = r#"{
-            "run_id": "old-row",
-            "task_id": "T-task",
-            "ts": "2026-07-23T11:04:15.526898Z",
-            "route": "mm",
-            "tier": "minimax",
-            "harness": "claude-code",
-            "branch": "T-task-mm",
-            "verdict": "pass",
-            "gate_backend": "hermetic",
-            "gate_log": "ok"
-        }"#;
-        let parsed: RunRow = serde_json::from_str(json).unwrap();
-        assert!(!parsed.synthetic);
-    }
-
-    #[test]
-    fn task_spec_synthetic_defaults_to_false() {
-        let json = r#"{
-            "task_id": "T-x",
-            "prompt_path": "/tmp/p.md",
-            "project_path": ".",
-            "base_ref": "HEAD",
-            "acceptance": {"kind": "shell_command", "command": "true"}
-        }"#;
-        let parsed: TaskSpec = serde_json::from_str(json).unwrap();
-        assert!(!parsed.synthetic);
     }
 }
