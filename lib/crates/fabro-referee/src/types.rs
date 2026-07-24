@@ -106,6 +106,7 @@ pub struct Route {
     /// The wrapper's decision basis for the actual tier (e.g.
     /// `branch-suffix`, `reqmodel-match`, `cloud-default`).
     pub decision_basis: Option<String>,
+<<<<<<< ours
     /// The final model the wrapper ran (e.g. `MiniMax-M3`,
     /// `claude-sonnet-5[1m]`). Recovered from
     /// `wrapper-decisions.jsonl` and forwarded into the row as
@@ -114,6 +115,8 @@ pub struct Route {
     /// tests, or wrapper id missing on this attempt).
     #[serde(default)]
     pub model:          Option<String>,
+=======
+>>>>>>> theirs
     /// The session id the wrapper recorded (the worktree dir name).
     pub session_id:     Option<String>,
     /// The diff this route produced. Captured by the runner before
@@ -148,6 +151,7 @@ pub struct GateOutput {
 /// One JSONL row — one route, one task, one scored gate-log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRow {
+<<<<<<< ours
     /// Schema version of this row. The zeninfra episode-store sink
     /// version-gates harvest on this field so a future shape change
     /// does not silently re-land older rows. **Bump on
@@ -178,6 +182,10 @@ pub struct RunRow {
     /// v1 rows: defaults to `""` on parse (no key to derive).
     #[serde(default)]
     pub attempt_key:    String,
+=======
+    pub run_id:         String,
+    pub task_id:        String,
+>>>>>>> theirs
     pub ts:             DateTime<Utc>,
     /// `"mm"` or `"sn"` — the route shorthand.
     pub route:          String,
@@ -189,6 +197,7 @@ pub struct RunRow {
     pub decision_basis: Option<String>,
     /// The harness name (always `claude-code` for P0).
     pub harness:        String,
+<<<<<<< ours
     /// The final model the wrapper ran (e.g. `MiniMax-M3`,
     /// `claude-sonnet-5[1m]`). Forwarded from
     /// `wrapper-decisions.jsonl::DecisionLogLine.final_model` so
@@ -208,6 +217,11 @@ pub struct RunRow {
     /// v1 rows default to `false` on parse.
     #[serde(default)]
     pub passed:         bool,
+=======
+    /// The branch the route was launched on.
+    pub branch:         String,
+    pub verdict:        Verdict,
+>>>>>>> theirs
     /// `"forkd"` | `"hermetic"` | `"fake"` — which backend fired.
     pub gate_backend:   String,
     /// The textual feedback GEPA consumes.
@@ -224,6 +238,7 @@ pub struct RunRow {
     /// The wrapper-decision-log session id (worktree dir name).
     #[serde(default)]
     pub session_id:     Option<String>,
+<<<<<<< ours
     /// `true` when this row was produced by the retro-scoring
     /// backfill driver replaying historical fleet attempts through
     /// the hermetic gate. `false` for live/canary runs. The harvest
@@ -247,6 +262,12 @@ fn default_schema_version() -> u32 {
 impl RunRow {
     /// Convenience constructor for tests. Always emits the current
     /// schema version so the row shape stays forward-compatible.
+=======
+}
+
+impl RunRow {
+    /// Convenience constructor for tests.
+>>>>>>> theirs
     pub fn new(
         run_id: &str,
         task_id: &str,
@@ -258,27 +279,40 @@ impl RunRow {
         gate_log: &str,
     ) -> Self {
         Self {
+<<<<<<< ours
             schema_version: CURRENT_SCHEMA_VERSION,
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
             attempt_key: format!("{task_id}#{run_id}#{route}"),
+=======
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+>>>>>>> theirs
             ts: Utc::now(),
             route: route.to_string(),
             tier: tier.to_string(),
             tier_resolved: None,
             decision_basis: None,
             harness: "claude-code".to_string(),
+<<<<<<< ours
             model: None,
             branch: branch.to_string(),
             verdict,
             passed: matches!(verdict, Verdict::Pass),
+=======
+            branch: branch.to_string(),
+            verdict,
+>>>>>>> theirs
             gate_backend: backend.to_string(),
             gate_log: gate_log.to_string(),
             score: None,
             valset_hash: None,
             diff_stat: None,
             session_id: None,
+<<<<<<< ours
             backfill: false,
+=======
+>>>>>>> theirs
         }
     }
 }

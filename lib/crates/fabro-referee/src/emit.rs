@@ -38,6 +38,7 @@ pub fn default_sink_dir() -> PathBuf {
 }
 
 /// Append one RunRow to `<run-id>.jsonl`. mkdir-p's the sink dir.
+<<<<<<< ours
 ///
 /// Idempotent: re-running the same `(run_id, route)` overwrites the
 /// prior row (no double-append, no double-count). This is necessary
@@ -50,6 +51,8 @@ pub fn default_sink_dir() -> PathBuf {
 /// new row, and atomically rewrite the file. The markdown summary
 /// (`write_markdown_summary`) already replaces the file on every
 /// call, so it stays in sync without further changes.
+=======
+>>>>>>> theirs
 #[expect(
     clippy::disallowed_methods,
     reason = "sync scorer binary: append-open the JSONL sink; no Tokio runtime here"
@@ -58,6 +61,7 @@ pub fn append_jsonl(sink_dir: &Path, row: &RunRow) -> Result<PathBuf> {
     std::fs::create_dir_all(sink_dir)
         .with_context(|| format!("create sink dir {}", sink_dir.display()))?;
     let path = sink_dir.join(format!("{}.jsonl", row.run_id));
+<<<<<<< ours
     // 1) read existing rows (ignore if the file is missing or empty)
     let mut existing: Vec<RunRow> = if path.exists() {
         let bytes = std::fs::read(&path)
@@ -101,6 +105,15 @@ pub fn append_jsonl(sink_dir: &Path, row: &RunRow) -> Result<PathBuf> {
         .with_context(|| format!("write tmp {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+=======
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let line = serde_json::to_string(row).context("serialize RunRow")?;
+    writeln!(f, "{line}").with_context(|| format!("write {}", path.display()))?;
+>>>>>>> theirs
     Ok(path)
 }
 
@@ -182,6 +195,7 @@ impl Verdict {
         matches!(self, Self::Pass)
     }
 }
+<<<<<<< ours
 
 #[cfg(test)]
 #[expect(
@@ -309,3 +323,5 @@ mod tests {
         );
     }
 }
+=======
+>>>>>>> theirs
