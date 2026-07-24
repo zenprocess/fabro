@@ -128,6 +128,13 @@ if [[ "$AUTO_DETECT" -eq 1 ]]; then
   RUN_ID="${WORKTREE_NAME}-${TIER_SINGLE}"
 fi
 
+# Synthetic runs get a "synthetic-" run_id prefix so their sink files and
+# every downstream consumer can filter them out by id alone, not just by the
+# row's `synthetic` field. Idempotent: never double-prefixes.
+if [[ "$SYNTHETIC" -eq 1 && -n "$RUN_ID" && "$RUN_ID" != synthetic-* ]]; then
+  RUN_ID="synthetic-${RUN_ID}"
+fi
+
 # --- Validation: fail-closed on malformed input ---
 
 # Exactly one of (two-tier) or (single-route) must be configured.
