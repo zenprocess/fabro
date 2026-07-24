@@ -32,7 +32,10 @@ use fabro_referee::canary::{
 };
 use fabro_referee::emit::default_sink_dir;
 <<<<<<< ours
+<<<<<<< ours
 use fabro_referee::gate::backend::forkd_token;
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
 use fabro_referee::gate::{BackendKind, GateBackend};
@@ -85,6 +88,7 @@ enum Command {
         /// Path to the task spec JSON file.
         #[arg(long)]
 <<<<<<< ours
+<<<<<<< ours
         task:     PathBuf,
         /// Path to the routes JSON file (Vec<Route> serialized).
         #[arg(long)]
@@ -100,6 +104,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         backfill: bool,
 =======
+=======
+>>>>>>> theirs
         task:   PathBuf,
         /// Path to the routes JSON file (Vec<Route> serialized).
         #[arg(long)]
@@ -107,6 +113,9 @@ enum Command {
         /// Run id (one canary = one run_id).
         #[arg(long)]
         run_id: String,
+<<<<<<< ours
+>>>>>>> theirs
+=======
 >>>>>>> theirs
     },
     /// Score the canary task against two routes (mm + sn).
@@ -153,7 +162,10 @@ fn main() -> Result<()> {
             routes,
             run_id,
 <<<<<<< ours
+<<<<<<< ours
             backfill,
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
         } => {
@@ -167,6 +179,7 @@ fn main() -> Result<()> {
                 &run_id,
                 decision_log.as_deref(),
 <<<<<<< ours
+<<<<<<< ours
                 backfill,
             )?;
             eprintln!(
@@ -176,12 +189,17 @@ fn main() -> Result<()> {
                 sink_dir.display(),
                 backfill,
 =======
+=======
+>>>>>>> theirs
             )?;
             eprintln!(
                 "fabro-referee: run_id={} rows={} sink_dir={}",
                 result.run_id,
                 result.rows.len(),
                 sink_dir.display(),
+<<<<<<< ours
+>>>>>>> theirs
+=======
 >>>>>>> theirs
             );
             for r in &result.rows {
@@ -219,7 +237,10 @@ fn main() -> Result<()> {
                 &run_id,
                 decision_log.as_deref(),
 <<<<<<< ours
+<<<<<<< ours
                 false, // live canary: never backfill
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
             )?;
@@ -303,11 +324,17 @@ fn do_doctor(cli: &Cli, sink_dir: &Path, decision_log: Option<&Path>, backend_ki
 
 fn check_endpoint(url: &str) -> Result<()> {
 <<<<<<< ours
+<<<<<<< ours
     let token = forkd_token()?;
     let client = fabro_http::blocking_http_client().context("build doctor http client")?;
     let resp = client
         .get(format!("{}/health", url.trim_end_matches('/')))
         .bearer_auth(token)
+=======
+    let client = fabro_http::blocking_http_client().context("build doctor http client")?;
+    let resp = client
+        .get(format!("{}/health", url.trim_end_matches('/')))
+>>>>>>> theirs
 =======
     let client = fabro_http::blocking_http_client().context("build doctor http client")?;
     let resp = client

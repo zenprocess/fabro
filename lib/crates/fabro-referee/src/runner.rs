@@ -27,7 +27,11 @@ use crate::decision_log::find_decision;
 use crate::emit::{append_jsonl, write_markdown_summary};
 use crate::gate::GateBackend;
 <<<<<<< ours
+<<<<<<< ours
 use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier, Verdict};
+=======
+use crate::types::{GateOutput, Route, RunRow, TaskSpec, Tier};
+>>>>>>> theirs
 =======
 use crate::types::{GateOutput, Route, RunRow, TaskSpec, Tier};
 >>>>>>> theirs
@@ -45,11 +49,14 @@ pub struct RunResult {
 /// test-friendly (a stub `ao spawn` is trivial) and the orchestrator
 /// in control of the actual spawn.
 <<<<<<< ours
+<<<<<<< ours
 ///
 /// `backfill` is propagated to every emitted `RunRow`. The live
 /// canary path calls `run()` with `backfill=false`; the retro-scoring
 /// backfill driver calls it with `backfill=true` so the harvest ETL
 /// can filter retroactive labeling out of the trainset.
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
 pub fn run(
@@ -60,7 +67,10 @@ pub fn run(
     run_id: &str,
     decision_log: Option<&Path>,
 <<<<<<< ours
+<<<<<<< ours
     backfill: bool,
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
 ) -> Result<RunResult> {
@@ -75,9 +85,13 @@ pub fn run(
         let mut route = route.clone();
         // If a decision-log path was supplied, attempt to recover
 <<<<<<< ours
+<<<<<<< ours
         // the wrapper's actual `tier_resolved` + `decision_basis` +
         // `final_model` (the model's name flows into the row as
         // `model` to match zeninfra's `GateLogLine.model`).
+=======
+        // the wrapper's actual `tier_resolved` + `decision_basis`.
+>>>>>>> theirs
 =======
         // the wrapper's actual `tier_resolved` + `decision_basis`.
 >>>>>>> theirs
@@ -87,7 +101,10 @@ pub fn run(
                     route.tier_resolved = Some(hit.tier_resolved);
                     route.decision_basis = Some(hit.decision_basis);
 <<<<<<< ours
+<<<<<<< ours
                     route.model = Some(hit.final_model);
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
                 }
@@ -104,7 +121,11 @@ pub fn run(
             .score(task, &route.diff)
             .with_context(|| format!("gate.score for branch={}", route.branch))?;
 <<<<<<< ours
+<<<<<<< ours
         let row = make_row(run_id, task, &route, &gate_out, backfill);
+=======
+        let row = make_row(run_id, task, &route, &gate_out);
+>>>>>>> theirs
 =======
         let row = make_row(run_id, task, &route, &gate_out);
 >>>>>>> theirs
@@ -118,7 +139,10 @@ pub fn run(
         task = %task.task_id,
         rows = rows.len(),
 <<<<<<< ours
+<<<<<<< ours
         backfill,
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
         "run complete"
@@ -132,6 +156,7 @@ pub fn run(
 /// Build a `RunRow` from one route + its gate output. The helper is
 /// pure / dead-simple so a reviewer can verify the row shape in one
 /// read.
+<<<<<<< ours
 <<<<<<< ours
 pub fn make_row(
     run_id: &str,
@@ -164,6 +189,8 @@ pub fn make_row(
         session_id: route.session_id.clone(),
         backfill,
 =======
+=======
+>>>>>>> theirs
 pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput) -> RunRow {
     RunRow {
         run_id:         run_id.to_string(),
@@ -182,6 +209,9 @@ pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput)
         valset_hash:    gate.valset_hash.clone(),
         diff_stat:      route.diff_stat.clone(),
         session_id:     route.session_id.clone(),
+<<<<<<< ours
+>>>>>>> theirs
+=======
 >>>>>>> theirs
     }
 }
@@ -206,7 +236,10 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             tier_resolved:  None,
             decision_basis: None,
 <<<<<<< ours
+<<<<<<< ours
             model:          None,
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
             session_id:     None,
@@ -219,7 +252,10 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             tier_resolved:  None,
             decision_basis: None,
 <<<<<<< ours
+<<<<<<< ours
             model:          None,
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
             session_id:     None,
@@ -230,6 +266,10 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
 }
 
 <<<<<<< ours
+<<<<<<< ours
+=======
+#[cfg(feature = "test-support")]
+>>>>>>> theirs
 =======
 #[cfg(feature = "test-support")]
 >>>>>>> theirs
@@ -261,7 +301,11 @@ mod tests {
         let task = make_task();
         let sink = std::env::temp_dir().join(format!("fabro-referee-test-{}", ulid::Ulid::new()));
 <<<<<<< ours
+<<<<<<< ours
         let res = run(&task, &routes, &fake, &sink, "run-test", None, false).unwrap();
+=======
+        let res = run(&task, &routes, &fake, &sink, "run-test", None).unwrap();
+>>>>>>> theirs
 =======
         let res = run(&task, &routes, &fake, &sink, "run-test", None).unwrap();
 >>>>>>> theirs
@@ -272,6 +316,7 @@ mod tests {
         assert_eq!(fake.calls(), 2);
         // Verify verdicts are Pass (as programmed).
         assert!(res.rows.iter().all(|r| matches!(r.verdict, Verdict::Pass)));
+<<<<<<< ours
 <<<<<<< ours
         // Live canary path: backfill MUST be false.
         assert!(res.rows.iter().all(|r| !r.backfill));
@@ -291,6 +336,8 @@ mod tests {
         // on the verdict — a Fail from a retro-scoring replay is
         // still tagged backfill so it stays out of the trainset).
         assert!(res.rows.iter().all(|r| r.backfill));
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
     }

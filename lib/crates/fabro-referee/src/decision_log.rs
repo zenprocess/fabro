@@ -30,9 +30,12 @@
 //!   * `tier_resolved` (Strick → `mm|sn|qw|opus|cloud`) — the actual tier.
 //!   * `decision_basis` (Strick) — why the wrapper chose that tier.
 <<<<<<< ours
+<<<<<<< ours
 //!   * `final_model` (Strick) — the model id the wrapper ran (e.g.
 //!     `MiniMax-M3`, `claude-sonnet-5[1m]`). Forwarded into `RunRow.model` to
 //!     match zeninfra's `GateLogLine.model`.
+=======
+>>>>>>> theirs
 =======
 >>>>>>> theirs
 
