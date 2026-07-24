@@ -23,6 +23,12 @@ Auto-detect options (hook-driven surface):
   --auto-detect               Derive branch + tier + task_id + run_id from
                               `git rev-parse --abbrev-ref HEAD` and
                               $AO_SESSION_ID. Exits 0 if not a tier branch.
+                              Also computes the diff base as
+                              `merge-base(main, HEAD)` (unless --base-ref is
+                              passed explicitly) and exits 0 with no row if
+                              that base equals HEAD or the resulting diff is
+                              empty — an empty diff is "nothing to score",
+                              never a Pass.
   --worktree-name NAME        Override AO_SESSION_ID (used in the run_id when
                               AO_SESSION_ID is unset; usually the worktree
                               dir basename).
@@ -43,6 +49,7 @@ USAGE
 
 TASK_ID="${TASK_ID:-}"
 BASE_REF="${BASE_REF:-HEAD}"
+BASE_REF_EXPLICIT=0
 PROJECT="${PROJECT:-.}"
 BRANCH_MM="${BRANCH_MM:-}"
 BRANCH_SN="${BRANCH_SN:-}"
@@ -60,7 +67,7 @@ WORKTREE_NAME="${WORKTREE_NAME:-${AO_SESSION_ID:-}}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --task-id) TASK_ID="$2"; shift 2 ;;
-    --base-ref) BASE_REF="$2"; shift 2 ;;
+    --base-ref) BASE_REF="$2"; BASE_REF_EXPLICIT=1; shift 2 ;;
     --project) PROJECT="$2"; shift 2 ;;
     --branch-mm) BRANCH_MM="$2"; shift 2 ;;
     --branch-sn) BRANCH_SN="$2"; shift 2 ;;
@@ -101,13 +108,11 @@ if [[ "$AUTO_DETECT" -eq 1 ]]; then
     # Detached HEAD or non-git project — nothing to score.
     exit 0
   fi
-  # Detect tier suffix: -mm, -sn, or -qw.
-  if [[ "$CUR_BRANCH" =~ -mm$ ]]; then
-    TIER_SINGLE="mm"
-  elif [[ "$CUR_BRANCH" =~ -sn$ ]]; then
-    TIER_SINGLE="sn"
-  elif [[ "$CUR_BRANCH" =~ -qw$ ]]; then
-    TIER_SINGLE="qw"
+  # Detect tier suffix: exactly one of -mm, -sn, -qw, anchored at the end
+  # of the ref so a coincidental substring (e.g. a date/token that happens
+  # to end in the same two letters) can never masquerade as a tier branch.
+  if [[ "$CUR_BRANCH" =~ -(mm|sn|qw)$ ]]; then
+    TIER_SINGLE="${BASH_REMATCH[1]}"
   else
     # Not a tier branch — main session, merge target, etc.
     # Fail-open: this is the "sibling doesn't exist yet" case the
@@ -117,6 +122,47 @@ if [[ "$AUTO_DETECT" -eq 1 ]]; then
   fi
   BRANCH_SINGLE="$CUR_BRANCH"
   TASK_ID="${CUR_BRANCH%-"$TIER_SINGLE"}"
+
+  # BASE_REF defaults to HEAD, and CUR_BRANCH *is* HEAD in auto-detect mode,
+  # so leaving it at the default turns `git diff BASE_REF...branch` into
+  # `git diff HEAD...HEAD` — always empty, which the gate scores as a
+  # trivial Pass. That's a false-positive Pass row for every tiered session,
+  # not "nothing to score". Compute the real merge-base against main instead,
+  # unless the caller explicitly passed --base-ref (used by the crash-test
+  # harness to force a real diff on demand).
+  if [[ "$BASE_REF_EXPLICIT" -ne 1 ]]; then
+    MERGE_TARGET="main"
+    if ! git -C "$PROJECT" rev-parse --verify --quiet "$MERGE_TARGET" >/dev/null 2>&1; then
+      MERGE_TARGET="origin/main"
+    fi
+    AUTO_BASE="$(git -C "$PROJECT" merge-base "$MERGE_TARGET" HEAD 2>/dev/null || true)"
+    if [[ -z "$AUTO_BASE" ]]; then
+      # No common ancestor found (main/origin-main unresolvable or history
+      # is disjoint) — nothing safe to score against. Skip, no row.
+      exit 0
+    fi
+    BASE_REF="$AUTO_BASE"
+  fi
+
+  HEAD_SHA="$(git -C "$PROJECT" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -z "$HEAD_SHA" || "$BASE_REF" == "$HEAD_SHA" ]]; then
+    # Base resolves to HEAD itself: nothing ahead of the merge-base yet.
+    # An empty/absent diff is "nothing to score" — never emit a Pass row
+    # for it.
+    exit 0
+  fi
+
+  if ! AUTO_DIFF="$(git -C "$PROJECT" diff "$BASE_REF...$CUR_BRANCH" 2>&1)"; then
+    printf 'referee-score-dispatch.sh: git diff %s...%s failed during auto-detect skip-check; skipping (no row emitted):\n%s\n' \
+      "$BASE_REF" "$CUR_BRANCH" "$AUTO_DIFF" >&2
+    exit 0
+  fi
+  if [[ -z "$AUTO_DIFF" ]]; then
+    # Real merge-base, but nothing changed relative to it — still "nothing
+    # to score", never a Pass.
+    exit 0
+  fi
+
   if [[ -z "$WORKTREE_NAME" ]]; then
     # Last-ditch: use the project dir basename (worktree name).
     WORKTREE_NAME="$(basename "$PROJECT")"
@@ -158,6 +204,22 @@ fi
 [[ -n "$TASK_ID" ]] || { printf '%s\n' 'referee-score-dispatch.sh: --task-id is required' >&2; exit 2; }
 [[ -n "$RUN_ID" ]] || { printf '%s\n' 'referee-score-dispatch.sh: --run-id is required (caller-supplied and stable)' >&2; exit 2; }
 [[ -d "$PROJECT" ]] || { printf 'referee-score-dispatch.sh: project is not a directory: %s\n' "$PROJECT" >&2; exit 2; }
+
+# A synthetic row must be unambiguously hermetic-tagged. Refuse to emit a
+# synthetic row under a live (forkd) backend under any circumstance.
+if [[ "$SYNTHETIC" -eq 1 && "$HERMETIC" -ne 1 ]]; then
+  printf 'referee-score-dispatch.sh: --synthetic requires --hermetic; refusing to emit a synthetic row under a non-hermetic backend\n' >&2
+  exit 2
+fi
+
+# Invariant: synthetic:true must always carry a synthetic- run_id prefix.
+# The prefixing above is idempotent and unconditional whenever SYNTHETIC=1,
+# so this should never trip; it exists purely as a guard against a future
+# code path adding a synthetic row without going through that prefix step.
+if [[ "$SYNTHETIC" -eq 1 && "$RUN_ID" != synthetic-* ]]; then
+  printf 'referee-score-dispatch.sh: internal invariant violated: synthetic run without synthetic- run_id prefix (run_id=%s)\n' "$RUN_ID" >&2
+  exit 70
+fi
 
 # Tier validation for single-route mode.
 if [[ "$SINGLE_ROUTE" -eq 1 ]]; then
@@ -204,8 +266,20 @@ capture_route() {
   esac
   local diff_file="$TMP_DIR/${tier}.diff"
   local stat_file="$TMP_DIR/${tier}.stat"
-  git -C "$PROJECT" diff "$BASE_REF...$branch" > "$diff_file" || true
-  git -C "$PROJECT" diff --stat "$BASE_REF...$branch" > "$stat_file" || true
+  # Fail closed: a failed `git diff` (bad ref, branch not found) must never
+  # be silently swallowed into an empty diff that then gets scored as a
+  # trivial Pass. Log and skip the whole run rather than emit a row derived
+  # from a failed diff.
+  if ! git -C "$PROJECT" diff "$BASE_REF...$branch" > "$diff_file" 2>"$TMP_DIR/${tier}.diff.err"; then
+    printf 'referee-score-dispatch.sh: git diff %s...%s failed; skipping (no row emitted):\n' "$BASE_REF" "$branch" >&2
+    cat "$TMP_DIR/${tier}.diff.err" >&2
+    exit 1
+  fi
+  if ! git -C "$PROJECT" diff --stat "$BASE_REF...$branch" > "$stat_file" 2>"$TMP_DIR/${tier}.stat.err"; then
+    printf 'referee-score-dispatch.sh: git diff --stat %s...%s failed; skipping (no row emitted):\n' "$BASE_REF" "$branch" >&2
+    cat "$TMP_DIR/${tier}.stat.err" >&2
+    exit 1
+  fi
   jq -n \
     --arg tier "$tier_full" \
     --arg branch "$branch" \
