@@ -81,13 +81,20 @@ enum Command {
     Score {
         /// Path to the task spec JSON file.
         #[arg(long)]
-        task:   PathBuf,
+        task:     PathBuf,
         /// Path to the routes JSON file (Vec<Route> serialized).
         #[arg(long)]
-        routes: PathBuf,
+        routes:   PathBuf,
         /// Run id (one canary = one run_id).
         #[arg(long)]
-        run_id: String,
+        run_id:   String,
+        /// Tag emitted rows as `backfill:true`. Set by the
+        /// retro-scoring backfill driver so the harvest ETL can keep
+        /// the row out of the trainset (the row was not a
+        /// contemporaneous decision — it is a retroactive label).
+        /// Live/canary scoring MUST leave this unset.
+        #[arg(long, default_value_t = false)]
+        backfill: bool,
     },
     /// Score the canary task against two routes (mm + sn).
     Canary {
@@ -132,6 +139,7 @@ fn main() -> Result<()> {
             task,
             routes,
             run_id,
+            backfill,
         } => {
             let task = load_task(&task)?;
             let routes = load_routes(&routes)?;
@@ -142,12 +150,14 @@ fn main() -> Result<()> {
                 &sink_dir,
                 &run_id,
                 decision_log.as_deref(),
+                backfill,
             )?;
             eprintln!(
-                "fabro-referee: run_id={} rows={} sink_dir={}",
+                "fabro-referee: run_id={} rows={} sink_dir={} backfill={}",
                 result.run_id,
                 result.rows.len(),
                 sink_dir.display(),
+                backfill,
             );
             for r in &result.rows {
                 eprintln!(
@@ -183,6 +193,7 @@ fn main() -> Result<()> {
                 &sink_dir,
                 &run_id,
                 decision_log.as_deref(),
+                false, // live canary: never backfill
             )?;
             eprintln!(
                 "fabro-referee canary: run_id={} task={} marker={:?}",

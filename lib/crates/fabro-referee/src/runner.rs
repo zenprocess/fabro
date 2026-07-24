@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::decision_log::find_decision;
 use crate::emit::{append_jsonl, write_markdown_summary};
 use crate::gate::GateBackend;
-use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier};
+use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier, Verdict};
 
 /// What the runner emits for one task.
 #[derive(Debug, Clone)]
@@ -40,6 +40,11 @@ pub struct RunResult {
 /// supplies the routes' diffs + tier names. This keeps the runner
 /// test-friendly (a stub `ao spawn` is trivial) and the orchestrator
 /// in control of the actual spawn.
+///
+/// `backfill` is propagated to every emitted `RunRow`. The live
+/// canary path calls `run()` with `backfill=false`; the retro-scoring
+/// backfill driver calls it with `backfill=true` so the harvest ETL
+/// can filter retroactive labeling out of the trainset.
 pub fn run(
     task: &TaskSpec,
     routes: &[Route],
@@ -47,6 +52,7 @@ pub fn run(
     sink_dir: &Path,
     run_id: &str,
     decision_log: Option<&Path>,
+    backfill: bool,
 ) -> Result<RunResult> {
     let mut rows: Vec<RunRow> = Vec::with_capacity(routes.len());
     for route in routes {
@@ -58,12 +64,15 @@ pub fn run(
         );
         let mut route = route.clone();
         // If a decision-log path was supplied, attempt to recover
-        // the wrapper's actual `tier_resolved` + `decision_basis`.
+        // the wrapper's actual `tier_resolved` + `decision_basis` +
+        // `final_model` (the model's name flows into the row as
+        // `model` to match zeninfra's `GateLogLine.model`).
         if let (Some(path), Some(sid)) = (decision_log, &route.session_id) {
             match find_decision(path, sid, &route.branch) {
                 Some(hit) => {
                     route.tier_resolved = Some(hit.tier_resolved);
                     route.decision_basis = Some(hit.decision_basis);
+                    route.model = Some(hit.final_model);
                 }
                 None => {
                     warn!(
@@ -77,7 +86,7 @@ pub fn run(
         let gate_out = gate
             .score(task, &route.diff)
             .with_context(|| format!("gate.score for branch={}", route.branch))?;
-        let row = make_row(run_id, task, &route, &gate_out);
+        let row = make_row(run_id, task, &route, &gate_out, backfill);
         append_jsonl(sink_dir, &row)
             .with_context(|| format!("emit jsonl for branch={}", route.branch))?;
         rows.push(row);
@@ -87,6 +96,7 @@ pub fn run(
         run_id = %run_id,
         task = %task.task_id,
         rows = rows.len(),
+        backfill,
         "run complete"
     );
     Ok(RunResult {
@@ -98,25 +108,36 @@ pub fn run(
 /// Build a `RunRow` from one route + its gate output. The helper is
 /// pure / dead-simple so a reviewer can verify the row shape in one
 /// read.
-pub fn make_row(run_id: &str, task: &TaskSpec, route: &Route, gate: &GateOutput) -> RunRow {
+pub fn make_row(
+    run_id: &str,
+    task: &TaskSpec,
+    route: &Route,
+    gate: &GateOutput,
+    backfill: bool,
+) -> RunRow {
+    let route_short = route_short(route.tier);
     RunRow {
         schema_version: CURRENT_SCHEMA_VERSION,
-        run_id:         run_id.to_string(),
-        task_id:        task.task_id.clone(),
-        ts:             Utc::now(),
-        route:          route_short(route.tier),
-        tier:           route.tier.to_string(),
-        tier_resolved:  route.tier_resolved.clone(),
+        run_id: run_id.to_string(),
+        task_id: task.task_id.clone(),
+        attempt_key: format!("{}#{}#{}", task.task_id, run_id, route_short),
+        ts: Utc::now(),
+        route: route_short,
+        tier: route.tier.to_string(),
+        tier_resolved: route.tier_resolved.clone(),
         decision_basis: route.decision_basis.clone(),
-        harness:        "claude-code".to_string(),
-        branch:         route.branch.clone(),
-        verdict:        gate.verdict,
-        gate_backend:   gate.backend.clone(),
-        gate_log:       gate.gate_log.clone(),
-        score:          gate.score,
-        valset_hash:    gate.valset_hash.clone(),
-        diff_stat:      route.diff_stat.clone(),
-        session_id:     route.session_id.clone(),
+        harness: "claude-code".to_string(),
+        model: route.model.clone(),
+        branch: route.branch.clone(),
+        verdict: gate.verdict,
+        passed: matches!(gate.verdict, Verdict::Pass),
+        gate_backend: gate.backend.clone(),
+        gate_log: gate.gate_log.clone(),
+        score: gate.score,
+        valset_hash: gate.valset_hash.clone(),
+        diff_stat: route.diff_stat.clone(),
+        session_id: route.session_id.clone(),
+        backfill,
     }
 }
 
@@ -139,6 +160,7 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             branch:         mm_branch,
             tier_resolved:  None,
             decision_basis: None,
+            model:          None,
             session_id:     None,
             diff:           mm_diff,
             diff_stat:      None,
@@ -148,6 +170,7 @@ pub fn two_tier_canary_routes(base_branch: &str, mm_diff: String, sn_diff: Strin
             branch:         sn_branch,
             tier_resolved:  None,
             decision_basis: None,
+            model:          None,
             session_id:     None,
             diff:           sn_diff,
             diff_stat:      None,
@@ -182,7 +205,7 @@ mod tests {
         let routes = two_tier_canary_routes("p0", "diff-mm".to_string(), "diff-sn".to_string());
         let task = make_task();
         let sink = std::env::temp_dir().join(format!("fabro-referee-test-{}", ulid::Ulid::new()));
-        let res = run(&task, &routes, &fake, &sink, "run-test", None).unwrap();
+        let res = run(&task, &routes, &fake, &sink, "run-test", None, false).unwrap();
         assert_eq!(res.rows.len(), 2);
         assert_eq!(res.rows[0].tier, "minimax");
         assert_eq!(res.rows[1].tier, "sonnet");
@@ -190,5 +213,23 @@ mod tests {
         assert_eq!(fake.calls(), 2);
         // Verify verdicts are Pass (as programmed).
         assert!(res.rows.iter().all(|r| matches!(r.verdict, Verdict::Pass)));
+        // Live canary path: backfill MUST be false.
+        assert!(res.rows.iter().all(|r| !r.backfill));
+    }
+
+    #[test]
+    fn runner_propagates_backfill_flag_to_every_row() {
+        let fake = FakeBackend::default();
+        fake.program(Verdict::Fail, "diff did not apply");
+        let routes = two_tier_canary_routes("p0", "diff-mm".to_string(), "diff-sn".to_string());
+        let task = make_task();
+        let sink = std::env::temp_dir().join(format!("fabro-referee-test-{}", ulid::Ulid::new()));
+        let res = run(&task, &routes, &fake, &sink, "backfill-x", None, true).unwrap();
+        assert_eq!(res.rows.len(), 2);
+        // Backfill MUST propagate to every row, even when the gate
+        // produced a Fail (the harvest ETL filters on the flag, not
+        // on the verdict — a Fail from a retro-scoring replay is
+        // still tagged backfill so it stays out of the trainset).
+        assert!(res.rows.iter().all(|r| r.backfill));
     }
 }
