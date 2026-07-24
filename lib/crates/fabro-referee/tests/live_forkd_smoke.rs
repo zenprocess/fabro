@@ -9,6 +9,11 @@ use fabro_referee::types::{Acceptance, TaskSpec, Verdict};
 
 #[test]
 #[ignore = "live forkd controller; run explicitly from an egress-allowlisted host"]
+#[expect(
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    reason = "operator-only live smoke: documented process-env lookup facade to gate on FORKD_TOKEN/FORKD_ENDPOINT presence; eprintln reports the skip when run explicitly"
+)]
 fn live_forkd_score_smoke() {
     if std::env::var_os("FORKD_TOKEN").is_none() {
         eprintln!("FORKD_TOKEN is unset; skipping live forkd smoke");
