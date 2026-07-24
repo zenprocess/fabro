@@ -33,6 +33,7 @@ fn live_forkd_score_smoke() {
         acceptance:        Acceptance::ShellCommand {
             command: "grep -F 'P0-CANARY:' CANARY.md".to_string(),
         },
+        synthetic:         false,
     };
     let diff = "--- a/CANARY.md\n+++ b/CANARY.md\n@@ -0,0 +1,1 @@\n+P0-CANARY: live-forkd-smoke\n";
 
