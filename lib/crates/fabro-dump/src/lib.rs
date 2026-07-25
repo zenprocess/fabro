@@ -500,6 +500,7 @@ mod tests {
             }),
             labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
             provenance:       test_support::test_run_provenance(),
+            origin: None,
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
