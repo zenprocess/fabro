@@ -24,6 +24,11 @@
 #      per_child_netns=true. The `true` is load-bearing: a probe using
 #      per_child_netns=false would have passed throughout the entire
 #      outage and is worthless. We test the mode that actually breaks.
+#      JSON body uses `snapshot_tag` (NOT `tag`) — verified live on
+#      dellsrv 2026-07-25: sending `{"tag":...}` returns
+#      `missing field snapshot_tag`, which does NOT match the netns
+#      failure regex and would silently kill the probe with a wrong
+#      reason on every run.
 #   2. Inspect the response. If it carries the netns-failure signature
 #      ('Invalid argument' / 'socket never appeared'), ALERT (or, with
 #      --heal, attempt the documented teardown+setup repair).
@@ -177,7 +182,7 @@ trap 'teardown_sandbox' EXIT
 
 # ---------- step 1: create sandbox with per_child_netns=true ----------
 log "create: POST /v1/sandboxes tag=$PROBE_TAG per_child_netns=true"
-create_body="$(printf '{"tag":"%s","per_child_netns":true}' "$PROBE_TAG")"
+create_body="$(printf '{"snapshot_tag":"%s","per_child_netns":true}' "$PROBE_TAG")"
 
 if [ "$DRY_RUN" = "1" ]; then
     log "DRY-RUN: would POST $FORKD_API_BASE/v1/sandboxes body=$create_body"
