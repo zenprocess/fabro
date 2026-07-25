@@ -1,0 +1,122 @@
+# =============================================================================
+# forkd-controller.service — systemd supervision for the dellsrv forkd VMM.
+#
+# OWNERSHIP NOTE (LOAD-BEARING):
+#   The real forkd-controller binary runs INSIDE the 'forkd' docker
+#   container. Host port 8891 IS that container (it is launched by
+#   /usr/local/sbin/forkd-ec-boot-dellsrv.sh via `docker exec`). This
+#   unit therefore supervises the BOOT SCRIPT, not the raw binary.
+#   Writing a unit that ExecStart=/usr/local/bin/forkd-controller serve
+#   would be WRONG: it would launch a SECOND, conflicting controller
+#   alongside the live container, and on a port collision the gate
+#   would flap between two PIDs. Don't do that.
+#
+# OPERATING MODEL:
+#   * The script forkd-ec-boot-dellsrv.sh is idempotent and is safe to
+#     re-run. If the 'forkd' container is already up and listening on
+#     8891, the script is a no-op. If it is not, it brings it up.
+#   * We give systemd a TYPE=forking wrapper that backgrounds the
+#     script and exits 0 once the gate is reachable on 8891 (ExecStart
+#     = /usr/local/sbin/forkd-controller-supervisor.sh; see that file).
+#   * Restart=on-failure re-invokes the wrapper if it exits non-zero
+#     (e.g. the script died, the docker daemon dropped the container,
+#     or port 8891 stopped answering). RestartSec=10s avoids hot-loop
+#     churn while the docker daemon comes back.
+#
+# SECRETS:
+#   The token file at /etc/forkd/forkd.env is read via EnvironmentFile.
+#   The unit file contains NO inline secrets. The file must be mode
+#   0600, owned by root:root. Rotate via:
+#       sudo install -m 0600 -o root -g root \
+#           /dev/null /etc/forkd/forkd.env
+#       sudo systemctl edit forkd-controller.service   # drop a secret here
+#       sudo systemctl restart forkd-controller.service
+#
+# DEPLOY (run on dellsrv, in order):
+#   sudo install -m 0755 scripts/ops/dellsrv-forkd-supervision/forkd-controller-supervisor.sh \
+#       /usr/local/sbin/forkd-controller-supervisor.sh
+#   sudo install -m 0644 scripts/ops/dellsrv-forkd-supervision/forkd-controller.service \
+#       /etc/systemd/system/forkd-controller.service
+#   sudo install -m 0600 -o root -g root /dev/null /etc/forkd/forkd.env
+#   # populate /etc/forkd/forkd.env (FORKD_TOKEN_FILE=/etc/forkd-token)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now forkd-controller.service
+#   sudo systemctl status forkd-controller.service
+#
+# ROLLBACK (without dropping the gate):
+#   The unit owns the boot script, not the container directly. To
+#   return to "manual process" cleanly without taking the gate down:
+#       sudo systemctl disable --now forkd-controller.service
+#       sudo systemctl stop forkd-controller.service
+#   That stops ONLY the supervisor; the running 'forkd' container is
+#   untouched. The operator can then run forkd-ec-boot-dellsrv.sh by
+#   hand. If you actually need to KILL the container too (e.g. to
+#   roll back a bad image), use `docker rm -f forkd` AFTER stopping
+#   the unit — never before.
+#
+# HEALTH / READINESS:
+#   The supervisor wrapper blocks on `curl -fsS http://127.0.0.1:8891/v1/health`
+#   until it returns 200, then exits 0. systemd treats exit 0 as
+#   "active (exited)" which is the correct state for a TYPE=oneshot
+#   supervisor: the long-lived process is the docker container, not
+#   this wrapper. Verify the gate is up with:
+#       curl -fsS http://127.0.0.1:8891/v1/health
+#   or, from the Mac, with the existing operator alias.
+# =============================================================================
+
+[Unit]
+Description=forkd VMM controller (dellsrv gate) — supervises forkd-ec-boot-dellsrv.sh
+Documentation=https://internal/forkd
+# Docker is the hard prerequisite: the boot script `docker exec`s into
+# the 'forkd' container. Without docker.service active, the script
+# fails immediately. network-online.target is intentionally NOT
+# required — forkd binds 0.0.0.0:8891 directly, so network-online is
+# nice-to-have but not load-bearing for this unit.
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# CRITICAL: this is the boot script, NOT the raw binary.
+ExecStart=/usr/local/sbin/forkd-controller-supervisor.sh
+
+# Bring the gate down on stop: best-effort, never fatal. We do NOT
+# kill the 'forkd' container here — see ROLLBACK above. A `systemctl
+# stop` should leave the running container up so the operator can
+# re-take manual control. If you want the container killed, do it
+# explicitly with `docker rm -f forkd` after the unit is down.
+ExecStop=/usr/bin/true
+ExecReload=/usr/bin/true
+
+# Environment is read from a 0600 file, NOT inlined here. See the
+# SECRETS block above. FORKD_BIND is also exported here because the
+# boot script sources it before docker-exec'ing; the live invocation
+# observed is FORKD_BIND=0.0.0.0:8891.
+EnvironmentFile=-/etc/forkd/forkd.env
+Environment=FORKD_BIND=0.0.0.0:8891
+
+# Restart policy: bring the gate back if the supervisor exits non-zero.
+# RestartSec=10s keeps us off the hot-loop path when docker is itself
+# restarting (docker's own systemd unit has a 5–10s recovery window).
+Restart=on-failure
+RestartSec=10s
+
+# Hardening. forkd-controller-supervisor.sh is a shell wrapper; it
+# does not need network or filesystem privileges beyond what docker
+# already has. We deliberately do NOT set ProtectSystem=strict,
+# ProtectHome=yes, etc. — the script has to read /usr/local/sbin/
+# forkd-ec-boot-dellsrv.sh and write to /var/log.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Log to journald. The boot script's own output will appear here.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forkd-controller
+
+[Install]
+WantedBy=multi-user.target
