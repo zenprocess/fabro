@@ -164,6 +164,7 @@ async fn persist_forked_run(
         automation:       spec.automation.clone(),
         db_prefix:        None,
         provenance:       spec.provenance.clone(),
+        origin:           spec.origin.clone(),
         manifest_blob:    spec.manifest_blob,
         git:              spec.git.clone(),
         fork_source_ref:  spec.fork_source_ref.clone(),
@@ -386,6 +387,7 @@ mod tests {
             automation:       None,
             db_prefix:        None,
             provenance:       test_support::test_run_provenance(),
+            origin:           None,
             manifest_blob:    None,
             git:              Some(fabro_types::GitContext {
                 origin_url:   "https://github.com/example/repo.git".to_string(),

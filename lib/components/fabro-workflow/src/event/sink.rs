@@ -261,6 +261,7 @@ mod tests {
             automation:       None,
             db_prefix:        None,
             provenance:       test_support::test_run_provenance(),
+            origin:           None,
             manifest_blob:    None,
             git:              None,
             fork_source_ref:  None,

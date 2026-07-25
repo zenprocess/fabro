@@ -4,7 +4,7 @@ use ::fabro_types::{
     AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary,
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
     PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
-    PullRequestLink, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunPairEndedReason,
+    PullRequestLink, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunOrigin, RunPairEndedReason,
     RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming, SandboxProviderKind, StageId,
     StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
 };
@@ -42,6 +42,8 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         db_prefix:        Option<String>,
         provenance:       RunProvenance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin:           Option<RunOrigin>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest_blob:    Option<RunBlobId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
