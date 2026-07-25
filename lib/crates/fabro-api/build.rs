@@ -337,6 +337,36 @@ fn main() {
             "fabro_types::RunServerProvenance",
             &[],
         ),
+        (
+            "RunOriginDetails",
+            "fabro_types::run_origin::RunOriginDetails",
+            &[],
+        ),
+        (
+            "RunGateOrigin",
+            "fabro_types::run_origin::RunGateOrigin",
+            &[],
+        ),
+        (
+            "RunRefereeOrigin",
+            "fabro_types::run_origin::RunRefereeOrigin",
+            &[],
+        ),
+        (
+            "RunRefereeBackfillOrigin",
+            "fabro_types::run_origin::RunRefereeBackfillOrigin",
+            &[],
+        ),
+        (
+            "RefereeVerdict",
+            "fabro_types::run_origin::RefereeVerdict",
+            &[],
+        ),
+        (
+            "RefereeDispatchPath",
+            "fabro_types::run_origin::RefereeDispatchPath",
+            &[],
+        ),
         ("Principal", "fabro_types::Principal", &[]),
         ("PrincipalUser", "fabro_types::UserPrincipal", &[]),
         ("SystemActorKind", "fabro_types::SystemActorKind", &[]),

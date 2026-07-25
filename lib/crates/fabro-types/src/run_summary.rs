@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::run_origin::RunOriginDetails;
 use crate::{
     DiffSummary, InterviewQuestionRecord, Principal, PullRequestLink, RepositoryRef,
     RunControlAction, RunId, RunSandbox, RunStatus, RunTiming,
@@ -110,23 +111,62 @@ pub struct AutomationRef {
     pub trigger_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunOrigin {
-    pub kind: RunOriginKind,
+    pub kind:    RunOriginKind,
+    /// Source-specific payload. Required for `gate`, `referee`, and
+    /// `referee_backfill` origins; always `None` for `api` (which has its
+    /// own structured `RunManifest` instead).
+    ///
+    /// Boxed so `RunOrigin` stays pointer-sized wherever it is embedded
+    /// (`RunSpec`, `RunCreatedProps`, `RunSummary`). The largest variant
+    /// (`RunRefereeBackfillOrigin`) is ~240 bytes; inlining it into every
+    /// async future that carries a `RunSpec` tripped clippy's `large_futures`
+    /// lint across the workflow engine. `Box<T>` serializes transparently, so
+    /// the wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<RunOriginDetails>>,
 }
 
 impl Default for RunOrigin {
     fn default() -> Self {
         Self {
-            kind: RunOriginKind::Api,
+            kind:    RunOriginKind::Api,
+            details: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum RunOriginKind {
+    /// Created via the regular `POST /api/v1/runs` workflow manifest path.
     Api,
+    /// Created by a live forkd gate execution registering its result.
+    /// Provenance payload lives in `RunOriginDetails::Gate`.
+    Gate,
+    /// Created by a live hermetic SessionEnd referee score (the
+    /// `referee-score-dispatch.sh` hook). Provenance payload lives in
+    /// `RunOriginDetails::Referee`.
+    Referee,
+    /// Created by the `backfill-referee.sh` retro-scoring driver. Distinct
+    /// from live `Referee` so the harvest ETL can filter it out of
+    /// trainset material. Provenance payload lives in
+    /// `RunOriginDetails::RefereeBackfill`.
+    RefereeBackfill,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

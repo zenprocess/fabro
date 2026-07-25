@@ -1313,6 +1313,71 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/runs/registrations:
+    post:
+      operationId: registerExternalRun
+      tags: [Runs]
+      summary: Register an External Run (gate / referee / backfill)
+      description: |
+        Registers a sentinel run that represents a non-`api` execution
+        (live forkd gate execution, live hermetic SessionEnd referee
+        score, or backfill retro-score). The registered run carries
+        full provenance in `origin.details` so the `/runs` pane reflects
+        the source of every row.
+
+        The run is terminal on creation (no live events; no workflow
+        graph). The verdict is mapped to:
+
+        - `pass` → `Succeeded { reason: Completed }`
+        - `fail` → `Failed { reason: WorkflowError }`
+        - `inconclusive` → `Failed { reason: TransientInfra }`
+
+        Gaps remain truthful: there is no "register a placeholder" path.
+        If the source cannot produce a real verdict, it MUST send
+        `inconclusive`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunRegistrationRequest"
+      responses:
+        "201":
+          description: Run registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "200":
+          description: |
+            Run already registered (idempotent re-registration). Returned
+            when the same `run_id` already exists; the existing run is
+            returned unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          description: |
+            Invalid registration (missing origin, missing verdict, ref name
+            instead of SHA, backfill without `backfill_at`, etc.)
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/v1/preflight:
     post:
       operationId: runPreflight
@@ -11345,12 +11410,200 @@ components:
           type: ["string", "null"]
 
     RunOrigin:
+      description: |
+        Where a registered run came from. The `kind` field is the primary
+        discriminator surfaced in the UI; the `details` field carries the
+        per-kind payload that survives a `kind` typo. The three
+        non-`api` kinds MUST stay distinguishable: collapsing them
+        (e.g. a single `external` kind) loses the live / backfill
+        boundary the harvest ETL relies on.
       type: object
       required: [kind]
       properties:
         kind:
           type: string
-          enum: [api]
+          enum: [api, gate, referee, referee_backfill]
+        details:
+          oneOf:
+            - $ref: "#/components/schemas/RunOriginDetails"
+            - type: "null"
+
+    RunOriginDetails:
+      description: |
+        Source-specific payload for a non-`api` RunOrigin. The tag MUST
+        match the parent `RunOrigin.kind`. Gate / referee / backfill
+        variants are structurally distinct (different required fields),
+        so a stray refactor cannot deserialize one into another.
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [gate, referee, referee_backfill]
+      oneOf:
+        - $ref: "#/components/schemas/RunGateOrigin"
+        - $ref: "#/components/schemas/RunRefereeOrigin"
+        - $ref: "#/components/schemas/RunRefereeBackfillOrigin"
+      discriminator:
+        propertyName: kind
+        mapping:
+          gate: "#/components/schemas/RunGateOrigin"
+          referee: "#/components/schemas/RunRefereeOrigin"
+          referee_backfill: "#/components/schemas/RunRefereeBackfillOrigin"
+
+    RefereeVerdict:
+      description: |
+        The verdict a gate/referee/backfill source supplied. `Inconclusive`
+        is the only honest answer when the source failed to produce a real
+        verdict (timeout, scorer crashed, infra error). The handler MUST
+        NOT default a missing verdict to `pass` — record `inconclusive`
+        instead.
+      type: string
+      enum: [pass, fail, inconclusive]
+
+    RefereeDispatchPath:
+      description: How the dispatch script was invoked.
+      type: string
+      enum: [auto_detect, explicit, referee_backfill]
+
+    RunGateOrigin:
+      type: object
+      required:
+        - endpoint
+        - sandbox_id
+        - model
+        - verdict
+        - verdict_at
+      properties:
+        endpoint:
+          type: string
+          description: Forkd endpoint that produced the verdict (e.g. `http://dellsrv:8891`).
+        sandbox_id:
+          type: string
+        model:
+          type: string
+        verdict:
+          $ref: "#/components/schemas/RefereeVerdict"
+        verdict_at:
+          type: string
+          format: date-time
+        score:
+          type: ["number", "null"]
+        valset_hash:
+          type: ["string", "null"]
+        gate_log:
+          type: ["string", "null"]
+        error:
+          type: ["string", "null"]
+          description: Populated when verdict is `inconclusive`.
+
+    RunRefereeOrigin:
+      type: object
+      required:
+        - tier
+        - base_sha
+        - head_sha
+        - verdict
+        - verdict_at
+        - dispatch_path
+      properties:
+        tier:
+          type: string
+        base_sha:
+          type: string
+          description: 40-char hex SHA the diff was taken against.
+        head_sha:
+          type: string
+          description: 40-char hex SHA of the session HEAD at dispatch time.
+        verdict:
+          $ref: "#/components/schemas/RefereeVerdict"
+        verdict_at:
+          type: string
+          format: date-time
+        dispatch_path:
+          $ref: "#/components/schemas/RefereeDispatchPath"
+        branch:
+          type: ["string", "null"]
+        synthetic:
+          type: boolean
+          description: true iff this run is a synthetic proof / training test.
+        score:
+          type: ["number", "null"]
+        valset_hash:
+          type: ["string", "null"]
+        error:
+          type: ["string", "null"]
+          description: Populated when verdict is `inconclusive`.
+
+    RunRefereeBackfillOrigin:
+      type: object
+      required:
+        - tier
+        - base_sha
+        - head_sha
+        - verdict
+        - verdict_at
+        - dispatch_path
+        - backfill_at
+        - requester
+      properties:
+        tier:
+          type: string
+        base_sha:
+          type: string
+          description: 40-char hex SHA the diff was taken against.
+        head_sha:
+          type: string
+          description: 40-char hex SHA of the session HEAD at dispatch time.
+        verdict:
+          $ref: "#/components/schemas/RefereeVerdict"
+        verdict_at:
+          type: string
+          format: date-time
+        dispatch_path:
+          $ref: "#/components/schemas/RefereeDispatchPath"
+        branch:
+          type: ["string", "null"]
+        synthetic:
+          type: boolean
+          description: true iff this run is a synthetic proof / training test.
+        score:
+          type: ["number", "null"]
+        valset_hash:
+          type: ["string", "null"]
+        error:
+          type: ["string", "null"]
+          description: Populated when verdict is `inconclusive`.
+        backfill_at:
+          type: string
+          format: date-time
+          description: When the backfill retro-score was produced.
+        requester:
+          type: string
+          description: Who produced the backfill row (e.g. `backfill-referee.sh`).
+
+    RunRegistrationRequest:
+      description: |
+        Request body for `POST /api/v1/runs/registrations`. The `origin`
+        field carries the source-specific payload; `run_id` is optional
+        (ULID is generated when absent). Re-registration with the same
+        `run_id` returns the existing run (idempotent).
+      type: object
+      required: [origin]
+      properties:
+        run_id:
+          type: string
+          description: Caller-supplied ULID. Re-registration returns the existing run.
+        origin:
+          $ref: "#/components/schemas/RunOriginDetails"
+        title:
+          type: ["string", "null"]
+        goal:
+          type: ["string", "null"]
+        summary:
+          type: ["string", "null"]
+        repository:
+          $ref: "#/components/schemas/RepositoryRef"
 
     RunLifecycle:
       type: object
