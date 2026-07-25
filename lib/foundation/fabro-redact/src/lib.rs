@@ -30,22 +30,6 @@ pub fn redacted_url_for_log(url: &str) -> String {
         .map_or_else(|_| "<invalid url>".to_string(), |url| url.redacted_string())
 }
 
-pub(crate) const REDACTION_MARKER: &str = "REDACTED";
-
-/// Redact a URL string for log or error output.
-///
-/// Returns the credential-redacted form when `url` parses as a URL, or a fixed
-/// `"<invalid url>"` placeholder when it does not. This is the one place log
-/// sites should reach for instead of re-rolling the
-/// [`DisplaySafeUrl::parse`] + [`DisplaySafeUrl::redacted_string`] fallback
-/// themselves, so an unparseable or credential-bearing URL never leaks into a
-/// log line.
-#[must_use]
-pub fn redacted_url_for_log(url: &str) -> String {
-    DisplaySafeUrl::parse(url)
-        .map_or_else(|_| "<invalid url>".to_string(), |url| url.redacted_string())
-}
-
 /// A byte range within a string that should be redacted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Region {
