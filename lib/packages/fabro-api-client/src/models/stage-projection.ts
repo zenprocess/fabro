@@ -15,6 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { AgentControlState } from './agent-control-state';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { AgentToolSummary } from './agent-tool-summary';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -28,6 +31,9 @@ import type { CommandTermination } from './command-termination';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { McpServerProjection } from './mcp-server-projection';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ParallelBranchResult } from './parallel-branch-result';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { PermissionLevel } from './permission-level';
@@ -75,9 +81,9 @@ export interface StageProjection {
      */
     'script_timing'?: object | null;
     /**
-     * Per-branch result objects produced by a parallel stage.
+     * Ordered per-branch results produced by a parallel stage.
      */
-    'parallel_results'?: Array<object> | null;
+    'parallel_results'?: Array<ParallelBranchResult> | null;
     'output'?: string | null;
     'output_bytes'?: number | null;
     'live_streaming'?: boolean | null;
@@ -108,6 +114,10 @@ export interface StageProjection {
      */
     'mcp_servers'?: Array<McpServerProjection>;
     'context_window'?: StageContextWindowProjection | null;
+    /**
+     * Whether the agent is executing normally or waiting for steering after an interrupt.
+     */
+    'agent_control': AgentControlState;
     /**
      * Lifecycle state of the stage projection.
      */

@@ -1,0 +1,541 @@
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::Context as _;
+pub use fabro_checkpoint::META_BRANCH_PREFIX;
+pub use fabro_checkpoint::author::GitAuthor;
+use fabro_checkpoint::git::Store;
+use fabro_types::WorkflowSettings;
+use tokio::task::{JoinError, spawn_blocking};
+use tokio::time::timeout;
+
+use crate::error::{Error, Result};
+
+/// Branch prefix for workflow run branches (e.g. `fabro/run/{run_id}`).
+pub const RUN_BRANCH_PREFIX: &str = "fabro/run/";
+
+pub fn git_author_from_settings(settings: &WorkflowSettings) -> GitAuthor {
+    settings
+        .run
+        .git
+        .author
+        .clone()
+        .map(|author| GitAuthor::from(&author))
+        .unwrap_or_default()
+}
+
+fn git_error(msg: impl Into<String>) -> Error {
+    Error::engine(msg.into())
+}
+
+/// Return a pre-configured `git` command with auto-maintenance disabled.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This shared synchronous git helper layer is used by sync code; async callers must wrap it in spawn_blocking."
+)]
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "maintenance.auto=0", "-c", "gc.auto=0"])
+        .current_dir(dir);
+    cmd
+}
+
+/// Assert the working directory is a clean git repo (no uncommitted changes).
+pub fn ensure_clean(repo: &Path) -> Result<()> {
+    tracing::debug!(path = %repo.display(), "Checking git cleanliness");
+    let output = git_cmd(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|e| Error::engine_with_source("git status failed", e))?;
+
+    if !output.status.success() {
+        return Err(git_error("not a git repository"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        return Err(git_error("working directory has uncommitted changes"));
+    }
+
+    Ok(())
+}
+
+/// Return the SHA of HEAD.
+pub fn head_sha(repo: &Path) -> Result<String> {
+    let output = git_cmd(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| Error::engine_with_source("git rev-parse failed", e))?;
+
+    if !output.status.success() {
+        return Err(git_error("git rev-parse HEAD failed"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run a `git push` command and check for success.
+fn run_git_push(cmd: &mut Command) -> Result<()> {
+    let output = cmd
+        .output()
+        .map_err(|e| Error::engine_with_source("git push failed", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(git_error(format!("git push failed: {stderr}")));
+    }
+    Ok(())
+}
+
+/// Push a local ref to an explicit remote URL.
+///
+/// Uses a URL (not a named remote) so the host repo's remote config is
+/// untouched. Disables credential helpers so only the inline URL credentials
+/// are used.
+pub fn push_ref(repo: &Path, url: &str, refname: &str) -> Result<()> {
+    let redacted_url = if let Some(at_pos) = url.find('@') {
+        format!("https://***@{}", &url[at_pos + 1..])
+    } else {
+        url.to_string()
+    };
+    tracing::info!(
+        repo_dir = %repo.display(),
+        url = %redacted_url,
+        refname,
+        "Pushing ref to remote"
+    );
+    run_git_push(git_cmd(repo).args(["-c", "credential.helper=", "push", url, refname]))
+}
+
+/// Push a local branch to the named remote using the user's configured
+/// credentials.
+pub fn push_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
+    tracing::info!(
+        repo_dir = %repo.display(),
+        remote,
+        branch,
+        "Pushing branch to remote"
+    );
+    run_git_push(git_cmd(repo).args(["push", remote, branch]))
+}
+
+/// Push a local branch to the named remote without allowing Git to prompt.
+pub fn push_branch_noninteractive(repo: &Path, remote: &str, branch: &str) -> Result<()> {
+    tracing::info!(
+        repo_dir = %repo.display(),
+        remote,
+        branch,
+        "Pushing branch to remote without terminal prompts"
+    );
+    run_git_push(
+        git_cmd(repo)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["push", remote, branch]),
+    )
+}
+
+/// Push run and metadata branches to origin if a remote tracking branch exists.
+///
+/// Callers supply pre-built refspecs so they control force-push (`+` prefix).
+#[allow(
+    clippy::print_stderr,
+    reason = "Git push status is operator feedback and should stay off stdout."
+)]
+pub fn push_run_branches(
+    store: &Store,
+    probe_branch: &str,
+    run_refspec: Option<&str>,
+    meta_refspec: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let repo_path = store.repo_dir();
+    let remote_ref = format!("refs/remotes/origin/{probe_branch}");
+    if store.repo().find_reference(&remote_ref).is_err() {
+        return Ok(());
+    }
+    eprintln!("Pushing {label} branches to origin...");
+    if let Some(refspec) = run_refspec {
+        push_branch(repo_path, "origin", refspec).context("failed to push run branch")?;
+    }
+    push_branch(repo_path, "origin", meta_refspec).context("failed to push metadata branch")?;
+    eprintln!("Remote refs updated.");
+    Ok(())
+}
+
+/// Error from [`blocking_push_with_timeout`].
+pub enum BlockingPushError {
+    /// The git push itself failed.
+    Push(Error),
+    /// The spawned blocking task panicked.
+    Panicked(JoinError),
+    /// The push did not complete within the timeout.
+    TimedOut,
+}
+
+impl std::fmt::Display for BlockingPushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push(e) => write!(f, "{e}"),
+            Self::Panicked(e) => write!(f, "task panicked: {e}"),
+            Self::TimedOut => write!(f, "timed out"),
+        }
+    }
+}
+
+/// Run a blocking git-push function with a timeout, flattening the
+/// triple-nested Result.
+pub async fn blocking_push_with_timeout<F>(
+    timeout_secs: u64,
+    f: F,
+) -> std::result::Result<(), BlockingPushError>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    match timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        spawn_blocking(f),
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(BlockingPushError::Push(e)),
+        Ok(Err(e)) => Err(BlockingPushError::Panicked(e)),
+        Err(_) => Err(BlockingPushError::TimedOut),
+    }
+}
+
+/// Returns true if the local branch has commits not yet on the remote.
+/// On any git error (no remote ref, detached HEAD, etc.), returns true
+/// so the caller falls back to pushing.
+pub fn branch_needs_push(repo: &Path, remote: &str, branch: &str) -> bool {
+    let local = git_cmd(repo)
+        .args(["rev-parse", &format!("refs/heads/{branch}")])
+        .output();
+    let remote_ref = git_cmd(repo)
+        .args(["rev-parse", &format!("refs/remotes/{remote}/{branch}")])
+        .output();
+    match (local, remote_ref) {
+        (Ok(l), Ok(r)) if l.status.success() && r.status.success() => l.stdout != r.stdout,
+        _ => true,
+    }
+}
+
+/// Tri-state summary of the local repository's readiness for a workflow run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitSyncStatus {
+    /// Working tree is clean and the branch is pushed to the remote.
+    Synced,
+    /// Working tree is clean but the branch has unpushed commits
+    /// (or push status could not be verified, e.g. detached HEAD).
+    Unsynced,
+    /// Working tree has uncommitted changes.
+    Dirty,
+}
+
+impl GitSyncStatus {
+    /// Whether the working tree has no uncommitted changes.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Synced | Self::Unsynced)
+    }
+}
+
+impl std::fmt::Display for GitSyncStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Synced => write!(f, "synced"),
+            Self::Unsynced => write!(f, "unsynced (unpushed commits)"),
+            Self::Dirty => write!(f, "dirty (uncommitted changes)"),
+        }
+    }
+}
+
+/// Determine the sync status of the repository relative to a remote.
+pub fn sync_status(repo: &Path, remote: &str, branch: Option<&str>) -> GitSyncStatus {
+    if ensure_clean(repo).is_err() {
+        return GitSyncStatus::Dirty;
+    }
+    match branch {
+        Some(b) if !branch_needs_push(repo, remote, b) => GitSyncStatus::Synced,
+        _ => GitSyncStatus::Unsynced,
+    }
+}
+
+/// Filenames allowed in per-node directories on the shadow branch.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests write git state fixtures to disk"
+)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use fabro_dump::RunDump;
+    use fabro_store::Database;
+    use fabro_types::{CommandTermination, StageModelUsage, fixtures, test_support};
+    use object_store::memory::InMemory;
+
+    use super::*;
+
+    /// Create a temporary git repo with an initial commit.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This synchronous test helper shells out to git while constructing fixture repositories."
+    )]
+    fn init_repo(dir: &Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+    }
+
+    fn test_store() -> Arc<Database> {
+        Arc::new(Database::new(
+            Arc::new(InMemory::new()),
+            "",
+            Duration::from_millis(1),
+            None,
+        ))
+    }
+
+    #[test]
+    fn ensure_clean_on_clean_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        assert!(ensure_clean(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn ensure_clean_fails_with_dirty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("dirty.txt"), "hello").unwrap();
+        let err = ensure_clean(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("uncommitted changes"));
+    }
+
+    #[test]
+    fn ensure_clean_fails_on_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ensure_clean(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not a git repository"));
+    }
+
+    #[test]
+    fn head_sha_returns_40_char_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let sha = head_sha(dir.path()).unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn scan_node_files_from_state_reconstructs_allowlisted_entries() {
+        use crate::event::{Event, append_event};
+
+        let store = test_store();
+        let run = store.create_run(&fixtures::RUN_1).await.unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::RunCreated {
+            run_id:           fixtures::RUN_1,
+            title:            None,
+            settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+                .unwrap(),
+            graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+            workflow_source:  None,
+            workflow_config:  None,
+            labels:           std::collections::BTreeMap::default(),
+            run_dir:          "/tmp".to_string(),
+            source_directory: None,
+            workflow_slug:    None,
+            automation:       None,
+            db_prefix:        None,
+            provenance:       test_support::test_run_provenance(),
+            manifest_blob:    None,
+            git:              None,
+            fork_source_ref:  None,
+            retried_from:     None,
+            parent_id:        None,
+            web_url:          None,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::Prompt {
+            stage:            "work".into(),
+            visit:            2,
+            text:             "hello".into(),
+            mode:             Some(StageModelUsage::MODE_PROMPT.to_string()),
+            provider:         Some("openai".into()),
+            model:            Some("gpt-5.4".into()),
+            reasoning_effort: None,
+            speed:            None,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::PromptCompleted {
+            node_id:  "work".into(),
+            response: "world".into(),
+            model:    "gpt-5.4".into(),
+            provider: "openai".into(),
+            billing:  None,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::StageCompleted {
+            node_id: "work".into(),
+            name: "Work".into(),
+            index: 2,
+            timing: fabro_types::StageTiming::wall_only(100),
+            status: "succeeded".into(),
+            preferred_label: None,
+            suggested_next_ids: Vec::new(),
+            billing: None,
+            failure: None,
+            notes: None,
+            files_touched: Vec::new(),
+            context_updates: None,
+            jump_to_node: None,
+            context_values: None,
+            node_visits: Some(std::collections::BTreeMap::from([("work".into(), 2)])),
+            loop_failure_signatures: None,
+            restart_failure_signatures: None,
+            response: Some("world".into()),
+            attempt: 1,
+            max_attempts: 1,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::CommandStarted {
+            node_id:    "work".into(),
+            script:     "echo hi".into(),
+            command:    "echo hi".into(),
+            language:   "shell".into(),
+            timeout_ms: None,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::CommandCompleted {
+            node_id:        "work".into(),
+            output:         "hi\n".into(),
+            exit_code:      Some(0),
+            duration_ms:    10,
+            termination:    CommandTermination::Exited,
+            output_bytes:   3,
+            live_streaming: true,
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::ParallelCompleted {
+            node_id:       "work".into(),
+            visit:         2,
+            duration_ms:   100,
+            success_count: 1,
+            failure_count: 0,
+            results:       vec![fabro_types::ParallelBranchResult {
+                id:              "a".to_string(),
+                status:          fabro_types::StageOutcome::Succeeded,
+                context_updates: std::collections::BTreeMap::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
+            node_id: "work".into(),
+            status: "succeeded".into(),
+            current_node: "work".into(),
+            completed_nodes: Vec::new(),
+            node_retries: std::collections::BTreeMap::new(),
+            context_values: std::collections::BTreeMap::new(),
+            node_outcomes: std::collections::BTreeMap::new(),
+            next_node_id: None,
+            git_commit_sha: None,
+            loop_failure_signatures: std::collections::BTreeMap::new(),
+            restart_failure_signatures: std::collections::BTreeMap::new(),
+            node_visits: std::collections::BTreeMap::from([("work".into(), 2)]),
+            diff: Some("diff --git a/story.txt b/story.txt".into()),
+            diff_summary: None,
+        })
+        .await
+        .unwrap();
+
+        let state = run.state().await.unwrap();
+        let files = RunDump::from_projection(&state)
+            .unwrap()
+            .git_entries()
+            .unwrap();
+        let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(paths.contains(&"stages/001-work@2/prompt.md"));
+        assert!(paths.contains(&"stages/001-work@2/response.md"));
+        assert!(paths.contains(&"stages/001-work@2/status.json"));
+        assert!(paths.contains(&"stages/001-work@2/provider_used.json"));
+        assert!(paths.contains(&"stages/001-work@2/script_invocation.json"));
+        assert!(paths.contains(&"stages/001-work@2/script_timing.json"));
+        assert!(paths.contains(&"stages/001-work@2/parallel_results.json"));
+    }
+
+    #[test]
+    fn push_branch_fails_for_nonexistent_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let result = push_branch(dir.path(), "nonexistent", "main");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn push_run_branches_preserves_push_error_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/remotes/origin/main", head, true, "test")
+            .unwrap();
+        let store = Store::new(repo);
+
+        let err = push_run_branches(&store, "main", Some("main"), "fabro/meta/test-run", "test")
+            .unwrap_err();
+        let chain = err.chain().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(
+            chain
+                .iter()
+                .any(|cause| cause.contains("failed to push run branch")),
+            "expected push context in chain, got {chain:#?}"
+        );
+        assert!(
+            chain.len() >= 2,
+            "expected push source to be preserved, got {chain:#?}"
+        );
+        assert!(
+            chain.iter().any(|cause| cause.contains("git push failed")),
+            "expected git source in chain, got {chain:#?}"
+        );
+    }
+
+    #[test]
+    fn branch_needs_push_when_no_remote_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path();
+
+        init_repo(repo_dir);
+
+        // No remote at all — should return true (safe default)
+        assert!(branch_needs_push(repo_dir, "origin", "main"));
+    }
+}

@@ -1,0 +1,735 @@
+//! Streaming decoder: Chat Completions SSE chunks → canonical `StreamEvent`s.
+//!
+//! Byte reading and `data:` framing live in the transport; this decoder is fed
+//! already-stripped payloads (including the `[DONE]` sentinel) via `on_event`.
+
+use super::translate::{map_finish_reason, parse_tool_arguments, ThinkStrip};
+use super::wire::{AccumulatedToolCall, StreamChunk};
+use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
+use crate::error::Error;
+use crate::types::{
+    ContentPart, FinishReason, Message, RateLimitInfo, Response, Role, StreamEvent, ThinkingData,
+    TokenCounts, ToolCall,
+};
+
+/// Accumulated state while decoding the Chat Completions SSE stream.
+pub(super) struct StreamState {
+    provider_name:         String,
+    model:                 String,
+    response_id:           String,
+    response_model:        String,
+    accumulated_text:      String,
+    accumulated_reasoning: String,
+    tool_calls:            Vec<AccumulatedToolCall>,
+    usage:                 TokenCounts,
+    finish_reason:         FinishReason,
+    text_started:          bool,
+    custom_tool_names:     Vec<String>,
+    /// True after `finish_events()` has run (guards against duplicates).
+    finished:              bool,
+    rate_limit:            Option<RateLimitInfo>,
+    /// In-band USD cost from the usage chunk (OpenRouter), surfaced as
+    /// authoritative on the final response.
+    cost_usd:              Option<f64>,
+    /// Stateful `<think>...</think>` prefix stripper. Applied to every
+    /// `delta.content` chunk on this codec because some reasoning models
+    /// (minimax, kimi/zai/glm/deepseek reasoning variants) emit their
+    /// reasoning inline in the content stream rather than on a dedicated
+    /// `reasoning_content` channel. Stripped reasoning is appended to
+    /// `accumulated_reasoning` (the existing `ContentPart::Thinking` slot).
+    think_strip:           ThinkStrip,
+}
+
+impl StreamState {
+    pub(super) fn new(ctx: &CodecCtx<'_>, rate_limit: Option<RateLimitInfo>) -> Self {
+        Self {
+            provider_name: ctx.provider_name.to_string(),
+            model: ctx.request.model.clone(),
+            response_id: String::new(),
+            response_model: String::new(),
+            accumulated_text: String::new(),
+            accumulated_reasoning: String::new(),
+            tool_calls: Vec::new(),
+            usage: TokenCounts::default(),
+            finish_reason: FinishReason::Stop,
+            text_started: false,
+            custom_tool_names: super::translate::custom_tool_names(ctx.request),
+            finished: false,
+            rate_limit,
+            cost_usd: None,
+            think_strip: ThinkStrip::new(),
+        }
+    }
+
+    /// Process a parsed SSE chunk and return events to emit, if any.
+    fn process_chunk(&mut self, chunk: &StreamChunk) -> Option<Vec<StreamEvent>> {
+        // Capture response metadata from the first chunk.
+        if let Some(id) = &chunk.id {
+            if self.response_id.is_empty() {
+                self.response_id.clone_from(id);
+            }
+        }
+        if let Some(model) = &chunk.model {
+            if self.response_model.is_empty() {
+                self.response_model.clone_from(model);
+            }
+        }
+
+        // Capture usage if present (often in a dedicated chunk).
+        if let Some(usage) = &chunk.usage {
+            self.usage = usage.token_counts();
+            // Keep a previously seen cost when a later usage chunk omits it.
+            self.cost_usd = usage.cost.or(self.cost_usd);
+        }
+
+        let choices = chunk.choices.as_ref()?;
+        let choice = choices.first()?;
+
+        let mut events = Vec::new();
+
+        // Check for finish_reason.
+        if let Some(reason) = &choice.finish_reason {
+            self.finish_reason = map_finish_reason(Some(reason.as_str()));
+        }
+
+        let delta = choice.delta.as_ref()?;
+
+        // Accumulate reasoning/thinking content (Kimi, etc.).
+        if let Some(reasoning) = delta.reasoning() {
+            if !reasoning.is_empty() {
+                self.accumulated_reasoning.push_str(reasoning);
+            }
+        }
+
+        // Handle text content delta. The stripper is always active on this
+        // codec; it is a no-op for models that do not emit a leading
+        // `<think>` reasoning prefix.
+        if let Some(content) = &delta.content {
+            if !content.is_empty() {
+                let visible = self.think_strip.process(content);
+                if !visible.is_empty() {
+                    if !self.text_started {
+                        self.text_started = true;
+                        events.push(StreamEvent::TextStart { text_id: None });
+                    }
+                    self.accumulated_text.push_str(&visible);
+                    events.push(StreamEvent::text_delta(&visible, None));
+                }
+            }
+        }
+
+        // Handle tool call deltas.
+        if let Some(tool_calls) = &delta.tool_calls {
+            for tc in tool_calls {
+                let index = tc.index;
+
+                // Grow the accumulated tool calls vector if needed.
+                while self.tool_calls.len() <= index {
+                    self.tool_calls.push(AccumulatedToolCall {
+                        id:        String::new(),
+                        name:      String::new(),
+                        arguments: String::new(),
+                        started:   false,
+                    });
+                }
+
+                let accumulated = &mut self.tool_calls[index];
+
+                // First chunk for this tool call carries id and name.
+                if let Some(id) = &tc.id {
+                    accumulated.id.clone_from(id);
+                }
+                if let Some(func) = &tc.function {
+                    if let Some(name) = &func.name {
+                        accumulated.name.clone_from(name);
+                    }
+                    if let Some(args) = &func.arguments {
+                        accumulated.arguments.push_str(args);
+                    }
+                }
+
+                let partial_tool_call =
+                    ToolCall::new(&accumulated.id, &accumulated.name, serde_json::json!(null));
+
+                if accumulated.started {
+                    events.push(StreamEvent::ToolCallDelta {
+                        tool_call: partial_tool_call,
+                    });
+                } else {
+                    accumulated.started = true;
+                    events.push(StreamEvent::ToolCallStart {
+                        tool_call: partial_tool_call,
+                    });
+                }
+            }
+        }
+
+        if events.is_empty() {
+            None
+        } else {
+            Some(events)
+        }
+    }
+
+    /// Generate the final events when `[DONE]` (or end-of-stream) is received.
+    fn finish_events(&mut self) -> Vec<StreamEvent> {
+        self.finished = true;
+        let mut events = Vec::new();
+
+        // Flush any bytes held in the tail buffer (covers an unclosed
+        // `<think>` from a truncated stream). Bytes held while inside a
+        // reasoning block are merged into `accumulated_reasoning` below via
+        // `take_reasoning`; any other tail is real visible output (leading
+        // whitespace and/or a partial `<think` opener that never completed)
+        // and must be surfaced, mirroring the non-streaming
+        // `strip_think_prefix` path.
+        let tail = self.think_strip.finish();
+        if !tail.is_empty() {
+            if !self.text_started {
+                self.text_started = true;
+                events.push(StreamEvent::TextStart { text_id: None });
+            }
+            self.accumulated_text.push_str(&tail);
+            events.push(StreamEvent::text_delta(&tail, None));
+        }
+
+        // End text segment if it was started.
+        if self.text_started {
+            events.push(StreamEvent::TextEnd { text_id: None });
+        }
+
+        let mut content_parts = Vec::new();
+
+        // Merge any inline `<think>...</think>` reasoning captured by the
+        // stripper into the same accumulation as the provider's proper
+        // `reasoning_content` channel. Both are surfaced as a single
+        // `ContentPart::Thinking` in the final response.
+        let stripped = self.think_strip.take_reasoning();
+        if !stripped.is_empty() {
+            self.accumulated_reasoning.push_str(&stripped);
+        }
+
+        // Include reasoning/thinking content if present (Kimi, etc.).
+        if !self.accumulated_reasoning.is_empty() {
+            content_parts.push(ContentPart::Thinking(ThinkingData {
+                text:      std::mem::take(&mut self.accumulated_reasoning),
+                signature: None,
+                redacted:  false,
+            }));
+        }
+
+        if !self.accumulated_text.is_empty() {
+            content_parts.push(ContentPart::text(&self.accumulated_text));
+        }
+
+        for accumulated in &self.tool_calls {
+            let arguments = parse_tool_arguments(
+                &accumulated.name,
+                &accumulated.arguments,
+                &self.custom_tool_names,
+            );
+            let mut tool_call = ToolCall::new(&accumulated.id, &accumulated.name, arguments);
+            tool_call.raw_arguments = Some(accumulated.arguments.clone());
+
+            events.push(StreamEvent::ToolCallEnd {
+                tool_call: tool_call.clone(),
+            });
+            content_parts.push(ContentPart::ToolCall(tool_call));
+        }
+
+        // Infer finish reason from tool calls if not explicitly set.
+        if !self.tool_calls.is_empty() && self.finish_reason == FinishReason::Stop {
+            self.finish_reason = FinishReason::ToolCalls;
+        }
+
+        let response_model = if self.response_model.is_empty() {
+            self.model.clone()
+        } else {
+            self.response_model.clone()
+        };
+
+        let response = Response {
+            id:            self.response_id.clone(),
+            model:         response_model,
+            provider:      self.provider_name.clone(),
+            message:       Message {
+                role:         Role::Assistant,
+                content:      content_parts,
+                name:         None,
+                tool_call_id: None,
+            },
+            finish_reason: self.finish_reason.clone(),
+            usage:         self.usage.clone(),
+            raw:           None,
+            warnings:      vec![],
+            rate_limit:    self.rate_limit.clone(),
+            cost_usd:      self.cost_usd,
+            cost_source:   super::translate::authoritative_cost_source(self.cost_usd),
+        };
+
+        events.push(StreamEvent::finish(
+            self.finish_reason.clone(),
+            self.usage.clone(),
+            response,
+        ));
+
+        events
+    }
+}
+
+impl StreamDecoder for StreamState {
+    fn on_event(&mut self, ev: RawEvent<'_>) -> Result<Vec<StreamEvent>, Error> {
+        // Chat Completions uses data-only framing; the `event:` field is unused.
+        if ev.data == "[DONE]" {
+            return Ok(self.finish_events());
+        }
+
+        let chunk: StreamChunk = serde_json::from_str(ev.data)
+            .map_err(|e| Error::stream_error(format!("failed to parse SSE chunk: {e}"), e))?;
+
+        Ok(self.process_chunk(&chunk).unwrap_or_default())
+    }
+
+    fn finish(&mut self) -> Vec<StreamEvent> {
+        // Stream ended without `[DONE]`. Some providers (e.g. Minimax) omit the
+        // sentinel; emit accumulated finish events if we have content and
+        // haven't already finished. Also fire when the `<think>` stripper
+        // captured reasoning that would otherwise be lost (e.g. a truncated
+        // stream that opened a reasoning block but never closed it).
+        if !self.finished
+            && (self.text_started
+                || !self.tool_calls.is_empty()
+                || self.think_strip.has_pending())
+        {
+            self.finish_events()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::CodecParams;
+    use crate::types::Request;
+
+    /// Build a decoder through `StreamState::new` (with a minimal request) for
+    /// unit tests that drive `process_chunk` / `finish_events`.
+    fn test_state(provider: &str, model: &str) -> StreamState {
+        let request = Request {
+            model:            model.to_string(),
+            messages:         Vec::new(),
+            provider:         None,
+            tools:            None,
+            tool_choice:      None,
+            response_format:  None,
+            temperature:      None,
+            top_p:            None,
+            max_tokens:       None,
+            stop_sequences:   None,
+            reasoning_effort: None,
+            speed:            None,
+            metadata:         None,
+            provider_options: None,
+        };
+        let params = CodecParams::default();
+        let ctx = CodecCtx {
+            request:       &request,
+            provider_name: provider,
+            deployment_id: model,
+            model:         None,
+            params:        &params,
+        };
+        StreamState::new(&ctx, None)
+    }
+
+    #[test]
+    fn stream_chunk_minimax_format() {
+        let json = r#"{"id":"abc","choices":[{"index":0,"delta":{"content":"hello","role":"assistant","name":"MiniMax AI","audio_content":""}}],"created":1772268546,"model":"MiniMax-M2.5","object":"chat.completion.chunk","usage":null,"input_sensitive":false,"output_sensitive":false}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let choices = chunk.choices.unwrap();
+        let delta = choices[0].delta.as_ref().unwrap();
+        assert_eq!(delta.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn stream_chunk_text_delta_parsing() {
+        let json = r#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.id.as_deref(), Some("chatcmpl-1"));
+        assert_eq!(chunk.model.as_deref(), Some("gpt-4"));
+        let choices = chunk.choices.unwrap();
+        assert_eq!(choices.len(), 1);
+        let delta = choices[0].delta.as_ref().unwrap();
+        assert_eq!(delta.content.as_deref(), Some("Hello"));
+        assert!(choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn stream_chunk_tool_call_parsing() {
+        let json = r#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"ci"}}]},"finish_reason":null}]}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let choices = chunk.choices.unwrap();
+        let delta = choices[0].delta.as_ref().unwrap();
+        let tc = &delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.index, 0);
+        assert_eq!(tc.id.as_deref(), Some("call_1"));
+        let func = tc.function.as_ref().unwrap();
+        assert_eq!(func.name.as_deref(), Some("get_weather"));
+        assert_eq!(func.arguments.as_deref(), Some("{\"ci"));
+    }
+
+    #[test]
+    fn stream_chunk_usage_parsing() {
+        let json = r#"{"id":"chatcmpl-1","model":"gpt-4","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+    }
+
+    #[test]
+    fn stream_chunk_finish_reason_parsing() {
+        let json = r#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let choices = chunk.choices.unwrap();
+        assert_eq!(choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn process_text_chunks() {
+        let mut state = test_state("test", "model");
+
+        let chunk1: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+        ).unwrap();
+        let events1 = state.process_chunk(&chunk1).unwrap();
+        assert_eq!(events1.len(), 2);
+        assert!(matches!(events1[0], StreamEvent::TextStart { .. }));
+        assert!(matches!(events1[1], StreamEvent::TextDelta { .. }));
+
+        let chunk2: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#,
+        ).unwrap();
+        let events2 = state.process_chunk(&chunk2).unwrap();
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(events2[0], StreamEvent::TextDelta { .. }));
+
+        assert_eq!(state.accumulated_text, "Hello world");
+    }
+
+    #[test]
+    fn process_tool_call_chunks() {
+        let mut state = test_state("test", "model");
+
+        let chunk1: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fn1","arguments":"{\"k"}}]},"finish_reason":null}]}"#,
+        ).unwrap();
+        let events1 = state.process_chunk(&chunk1).unwrap();
+        assert_eq!(events1.len(), 1);
+        assert!(matches!(events1[0], StreamEvent::ToolCallStart { .. }));
+
+        let chunk2: StreamChunk = serde_json::from_str(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ey\"}"}}]},"finish_reason":null}]}"#,
+        ).unwrap();
+        let events2 = state.process_chunk(&chunk2).unwrap();
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(events2[0], StreamEvent::ToolCallDelta { .. }));
+
+        assert_eq!(state.tool_calls[0].arguments, r#"{"key"}"#);
+    }
+
+    #[test]
+    fn finish_events_text_only() {
+        let mut state = test_state("test-provider", "test-model");
+        state.response_id = "resp-1".into();
+        state.response_model = "gpt-4".into();
+        state.accumulated_text = "Hello world".into();
+        state.text_started = true;
+        state.usage = TokenCounts {
+            input_tokens: 5,
+            output_tokens: 10,
+            ..TokenCounts::default()
+        };
+
+        let events = state.finish_events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::TextEnd { .. }));
+        match &events[1] {
+            StreamEvent::Finish {
+                finish_reason,
+                usage,
+                response,
+            } => {
+                assert_eq!(*finish_reason, FinishReason::Stop);
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 10);
+                assert_eq!(response.text(), "Hello world");
+                assert_eq!(response.id, "resp-1");
+                assert_eq!(response.model, "gpt-4");
+                assert_eq!(response.provider, "test-provider");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_events_with_tool_calls() {
+        let mut state = test_state("test", "model");
+        state.response_id = "resp-1".into();
+        state.tool_calls.push(AccumulatedToolCall {
+            id:        "call_1".into(),
+            name:      "get_weather".into(),
+            arguments: r#"{"city":"SF"}"#.into(),
+            started:   true,
+        });
+
+        let events = state.finish_events();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            StreamEvent::ToolCallEnd { tool_call } => {
+                assert_eq!(tool_call.id, "call_1");
+                assert_eq!(tool_call.name, "get_weather");
+                assert_eq!(tool_call.raw_arguments.as_deref(), Some(r#"{"city":"SF"}"#));
+            }
+            other => panic!("Expected ToolCallEnd, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::Finish {
+                finish_reason,
+                response,
+                ..
+            } => {
+                assert_eq!(*finish_reason, FinishReason::ToolCalls);
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "get_weather");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uses_request_model_as_fallback() {
+        let mut state = test_state("test", "fallback-model");
+        let events = state.finish_events();
+        match &events[0] {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.model, "fallback-model");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    // --- think-strip integration tests (streaming path) ---
+
+    /// Parse a JSON string into a `StreamChunk` for the streaming tests.
+    fn chunk_from(json: &str) -> StreamChunk {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Raw SSE `data:` JSON payload for a single-content-delta chunk, for
+    /// tests that drive the decoder through `on_event` directly.
+    fn content_chunk_json(content: &str) -> String {
+        format!(
+            r#"{{"id":"c1","model":"m1","choices":[{{"delta":{{"content":{content}}},"finish_reason":null}}]}}"#,
+            content = serde_json::Value::String(content.to_string()),
+        )
+    }
+
+    fn content_chunk(content: &str) -> StreamChunk {
+        chunk_from(&content_chunk_json(content))
+    }
+
+    #[test]
+    fn stream_strips_multi_delta_think_prefix() {
+        // Reproduces the live minimax emission pattern: `<think>` opens in
+        // delta 1, the reasoning body and closing tag straddle later
+        // deltas, and the visible answer arrives after the closing tag.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let e1 = state
+            .process_chunk(&content_chunk("<think>\nThe user"))
+            .unwrap_or_default();
+        assert!(
+            e1.is_empty(),
+            "no visible events while inside the think prefix, got {e1:?}"
+        );
+
+        let e2 = state
+            .process_chunk(&content_chunk(" said hello</think>"))
+            .unwrap_or_default();
+        assert!(
+            e2.is_empty(),
+            "still no visible events until after the close tag, got {e2:?}"
+        );
+
+        let e3 = state
+            .process_chunk(&content_chunk("\n\nThe answer is 42."))
+            .expect("visible answer chunk should produce events");
+        assert_eq!(e3.len(), 2, "TextStart + one TextDelta, got {e3:?}");
+        assert!(matches!(e3[0], StreamEvent::TextStart { .. }));
+        match &e3[1] {
+            StreamEvent::TextDelta { delta, .. } => {
+                assert_eq!(delta, "\n\nThe answer is 42.");
+            }
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+
+        let events = state.finish_events();
+        assert_eq!(events.len(), 2, "TextEnd + Finish, got {events:?}");
+        assert!(matches!(events[0], StreamEvent::TextEnd { .. }));
+        match &events[1] {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "\n\nThe answer is 42.");
+                let reasoning = response
+                    .reasoning()
+                    .expect("stripped reasoning should be surfaced");
+                assert_eq!(reasoning, "\nThe user said hello");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_unclosed_think_is_captured_as_reasoning() {
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let events = state
+            .process_chunk(&content_chunk("<think>never closed"))
+            .unwrap_or_default();
+        assert!(events.is_empty(), "no visible events, got {events:?}");
+
+        // Stream ends without `[DONE]`; the decoder's `finish()` path
+        // synthesises a `Finish` when content started.
+        let finish = state.finish();
+        match finish.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "");
+                let reasoning = response
+                    .reasoning()
+                    .expect("unclosed think should still surface as reasoning");
+                assert_eq!(reasoning, "never closed");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_bare_partial_think_opener_is_surfaced_as_visible_tail() {
+        // A stream whose entire content is a partial `<think` opener that
+        // never completes (and never closes) must not silently drop those
+        // bytes: `finish_events()` flushes the tail buffer as visible text,
+        // matching non-streaming `strip_think_prefix` on identical input.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  &content_chunk_json("<think"),
+            })
+            .unwrap();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state
+            .on_event(RawEvent {
+                event: None,
+                data:  "[DONE]",
+            })
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "TextStart + TextDelta (tail) + TextEnd + Finish, got {events:?}"
+        );
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        match &events[1] {
+            StreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "<think"),
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+        assert!(matches!(events[2], StreamEvent::TextEnd { .. }));
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "<think");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_whitespace_only_content_parity() {
+        // Whitespace-only content held in the `Prefix` state's tail buffer
+        // is real visible output (no `<think>` opener ever arrived) and must
+        // be surfaced verbatim, matching non-streaming decode of the same
+        // content.
+        let mut state = test_state("minimax", "minimax-m2.5");
+
+        let events = state
+            .process_chunk(&content_chunk("   "))
+            .unwrap_or_default();
+        assert!(events.is_empty(), "no visible events yet, got {events:?}");
+
+        let events = state.finish_events();
+        match events.last().expect("Finish event expected") {
+            StreamEvent::Finish { response, .. } => {
+                assert_eq!(response.text(), "   ");
+            }
+            other => panic!("Expected Finish, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_no_think_passthrough_is_unchanged() {
+        let mut state = test_state("openai-compatible", "gpt-4");
+        let events = state.process_chunk(&content_chunk("Hello world")).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        match &events[1] {
+            StreamEvent::TextDelta { delta, .. } => assert_eq!(delta, "Hello world"),
+            other => panic!("Expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_mid_content_literal_think_is_not_stripped() {
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let e1 = state
+            .process_chunk(&content_chunk("Here is how you write <think>"))
+            .expect("chunk 1 should emit events (visible text before <think>)");
+        let e2 = state
+            .process_chunk(&content_chunk(" in plain text"))
+            .expect("chunk 2 should emit a TextDelta");
+
+        // Both deltas contain visible text — the literal `<think>` must
+        // pass through and be surfaced verbatim.
+        let combined: String = e1
+            .iter()
+            .chain(e2.iter())
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(combined, "Here is how you write <think> in plain text");
+        assert!(
+            state.accumulated_reasoning.is_empty(),
+            "no reasoning should be captured, got {:?}",
+            state.accumulated_reasoning
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_deltas_are_unaffected_by_stripper() {
+        // Tool-call deltas never go through the content channel, but
+        // make sure the stripper does not interfere with mixed chunks.
+        let mut state = test_state("minimax", "minimax-m2.5");
+        let chunk = chunk_from(
+            r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fn1","arguments":"{\"k"}}]},"finish_reason":null}]}"#,
+        );
+        let events = state.process_chunk(&chunk).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::ToolCallStart { .. }));
+        assert!(state.accumulated_text.is_empty());
+        assert!(state.accumulated_reasoning.is_empty());
+    }
+}
