@@ -1,0 +1,97 @@
+# =============================================================================
+# gate-health-probe.service — runs the gate-health-probe.sh script.
+#
+# INDEPENDENCE NOTE (load-bearing):
+#   forkd-ec.service ALREADY owns forkd-ec-boot-dellsrv.sh and is
+#   enabled+active. This service does NOT Require= or After= that unit.
+#   We add a soft After= for boot ordering so the probe does not race
+#   forkd-ec at first boot, but we deliberately do NOT depend on it:
+#   the probe must keep running even if the supervision unit is
+#   misconfigured, because the probe is the canary that tells us when
+#   something is wrong. Coupling the canary to the thing it watches
+#   defeats the purpose.
+#
+#   We DO depend on docker.service: the probe executes via
+#   `docker exec forkd sh`, so the docker daemon must be live.
+#
+# WHAT THIS DOES
+#   Runs scripts/ops/dellsrv-forkd-supervision/gate-health-probe.sh.
+#   The script itself does the work; this unit is just the trigger
+#   shape. Its stderr is journald; the script emits structured
+#   `FORKD-GATE-ALERT` / `FORKD-GATE-HEAL` lines that operators grep
+#   for.
+#
+# HEAL VS ALERT
+#   By default this unit runs the probe in ALERT mode (no auto-heal).
+#   Operators can flip to heal mode by editing the unit to pass
+#   --heal (see README.md for the rationale — auto-heal that masks
+#   a recurring fault is its own hazard, so the default is loud
+#   alert-only and heal is opt-in).
+#
+# DEPLOY (on dellsrv)
+#   sudo install -m 0755 scripts/ops/dellsrv-forkd-supervision/gate-health-probe.sh \
+#       /usr/local/sbin/gate-health-probe.sh
+#   sudo install -m 0644 scripts/ops/dellsrv-forkd-supervision/gate-health-probe.service \
+#       /etc/systemd/system/gate-health-probe.service
+#   sudo install -m 0644 scripts/ops/dellsrv-forkd-supervision/gate-health-probe.timer \
+#       /etc/systemd/system/gate-health-probe.timer
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gate-health-probe.timer
+#   sudo systemctl list-timers gate-health-probe.timer
+#
+# ROLLBACK (does not touch the gate)
+#   sudo systemctl disable --now gate-health-probe.timer
+#   sudo systemctl stop gate-health-probe.service  # idempotent if idle
+#   This stops the periodic probe ONLY. The forkd controller and
+#   forkd-ec.service are unaffected. To remove the unit files
+#   entirely: `sudo rm /etc/systemd/system/gate-health-probe.{service,timer}`
+#   followed by `sudo systemctl daemon-reload`.
+# =============================================================================
+
+[Unit]
+Description=forkd gate health probe (exercises per_child_netns=true sandbox path)
+Documentation=https://internal/forkd/probe
+
+# Soft ordering only — see INDEPENDENCE NOTE above.
+After=docker.service forkd-ec.service
+# Hard dependency on docker only. NOT on forkd-ec.service — the probe
+# is the canary and must keep running when the thing it watches is
+# broken; that's how we get an alert.
+Requires=docker.service
+
+[Service]
+Type=oneshot
+
+# Token handling: the script reads /etc/forkd-token INSIDE the forkd
+# docker container via `cat`, never from the host argv. The probe
+# script's heredoc-based in_container_curl keeps the token value in
+# an in-container shell variable. The host's process table never
+# sees the token. No EnvironmentFile is needed here; the script
+# defaults FORKD_TOKEN_FILE=/etc/forkd-token which is valid inside
+# the container.
+ExecStart=/usr/local/sbin/gate-health-probe.sh
+
+# The probe is short-lived (seconds). Cap at 5 minutes so a stuck
+# `docker exec` cannot pin the unit indefinitely.
+TimeoutStartSec=300
+
+# Run as root — only root can `docker exec` into the forkd container.
+# The script does NOT take secrets from argv; see header comment.
+User=root
+Group=root
+
+# Hardening: no new privs, private /tmp. The script does need
+# filesystem access to the install path, so ProtectSystem is left
+# at the default (not strict).
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Log everything to journald. The script's FORKD-GATE-ALERT /
+# FORKD-GATE-HEAL lines are greppable via:
+#   journalctl -t gate-health-probe
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gate-health-probe
+
+[Install]
+WantedBy=multi-user.target
