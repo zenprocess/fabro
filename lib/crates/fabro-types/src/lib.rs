@@ -27,6 +27,7 @@ pub mod run_blob_id;
 pub mod run_event;
 pub mod run_failure;
 pub mod run_id;
+pub mod run_origin;
 pub mod run_projection;
 pub mod run_sandbox;
 pub mod run_summary;
