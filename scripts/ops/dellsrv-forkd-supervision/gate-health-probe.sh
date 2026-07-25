@@ -29,6 +29,15 @@
 #      `missing field snapshot_tag`, which does NOT match the netns
 #      failure regex and would silently kill the probe with a wrong
 #      reason on every run.
+#
+#   2. Scrape the sandbox id IMMEDIATELY (before any die()) so the
+#      EXIT trap can always clean up if the controller actually
+#      created a sandbox. Verified live 2026-07-25: the create
+#      response is a JSON ARRAY of one object, e.g.
+#          [{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]
+#      so we query `.[0].id` (not `.id`). The scrape_field helper
+#      also falls back to alternative field names and a regex
+#      escape hatch for non-JSON / shape-change resilience.
 #   2. Inspect the response. If it carries the netns-failure signature
 #      ('Invalid argument' / 'socket never appeared'), ALERT (or, with
 #      --heal, attempt the documented teardown+setup repair).
@@ -76,8 +85,16 @@ HEAL_ON_NETNS_FAILURE=0
 # If the controller uses different names (e.g. sandboxId, exitCode), the
 # parse step will fail LOUD with the raw response — that is the intended
 # signal: don't silently mis-detect.
-SANDBOX_ID_FIELD=".id"
-EXIT_CODE_FIELD=".exit_code"
+#
+# Verified live on dellsrv 2026-07-25: the create endpoint returns a
+# JSON ARRAY of one object, not a bare object. e.g.
+#     [{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]
+# scrape_field (below) handles the array wrapping via `.[0].<field>`.
+# These names are the INNER field names; the helper prepends `.[0].`.
+SANDBOX_ID_FIELD="id"
+EXIT_CODE_FIELD="exit_code"
+SANDBOX_ID_FALLBACKS=(sandbox_id sandboxId ID)
+EXIT_CODE_FALLBACKS=(exitCode code status)
 
 # ---------- args ----------
 usage() {
@@ -149,6 +166,65 @@ curl -sS -X ${method@Q} ${FORKD_API_BASE@Q}${path_q} \\
 EOF
 }
 
+# scrape_field extracts a field from a controller API response.
+#
+# Verified live on dellsrv 2026-07-25: the create endpoint returns
+# a JSON ARRAY of one object, not a bare object. e.g.
+#     [{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]
+# So `.id` yields nothing — we MUST query `.[0].id`. This helper
+# builds the path with the array wrapper.
+#
+# Strategy (in order):
+#   1. jq `.[0].<primary>` — the verified shape
+#   2. jq `.[0].<alt>` for each fallback name (do NOT include the
+#      primary in the fallbacks — caller passes them separately)
+#   3. raw regex grep `"<primary>":"<value>"` as escape hatch — if
+#      jq fails (malformed JSON, server returned HTML, response shape
+#      changed) we still get something usable. False-positive risk is
+#      low: an id-shaped token at the top of a controller response is
+#      almost always the id.
+#
+# Args:
+#   $1 = response body
+#   $2 = primary field name (no leading dot)
+#   $3.. = fallback field names
+# Stdout: extracted value, or nothing.
+# Return: 0 on extraction, 1 if nothing found.
+scrape_field() {
+    local response="$1" primary="$2"; shift 2
+    local value
+
+    # 1. primary path: .[0].<primary>
+    value="$(printf '%s' "$response" | jq -r ".[0].${primary} // empty" 2>/dev/null || true)"
+    if [ -n "$value" ] && [ "$value" != "null" ]; then
+        printf '%s' "$value"
+        return 0
+    fi
+
+    # 2. fallbacks: .[0].<alt>
+    for alt in "$@"; do
+        value="$(printf '%s' "$response" | jq -r ".[0].${alt} // empty" 2>/dev/null || true)"
+        if [ -n "$value" ] && [ "$value" != "null" ]; then
+            log "WARN: scraped field from fallback name '$alt' (update primary if this is canonical)"
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+
+    # 3. regex escape hatch. Pattern matches the first occurrence of
+    # `"<primary>":"<value>"` anywhere in the response. Greedy enough
+    # to survive non-JSON / malformed JSON.
+    value="$(printf '%s' "$response" | grep -oE "\"${primary}\":\"[^\"]+\"" \
+             | head -1 | sed -E "s/^\"${primary}\":\"([^\"]+)\"/\1/")"
+    if [ -n "$value" ]; then
+        log "WARN: scraped field via regex escape hatch (jq path failed for '$primary')"
+        printf '%s' "$value"
+        return 0
+    fi
+
+    return 1
+}
+
 # ---------- preflight ----------
 command -v docker >/dev/null 2>&1 || die "docker binary not found on host PATH"
 command -v jq     >/dev/null 2>&1 || die "jq is required to parse API responses"
@@ -165,6 +241,12 @@ SANDBOX_ID=""
 # shellcheck disable=SC2329
 teardown_sandbox() {
     if [ -z "$SANDBOX_ID" ]; then
+        # Load-bearing warning. If we got here with an empty id, it
+        # means the controller created a sandbox but our parse failed
+        # so badly that even the regex escape hatch produced nothing.
+        # That is exactly the leak that triggered the 2026-07-25
+        # fix. The operator MUST see this in journald and act.
+        log "WARN: EXIT trap teardown: SANDBOX_ID is empty — VM may have leaked; check forkd sandboxes manually and delete orphans"
         return 0
     fi
     log "teardown: DELETE /v1/sandboxes/$SANDBOX_ID"
@@ -186,7 +268,7 @@ create_body="$(printf '{"snapshot_tag":"%s","per_child_netns":true}' "$PROBE_TAG
 
 if [ "$DRY_RUN" = "1" ]; then
     log "DRY-RUN: would POST $FORKD_API_BASE/v1/sandboxes body=$create_body"
-    log "DRY-RUN: would parse sandbox id from ${SANDBOX_ID_FIELD}, exec /bin/true, then DELETE"
+    log "DRY-RUN: would scrape sandbox id from .[0].${SANDBOX_ID_FIELD} (array-aware), exec /bin/true, then DELETE"
     log "DRY-RUN: skipping all API calls"
     exit 0
 fi
@@ -194,7 +276,31 @@ fi
 create_response="$(in_container_curl POST "/v1/sandboxes" "$create_body")"
 log "create response (raw): $create_response"
 
-# ---------- step 1a: netns-failure signature detection ----------
+# ---------- step 1a: defensively scrape the sandbox id FIRST ----------
+# Load-bearing ordering. The earlier design parsed after the netns
+# check, which meant a parse failure left the EXIT trap with an
+# empty SANDBOX_ID and the controller-side sandbox leaked. Verified
+# live 2026-07-25: sb-6a64b43f-0031 stayed alive after the probe
+# died on parse because the response is an array (.[0].id) and the
+# old code queried `.id` (no array wrap).
+#
+# We scrape the id immediately, BEFORE any die() can fire, so the
+# EXIT trap always has something to clean up if the controller
+# actually created a sandbox. If our jq path is wrong, the regex
+# escape hatch in scrape_field still gets us an id. Only if that
+# also fails do we accept the leak — and we log it loudly so the
+# operator notices.
+SANDBOX_ID="$(scrape_field "$create_response" "$SANDBOX_ID_FIELD" "${SANDBOX_ID_FALLBACKS[@]}")" || SANDBOX_ID=""
+if [ -n "$SANDBOX_ID" ]; then
+    log "sandbox id: $SANDBOX_ID"
+else
+    # Don't die here. The netns check below is more important and
+    # the EXIT trap will fire regardless. We just want the operator
+    # to see the warning clearly when reading journald.
+    log "WARN: could not extract sandbox id from create response (jq + regex both failed) — possible VM leak"
+fi
+
+# ---------- step 1b: netns-failure signature detection ----------
 # This is the load-bearing check. The probe MUST fail loud on these
 # strings even if HTTP returned 200 — that is exactly the bug-of-record:
 # the API can return success while the sandbox never actually came up.
@@ -221,24 +327,6 @@ INNER_EOF
     die "netns failure signature in create response: $excerpt"
 fi
 
-# ---------- step 1b: parse sandbox id ----------
-SANDBOX_ID="$(printf '%s' "$create_response" | jq -r "${SANDBOX_ID_FIELD} // empty" 2>/dev/null || true)"
-if [ -z "$SANDBOX_ID" ] || [ "$SANDBOX_ID" = "null" ]; then
-    # Fallback: try a few common alternative field names.
-    for alt in .sandbox_id .sandboxId .ID; do
-        if [ "$alt" != "$SANDBOX_ID_FIELD" ]; then
-            candidate="$(printf '%s' "$create_response" | jq -r "${alt} // empty" 2>/dev/null || true)"
-            if [ -n "$candidate" ] && [ "$candidate" != "null" ]; then
-                SANDBOX_ID="$candidate"
-                log "WARN: parsed sandbox id from fallback field $alt (update SANDBOX_ID_FIELD if this is the canonical name)"
-                break
-            fi
-        fi
-    done
-fi
-[ -n "$SANDBOX_ID" ] || die "could not parse sandbox id from create response: $create_response"
-log "sandbox id: $SANDBOX_ID"
-
 # ---------- step 2: exec /bin/true ----------
 log "exec: POST /v1/sandboxes/$SANDBOX_ID/exec args=[$PROBE_CMD]"
 exec_body="$(printf '{"args":["%s"]}' "$PROBE_CMD")"
@@ -246,19 +334,8 @@ exec_body="$(printf '{"args":["%s"]}' "$PROBE_CMD")"
 exec_response="$(in_container_curl POST "/v1/sandboxes/$SANDBOX_ID/exec" "$exec_body")"
 log "exec response (raw): $exec_response"
 
-exit_code="$(printf '%s' "$exec_response" | jq -r "${EXIT_CODE_FIELD} // empty" 2>/dev/null || true)"
-if [ -z "$exit_code" ] || [ "$exit_code" = "null" ]; then
-    for alt in .exitCode .code .status; do
-        if [ "$alt" != "$EXIT_CODE_FIELD" ]; then
-            candidate="$(printf '%s' "$exec_response" | jq -r "${alt} // empty" 2>/dev/null || true)"
-            if [ -n "$candidate" ] && [ "$candidate" != "null" ]; then
-                exit_code="$candidate"
-                log "WARN: parsed exit_code from fallback field $alt (update EXIT_CODE_FIELD if this is the canonical name)"
-                break
-            fi
-        fi
-    done
-fi
+# Array-aware parse — same shape assumption as create (verified live).
+exit_code="$(scrape_field "$exec_response" "$EXIT_CODE_FIELD" "${EXIT_CODE_FALLBACKS[@]}")" || exit_code=""
 
 if [ "$exit_code" != "0" ]; then
     alert "exec_nonzero_exit" "$exec_response" "alert_only_no_heal"

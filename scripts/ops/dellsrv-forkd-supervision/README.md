@@ -65,13 +65,24 @@ start. Nothing probes them. This probe is that probe.
    `missing field snapshot_tag`, which does NOT match the netns
    failure regex and would silently kill the probe with a wrong
    reason on every run.
-2. Inspect the response for the netns-failure signature
+2. **Defensively scrape the sandbox id immediately** from the
+   create response. Verified live 2026-07-25: the response is a
+   JSON ARRAY of one object, e.g.
+   `[{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]`,
+   so the probe queries `.[0].id` (not `.id`). The `scrape_field`
+   helper falls back to alternative field names and a regex escape
+   hatch so the EXIT trap can always clean up if the controller
+   actually created a sandbox. **This ordering is load-bearing** —
+   a probe that parsed the id AFTER the netns check leaked a live
+   microVM (sb-6a64b43f-0031) on every failed run.
+3. Inspect the response for the netns-failure signature
    (`Invalid argument` / `socket never appeared`). If matched,
    alert (or, with `--heal`, attempt the documented repair).
-3. `POST /v1/sandboxes/{id}/exec` with body
-   `{"args":["/bin/true"]}` and assert `exit_code == 0`.
-4. `DELETE /v1/sandboxes/{id}` — **always**, even on prior failure.
-5. Exit 0 on success, non-zero with a precise, greppable reason on
+4. `POST /v1/sandboxes/{id}/exec` with body
+   `{"args":["/bin/true"]}` and assert `exit_code == 0`. Same
+   array-aware parse as create.
+5. `DELETE /v1/sandboxes/{id}` — **always**, even on prior failure.
+6. Exit 0 on success, non-zero with a precise, greppable reason on
    any failure.
 
 ## Heal vs alert — design decision
@@ -155,6 +166,25 @@ journalctl -t gate-health-probe | grep FORKD-GATE-ALERT
 # Just the heal events (only emitted with --heal):
 journalctl -t gate-health-probe | grep FORKD-GATE-HEAL
 ```
+
+## Exit code semantics
+
+The systemd service invokes the probe **directly** — `ExecStart=
+/usr/local/sbin/gate-health-probe.sh`, no shell, no pipe, no
+`tee`. So a probe failure (`die`) propagates as a non-zero unit
+exit, which systemd records as a failed `gate-health-probe.service`
+activation. The timer fires the unit again on its next scheduled
+interval; the unit is `Type=oneshot` so reactivation is cheap and
+correct.
+
+**Do not pipe the probe manually if you care about its exit code.**
+If you invoke the script as `probe.sh | tee log.txt` or
+`probe.sh | grep something`, `$?` reflects the last command in the
+pipeline (typically `tee` or `grep`), not the probe. To preserve
+the exit code while still logging output, use `set -o pipefail` in
+a wrapper, or invoke via systemd where the direct exec path is
+guaranteed. The timer + service pair is the supported way to run
+this; ad-hoc shell pipelines are not.
 
 ## Rollback
 
