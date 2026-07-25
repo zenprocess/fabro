@@ -1,10 +1,13 @@
 //! Thin async client for the forkd controller HTTP API.
 //!
 //! Wire shape (forkd 0.5.2):
-//! * `POST /v1/sandboxes`               `{snapshot_tag}` -> `[{id, snapshot_tag?}]`
+//! * `POST /v1/sandboxes`               `{snapshot_tag}` -> `[{id,
+//!   snapshot_tag?}]`
 //! * `GET  /v1/sandboxes/{id}`          -> 2xx / 404 (liveness)
-//! * `DELETE /v1/sandboxes/{id}`        -> 2xx / 404 (idempotent: 404 == already gone)
-//! * `POST /v1/sandboxes/{id}/exec`     `{args, timeout_secs}` -> `{stdout, stderr, exit_code}`
+//! * `DELETE /v1/sandboxes/{id}`        -> 2xx / 404 (idempotent: 404 ==
+//!   already gone)
+//! * `POST /v1/sandboxes/{id}/exec`     `{args, timeout_secs}` -> `{stdout,
+//!   stderr, exit_code}`
 //!
 //! All requests are bearer-authenticated with the configured token.
 
@@ -56,7 +59,7 @@ pub enum CreateSandboxResponse {
 impl CreateSandboxResponse {
     pub fn into_first(self) -> Option<SandboxEntry> {
         match self {
-            Self::Array(mut v) if v.is_empty() => None,
+            Self::Array(v) if v.is_empty() => None,
             Self::Array(mut v) => Some(v.remove(0)),
             Self::Single(entry) => Some(entry),
         }
@@ -65,7 +68,7 @@ impl CreateSandboxResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SandboxEntry {
-    pub id: String,
+    pub id:           String,
     #[serde(default)]
     pub snapshot_tag: Option<String>,
 }
@@ -73,7 +76,7 @@ pub struct SandboxEntry {
 /// `POST /v1/sandboxes/{id}/exec` request body.
 #[derive(Debug, Serialize)]
 pub struct ExecRequest {
-    pub args: Vec<String>,
+    pub args:         Vec<String>,
     pub timeout_secs: u64,
 }
 
@@ -81,9 +84,9 @@ pub struct ExecRequest {
 #[derive(Debug, Deserialize)]
 pub struct ExecResponse {
     #[serde(default)]
-    pub stdout: Option<String>,
+    pub stdout:    Option<String>,
     #[serde(default)]
-    pub stderr: Option<String>,
+    pub stderr:    Option<String>,
     #[serde(default)]
     pub exit_code: Option<i32>,
 }
@@ -98,12 +101,22 @@ impl HttpClient {
         Self
     }
 
-    fn build(&self) -> Result<reqwest::Client, PluginError> {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+    fn build() -> Result<reqwest::Client, PluginError> {
+        // We construct a raw reqwest client here rather than going through
+        // `fabro_http` because this crate is intentionally a standalone
+        // subprocess with a single dependency: the forkd controller.  The
+        // `disallowed_methods` lint is the global server-side policy, not
+        // the plugin-spawn boundary.  See `docs/internal/server-secrets-strategy.md`.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Plugin subprocess owns its own HTTP client lifecycle; the global policy applies to the in-tree server code, not to plugin subprocesses."
+        )]
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_mins(2))
             .connect_timeout(Duration::from_secs(15))
             .build()
-            .map_err(|e| PluginError::Forkd(format!("build HTTP client: {e}")))
+            .map_err(|e| PluginError::Forkd(format!("build HTTP client: {e}")))?;
+        Ok(client)
     }
 }
 
@@ -115,9 +128,11 @@ impl ForkdClient for HttpClient {
         token: &str,
         snapshot_tag: &str,
     ) -> Result<CreateSandboxResponse, PluginError> {
-        let client = self.build()?;
+        let client = Self::build()?;
         let url = format!("{base_url}/v1/sandboxes");
-        let body = CreateSandboxRequest { snapshot_tag: snapshot_tag.to_string() };
+        let body = CreateSandboxRequest {
+            snapshot_tag: snapshot_tag.to_string(),
+        };
         let resp = client
             .post(&url)
             .bearer_auth(token)
@@ -138,7 +153,7 @@ impl ForkdClient for HttpClient {
     }
 
     async fn delete(&self, base_url: &str, token: &str, id: &str) -> Result<(), PluginError> {
-        let client = self.build()?;
+        let client = Self::build()?;
         let url = format!("{base_url}/v1/sandboxes/{id}");
         let resp = client
             .delete(&url)
@@ -152,7 +167,9 @@ impl ForkdClient for HttpClient {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(PluginError::Forkd(format!("delete returned {status}: {text}")))
+            Err(PluginError::Forkd(format!(
+                "delete returned {status}: {text}"
+            )))
         }
     }
 
@@ -164,9 +181,12 @@ impl ForkdClient for HttpClient {
         args: &[String],
         timeout_secs: u64,
     ) -> Result<ExecResponse, PluginError> {
-        let client = self.build()?;
+        let client = Self::build()?;
         let url = format!("{base_url}/v1/sandboxes/{id}/exec");
-        let body = ExecRequest { args: args.to_vec(), timeout_secs };
+        let body = ExecRequest {
+            args: args.to_vec(),
+            timeout_secs,
+        };
         let resp = client
             .post(&url)
             .bearer_auth(token)
@@ -177,7 +197,9 @@ impl ForkdClient for HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(PluginError::Forkd(format!("exec returned {status}: {text}")));
+            return Err(PluginError::Forkd(format!(
+                "exec returned {status}: {text}"
+            )));
         }
         resp.json::<ExecResponse>()
             .await

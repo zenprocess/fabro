@@ -10,8 +10,8 @@
 /// upstream sketch only models `snapshots: { dockerfile }`.  There is no
 /// way to express:
 /// * register-snapshot  — promote a running sandbox to a named snapshot
-/// * branch-from-snapshot — create a new sandbox whose rootfs/memory come
-///   from a named snapshot, sharing the read-only pages with siblings
+/// * branch-from-snapshot — create a new sandbox whose rootfs/memory come from
+///   a named snapshot, sharing the read-only pages with siblings
 /// * snapshot listing / deletion
 ///
 /// GAP 2 — guest resource sizing has no home in `SandboxSpec`.

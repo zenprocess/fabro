@@ -1,11 +1,11 @@
-//! `fabro-sandbox-forkd` — JSON-RPC 2.0 over stdio sandbox-provider plugin for the
-//! forkd microVM controller.
+//! `fabro-sandbox-forkd` — JSON-RPC 2.0 over stdio sandbox-provider plugin for
+//! the forkd microVM controller.
 //!
-//! This is a **reference implementation** of the upstream fabro-sh provider-plugin
-//! sketch (PR #567).  The plugin is spawned by the host as a subprocess and
-//! exchanges newline-delimited JSON-RPC 2.0 messages on stdin/stdout.  **stdout
-//! is the protocol channel — do not write anything else to it.**  All logging
-//! goes to stderr (and/or the `host/log` callback).
+//! This is a **reference implementation** of the upstream fabro-sh
+//! provider-plugin sketch (PR #567).  The plugin is spawned by the host as a
+//! subprocess and exchanges newline-delimited JSON-RPC 2.0 messages on
+//! stdin/stdout.  **stdout is the protocol channel — do not write anything else
+//! to it.**  All logging goes to stderr (and/or the `host/log` callback).
 //!
 //! The implementation is intentionally minimal: it covers the wire protocol
 //! surface needed to demonstrate that the sketch works against a genuinely
@@ -18,18 +18,18 @@
 //! Out of scope (deliberately):
 //! * The upstream `Sandbox` trait split / registry wiring / `PluginProvider`
 //!   host side.
-//! * Streaming exec (`exec/stream`, `exec/output` notifications) — forkd's
-//!   exec is buffered; we declare `exec.streaming:false` and return the
-//!   unsupported error.
-//! * Native `fs/*` handlers — declared `fs.native:false`; the host derives
-//!   them from exec (base64 cat/tee).
+//! * Streaming exec (`exec/stream`, `exec/output` notifications) — forkd's exec
+//!   is buffered; we declare `exec.streaming:false` and return the unsupported
+//!   error.
+//! * Native `fs/*` handlers — declared `fs.native:false`; the host derives them
+//!   from exec (base64 cat/tee).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -75,7 +75,7 @@ pub enum PluginError {
 #[derive(Debug, Default)]
 pub struct SandboxState {
     /// The server-assigned sandbox id from `POST /v1/sandboxes`.
-    pub id: Option<String>,
+    pub id:           Option<String>,
     /// The snapshot tag the server resolved for us (may differ from the
     /// requested tag — see forkd 0.5.2 contract).
     pub snapshot_tag: Option<String>,
@@ -86,30 +86,45 @@ pub struct SandboxState {
 #[derive(Debug, Default)]
 pub struct PluginState {
     /// Forkd controller base URL (e.g. `http://127.0.0.1:8889`).
-    pub forkd_url: String,
+    pub forkd_url:            String,
     /// Bearer token sent to the forkd controller.  NEVER loaded from a real
     /// secret in this skeleton — tests construct the state directly.
-    pub forkd_token: String,
+    pub forkd_token:          String,
     /// Default snapshot tag used when `sandbox/create` does not specify one.
     pub default_snapshot_tag: String,
     /// The single sandbox this plugin process owns.
-    pub sandbox: Mutex<SandboxState>,
+    pub sandbox:              Mutex<SandboxState>,
     /// Whether `initialize` has succeeded.  Everything else is rejected
     /// before this is set.
-    pub initialized: Mutex<bool>,
+    pub initialized:          Mutex<bool>,
 }
 
 impl PluginState {
     /// Build a new plugin state from env.  The token is read from
     /// `FORKD_TOKEN`; the URL from `FORKD_URL`; the default snapshot tag from
     /// `FORKD_SNAPSHOT_TAG`.
+    ///
+    /// This is the only point in the crate that reads process env.  The
+    /// plugin is a standalone subprocess whose entire configuration is
+    /// delivered through env vars set by the host at spawn time; this is
+    /// the documented `server-secrets-strategy` boundary for plugin
+    /// subprocesses, not a process-wide env mutation.
     pub fn from_env() -> Self {
+        // Read the three vars with `#[expect]` because reading a
+        // process-env value at the plugin-spawn boundary IS the documented
+        // env-var facade for plugin subprocesses.  See
+        // `docs/internal/server-secrets-strategy.md`.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Plugin subprocess reads its configuration from env at spawn time; this is the documented env-var facade for plugin processes."
+        )]
+        let read = |name: &str, default: &str| -> String {
+            std::env::var(name).unwrap_or_else(|_| default.to_string())
+        };
         Self {
-            forkd_url: std::env::var("FORKD_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8889".to_string()),
-            forkd_token: std::env::var("FORKD_TOKEN").unwrap_or_default(),
-            default_snapshot_tag: std::env::var("FORKD_SNAPSHOT_TAG")
-                .unwrap_or_else(|_| "default".to_string()),
+            forkd_url: read("FORKD_URL", "http://127.0.0.1:8889"),
+            forkd_token: read("FORKD_TOKEN", ""),
+            default_snapshot_tag: read("FORKD_SNAPSHOT_TAG", "default"),
             ..Self::default()
         }
     }
@@ -120,24 +135,28 @@ impl PluginState {
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    pub method: String,
+    pub method:  String,
     #[serde(default)]
-    pub params: Value,
+    pub params:  Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
+    pub id:      Option<Value>,
 }
 
 /// A JSON-RPC 2.0 success response.  `id` mirrors the request id.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
-    pub result: Value,
-    pub id: Value,
+    pub result:  Value,
+    pub id:      Value,
 }
 
 impl JsonRpcResponse {
     pub fn ok(result: Value, id: Value) -> Self {
-        Self { jsonrpc: "2.0", result, id }
+        Self {
+            jsonrpc: "2.0",
+            result,
+            id,
+        }
     }
 }
 
@@ -146,23 +165,23 @@ impl JsonRpcResponse {
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
     pub jsonrpc: &'static str,
-    pub error: JsonRpcErrorBody,
-    pub id: Value,
+    pub error:   JsonRpcErrorBody,
+    pub id:      Value,
 }
 
 impl JsonRpcError {
     pub fn for_request(request_id: Value, code: i32, message: String) -> Self {
         Self {
             jsonrpc: "2.0",
-            error: JsonRpcErrorBody { code, message },
-            id: request_id,
+            error:   JsonRpcErrorBody { code, message },
+            id:      request_id,
         }
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct JsonRpcErrorBody {
-    pub code: i32,
+    pub code:    i32,
     pub message: String,
 }
 
@@ -199,7 +218,7 @@ pub trait RequestHandler: Send + Sync {
 /// The single dispatcher used by this plugin.  It owns the table of
 /// method-name → handler and the plugin-wide state.
 pub struct Plugin {
-    pub state: Arc<PluginState>,
+    pub state:   Arc<PluginState>,
     pub handler: Arc<dyn RequestHandler>,
 }
 
@@ -227,7 +246,10 @@ impl Plugin {
             return None;
         }
 
-        let result = self.handler.handle(&req.method, req.params, self.state.clone()).await;
+        let result = self
+            .handler
+            .handle(&req.method, req.params, self.state.clone())
+            .await;
 
         let id = id?;
         Some(match result {
@@ -239,14 +261,11 @@ impl Plugin {
                         error_code::UNSUPPORTED_BY_PROVIDER,
                         "this sandbox provider does not support it".to_string(),
                     ),
-                    PluginError::InvalidState(msg) => {
-                        (error_code::INVALID_PARAMS, msg.clone())
+                    PluginError::InvalidState(msg) => (error_code::INVALID_PARAMS, msg.clone()),
+                    PluginError::Protocol(msg) => (error_code::INVALID_REQUEST, msg.clone()),
+                    PluginError::Forkd(msg) | PluginError::Stdio(msg) => {
+                        (error_code::INTERNAL_ERROR, msg.clone())
                     }
-                    PluginError::Protocol(msg) => {
-                        (error_code::INVALID_REQUEST, msg.clone())
-                    }
-                    PluginError::Forkd(msg) => (error_code::INTERNAL_ERROR, msg.clone()),
-                    PluginError::Stdio(msg) => (error_code::INTERNAL_ERROR, msg.clone()),
                 };
                 if matches!(err, PluginError::Unsupported) {
                     debug!(method = req.method, "plugin: unsupported method");
@@ -264,15 +283,19 @@ impl Plugin {
     /// initiated by the plugin) are emitted as one JSON object per line on
     /// stdout.  Logs go to stderr.
     pub async fn run(self) -> Result<(), PluginError> {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
+        let stdin = io::stdin();
+        let stdout = io::stdout();
         let mut reader = BufReader::new(stdin).lines();
         let mut writer = stdout;
         let mut out = String::new();
 
         info!(forkd_url = %self.state.forkd_url, "fabro-sandbox-forkd plugin started");
 
-        while let Some(line) = reader.next_line().await.map_err(|e| PluginError::Stdio(e.to_string()))? {
+        while let Some(line) = reader
+            .next_line()
+            .await
+            .map_err(|e| PluginError::Stdio(e.to_string()))?
+        {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -298,7 +321,10 @@ impl Plugin {
                         .write_all(out.as_bytes())
                         .await
                         .map_err(|e| PluginError::Stdio(e.to_string()))?;
-                    writer.flush().await.map_err(|e| PluginError::Stdio(e.to_string()))?;
+                    writer
+                        .flush()
+                        .await
+                        .map_err(|e| PluginError::Stdio(e.to_string()))?;
                     continue;
                 }
             };
@@ -317,15 +343,18 @@ impl Plugin {
                         .write_all(out.as_bytes())
                         .await
                         .map_err(|e| PluginError::Stdio(e.to_string()))?;
-                    writer.flush().await.map_err(|e| PluginError::Stdio(e.to_string()))?;
+                    writer
+                        .flush()
+                        .await
+                        .map_err(|e| PluginError::Stdio(e.to_string()))?;
                 }
                 return Ok(());
             }
 
             let response = self.dispatch(req).await;
             if let Some(response) = response {
-                let serialized = serde_json::to_string(&response)
-                    .expect("response serialization is infallible");
+                let serialized =
+                    serde_json::to_string(&response).expect("response serialization is infallible");
                 out.clear();
                 out.push_str(&serialized);
                 out.push('\n');
@@ -333,7 +362,10 @@ impl Plugin {
                     .write_all(out.as_bytes())
                     .await
                     .map_err(|e| PluginError::Stdio(e.to_string()))?;
-                writer.flush().await.map_err(|e| PluginError::Stdio(e.to_string()))?;
+                writer
+                    .flush()
+                    .await
+                    .map_err(|e| PluginError::Stdio(e.to_string()))?;
             }
         }
         Ok(())
@@ -342,7 +374,9 @@ impl Plugin {
 
 /// Build the live handler with the default forkd HTTP client.
 pub fn default_handler() -> Arc<dyn RequestHandler> {
-    Arc::new(protocol::DefaultHandler::new(forkd::ForkdClient::default()))
+    Arc::new(protocol::DefaultHandler::new(Arc::new(
+        forkd::HttpClient::new(),
+    )))
 }
 
 /// Common helper: pull a string field out of a JSON object, returning the
@@ -370,7 +404,7 @@ pub struct DeleteParams {
 /// `{args:[string],timeout_secs:int?}`.
 #[derive(Debug, Deserialize)]
 pub struct ExecParams {
-    pub args: Vec<String>,
+    pub args:         Vec<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -390,17 +424,17 @@ fn default_timeout_secs() -> u64 {
 /// `outcomeKind` field that the host can opt into.
 #[derive(Debug, Serialize)]
 pub struct ExecResult {
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
+    pub exit_code:    Option<i32>,
+    pub stdout:       String,
+    pub stderr:       String,
     /// Mirrors the upstream `termination: "exited"`.  Buffered-only plugin,
     /// so this is always "exited" today.
-    pub termination: &'static str,
+    pub termination:  &'static str,
     /// GAP 3 marker: which forkd stage produced this result.  `boot` is the
     /// sandbox-create round-trip, `exec` is the command execution, `teardown`
     /// is sandbox-delete.  Allows the host to SEPARATE infra failures from
     /// true code verdicts even when the wire-level exit code is non-zero.
-    pub stage: &'static str,
+    pub stage:        &'static str,
     /// GAP 3 marker: `ran` (the command legitimately ran — exit code is a
     /// real code verdict) or `infra` (the sandbox could not be
     /// created/reached/exec'd/torn down — does NOT count as a code verdict).
@@ -420,8 +454,8 @@ pub struct CreateParams {
 /// `{id, state, runtime metadata}`.
 #[derive(Debug, Serialize)]
 pub struct CreateResult {
-    pub id: String,
-    pub state: String,
+    pub id:           String,
+    pub state:        String,
     pub snapshot_tag: String,
 }
 
@@ -434,7 +468,9 @@ pub async fn set_sandbox_id(
 ) -> HashMap<&'static str, String> {
     let mut sb = state.sandbox.lock().await;
     sb.id = Some(id.clone());
-    sb.snapshot_tag = snapshot_tag.clone();
+    if let Some(ref tag) = snapshot_tag {
+        sb.snapshot_tag = Some(tag.clone());
+    }
     let mut out = HashMap::new();
     out.insert("id", id);
     if let Some(tag) = snapshot_tag {

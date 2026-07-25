@@ -15,31 +15,34 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// harness asserts the EXACT honest values returned to the host.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct InitializeResult {
+    #[serde(rename = "protocolVersion")]
     pub protocol_version: u32,
-    pub provider: ProviderInfo,
-    pub capabilities: Capabilities,
-    pub limits: Limits,
+    pub provider:         ProviderInfo,
+    pub capabilities:     Capabilities,
+    pub limits:           Limits,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ProviderInfo {
-    pub kind: &'static str,
-    pub version: &'static str,
+    pub kind:         &'static str,
+    pub version:      &'static str,
+    #[serde(rename = "displayName")]
     pub display_name: &'static str,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Capabilities {
-    pub exec: ExecCapability,
-    pub stdio: bool,
-    pub fs: FsCapability,
-    pub grep: bool,
-    pub glob: bool,
+    pub exec:         ExecCapability,
+    pub stdio:        bool,
+    pub fs:           FsCapability,
+    pub grep:         bool,
+    pub glob:         bool,
+    #[serde(rename = "previewUrls")]
     pub preview_urls: bool,
-    pub snapshots: SnapshotCapability,
-    pub network: NetworkCapability,
-    pub lifecycle: LifecycleCapability,
-    pub clone: CloneCapability,
+    pub snapshots:    SnapshotCapability,
+    pub network:      NetworkCapability,
+    pub lifecycle:    LifecycleCapability,
+    pub clone:        CloneCapability,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -49,17 +52,17 @@ pub struct ExecCapability {
     /// `liveStreaming:false` in `exec/run`).  Declaring `true` would be a
     /// lie that breaks the host's preflight contract.
     pub streaming: bool,
-    pub cancel: bool,
+    pub cancel:    bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct FsCapability {
     /// `false` — forkd has no native fs ops; the host derives read/write/
     /// list/grep/glob from exec (base64 cat/tee + POSIX grep/find).
-    pub native: bool,
+    pub native:   bool,
     /// Whether the plugin can upload a file directly (not via exec).  forkd
     /// cannot — it goes through `exec` with `tee`.
-    pub upload: bool,
+    pub upload:   bool,
     /// Whether the plugin can download a file directly (not via exec).  forkd
     /// cannot — it goes through `exec` with `cat | base64`.
     pub download: bool,
@@ -84,7 +87,8 @@ pub struct NetworkCapability {
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct LifecycleCapability {
-    pub stop: bool,
+    pub stop:      bool,
+    #[serde(rename = "autoStop")]
     pub auto_stop: bool,
 }
 
@@ -97,6 +101,7 @@ pub struct CloneCapability {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Limits {
     /// 4 MiB — matches the upstream sketch.
+    #[serde(rename = "maxMessageBytes")]
     pub max_message_bytes: u32,
 }
 
@@ -104,30 +109,42 @@ pub struct Limits {
 pub fn build_initialize_result() -> InitializeResult {
     InitializeResult {
         protocol_version: PROTOCOL_VERSION,
-        provider: ProviderInfo {
-            kind: "forkd",
+        provider:         ProviderInfo {
+            kind:         "forkd",
             // The forkd controller version this skeleton targets.  Test
             // should not pin this; bump when the wire shape changes.
-            version: "0.1.0",
+            version:      "0.1.0",
             display_name: "forkd microVM sandbox provider",
         },
-        capabilities: Capabilities {
+        capabilities:     Capabilities {
             // GAP-adjacent: see `ExecCapability::streaming`.  Buffer-only.
-            exec: ExecCapability { streaming: false, cancel: false },
-            stdio: false,
-            fs: FsCapability { native: false, upload: false, download: false },
-            grep: false,
-            glob: false,
+            exec:         ExecCapability {
+                streaming: false,
+                cancel:    false,
+            },
+            stdio:        false,
+            fs:           FsCapability {
+                native:   false,
+                upload:   false,
+                download: false,
+            },
+            grep:         false,
+            glob:         false,
             preview_urls: false,
             // GAP 1 marker: see `SnapshotCapability::dockerfile` and
             // `gaps::gap_1`.  No dockerfile snapshot path on forkd.
-            snapshots: SnapshotCapability { dockerfile: false },
-            network: NetworkCapability {
+            snapshots:    SnapshotCapability { dockerfile: false },
+            network:      NetworkCapability {
                 modes: vec!["allow_all", "block", "cidr_allow_list"],
             },
-            lifecycle: LifecycleCapability { stop: false, auto_stop: false },
-            clone: CloneCapability { github: true },
+            lifecycle:    LifecycleCapability {
+                stop:      false,
+                auto_stop: false,
+            },
+            clone:        CloneCapability { github: true },
         },
-        limits: Limits { max_message_bytes: 4 * 1024 * 1024 },
+        limits:           Limits {
+            max_message_bytes: 4 * 1024 * 1024,
+        },
     }
 }
