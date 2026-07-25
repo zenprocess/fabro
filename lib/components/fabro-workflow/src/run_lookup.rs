@@ -1,0 +1,542 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "directory walk for CLI run listing; async server paths call the heavier filesystem \
+              scans from spawn_blocking boundaries"
+)]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use fabro_config::Storage;
+use fabro_config::user::default_storage_dir;
+use fabro_store::Database;
+use fabro_types::{Run, RunId};
+use serde::Serialize;
+
+use crate::operations::make_run_dir;
+use crate::run_status::RunStatus;
+
+#[derive(Debug, Clone)]
+struct RunLocalState {
+    dir_name:      String,
+    start_time_dt: Option<DateTime<Utc>>,
+    end_time:      Option<DateTime<Utc>>,
+    path:          PathBuf,
+    is_orphan:     bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunInfo {
+    #[serde(skip)]
+    summary:           Option<Run>,
+    pub dir_name:      String,
+    #[serde(skip)]
+    pub start_time_dt: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub end_time:      Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub path:          PathBuf,
+    #[serde(skip)]
+    pub is_orphan:     bool,
+}
+
+impl RunInfo {
+    fn new(summary: Option<Run>, local: RunLocalState) -> Self {
+        Self {
+            summary,
+            dir_name: local.dir_name,
+            start_time_dt: local.start_time_dt,
+            end_time: local.end_time,
+            path: local.path,
+            is_orphan: local.is_orphan,
+        }
+    }
+
+    pub fn run_id(&self) -> RunId {
+        self.summary
+            .as_ref()
+            .map(|summary| summary.id)
+            .or_else(|| parse_run_id(&self.dir_name))
+            .expect("RunInfo must have a run id")
+    }
+
+    pub fn workflow_name(&self) -> Option<&str> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.workflow.name.as_deref())
+    }
+
+    pub fn workflow_graph_name(&self) -> Option<&str> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.workflow.graph_name.as_deref())
+    }
+
+    pub fn workflow_slug(&self) -> Option<&str> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.workflow.slug.as_deref())
+    }
+
+    pub fn workflow_display_name(&self) -> String {
+        self.summary.as_ref().map_or_else(
+            || "[no run spec]".to_string(),
+            |summary| summary.workflow.display_name().unwrap_or("-").to_string(),
+        )
+    }
+
+    fn workflow_matches(&self, pattern: &str) -> bool {
+        [
+            self.workflow_name(),
+            self.workflow_graph_name(),
+            self.workflow_slug(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.contains(pattern))
+    }
+
+    pub fn status(&self) -> RunStatus {
+        self.summary
+            .as_ref()
+            .map_or(RunStatus::Submitted, |summary| summary.lifecycle.status)
+    }
+
+    pub fn status_reason(&self) -> Option<String> {
+        match self.status() {
+            RunStatus::Succeeded { reason } => Some(reason.to_string()),
+            RunStatus::Failed { reason } => Some(reason.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn start_time(&self) -> String {
+        self.summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .timestamps
+                    .started_at
+                    .or(Some(summary.id.created_at()))
+            })
+            .or(self.start_time_dt)
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_default()
+    }
+
+    pub fn labels(&self) -> &HashMap<String, String> {
+        if let Some(summary) = self.summary.as_ref() {
+            &summary.labels
+        } else {
+            empty_labels()
+        }
+    }
+
+    pub fn wall_time_ms(&self) -> Option<u64> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.timing.as_ref().map(|t| t.wall_time_ms))
+    }
+
+    pub fn total_cost(&self) -> Option<f64> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.billing.as_ref()?.total_usd_micros)
+            .map(|value| value as f64 / 1_000_000.0)
+    }
+
+    pub fn total_usd_micros(&self) -> Option<i64> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.billing.as_ref()?.total_usd_micros)
+    }
+
+    pub fn source_directory(&self) -> Option<&str> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.source_directory.as_deref())
+    }
+
+    pub fn repo_origin_url(&self) -> Option<&str> {
+        self.summary
+            .as_ref()
+            .and_then(|summary| summary.repository.as_ref()?.origin_url.as_deref())
+    }
+
+    pub fn goal(&self) -> String {
+        self.summary
+            .as_ref()
+            .map(|summary| summary.goal.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn empty_labels() -> &'static HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
+}
+
+pub fn scratch_base(storage_dir: &Path) -> PathBuf {
+    Storage::new(storage_dir).scratch_dir()
+}
+
+pub fn default_scratch_base() -> PathBuf {
+    scratch_base(&default_storage_dir())
+}
+
+fn scan_orphan_runs(base: &Path) -> Result<Vec<RunInfo>> {
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("reading orphan runs directory {}", base.display())));
+        }
+    };
+
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if parse_run_id(&dir_name).is_none() {
+            continue;
+        }
+
+        let mtime_dt = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|time| -> DateTime<Utc> { time.into() });
+
+        runs.push(RunInfo::new(None, RunLocalState {
+            dir_name,
+            start_time_dt: mtime_dt,
+            end_time: None,
+            path,
+            is_orphan: true,
+        }));
+    }
+
+    runs.sort_by(|a, b| {
+        b.start_time_dt
+            .cmp(&a.start_time_dt)
+            .then_with(|| b.run_id().cmp(&a.run_id()))
+    });
+    Ok(runs)
+}
+
+pub async fn scan_runs_combined(store: &Database, base: &Path) -> Result<Vec<RunInfo>> {
+    let store_runs = store
+        .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
+        .await
+        .unwrap_or_default();
+    scan_runs_with_summaries(&store_runs, base)
+}
+
+pub fn scan_runs_with_summaries(summaries: &[Run], base: &Path) -> Result<Vec<RunInfo>> {
+    let mut runs_by_id: HashMap<RunId, RunInfo> = HashMap::new();
+
+    for summary in summaries {
+        let Some(run_info) = run_info_from_summary(summary, base) else {
+            continue;
+        };
+        runs_by_id.insert(run_info.run_id(), run_info);
+    }
+
+    let store_run_ids = runs_by_id
+        .keys()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    for run in scan_orphan_runs(base)?
+        .into_iter()
+        .filter(|run| run.is_orphan && !store_run_ids.contains(&run.run_id()))
+    {
+        runs_by_id.insert(run.run_id(), run);
+    }
+
+    let mut runs: Vec<_> = runs_by_id.into_values().collect();
+    runs.sort_by(|a, b| {
+        b.start_time_dt
+            .cmp(&a.start_time_dt)
+            .then_with(|| b.run_id().cmp(&a.run_id()))
+    });
+    Ok(runs)
+}
+
+fn run_info_from_summary(summary: &Run, scratch_base: &Path) -> Option<RunInfo> {
+    let path = make_run_dir(scratch_base, &summary.id);
+    if !path.exists() {
+        return None;
+    }
+    let dir_name = path.file_name()?.to_string_lossy().to_string();
+    let start_time_dt = summary.id.created_at();
+    let end_time = if summary.lifecycle.status.is_terminal() {
+        summary.timing.as_ref().and_then(|timing| {
+            Some(
+                start_time_dt
+                    + chrono::Duration::milliseconds(i64::try_from(timing.wall_time_ms).ok()?),
+            )
+        })
+    } else {
+        None
+    };
+
+    Some(RunInfo::new(Some(summary.clone()), RunLocalState {
+        dir_name,
+        start_time_dt: Some(start_time_dt),
+        end_time,
+        path,
+        is_orphan: false,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFilter {
+    RunningOnly,
+    All,
+}
+
+pub fn filter_runs(
+    runs: &[RunInfo],
+    before: Option<&str>,
+    workflow: Option<&str>,
+    labels: &[(String, String)],
+    include_orphans: bool,
+    status_filter: StatusFilter,
+) -> Vec<RunInfo> {
+    runs.iter()
+        .filter(|run| {
+            if status_filter == StatusFilter::RunningOnly && !run.status().is_active() {
+                return false;
+            }
+            if run.is_orphan && !include_orphans {
+                return false;
+            }
+            if let Some(before) = before {
+                let start_time = run.start_time();
+                if !start_time.is_empty() && start_time.as_str() >= before {
+                    return false;
+                }
+            }
+            if let Some(pattern) = workflow {
+                if !run.workflow_matches(pattern) {
+                    return false;
+                }
+            }
+            for (key, value) in labels {
+                match run.labels().get(key) {
+                    Some(current) if current == value => {}
+                    _ => return false,
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+pub async fn resolve_run_combined(
+    store: &Database,
+    base: &Path,
+    identifier: &str,
+) -> Result<RunInfo> {
+    let runs = scan_runs_combined(store, base)
+        .await
+        .context("Failed to scan runs")?;
+    resolve_run_from_infos(&runs, identifier)
+}
+
+pub fn resolve_run_from_summaries(
+    summaries: &[Run],
+    base: &Path,
+    identifier: &str,
+) -> Result<RunInfo> {
+    let runs = scan_runs_with_summaries(summaries, base).context("Failed to scan runs")?;
+    resolve_run_from_infos(&runs, identifier)
+}
+
+fn resolve_run_from_infos(runs: &[RunInfo], identifier: &str) -> Result<RunInfo> {
+    let id_matches: Vec<_> = runs
+        .iter()
+        .filter(|run| run_id_matches(run.run_id(), identifier))
+        .collect();
+
+    match id_matches.len() {
+        1 => return Ok(id_matches[0].clone()),
+        count if count > 1 => {
+            let ids: Vec<String> = id_matches
+                .iter()
+                .map(|run| {
+                    format!(
+                        "{} created_at={} workflow={} origin={}",
+                        run.run_id(),
+                        run.run_id().created_at().to_rfc3339(),
+                        run.workflow_display_name(),
+                        run.repo_origin_url().unwrap_or("-")
+                    )
+                })
+                .collect();
+            bail!(
+                "Ambiguous prefix '{identifier}': {count} runs match:\n{}",
+                ids.join("\n")
+            )
+        }
+        _ => {}
+    }
+
+    let id_lower = identifier.to_lowercase();
+    let id_collapsed = collapse_separators(&id_lower);
+    let workflow_match = runs
+        .iter()
+        .filter(|run| !run.is_orphan)
+        .filter(|run| {
+            if let Some(slug) = run.workflow_slug() {
+                if slug.to_lowercase() == id_lower {
+                    return true;
+                }
+            }
+            [run.workflow_name(), run.workflow_graph_name()]
+                .into_iter()
+                .flatten()
+                .any(|name| {
+                    let name_lower = name.to_lowercase();
+                    name_lower.contains(&id_lower)
+                        || collapse_separators(&name_lower).contains(&id_collapsed)
+                })
+        })
+        .max_by_key(|run| run.run_id().created_at());
+
+    match workflow_match {
+        Some(run) => Ok(run.clone()),
+        None => {
+            bail!("No run found matching '{identifier}' (tried run ID prefix and workflow name)")
+        }
+    }
+}
+
+fn collapse_separators(s: &str) -> String {
+    s.chars().filter(|c| *c != '-' && *c != '_').collect()
+}
+
+fn parse_run_id(value: &str) -> Option<RunId> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // Try direct ULID parse first, then try extracting ULID after date prefix
+    // (YYYYMMDD-ULID).
+    value.parse().ok().or_else(|| {
+        value
+            .split_once('-')
+            .and_then(|(_, ulid)| ulid.parse().ok())
+    })
+}
+
+fn run_id_matches(run_id: RunId, prefix: &str) -> bool {
+    run_id.to_string().starts_with(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use fabro_graphviz::graph::Graph;
+    use fabro_store::Database;
+    use fabro_types::{RunStatus, WorkflowSettings, fixtures, test_support};
+    use object_store::memory::InMemory;
+
+    use super::scan_runs_combined;
+    use crate::event::{Event, append_event};
+    use crate::operations::make_run_dir;
+    use crate::records::RunSpec;
+
+    fn memory_store() -> Arc<Database> {
+        Arc::new(Database::new(
+            Arc::new(InMemory::new()),
+            "",
+            Duration::from_millis(1),
+            None,
+        ))
+    }
+
+    fn sample_run_spec() -> RunSpec {
+        RunSpec {
+            run_id:           fixtures::RUN_1,
+            settings:         WorkflowSettings::default(),
+            graph:            Graph::new("test"),
+            graph_source:     None,
+            workflow_slug:    Some("test".to_string()),
+            automation:       None,
+            source_directory: Some("/tmp/project".to_string()),
+            git:              Some(fabro_types::GitContext {
+                origin_url:   String::new(),
+                branch:       "main".to_string(),
+                sha:          None,
+                dirty:        fabro_types::DirtyStatus::Clean,
+                push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            }),
+            labels:           HashMap::new(),
+            provenance:       test_support::test_run_provenance(),
+            manifest_blob:    None,
+            definition_blob:  None,
+            fork_source_ref:  None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_runs_combined_uses_store_status_without_status_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = make_run_dir(temp.path(), &fixtures::RUN_1);
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let store = memory_store();
+        let run_spec = sample_run_spec();
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        append_event(&run_store, &fixtures::RUN_1, &Event::RunCreated {
+            run_id:           fixtures::RUN_1,
+            title:            None,
+            settings:         serde_json::to_value(&run_spec.settings).unwrap(),
+            graph:            serde_json::to_value(&run_spec.graph).unwrap(),
+            workflow_source:  None,
+            workflow_config:  None,
+            labels:           run_spec.labels.clone().into_iter().collect(),
+            run_dir:          run_dir.display().to_string(),
+            source_directory: run_spec.source_directory.clone(),
+            workflow_slug:    run_spec.workflow_slug.clone(),
+            automation:       None,
+            db_prefix:        None,
+            provenance:       run_spec.provenance.clone(),
+            manifest_blob:    None,
+            git:              run_spec.git.clone(),
+            fork_source_ref:  run_spec.fork_source_ref.clone(),
+            retried_from:     None,
+            parent_id:        None,
+            web_url:          None,
+        })
+        .await
+        .unwrap();
+        append_event(&run_store, &fixtures::RUN_1, &Event::RunSubmitted {
+            definition_blob: None,
+        })
+        .await
+        .unwrap();
+
+        let runs = scan_runs_combined(&store, temp.path()).await.unwrap();
+        let run = runs
+            .iter()
+            .find(|run| run.run_id() == fixtures::RUN_1)
+            .expect("run should be listed");
+
+        assert_eq!(run.status(), RunStatus::Submitted);
+        assert!(!run.is_orphan);
+    }
+}

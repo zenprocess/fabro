@@ -1,5 +1,5 @@
 import { useMemo, useReducer, useState } from "react";
-import { useParams } from "react-router";
+import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
   ChevronDownIcon,
@@ -42,10 +42,7 @@ import {
 } from "../components/ui";
 import { ConditionalDecision } from "../components/stage-renderers/conditional-decision";
 import { FanInResults } from "../components/stage-renderers/fan-in-results";
-import {
-  extractStageContext,
-  extractStageNotes,
-} from "../components/stage-renderers/helpers";
+import { extractStageContext } from "../components/stage-renderers/helpers";
 import { HumanQA } from "../components/stage-renderers/human-qa";
 import { ParallelChildren } from "../components/stage-renderers/parallel-children";
 import {
@@ -292,6 +289,13 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       }
       case "agent.interrupt.injected":
         turns.push({ kind: "interrupt", ts: e.ts, content: "Agent interrupted" });
+        break;
+      case "agent.round.interrupted":
+        turns.push({
+          kind: "interrupt",
+          ts: e.ts,
+          content: "Interrupted — waiting for steering",
+        });
         break;
       case "agent.pair.user_message": {
         const text = getString(props, "text") ?? e.text ?? "";
@@ -1572,11 +1576,7 @@ function StageActivityBody({
             allStages={stages}
           />
         ) : renderer === "fan_in" ? (
-          <FanInResults
-            stage={selectedStage}
-            events={debugEvents}
-            notes={extractStageNotes(debugEvents)}
-          />
+          <FanInResults stage={selectedStage} events={debugEvents} />
         ) : renderer === "wait" ? (
           <WaitStatus stage={selectedStage} />
         ) : (
@@ -1738,6 +1738,17 @@ function RunStageActivityStage({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col pt-3">
         <div className="shrink-0 border-b border-line">
           <div className="pl-3 pr-3">
+            {selectedStage.resumedFromStageId && (
+              <p className="pb-2 text-xs text-fg-muted">
+                Resumed from{" "}
+                <Link
+                  to={`/runs/${runId}/stages/${encodeURIComponent(selectedStage.resumedFromStageId)}`}
+                  className="font-mono text-teal-500 hover:underline"
+                >
+                  {selectedStage.resumedFromStageId}
+                </Link>
+              </p>
+            )}
             <EventsToolbar
               tab={effectiveTab}
               renderer={renderer}

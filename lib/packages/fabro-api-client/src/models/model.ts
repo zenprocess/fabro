@@ -15,6 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { ModelControls } from './model-controls';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { ModelCosts } from './model-costs';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -24,11 +27,11 @@ import type { ModelFeatures } from './model-features';
 import type { ModelLimits } from './model-limits';
 
 /**
- * An available LLM model from the built-in catalog.
+ * One provider\'s offering of an LLM model. The `id` is unique within `provider`; `(provider, id)` is the stable resource identity.
  */
 export interface Model {
     /**
-     * Unique model identifier.
+     * Canonical human-facing model ID, unique within the provider.
      */
     'id': string;
     /**
@@ -53,6 +56,7 @@ export interface Model {
      */
     'knowledge_cutoff': string | null;
     'features': ModelFeatures;
+    'controls': ModelControls;
     'costs': ModelCosts;
     /**
      * Estimated output tokens per second.

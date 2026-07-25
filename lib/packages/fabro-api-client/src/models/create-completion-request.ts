@@ -22,6 +22,9 @@ import type { CompletionToolChoice } from './completion-tool-choice';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { CompletionToolDefinition } from './completion-tool-definition';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ReasoningEffort } from './reasoning-effort';
 
 export interface CreateCompletionRequest {
     /**
@@ -29,7 +32,7 @@ export interface CreateCompletionRequest {
      */
     'messages': Array<CompletionMessage>;
     /**
-     * Model ID or alias. Server picks default if omitted.
+     * Model ID or alias. Server picks a ready-provider default if omitted.
      */
     'model'?: string;
     /**
@@ -56,9 +59,9 @@ export interface CreateCompletionRequest {
     /**
      * Reasoning effort level.
      */
-    'reasoning_effort'?: string;
+    'reasoning_effort'?: ReasoningEffort;
     /**
-     * Provider to route to.
+     * Optional provider pin.
      */
     'provider'?: string;
     'provider_options'?: any;

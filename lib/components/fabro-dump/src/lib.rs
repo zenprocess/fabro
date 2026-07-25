@@ -1,0 +1,754 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "sync run dump writer used by CLI export paths; async callers wrap it in spawn_blocking"
+)]
+
+use std::collections::HashMap;
+#[expect(
+    clippy::disallowed_types,
+    reason = "in-memory Vec<u8>::write_all for jsonl serialization; no filesystem or network I/O"
+)]
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
+use fabro_store::{
+    EventEnvelope, RunProjection, SerializableProjection, StageId, retry_storage_segment,
+};
+use fabro_types::{RunBlobId, parse_blob_ref};
+use futures::future::BoxFuture;
+
+pub type BlobReader = Box<dyn FnMut(RunBlobId) -> BoxFuture<'static, Result<Option<Bytes>>> + Send>;
+
+const STAGE_RANK_WIDTH: usize = 3;
+const MAX_STAGES_IN_DUMP: usize = {
+    let mut value = 1usize;
+    let mut i = 0usize;
+    while i < STAGE_RANK_WIDTH {
+        value *= 10;
+        i += 1;
+    }
+    value - 1
+};
+
+fn stage_dir_name(rank: u32, stage_id: &StageId) -> String {
+    format!("{rank:0>STAGE_RANK_WIDTH$}-{stage_id}")
+}
+
+#[derive(Debug, Clone)]
+pub struct RunDump {
+    entries:        Vec<RunDumpEntry>,
+    stage_ranks:    HashMap<StageId, u32>,
+    dump_log_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunDumpEntry {
+    path:     String,
+    contents: RunDumpContents,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RunDumpContents {
+    Text(String),
+    Json(serde_json::Value),
+    Bytes(Vec<u8>),
+}
+
+impl RunDump {
+    pub fn from_projection(state: &RunProjection) -> Result<Self> {
+        let mut entries = Vec::new();
+
+        push_json_entry(&mut entries, "run.json", &SerializableProjection(state))?;
+
+        if let Some(graph_source) = state.spec.graph_source.as_ref() {
+            entries.push(RunDumpEntry::text("graph.fabro", graph_source.clone()));
+        }
+
+        let stages: Vec<_> = state.iter_stages().collect();
+        if stages.len() > MAX_STAGES_IN_DUMP {
+            bail!(
+                "run dump supports at most {MAX_STAGES_IN_DUMP} stages with the current path prefix width (got {})",
+                stages.len()
+            );
+        }
+
+        let mut stage_ranks = HashMap::new();
+        for (index, (stage_id, _)) in stages.iter().enumerate() {
+            let rank = u32::try_from(index + 1).context("stage rank should fit in u32")?;
+            stage_ranks.insert((*stage_id).clone(), rank);
+        }
+
+        for (index, (stage_id, stage)) in stages.into_iter().enumerate() {
+            let rank = u32::try_from(index + 1).context("stage rank should fit in u32")?;
+            let base = PathBuf::from("stages").join(stage_dir_name(rank, stage_id));
+
+            if let Some(prompt) = stage.prompt.as_ref() {
+                entries.push(RunDumpEntry::text_path(
+                    &base.join("prompt.md"),
+                    prompt.clone(),
+                ));
+            }
+            if let Some(response) = stage.response.as_ref() {
+                entries.push(RunDumpEntry::text_path(
+                    &base.join("response.md"),
+                    response.clone(),
+                ));
+            }
+            if let Some(completion) = stage.completion.as_ref() {
+                push_json_entry_path(&mut entries, &base.join("status.json"), completion)?;
+            }
+            if let Some(provider_used) = stage.provider_used.as_ref() {
+                push_json_entry_path(
+                    &mut entries,
+                    &base.join("provider_used.json"),
+                    provider_used,
+                )?;
+            }
+            if let Some(diff) = stage.diff.as_ref() {
+                entries.push(RunDumpEntry::text_path(
+                    &base.join("diff.patch"),
+                    diff.clone(),
+                ));
+            }
+            if let Some(script_invocation) = stage.script_invocation.as_ref() {
+                entries.push(RunDumpEntry::json_path(
+                    &base.join("script_invocation.json"),
+                    script_invocation.clone(),
+                ));
+            }
+            if let Some(script_timing) = stage.script_timing.as_ref() {
+                entries.push(RunDumpEntry::json_path(
+                    &base.join("script_timing.json"),
+                    script_timing.clone(),
+                ));
+            }
+            if let Some(parallel_results) = stage.parallel_results.as_ref() {
+                entries.push(RunDumpEntry::json_path(
+                    &base.join("parallel_results.json"),
+                    serde_json::to_value(parallel_results)?,
+                ));
+            }
+            if let Some(output) = stage.output.as_ref() {
+                entries.push(RunDumpEntry::text_path(
+                    &base.join("output.log"),
+                    output.clone(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            entries,
+            stage_ranks,
+            dump_log_index: None,
+        })
+    }
+
+    pub fn from_store_state_and_events(
+        state: &RunProjection,
+        events: &[EventEnvelope],
+    ) -> Result<Self> {
+        let mut dump = Self::from_projection(state)?;
+
+        let mut events_jsonl = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut events_jsonl, event)?;
+            events_jsonl.write_all(b"\n")?;
+        }
+        dump.entries
+            .push(RunDumpEntry::bytes("events.jsonl", events_jsonl));
+
+        for record in &state.checkpoints {
+            push_json_entry_path(
+                &mut dump.entries,
+                &PathBuf::from("checkpoints").join(format!("{:04}.json", record.seq)),
+                &record.checkpoint,
+            )?;
+        }
+
+        Ok(dump)
+    }
+
+    pub fn add_artifact_bytes(
+        &mut self,
+        stage_id: &StageId,
+        retry: u32,
+        filename: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let path = artifact_dump_path(&self.stage_ranks, stage_id, retry, filename)?;
+        if !self.stage_ranks.contains_key(stage_id) {
+            self.add_orphan_notice(stage_id);
+        }
+        self.entries.push(RunDumpEntry::bytes_path(&path, data));
+        Ok(())
+    }
+
+    fn add_orphan_notice(&mut self, stage_id: &StageId) {
+        let line = format!("notice: artifact stage {stage_id} was not present in run projection\n");
+        if let Some(index) = self.dump_log_index {
+            if let Some(RunDumpContents::Text(text)) =
+                self.entries.get_mut(index).map(|entry| &mut entry.contents)
+            {
+                text.push_str(&line);
+                return;
+            }
+        }
+        self.dump_log_index = Some(self.entries.len());
+        self.entries.push(RunDumpEntry::text("dump.log", line));
+    }
+
+    pub fn add_file_bytes(&mut self, path: impl Into<String>, contents: Vec<u8>) {
+        self.entries.push(RunDumpEntry::bytes(path, contents));
+    }
+
+    pub async fn hydrate_referenced_blobs_with_reader<'a, F>(
+        &mut self,
+        mut read_blob: F,
+    ) -> Result<()>
+    where
+        F: FnMut(RunBlobId) -> BoxFuture<'a, Result<Option<Bytes>>>,
+    {
+        let mut cache = HashMap::new();
+        for entry in &mut self.entries {
+            match &mut entry.contents {
+                RunDumpContents::Json(value) => {
+                    let mut blob_ids = Vec::new();
+                    collect_blob_refs_in_value(value, &mut blob_ids);
+                    for blob_id in blob_ids {
+                        if cache.contains_key(&blob_id) {
+                            continue;
+                        }
+                        let blob = read_blob(blob_id).await?.with_context(|| {
+                            format!("blob {blob_id:?} is missing from the store")
+                        })?;
+                        let hydrated: serde_json::Value = serde_json::from_slice(&blob)
+                            .with_context(|| format!("blob {blob_id:?} is not valid JSON"))?;
+                        cache.insert(blob_id, hydrated);
+                    }
+                    replace_blob_refs_in_value(value, &cache)?;
+                }
+                RunDumpContents::Text(text) => {
+                    let Some(blob_id) = parse_blob_ref(text) else {
+                        continue;
+                    };
+                    let blob = read_blob(blob_id)
+                        .await?
+                        .with_context(|| format!("blob {blob_id:?} is missing from the store"))?;
+                    *text = serde_json::from_slice::<String>(&blob).with_context(|| {
+                        format!("blob {blob_id:?} is not a JSON string text log")
+                    })?;
+                }
+                RunDumpContents::Bytes(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn entries(&self) -> &[RunDumpEntry] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn write_to_dir(&self, root: &Path) -> Result<usize> {
+        for entry in &self.entries {
+            entry.write_to_dir(root)?;
+        }
+        Ok(self.file_count())
+    }
+
+    pub fn git_entries(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.entries
+            .iter()
+            .map(|entry| Ok((entry.path.clone(), entry.contents.to_bytes()?)))
+            .collect()
+    }
+}
+
+impl RunDumpEntry {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.contents.to_bytes()
+    }
+
+    fn text(path: impl Into<String>, contents: String) -> Self {
+        Self {
+            path:     path.into(),
+            contents: RunDumpContents::Text(contents),
+        }
+    }
+
+    fn text_path(path: &Path, contents: String) -> Self {
+        Self {
+            path:     path_to_string(path),
+            contents: RunDumpContents::Text(contents),
+        }
+    }
+
+    fn json(path: impl Into<String>, contents: serde_json::Value) -> Self {
+        Self {
+            path:     path.into(),
+            contents: RunDumpContents::Json(contents),
+        }
+    }
+
+    fn json_path(path: &Path, contents: serde_json::Value) -> Self {
+        Self {
+            path:     path_to_string(path),
+            contents: RunDumpContents::Json(contents),
+        }
+    }
+
+    fn bytes(path: impl Into<String>, contents: Vec<u8>) -> Self {
+        Self {
+            path:     path.into(),
+            contents: RunDumpContents::Bytes(contents),
+        }
+    }
+
+    fn bytes_path(path: &Path, contents: Vec<u8>) -> Self {
+        Self {
+            path:     path_to_string(path),
+            contents: RunDumpContents::Bytes(contents),
+        }
+    }
+
+    fn write_to_dir(&self, root: &Path) -> Result<()> {
+        let relative = validate_relative_path("run dump path", &self.path)?;
+        let path = root.join(relative);
+        ensure_parent_dir(&path)?;
+        std::fs::write(&path, self.contents.to_bytes()?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+impl RunDumpContents {
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Text(value) => Ok(value.as_bytes().to_vec()),
+            Self::Json(value) => Ok(serde_json::to_vec_pretty(value)?),
+            Self::Bytes(value) => Ok(value.clone()),
+        }
+    }
+}
+
+fn push_json_entry<T>(entries: &mut Vec<RunDumpEntry>, path: &str, value: &T) -> Result<()>
+where
+    T: serde::Serialize,
+{
+    entries.push(RunDumpEntry::json(path, serde_json::to_value(value)?));
+    Ok(())
+}
+
+fn push_json_entry_path<T>(entries: &mut Vec<RunDumpEntry>, path: &Path, value: &T) -> Result<()>
+where
+    T: serde::Serialize,
+{
+    entries.push(RunDumpEntry::json_path(path, serde_json::to_value(value)?));
+    Ok(())
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn validate_single_path_segment(kind: &str, value: &str) -> Result<PathBuf> {
+    let path = validate_relative_path(kind, value)?;
+    if path.components().count() != 1 {
+        bail!("{kind} {value:?} must be a single path segment");
+    }
+    Ok(path)
+}
+
+fn validate_relative_path(kind: &str, value: &str) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("{kind} {value:?} must be a relative path without '..'");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("{kind} {value:?} must not be empty");
+    }
+    Ok(normalized)
+}
+
+fn collect_blob_refs_in_value(value: &serde_json::Value, blob_ids: &mut Vec<RunBlobId>) {
+    match value {
+        serde_json::Value::String(current) => {
+            if let Some(blob_id) = parse_blob_ref(current) {
+                blob_ids.push(blob_id);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_blob_refs_in_value(item, blob_ids);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_blob_refs_in_value(item, blob_ids);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn replace_blob_refs_in_value(
+    value: &mut serde_json::Value,
+    cache: &HashMap<RunBlobId, serde_json::Value>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::String(current) => {
+            let Some(blob_id) = parse_blob_ref(current) else {
+                return Ok(());
+            };
+            let hydrated = cache
+                .get(&blob_id)
+                .cloned()
+                .with_context(|| format!("blob {blob_id:?} is missing from the hydration cache"))?;
+            *value = hydrated;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_blob_refs_in_value(item, cache)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                replace_blob_refs_in_value(item, cache)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn artifact_dump_path(
+    stage_ranks: &HashMap<StageId, u32>,
+    stage_id: &StageId,
+    retry: u32,
+    filename: &str,
+) -> Result<PathBuf> {
+    validate_single_path_segment("node id", stage_id.node_id())?;
+    let filename_path = validate_relative_path("artifact filename", filename)?;
+    let stage_dir = stage_ranks.get(stage_id).map_or_else(
+        || PathBuf::from("_orphans").join(stage_id.to_string()),
+        |rank| PathBuf::from(stage_dir_name(*rank, stage_id)),
+    );
+    Ok(PathBuf::from("artifacts")
+        .join(stage_dir)
+        .join(retry_storage_segment(retry))
+        .join(filename_path))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path {} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::{TimeZone, Utc};
+    use fabro_store::{RunProjection, StageId};
+    use fabro_types::graph::Graph;
+    use fabro_types::run::RunSpec;
+    use fabro_types::{
+        Checkpoint, CheckpointRecord, Conclusion, RunDiff, RunSandbox, RunSandboxInstance,
+        RunSandboxPlan, RunStatus, SandboxProviderKind, StageCompletion, StageModelUsage,
+        StageOutcome, StartRecord, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+        test_support,
+    };
+    use futures::executor;
+
+    use super::{RunDump, RunDumpContents, RunDumpEntry};
+
+    fn sample_run_spec() -> RunSpec {
+        RunSpec {
+            run_id:           fixtures::RUN_1,
+            settings:         WorkflowSettings::default(),
+            graph:            Graph::new("ship"),
+            graph_source:     Some("digraph Ship {}".to_string()),
+            workflow_slug:    Some("demo".to_string()),
+            automation:       None,
+            source_directory: Some("/tmp/project".to_string()),
+            git:              Some(fabro_types::GitContext {
+                origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
+                branch:       "main".to_string(),
+                sha:          None,
+                dirty:        fabro_types::DirtyStatus::Clean,
+                push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            }),
+            labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
+            provenance:       test_support::test_run_provenance(),
+            manifest_blob:    None,
+            definition_blob:  None,
+            fork_source_ref:  None,
+        }
+    }
+
+    fn sample_checkpoint() -> Checkpoint {
+        Checkpoint {
+            timestamp:                  Utc
+                .with_ymd_and_hms(2026, 4, 20, 12, 0, 0)
+                .single()
+                .unwrap(),
+            current_node:               "build".to_string(),
+            completed_nodes:            vec!["build".to_string()],
+            node_retries:               HashMap::new(),
+            context_values:             HashMap::new(),
+            node_outcomes:              HashMap::new(),
+            next_node_id:               Some("ship".to_string()),
+            git_commit_sha:             Some("abc123".to_string()),
+            loop_failure_signatures:    HashMap::new(),
+            restart_failure_signatures: HashMap::new(),
+            node_visits:                HashMap::from([("build".to_string(), 2usize)]),
+        }
+    }
+
+    #[test]
+    fn from_projection_uses_stages_layout_and_collapses_top_level_metadata_files() {
+        let stage_id = StageId::new("build", 2);
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
+        projection.start = Some(StartRecord {
+            start_time: Utc
+                .with_ymd_and_hms(2026, 4, 20, 12, 0, 0)
+                .single()
+                .unwrap(),
+            run_branch: Some("fabro/run/demo".to_string()),
+            base_sha:   Some("deadbeef".to_string()),
+        });
+        projection.status = RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        };
+        projection.checkpoints.push(CheckpointRecord {
+            seq:        7,
+            checkpoint: sample_checkpoint(),
+            diff:       RunDiff::default(),
+        });
+        projection.conclusion = Some(Conclusion {
+            timestamp:            Utc
+                .with_ymd_and_hms(2026, 4, 20, 12, 5, 0)
+                .single()
+                .unwrap(),
+            status:               StageOutcome::Succeeded,
+            timing:               fabro_types::RunTiming::wall_only(5),
+            failure:              None,
+            final_git_commit_sha: Some("abc123".to_string()),
+            stages:               Vec::new(),
+            billing:              None,
+            total_retries:        0,
+            diff:                 RunDiff::default(),
+        });
+        projection.sandbox = Some(RunSandbox::ready(
+            RunSandboxPlan {
+                provider: SandboxProviderKind::Local,
+                image:    None,
+                snapshot: None,
+            },
+            RunSandboxInstance {
+                provider: SandboxProviderKind::Local,
+                image:    None,
+                snapshot: None,
+                runtime:  fabro_types::RunSandboxRuntime {
+                    id:                "sandbox-1".to_string(),
+                    working_directory: "/tmp/project".to_string(),
+                    repo_cloned:       None,
+                    clone_origin_url:  None,
+                    clone_branch:      None,
+                    workspace_root:    None,
+                    repos_root:        None,
+                    primary_repo_path: None,
+                    primary_repo_link: None,
+                },
+            },
+        ));
+        let stage =
+            projection.stage_entry(stage_id.node_id(), stage_id.visit(), first_event_seq(2));
+        stage.prompt = Some("plan".to_string());
+        stage.response = Some("done".to_string());
+        stage.completion = Some(StageCompletion {
+            outcome:        StageOutcome::Succeeded,
+            notes:          Some("ok".to_string()),
+            failure_reason: None,
+            timestamp:      Utc
+                .with_ymd_and_hms(2026, 4, 20, 12, 1, 0)
+                .single()
+                .unwrap(),
+        });
+        stage.provider_used = Some(StageModelUsage {
+            mode:             StageModelUsage::MODE_PROMPT.to_string(),
+            provider:         Some("openai".to_string()),
+            model:            None,
+            reasoning_effort: None,
+            speed:            None,
+        });
+        stage.diff = Some("diff --git a/a b/a".to_string());
+        stage.script_invocation = Some(serde_json::json!({ "command": "cargo test" }));
+        stage.script_timing = Some(serde_json::json!({ "duration_ms": 10 }));
+        stage.parallel_results = Some(vec![fabro_types::ParallelBranchResult {
+            id:              "review".to_string(),
+            status:          fabro_types::StageOutcome::Succeeded,
+            context_updates: std::collections::BTreeMap::from([(
+                "response.review".to_string(),
+                serde_json::json!("looks good"),
+            )]),
+        }]);
+        stage.output = Some("output".to_string());
+
+        let dump = RunDump::from_projection(&projection).unwrap();
+        let paths: Vec<&str> = dump
+            .entries()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+
+        assert!(paths.contains(&"run.json"));
+        assert!(paths.contains(&"graph.fabro"));
+        assert!(paths.contains(&"stages/001-build@2/prompt.md"));
+        assert!(paths.contains(&"stages/001-build@2/response.md"));
+        assert!(paths.contains(&"stages/001-build@2/status.json"));
+        assert!(paths.contains(&"stages/001-build@2/provider_used.json"));
+        assert!(paths.contains(&"stages/001-build@2/diff.patch"));
+        assert!(paths.contains(&"stages/001-build@2/script_invocation.json"));
+        assert!(paths.contains(&"stages/001-build@2/script_timing.json"));
+        assert!(paths.contains(&"stages/001-build@2/parallel_results.json"));
+        assert!(paths.contains(&"stages/001-build@2/output.log"));
+        assert!(!paths.contains(&"start.json"));
+        assert!(!paths.contains(&"status.json"));
+        assert!(!paths.contains(&"checkpoint.json"));
+        assert!(!paths.contains(&"sandbox.json"));
+        assert!(!paths.contains(&"conclusion.json"));
+
+        let run_json = dump
+            .entries()
+            .iter()
+            .find(|entry| entry.path == "run.json")
+            .expect("run.json should be emitted");
+        let RunDumpContents::Json(value) = &run_json.contents else {
+            panic!("run.json should be json");
+        };
+        let round_tripped: RunProjection = serde_json::from_value(value.clone()).unwrap();
+        let node = round_tripped.stage(&stage_id).expect("node should exist");
+
+        assert_eq!(round_tripped.spec.run_id, fixtures::RUN_1);
+        assert!(round_tripped.start.is_some());
+        assert!(round_tripped.status.is_terminal());
+        assert!(round_tripped.current_checkpoint().is_some());
+        assert!(round_tripped.conclusion.is_some());
+        assert!(round_tripped.sandbox.is_some());
+        assert_eq!(node.prompt, None);
+        assert_eq!(node.response, None);
+        assert_eq!(node.diff, None);
+        assert_eq!(node.output, None);
+        assert_eq!(
+            node.provider_used.as_ref().map(|usage| usage.mode.as_str()),
+            Some(StageModelUsage::MODE_PROMPT)
+        );
+        assert_eq!(
+            node.provider_used
+                .as_ref()
+                .and_then(|usage| usage.provider.as_deref()),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn from_projection_prefixes_stage_paths_but_not_artifact_paths() {
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
+        projection
+            .stage_entry("zebra", 1, first_event_seq(1))
+            .prompt = Some("first".to_string());
+        projection
+            .stage_entry("apple", 1, first_event_seq(2))
+            .prompt = Some("second".to_string());
+
+        let mut dump = RunDump::from_projection(&projection).unwrap();
+        dump.add_artifact_bytes(&StageId::new("zebra", 1), 0, "report.txt", b"z".to_vec())
+            .unwrap();
+        dump.add_artifact_bytes(&StageId::new("apple", 1), 0, "report.txt", b"a".to_vec())
+            .unwrap();
+
+        let paths: Vec<&str> = dump
+            .entries()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+
+        assert!(paths.contains(&"stages/001-zebra@1/prompt.md"));
+        assert!(paths.contains(&"stages/002-apple@1/prompt.md"));
+        assert!(paths.contains(&"artifacts/001-zebra@1/retry-0000/report.txt"));
+        assert!(paths.contains(&"artifacts/002-apple@1/retry-0000/report.txt"));
+    }
+
+    #[test]
+    fn add_artifact_bytes_places_orphans_under_sentinel() {
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
+        projection
+            .stage_entry("known", 1, first_event_seq(1))
+            .prompt = Some("present".to_string());
+
+        let mut dump = RunDump::from_projection(&projection).unwrap();
+        dump.add_artifact_bytes(&StageId::new("missing", 1), 0, "report.txt", b"m".to_vec())
+            .unwrap();
+
+        let paths: Vec<&str> = dump
+            .entries()
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(paths.contains(&"artifacts/_orphans/missing@1/retry-0000/report.txt"));
+        assert!(paths.contains(&"dump.log"));
+    }
+
+    #[test]
+    fn hydrate_referenced_blobs_ignores_legacy_artifact_file_refs() {
+        let blob = serde_json::to_vec("hydrated legacy text").unwrap();
+        let blob_id = fabro_types::RunBlobId::new(&blob);
+        let legacy_ref = format!("file:///sandbox/.fabro/artifacts/{blob_id}.json");
+        let mut dump = RunDump {
+            entries:        vec![RunDumpEntry::json(
+                "run.json",
+                serde_json::json!({ "stdout": legacy_ref }),
+            )],
+            stage_ranks:    HashMap::new(),
+            dump_log_index: None,
+        };
+
+        executor::block_on(async {
+            dump.hydrate_referenced_blobs_with_reader(|read_blob_id| {
+                let blob = blob.clone();
+                Box::pin(async move {
+                    assert_eq!(read_blob_id, blob_id);
+                    Ok(Some(bytes::Bytes::from(blob)))
+                })
+            })
+            .await
+        })
+        .unwrap();
+
+        let RunDumpContents::Json(value) = &dump.entries[0].contents else {
+            panic!("entry should be JSON");
+        };
+        assert_eq!(value["stdout"], legacy_ref);
+    }
+}

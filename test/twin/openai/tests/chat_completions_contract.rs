@@ -69,6 +69,7 @@ async fn chat_completions_accepts_supported_openai_compatible_fields() {
                 },
                 { "role": "user", "content": "structured chat" }
             ],
+            "max_tokens": 128,
             "stream": false,
             "tools": [{ "type": "function", "function": { "name": "lookup" } }],
             "tool_choice": "auto",
@@ -86,6 +87,44 @@ async fn chat_completions_accepts_supported_openai_compatible_fields() {
     assert_eq!(
         body["choices"][0]["message"]["reasoning"][0],
         "reasoning: structured chat"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_accepts_tool_call_history() {
+    let server = common::spawn_server().await.expect("server should start");
+
+    let response = server
+        .post_chat(json!({
+            "model": "gpt-test",
+            "messages": [
+                { "role": "user", "content": "replace old with new" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_edit",
+                        "type": "function",
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": "{\"old\":\"old\",\"new\":\"new\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "Updated data.txt",
+                    "tool_call_id": "call_edit"
+                }
+            ],
+            "stream": false
+        }))
+        .await;
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.expect("json");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "deterministic: replace old with new"
     );
 }
 
