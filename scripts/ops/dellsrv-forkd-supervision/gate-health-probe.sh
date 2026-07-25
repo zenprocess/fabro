@@ -168,42 +168,53 @@ EOF
 
 # scrape_field extracts a field from a controller API response.
 #
-# Verified live on dellsrv 2026-07-25: the create endpoint returns
-# a JSON ARRAY of one object, not a bare object. e.g.
-#     [{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]
-# So `.id` yields nothing — we MUST query `.[0].id`. This helper
-# builds the path with the array wrapper.
+# Verified live on dellsrv 2026-07-25:
+#   - CREATE response is a JSON ARRAY of one object, e.g.
+#         [{"id":"sb-...","snapshot_tag":"...","netns":"forkd-child-1",...}]
+#     so we must query `.[0].id` (not `.id`).
+#   - EXEC response is a PLAIN flat object, e.g.
+#         {"stdout":"","stderr":"","exit_code":0}
+#     so we must query `.exit_code` (not `.[0].exit_code`, which
+#     would query an array index into an object and yield nothing).
+#   - DELETE response is not parsed; we only check the call's exit
+#     code. If the controller ever starts returning a useful field
+#     from DELETE, the caller passes the right path prefix.
+#
+# The caller tells us the response shape by passing a jq path
+# prefix: "." for a flat object, ".[0]." for an array-wrapped
+# object. The helper is otherwise shape-agnostic.
 #
 # Strategy (in order):
-#   1. jq `.[0].<primary>` — the verified shape
-#   2. jq `.[0].<alt>` for each fallback name (do NOT include the
-#      primary in the fallbacks — caller passes them separately)
+#   1. jq <prefix><primary> — the verified shape
+#   2. jq <prefix><alt> for each fallback name
 #   3. raw regex grep `"<primary>":"<value>"` as escape hatch — if
 #      jq fails (malformed JSON, server returned HTML, response shape
-#      changed) we still get something usable. False-positive risk is
-#      low: an id-shaped token at the top of a controller response is
-#      almost always the id.
+#      changed) we still get something usable. The regex is
+#      shape-agnostic: it just finds the first "key":"value" pair
+#      in the response, so it works for both flat and array-wrapped
+#      responses.
 #
 # Args:
 #   $1 = response body
-#   $2 = primary field name (no leading dot)
-#   $3.. = fallback field names
+#   $2 = jq path prefix: "." (flat object) or ".[0]." (array-wrapped)
+#   $3 = primary field name (no leading dot)
+#   $4.. = fallback field names
 # Stdout: extracted value, or nothing.
 # Return: 0 on extraction, 1 if nothing found.
 scrape_field() {
-    local response="$1" primary="$2"; shift 2
+    local response="$1" prefix="$2" primary="$3"; shift 3
     local value
 
-    # 1. primary path: .[0].<primary>
-    value="$(printf '%s' "$response" | jq -r ".[0].${primary} // empty" 2>/dev/null || true)"
+    # 1. primary path: <prefix><primary>
+    value="$(printf '%s' "$response" | jq -r "${prefix}${primary} // empty" 2>/dev/null || true)"
     if [ -n "$value" ] && [ "$value" != "null" ]; then
         printf '%s' "$value"
         return 0
     fi
 
-    # 2. fallbacks: .[0].<alt>
+    # 2. fallbacks: <prefix><alt>
     for alt in "$@"; do
-        value="$(printf '%s' "$response" | jq -r ".[0].${alt} // empty" 2>/dev/null || true)"
+        value="$(printf '%s' "$response" | jq -r "${prefix}${alt} // empty" 2>/dev/null || true)"
         if [ -n "$value" ] && [ "$value" != "null" ]; then
             log "WARN: scraped field from fallback name '$alt' (update primary if this is canonical)"
             printf '%s' "$value"
@@ -213,7 +224,7 @@ scrape_field() {
 
     # 3. regex escape hatch. Pattern matches the first occurrence of
     # `"<primary>":"<value>"` anywhere in the response. Greedy enough
-    # to survive non-JSON / malformed JSON.
+    # to survive non-JSON / malformed JSON. Shape-agnostic.
     value="$(printf '%s' "$response" | grep -oE "\"${primary}\":\"[^\"]+\"" \
              | head -1 | sed -E "s/^\"${primary}\":\"([^\"]+)\"/\1/")"
     if [ -n "$value" ]; then
@@ -290,7 +301,7 @@ log "create response (raw): $create_response"
 # escape hatch in scrape_field still gets us an id. Only if that
 # also fails do we accept the leak — and we log it loudly so the
 # operator notices.
-SANDBOX_ID="$(scrape_field "$create_response" "$SANDBOX_ID_FIELD" "${SANDBOX_ID_FALLBACKS[@]}")" || SANDBOX_ID=""
+SANDBOX_ID="$(scrape_field "$create_response" ".[0]." "$SANDBOX_ID_FIELD" "${SANDBOX_ID_FALLBACKS[@]}")" || SANDBOX_ID=""
 if [ -n "$SANDBOX_ID" ]; then
     log "sandbox id: $SANDBOX_ID"
 else
@@ -335,7 +346,7 @@ exec_response="$(in_container_curl POST "/v1/sandboxes/$SANDBOX_ID/exec" "$exec_
 log "exec response (raw): $exec_response"
 
 # Array-aware parse — same shape assumption as create (verified live).
-exit_code="$(scrape_field "$exec_response" "$EXIT_CODE_FIELD" "${EXIT_CODE_FALLBACKS[@]}")" || exit_code=""
+exit_code="$(scrape_field "$exec_response" "." "$EXIT_CODE_FIELD" "${EXIT_CODE_FALLBACKS[@]}")" || exit_code=""
 
 if [ "$exit_code" != "0" ]; then
     alert "exec_nonzero_exit" "$exec_response" "alert_only_no_heal"
