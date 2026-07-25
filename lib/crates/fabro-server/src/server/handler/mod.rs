@@ -21,6 +21,7 @@ mod models;
 mod pair;
 mod playground;
 mod pull_requests;
+mod registrations;
 pub(in crate::server) mod runs;
 mod sandbox;
 mod sandboxes;
@@ -206,6 +207,10 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         )
         .route("/insights/execute", post(not_implemented))
         .route("/insights/history", get(not_implemented))
+        .route(
+            "/runs/registrations",
+            post(registrations::register_external_run),
+        )
         .merge(runs::routes())
         .merge(events::routes())
         .merge(billing::routes())

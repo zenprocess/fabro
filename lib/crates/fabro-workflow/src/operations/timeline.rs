@@ -250,6 +250,7 @@ mod tests {
                 source_directory: None,
                 labels:           HashMap::new(),
                 provenance:       test_support::test_run_provenance(),
+                origin: None,
                 manifest_blob:    None,
                 definition_blob:  None,
                 git:              None,

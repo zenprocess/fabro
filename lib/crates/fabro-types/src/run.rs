@@ -7,7 +7,7 @@ use crate::graph::Graph;
 use crate::principal::Principal;
 use crate::run_blob_id::RunBlobId;
 use crate::run_id::RunId;
-use crate::run_summary::AutomationRef;
+use crate::run_summary::{AutomationRef, RunOrigin};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunServerProvenance {
@@ -93,6 +93,8 @@ pub struct RunSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels:           HashMap<String, String>,
     pub provenance:       RunProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin:           Option<RunOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_blob:    Option<RunBlobId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
