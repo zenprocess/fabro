@@ -53,7 +53,7 @@
 #                                                    # binary contains this string
 #
 # WEB UI
-#   rust_embed compiles lib/crates/fabro-spa/assets/ into the binary at build
+#   rust_embed compiles lib/apps/fabro-spa/assets/ into the binary at build
 #   time; release binaries have NO on-disk fallback. If that directory is
 #   empty when this script rsyncs the tree (the common case — it's built by a
 #   separate step, not checked in populated), the resulting binary is
