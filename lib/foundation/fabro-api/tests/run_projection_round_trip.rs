@@ -138,6 +138,7 @@ fn run_spec_json() -> serde_json::Value {
         source_directory: None,
         labels:           std::collections::HashMap::new(),
         provenance:       test_support::test_run_provenance(),
+        origin:           None,
         manifest_blob:    None,
         definition_blob:  None,
         git:              None,
