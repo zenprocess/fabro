@@ -23,6 +23,7 @@ re-base is already live on dellsrv.
 | Path | Role |
 |---|---|
 | `gate-health-probe.sh` | Exercises the real `per_child_netns=true` sandbox path end-to-end. Default: alert-only. `--heal` for auto-repair. |
+| `exec-eagain-control.sh` | Added 2026-07-28 for the active EAGAIN-at-exec outage (`POST /v1/sandboxes/{id}/exec -> HTTP 500 "Resource temporarily unavailable"`). Runs one trivial `echo hi` exec on a chosen `--tag` to split the failure into deterministic/global vs. workload-dependent. `--diagnose` adds a strictly read-only one-pass diagnostic capture (controller/proxy state, orphans, limits, netns, disk/memory). See its header comment for the full decision tree. |
 | `gate-health-probe.service` | systemd one-shot service for the probe. Independent of `forkd-ec.service`. |
 | `gate-health-probe.timer` | Periodic trigger (5 min, `Persistent=true`, `AccuracySec=60s`). |
 
@@ -145,6 +146,39 @@ sudo /usr/local/sbin/gate-health-probe.sh --heal
 # or, dry-run:
 sudo /usr/local/sbin/gate-health-probe.sh --dry-run
 ```
+
+## exec-eagain-control.sh — the EAGAIN-at-exec outage control experiment
+
+Added 2026-07-28 for an active outage distinct from the netns failure above:
+`POST /v1/sandboxes/{id}/exec` returning `HTTP 500 "exec: read response: Resource
+temporarily unavailable"` (EAGAIN), 182 occurrences, zero successful gate runs on
+the affected repo. Unlike the netns failure, sandbox **create** succeeds — only the
+exec response read fails.
+
+This script is not a continuous probe (no `.timer` — it is a diagnostic, run once
+per investigation). It exists to answer one question before anyone reaches for a
+fix: **is this deterministic (fires on any command) or workload-dependent (fires
+only on heavier/longer/larger-output commands)?** Those two answers point at
+opposite remediations — see the script's header comment for the full reasoning,
+including the specific code path this investigation flagged in
+`~/fabro-run/forkd-shim.py`'s reverse-proxy retry logic (sandbox-create gets
+retries on a known transient signature; every other request shape, including
+exec, gets exactly one attempt).
+
+```bash
+# Run against the tag the gate actually uses for the affected repo:
+sudo scripts/ops/dellsrv-forkd-supervision/exec-eagain-control.sh --tag zen-gate-big
+
+# Also capture read-only diagnostics in the same pass:
+sudo scripts/ops/dellsrv-forkd-supervision/exec-eagain-control.sh --tag zen-gate-big --diagnose
+
+# dry-run:
+sudo scripts/ops/dellsrv-forkd-supervision/exec-eagain-control.sh --dry-run
+```
+
+Read the `CONTROL-RESULT:` and `EXEC-ELAPSED:` lines on stdout — everything else is
+diagnostic logging on stderr. As with `gate-health-probe.sh` below, **do not pipe
+this script** if you care about its exit code.
 
 ## Independence from forkd-ec.service
 
