@@ -1,0 +1,43 @@
+diff --git a/lib/components/fabro-referee/src/lib.rs b/lib/components/fabro-referee/src/lib.rs
+index bc1482351..57adf6838 100644
+--- a/lib/components/fabro-referee/src/lib.rs
++++ b/lib/components/fabro-referee/src/lib.rs
+@@ -30,6 +30,7 @@ pub mod canary;
+ pub mod decision_log;
+ pub mod emit;
+ pub mod gate;
++pub mod register;
+ pub mod runner;
+ pub mod types;
+ 
+diff --git a/lib/components/fabro-referee/src/runner.rs b/lib/components/fabro-referee/src/runner.rs
+index 217a65c18..71d2e08c7 100644
+--- a/lib/components/fabro-referee/src/runner.rs
++++ b/lib/components/fabro-referee/src/runner.rs
+@@ -26,6 +26,7 @@ use tracing::{info, warn};
+ use crate::decision_log::find_decision;
+ use crate::emit::{append_jsonl, write_markdown_summary};
+ use crate::gate::GateBackend;
++use crate::register;
+ use crate::types::{CURRENT_SCHEMA_VERSION, GateOutput, Route, RunRow, TaskSpec, Tier, Verdict};
+ 
+ /// What the runner emits for one task.
+@@ -89,6 +90,18 @@ pub fn run(
+         let row = make_row(run_id, task, &route, &gate_out, backfill);
+         append_jsonl(sink_dir, &row)
+             .with_context(|| format!("emit jsonl for branch={}", route.branch))?;
++        // Optional, opt-in fan-out to the Fabro run board. The JSONL
++        // sink above is the authoritative artifact; a server outage
++        // must degrade to a logged warning, never a lost score.
++        if let Err(e) = register::register(&row, &task.base_ref) {
++            warn!(
++                run_id = %run_id,
++                task = %task.task_id,
++                branch = %route.branch,
++                err = %e,
++                "referee run registration failed; JSONL sink retained as authoritative"
++            );
++        }
+         rows.push(row);
+     }
+     write_markdown_summary(sink_dir, run_id, &rows).with_context(|| "emit markdown summary")?;
