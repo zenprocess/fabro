@@ -19,6 +19,19 @@
 #   forkd-ec-boot.sh provisions the netns only at container start. Nothing
 #   probes them. This script IS that probe.
 #
+#   EXTENDED fabro-122 (2026-07-31): the exec round-trip now also
+#   classifies the EAGAIN-500 signature (controller returns HTTP 500
+#   from POST .../exec with body containing "Resource temporarily
+#   unavailable (os error 11)") and emits a structured
+#   `FORKD-GATE-ALERT reason=exec_eagain_500` marker. The poll log
+#   evidence is that this single signature accounts for ~91:1 of all
+#   observed gate failures (1092 occurrences vs 12 for snapshot-restore
+#   400). Without a dedicated alert tag, monitoring cannot distinguish
+#   it from any other exec failure — and the leading hypothesis is that
+#   the fix lives in the controller's read loop (retry-with-deadline on
+#   EAGAIN, bounded by FABRO_EXEC_TIMEOUT), not on this probe path.
+#   See docs/internal/forkd-snapshot-registry.md §3 (EAGAIN hypothesis).
+#
 # WHAT IT DOES
 #   1. POST /v1/sandboxes (create) with tag=zen-gate-base and
 #      per_child_netns=true. The `true` is load-bearing: a probe using
@@ -42,7 +55,10 @@
 #      ('Invalid argument' / 'socket never appeared'), ALERT (or, with
 #      --heal, attempt the documented teardown+setup repair).
 #   3. POST /v1/sandboxes/{id}/exec with body {"args":["/bin/true"]} and
-#      assert exit_code == 0.
+#      assert exit_code == 0. If the raw response carries the EAGAIN-500
+#      signature, ALERT with reason=exec_eagain_500 BEFORE die() so
+#      monitoring can count this failure class distinctly from
+#      non-EAGAIN exec failures (forkd #122 — see runbook link below).
 #   4. DELETE /v1/sandboxes/{id} — ALWAYS, even on prior failure.
 #   5. Exit 0 on full success, non-zero with a precise, greppable reason
 #      on any failure.
@@ -349,6 +365,20 @@ log "exec response (raw): $exec_response"
 exit_code="$(scrape_field "$exec_response" "." "$EXIT_CODE_FIELD" "${EXIT_CODE_FALLBACKS[@]}")" || exit_code=""
 
 if [ "$exit_code" != "0" ]; then
+    # fabro-122: emit a specific EAGAIN-500 alert tag BEFORE the generic
+    # exec_nonzero_exit so monitoring can split the failure class. The
+    # leading hypothesis (controller source not local — see §3 of
+    # docs/internal/forkd-snapshot-registry.md) is that a non-blocking fd
+    # read in the controller's exec-response path treats EAGAIN as
+    # fatal; the fix lives in the controller's read loop
+    # (retry-with-deadline bounded by FABRO_EXEC_TIMEOUT), NOT here.
+    # The structured alert is what surfaces the class to ops so the
+    # controller fix becomes the priority instead of being misdiagnosed
+    # as a probe-side regression.
+    if printf '%s' "$exec_response" | grep -qE 'os error 11|Resource temporarily unavailable'; then
+        excerpt="${exec_response:0:200}"
+        alert "exec_eagain_500" "$excerpt" "controller-side-EAGAIN-hypothesis-see-forkd-snapshot-registry-runbook"
+    fi
     alert "exec_nonzero_exit" "$exec_response" "alert_only_no_heal"
     die "exec returned exit_code=$exit_code (expected 0) for command=$PROBE_CMD"
 fi
