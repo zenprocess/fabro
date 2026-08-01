@@ -156,6 +156,17 @@ surface area the user sees.
 
 ### 5a. Rust client retry — already in place (verified by source)
 
+> **STOP — read this twice.** The Rust client retry below is **defense
+> in depth, NOT the fix**. It masks the symptom by absorbing transient
+> EAGAINs that land inside its 3-attempt / ~1.25 s envelope, but the
+> remaining 1092-occurrence poll-log rate is the **tail** beyond that
+> envelope (the EAGAIN persists longer than the backoff schedule, or
+> many EAGAINs interleave across poll cycles). The **fix** is still the
+> controller-side retry-with-deadline bounded by `FABRO_EXEC_TIMEOUT`
+> (§4, §8). Client-side retry does NOT close the issue; it lowers the
+> surface area while the controller fix lands. **Do not read this
+> section as "closed" or as a substitute for the controller patch.**
+
 In
 `lib/components/fabro-sandbox/src/forkd/mod.rs::ForkdSandbox::exec_in_sandbox`
 on `origin/main`:
@@ -213,7 +224,8 @@ The implication: a transient EAGAIN lasting <~1.25 s (250 + 500 +
 1000 ms backoff between 3 attempts) is already absorbed client-side.
 The remaining 1092-occurrence poll-log rate is the **tail** beyond
 that envelope (the EAGAIN persists longer than the backoff schedule,
-or many EAGAINs interleave across poll cycles).
+or many EAGAINs interleave across poll cycles). **The fix is on the
+controller side** (§4, §8); do not let this section read as closure.
 
 ### 5b. Gate-side deferral — added by ao-company PR #145
 
@@ -340,12 +352,29 @@ depends on `daytona-sdk` (a registry fetch) which this sandbox cannot
 reach. The orchestrator's brief mandates scoping cargo to `-p
 fabro-sandbox` ("Never run a repo-wide cargo command"); with that
 constraint the build is blocked by the workspace-resolve step, not by
-my edits. The reading verification (file content + HTTP_RETRY_LIMIT
-constants + retry envelope) is the primary deliverable and is
-complete. The honest "could not verify live" applies: a clean
-`cargo build` of `lib/components/fabro-sandbox` with the `forkd`
-feature requires an environment with crates.io access for the
-workspace deps, which is not this box.
+my edits. Concretely:
+
+```
+$ cargo build -p fabro-sandbox --features forkd
+error: failed to get `daytona-sdk` as a dependency of package `fabro-cli v0.304.0-nightly.1 …
+Caused by: failed to load source for dependency `daytona-sdk`
+cargo build: 1 errors, 0 warnings (0 crates)
+```
+
+`daytona-sdk` is NOT a dep of `lib/components/fabro-sandbox/` itself —
+it's a dep of `lib/apps/fabro-cli/`. But cargo resolves the workspace
+dependency graph before honoring `-p`, and that resolve step needs
+`daytona-sdk`, which is unreachable from this sandbox. The reading
+verification (file content + HTTP_RETRY_LIMIT constants + retry
+envelope) is the primary deliverable for Item 1 and is complete. A
+clean `cargo build -p fabro-sandbox` requires either an environment
+with crates.io access or offline-vendored deps (`cargo vendor` + a
+local index), neither of which is this box.
+
+The orchestrator's instruction to scope cargo to `-p fabro-sandbox`
+IS being honored at the syntax level; the workspace-resolve step that
+precedes `-p` filtering is itself the blocker. The honest
+"could not verify live" applies.
 
 ---
 
