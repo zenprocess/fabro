@@ -1,0 +1,44 @@
+# fabro — self-gate descriptor (in-repo). Schema A is canonical for
+# in-repo .zp/project.yaml — matches argus, zeninfra, foundry, uniforme, cal.
+# The live poller at bin/fabro-gate-poll.sh (ao/fabro-121/gate-poll-descriptors)
+# accepts BOTH Schema A and trader-style Schema B; this file is Schema A.
+#
+# Self-gate wiring (issue #129 acceptance): gate.context binds fabro/qa-pipeline
+# and gate.blocking makes a red status sticky on this repo's PRs. The
+# testCmd below is a NARROW scope (single crate's nextest invocation, not
+# --workspace) so it fits FABRO_EXEC_TIMEOUT=500s and the gate VM's 484 MB
+# /tmp tmpfs — see docs/GATE-ONBOARDING.md §"testCmd constraints".
+#
+# UNVERIFIED at PR-time: this testCmd ran author-side once; the operator
+# must `reverdict` the first merge that lands it to confirm the gate VM
+# actually completes the run within the time/RAM budget.
+descriptorVersion: 1
+project: fabro
+repo: https://github.com/zenprocess/fabro
+
+qa:
+  language: rust
+  # Self-gate command (UNVERIFIED at PR merge time — see header note).
+  # Scoped to fabro-server because it is the most-load-bearing hermetic
+  # suite in the workspace and produces a nextest binary that completes
+  # inside ~250s on the production CI Mac (nextest runtimes are not yet
+  # measured on the gate VM; the operator's `reverdict` cycle proves
+  # both). `--no-fail-fast` is load-bearing so the gate report shows
+  # every failing test, not the first. `--msg-format=human` keeps the
+  # output pipe well under the controller's OUTPUT_TAIL_BYTES so a
+  # concrete failure signature is preserved in the verdict tail.
+  testCmd: "cargo nextest run -p fabro-server --no-fail-fast --msg-format=human"
+  needsDocker: false
+  needsTestcontainers: false
+  weight: light
+  trustTier: T2   # platform gate; the gate is the deployment surface, not a deploy target
+
+gate:
+  context: fabro/qa-pipeline
+  blocking: true
+
+github:
+  org: zenprocess                # zenprocess is a USER account (not an org)
+  repo: fabro
+  private: false                  # fabro is a public fork
+  defaultBranch: main
