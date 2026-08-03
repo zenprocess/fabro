@@ -16,9 +16,9 @@ use fabro_types::{
     RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
     RunModel, RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxPlan,
     RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps, SandboxProviderKind,
-    StageCompletion, StageHandler, StageId, StageModelUsage, StageOutcome, StageProjection,
-    StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
-    TodoProjection, WorkflowRef, first_event_seq,
+    StageCompletion, StageHandler, StageId, StageInferenceProjection, StageModelUsage, StageOutcome,
+    StageProjection, StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind,
+    TodoListProjection, TodoProjection, WorkflowRef, first_event_seq, timing,
 };
 use fabro_util::error::render_compact_with_causes;
 

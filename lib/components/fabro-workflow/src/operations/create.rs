@@ -476,6 +476,7 @@ pub async fn persist_create_run(
             source_directory: Some(source_directory),
             labels,
             provenance,
+            origin: None,
             manifest_blob: None,
             definition_blob: None,
             git,
@@ -657,60 +658,6 @@ fn apply_goal_override(graph: &mut Graph, goal_override: Option<&str>) {
             AttrValue::String(goal_override.to_string()),
         );
     }
-}
-
-fn persist_validated(
-    validated: Validated,
-    options: PersistCreateOptions,
-) -> Result<Persisted, Error> {
-    let PersistCreateOptions {
-        settings,
-        run_id,
-        run_dir,
-        workflow_slug,
-        source_name: _,
-        labels,
-        source_directory,
-        automation,
-        git,
-        fork_source_ref,
-        provenance,
-        configured_providers,
-        catalog,
-    } = options;
-
-    let settings = materialize_run(
-        settings,
-        validated.graph(),
-        catalog.as_ref(),
-        &configured_providers,
-    )?;
-
-    let run_id = run_id.unwrap_or_else(RunId::new);
-    let run_dir = run_dir.unwrap_or_else(|| default_run_dir(&run_id));
-
-    let run_spec = RunSpec {
-        run_id,
-        settings,
-        graph: validated.graph().clone(),
-        graph_source: Some(validated.source().to_string()),
-        workflow_slug,
-        automation,
-        source_directory,
-        labels,
-        provenance,
-        origin: None,
-        manifest_blob: None,
-        definition_blob: None,
-        git,
-        fork_source_ref,
-    };
-
-    pipeline::persist(validated, PersistOptions { run_dir, run_spec })
-}
-
-pub(crate) fn default_run_dir(run_id: &RunId) -> PathBuf {
-    make_run_dir(&default_scratch_base(), run_id)
 }
 
 pub fn make_run_dir(scratch_base: &Path, run_id: &RunId) -> PathBuf {

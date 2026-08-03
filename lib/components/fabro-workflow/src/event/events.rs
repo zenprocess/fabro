@@ -4,9 +4,9 @@ use ::fabro_types::{
     AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary,
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
     PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
-    PullRequestLink, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunOrigin, RunPairEndedReason,
-    RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming, SandboxProviderKind, StageId,
-    StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
+    PullRequestLink, ReviewTarget, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunOrigin,
+    RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming,
+    SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
 use fabro_model::{ReasoningEffort, Speed};
