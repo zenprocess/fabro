@@ -20,7 +20,7 @@
 //!
 //! All subcommands honor `--backend hermetic` (default) or
 //! `--backend forkd`. `--backend forkd` requires the egress
-//! allowlist to include `dellsrv:8891` (it does not from this
+//! allowlist to include `forkd.internal.example:8891` (it does not from this
 //! worktree).
 
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ struct Cli {
     sink_dir: Option<PathBuf>,
 
     /// Backend kind: hermetic (default, no network) | forkd (real,
-    /// needs dellsrv:8891 in the egress allowlist) | fake (test-only).
+    /// needs forkd.internal.example:8891 in the egress allowlist) | fake (test-only).
     #[arg(long, global = true, default_value = "hermetic")]
     backend: String,
 
@@ -62,7 +62,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        default_value = "http://dellsrv:8891",
+        default_value = "http://forkd.internal.example:8891",
         value_name = "URL"
     )]
     forkd_endpoint: String,
@@ -265,7 +265,7 @@ fn do_doctor(cli: &Cli, sink_dir: &Path, decision_log: Option<&Path>, backend_ki
     println!("  task_id default: {CANARY_TASK_ID}");
     println!("  canary file  : CANARY.md (operator-overridable via --file)");
     // Cheap reachability check for the forkd endpoint (one sync HTTP
-    // GET). We do NOT fail if dellsrv is unreachable — that is the
+    // GET). We do NOT fail if <gate-host> is unreachable — that is the
     // egress boundary working as designed. We just report.
     match check_endpoint(&cli.forkd_endpoint) {
         Ok(()) => println!("  forkd endpoint: reachable (HTTP 2xx)"),

@@ -522,7 +522,7 @@ mod tests {
 
     fn gate_origin(verdict: RefereeVerdict) -> RunOriginDetails {
         RunOriginDetails::Gate(RunGateOrigin {
-            endpoint: "http://dellsrv:8891".to_string(),
+            endpoint: "http://forkd.internal.example:8891".to_string(),
             sandbox_id: "sb-test".to_string(),
             model: "claude-sonnet-5[1m]".to_string(),
             verdict,

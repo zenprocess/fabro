@@ -52,13 +52,13 @@ pub fn forkd_token() -> Result<String> {
     bail!("forkd token unavailable: set FORKD_TOKEN or provide {FORKD_TOKEN_FILE}")
 }
 
-/// The real forkd controller at `dellsrv:8891`. The scorer only uses the
+/// The real forkd controller at `forkd.internal.example:8891`. The scorer only uses the
 /// existing score/read path: it creates a `zen-gate-base` sandbox, executes
 /// the apply-and-acceptance pipeline, and deletes that sandbox. It never
 /// activates, reconfigures, restarts, or re-baselines the controller or its
 /// golden rootfs.
 pub struct ForkdController {
-    /// The controller endpoint, e.g. `http://dellsrv:8891`.
+    /// The controller endpoint, e.g. `http://forkd.internal.example:8891`.
     endpoint: String,
     /// HTTP client from `fabro-http::blocking_http_client()` (sync,
     /// to fit the synchronous `GateBackend` trait).
@@ -285,7 +285,7 @@ impl GateBackend for ForkdController {
 /// This is the *fallback* backend the P0 spec mandates: it has the
 /// same return shape as `ForkdController` so the runner emits the
 /// JSONL row indistinguishably, and it works with **neither** `ao`
-/// **nor** `dellsrv` — which is why the hermetic tests can run
+/// **nor** `<gate-host>` — which is why the hermetic tests can run
 /// anywhere.
 pub struct HermeticLocal {
     /// The directory the hermetic checkout is seeded from. The

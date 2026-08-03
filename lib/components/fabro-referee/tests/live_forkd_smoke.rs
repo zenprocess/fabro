@@ -21,7 +21,7 @@ fn live_forkd_score_smoke() {
     }
 
     let endpoint =
-        std::env::var("FORKD_ENDPOINT").unwrap_or_else(|_| "http://dellsrv:8891".to_string());
+        std::env::var("FORKD_ENDPOINT").unwrap_or_else(|_| "http://forkd.internal.example:8891".to_string());
     let controller = ForkdController::new(&endpoint).expect("build authenticated forkd client");
     let task = TaskSpec {
         task_id:           "T-live-forkd-score-smoke".to_string(),

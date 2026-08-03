@@ -8,7 +8,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'USAGE'
 Usage: referee-activate-live.sh --run-id ID [--live] [--dry-run] [options]
-  --forkd-endpoint URL   Forkd endpoint (default: http://dellsrv:8891)
+  --forkd-endpoint URL   Forkd endpoint (default: http://forkd.internal.example:8891)
   --live                  Run the operator-confirmed live forkd canary
   --dry-run               Print all phases without running any command
 USAGE
@@ -16,7 +16,7 @@ USAGE
 }
 
 RUN_ID="${RUN_ID:-${FABRO_REFEREE_RUN_ID:-}}"
-FORKD_ENDPOINT="${FORKD_ENDPOINT:-http://dellsrv:8891}"
+FORKD_ENDPOINT="${FORKD_ENDPOINT:-http://forkd.internal.example:8891}"
 LIVE=0
 DRY_RUN=0
 

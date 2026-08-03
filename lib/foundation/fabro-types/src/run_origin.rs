@@ -80,7 +80,7 @@ pub enum RefereeDispatchPath {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunGateOrigin {
     /// The forkd endpoint that produced the verdict (e.g.
-    /// `http://dellsrv:8891`).
+    /// `http://forkd.internal.example:8891`).
     pub endpoint:    String,
     /// The forkd sandbox id this run was executed in.
     pub sandbox_id:  String,
@@ -216,7 +216,7 @@ mod tests {
         // `tag = "kind"` rename_all `snake_case` discriminator stops
         // disambiguating and the deserialization below will panic.
         let gate = RunOriginDetails::Gate(RunGateOrigin {
-            endpoint:    "http://dellsrv:8891".to_string(),
+            endpoint:    "http://forkd.internal.example:8891".to_string(),
             sandbox_id:  "sb-1".to_string(),
             model:       "claude-sonnet-5[1m]".to_string(),
             verdict:     RefereeVerdict::Pass,
@@ -279,7 +279,7 @@ mod tests {
         // backfill-only fields are absorbed into the live type and the
         // hand-rolled discrimination is silently lost.
         let gate_json = serde_json::to_string(&RunOriginDetails::Gate(RunGateOrigin {
-            endpoint:    "http://dellsrv:8891".to_string(),
+            endpoint:    "http://forkd.internal.example:8891".to_string(),
             sandbox_id:  "sb-1".to_string(),
             model:       "claude-sonnet-5[1m]".to_string(),
             verdict:     RefereeVerdict::Pass,

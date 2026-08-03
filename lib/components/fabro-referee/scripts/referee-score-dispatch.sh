@@ -41,7 +41,7 @@ Common:
   --hermetic                  Use the no-network hermetic backend (default
                               for hook invocations; T3 forkd is not safe
                               from a session-end hook in this worktree).
-  --forkd-endpoint URL        Forkd endpoint (default: http://dellsrv:8891).
+  --forkd-endpoint URL        Forkd endpoint (default: http://forkd.internal.example:8891).
   --sink-dir PATH             Sink directory (default: ~/.ao/data/aofactory/referee/runs).
 USAGE
   exit 2
@@ -57,7 +57,7 @@ BRANCH_SINGLE="${BRANCH_SINGLE:-}"
 TIER_SINGLE="${TIER_SINGLE:-}"
 ACCEPTANCE_CMD="${ACCEPTANCE_CMD:-true}"
 RUN_ID="${RUN_ID:-${FABRO_REFEREE_RUN_ID:-}}"
-FORKD_ENDPOINT="${FORKD_ENDPOINT:-http://dellsrv:8891}"
+FORKD_ENDPOINT="${FORKD_ENDPOINT:-http://forkd.internal.example:8891}"
 SINK_DIR="${SINK_DIR:-${HOME}/.ao/data/aofactory/referee/runs}"
 HERMETIC=0
 SYNTHETIC=0

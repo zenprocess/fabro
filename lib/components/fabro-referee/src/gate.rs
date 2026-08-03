@@ -6,7 +6,7 @@
 //!
 //! Production backends:
 //!
-//!   * [`backend::ForkdController`] — T3 real, scored via `dellsrv:8891`
+//!   * [`backend::ForkdController`] — T3 real, scored via `forkd.internal.example:8891`
 //!     zen-gates `gate-run` / `forkd-exec`. Fully wired against the contract
 //!     shape from the P0 spec but **NOT ACTIVATED** from this worktree (egress
 //!     boundary; see `CONTRACTS.md` §1).
@@ -19,7 +19,7 @@
 //!
 //!   * [`test_support::FakeBackend`] — a programmable in-process backend behind
 //!     the same trait; lets the runner's JSONL/sink plumbing be exercised
-//!     without `ao` or `dellsrv`. **Not in production.**
+//!     without `ao` or `<gate-host>`. **Not in production.**
 //!
 //! The trait is synchronous: a gate is one short-lived operation per
 //! route (one POST + one diff-apply + one acceptance run). Tokio would
@@ -55,11 +55,11 @@ pub trait GateBackend: Send + Sync {
 }
 
 /// Configuration: which backend to use. CLI flag `--backend hermetic`
-/// is the default for the canary (dellsrv is unreachable from this
+/// is the default for the canary (<gate-host> is unreachable from this
 /// worktree).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Real forkd controller at `dellsrv:8891`.
+    /// Real forkd controller at `forkd.internal.example:8891`.
     Forkd,
     /// Contract-identical hermetic local gate.
     Hermetic,

@@ -4,7 +4,7 @@
 //! `test_support::FakeBackend::default()` directly from a test.
 //!
 //! The fake backend satisfies the gate trait so the runner's
-//! JSONL/sink plumbing can be exercised without `ao` or `dellsrv`.
+//! JSONL/sink plumbing can be exercised without `ao` or `<gate-host>`.
 //! It is also how the hermetic tests prove the **three-stage seam**
 //! (run-routes → gate → emit) without depending on any external
 //! system.

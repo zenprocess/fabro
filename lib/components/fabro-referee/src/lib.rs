@@ -20,7 +20,7 @@
 //! runner never fakes a pass — the verdict comes from the backend's
 //! response. The hermetic tests use the `test_support::FakeBackend`
 //! (feature-gated) to exercise the JSONL/sink plumbing without
-//! needing `ao` or `dellsrv`.
+//! needing `ao` or `<gate-host>`.
 //!
 //! See `~/.ao/data/aofactory/referee/CONTRACTS.md` for the three
 //! binding contracts; `CANARY-RUNBOOK.md` for the orchestrator's
