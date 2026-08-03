@@ -1,7 +1,7 @@
 //! Response decoding: Chat Completions body → canonical `Response`.
 
 use super::translate::{self, map_finish_reason, strip_think_prefix};
-use super::wire::{ApiResponse, ApiUsage};
+use super::wire::{ApiResponse, ApiUsage, ReasoningDetails};
 use crate::codec::CodecCtx;
 use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind};
 use crate::types::{

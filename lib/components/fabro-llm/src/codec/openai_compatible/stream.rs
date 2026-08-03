@@ -4,7 +4,7 @@
 //! already-stripped payloads (including the `[DONE]` sentinel) via `on_event`.
 
 use super::translate::{map_finish_reason, parse_tool_arguments, ThinkStrip};
-use super::wire::{AccumulatedToolCall, StreamChunk};
+use super::wire::{AccumulatedToolCall, ReasoningDetails, StreamChunk};
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
 use crate::error::Error;
 use crate::types::{
