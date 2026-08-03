@@ -7,8 +7,8 @@ Feature: forkd end-to-end capability
   @task-create-sandbox
   Scenario: creating a sandbox from a snapshot tag returns a server-assigned id
     Given the forkd service is reachable
-    And a snapshot tag "zen-gate-base" exists in the snapshot registry
-    When I send a create-sandbox request with snapshot_tag "zen-gate-base"
+    And a snapshot tag "forkd-base" exists in the snapshot registry
+    When I send a create-sandbox request with snapshot_tag "forkd-base"
     Then the response status is 201
     And the response body contains a non-empty "id" field
     And the returned id matches the pattern "[a-f0-9-]{36}"
@@ -54,8 +54,8 @@ Feature: forkd end-to-end capability
   @task-real-workflow
   Scenario: a real workflow executing git clone and running a command completes inside the microVM
     Given the forkd service is reachable
-    And a snapshot tag "zen-gate-base" exists in the snapshot registry
-    When I create a sandbox from snapshot_tag "zen-gate-base" and store its id as "wf_sandbox_id"
+    And a snapshot tag "forkd-base" exists in the snapshot registry
+    When I create a sandbox from snapshot_tag "forkd-base" and store its id as "wf_sandbox_id"
     And I exec in sandbox "wf_sandbox_id" with argv ["git", "clone", "--depth", "1", "https://github.com/nicowillis/hello-world.git", "/tmp/repo"]
     Then the exec response exit_code is 0
     And the sandbox filesystem path "/tmp/repo" exists

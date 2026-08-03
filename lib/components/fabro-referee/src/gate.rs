@@ -71,7 +71,7 @@ pub enum BackendKind {
 impl BackendKind {
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "forkd" | "controller" | "zen-gates" => Some(Self::Forkd),
+            "forkd" | "controller" => Some(Self::Forkd),
             "hermetic" | "local" | "fallback" => Some(Self::Hermetic),
             "fake" | "test" | "mock" => Some(Self::Fake),
             _ => None,
