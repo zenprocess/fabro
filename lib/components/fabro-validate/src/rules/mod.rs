@@ -1,10 +1,12 @@
 mod all_conditional_edges;
 mod backend_valid;
+mod command_requires_script;
 mod condition_syntax;
 mod direction_valid;
 mod edge_target_exists;
 mod exit_no_outgoing;
 mod fidelity_valid;
+mod for_each_contract;
 mod freeform_edge_count;
 mod goal_gate_has_retry;
 mod import_error;
@@ -24,6 +26,7 @@ mod script_absolute_cd;
 mod selection_valid;
 mod start_no_incoming;
 mod start_node;
+mod stdin_source_valid;
 mod stylesheet_model_known;
 mod stylesheet_syntax;
 mod terminal_node;
@@ -54,11 +57,14 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         goal_gate_has_retry::rule(),
         prompt_on_llm_nodes::rule(),
         freeform_edge_count::rule(),
+        for_each_contract::rule(),
+        stdin_source_valid::rule(),
         direction_valid::rule(),
         reserved_keyword_node_id::rule(),
         all_conditional_edges::rule(),
         orphan_custom_outcome::rule(),
         script_absolute_cd::rule(),
+        command_requires_script::rule(),
         import_error::rule(),
         join_policy_removed::rule(),
         unresolved_file_ref::rule(),

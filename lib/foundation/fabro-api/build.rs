@@ -245,6 +245,16 @@ fn main() {
             &[],
         ),
         (
+            "RunModelSettings",
+            "fabro_types::settings::run::RunModelSettings",
+            &[],
+        ),
+        (
+            "RunModelControls",
+            "fabro_types::settings::run::RunModelControls",
+            &[],
+        ),
+        (
             "ServerSandboxSettings",
             "fabro_types::settings::server::ServerSandboxSettings",
             &[],
@@ -375,6 +385,7 @@ fn main() {
         ("Conclusion", "fabro_types::Conclusion", &[]),
         ("StageOutcome", "fabro_types::StageOutcome", &[]),
         ("StageId", "fabro_types::StageId", &[]),
+        ("ParallelBranchId", "fabro_types::ParallelBranchId", &[]),
         ("StageHandler", "fabro_types::StageHandler", &[]),
         ("StageState", "fabro_types::StageState", &[]),
         ("AgentControlState", "fabro_types::AgentControlState", &[]),
@@ -386,6 +397,17 @@ fn main() {
             &[],
         ),
         ("StageProjection", "fabro_types::StageProjection", &[]),
+        (
+            "StageInferenceProjection",
+            "fabro_types::StageInferenceProjection",
+            &[],
+        ),
+        (
+            "StageToolBatchProjection",
+            "fabro_types::StageToolBatchProjection",
+            &[],
+        ),
+        ("LlmOutputKind", "fabro_types::LlmOutputKind", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (
             "AgentSessionActivatedProps",
@@ -487,6 +509,8 @@ fn main() {
             &[],
         ),
         ("InterviewOption", "fabro_types::InterviewOption", &[]),
+        ("ReviewTarget", "fabro_types::ReviewTarget", &[]),
+        ("ReviewTargetKind", "fabro_types::ReviewTargetKind", &[]),
         (
             "InterviewQuestionRecord",
             "fabro_types::InterviewQuestionRecord",
@@ -710,6 +734,7 @@ fn main() {
         ("SessionRecord", "fabro_types::SessionRecord", &[]),
         ("SessionSummary", "fabro_types::SessionSummary", &[]),
         ("SessionDetail", "fabro_types::SessionDetail", &[]),
+        ("ReasoningOutput", "fabro_types::ReasoningOutput", &[]),
         ("CompletionMessage", "fabro_types::Message", &[]),
         ("CompletionMessageRole", "fabro_types::Role", &[]),
         ("CompletionContentPart", "fabro_types::ContentPart", &[]),

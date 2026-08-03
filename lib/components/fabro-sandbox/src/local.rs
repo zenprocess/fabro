@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use fabro_static::EnvVars;
@@ -12,17 +12,44 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::{StdioProcessControl, optional_timeout};
+use crate::sandbox::{
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, StdioProcessControl, optional_timeout,
+    validate_bash_probe, write_process_stdin,
+};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
-    StdioProcess, StdioProcessHandle, StdioProcessTermination, glob_match,
+    ExecStreamingRequest, ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent,
+    SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess, StdioProcessHandle,
+    StdioProcessTermination, WalkOptions,
 };
+
+/// Remediation shown when the worker has no usable Bash.
+///
+/// Local sandboxes resolve `bash` through `PATH` rather than requiring
+/// `/bin/bash`, which is what keeps them working on NixOS.
+const LOCAL_BASH_REMEDIATION: &str = "Local sandboxes require Bash on the worker PATH. Install bash, or run this workflow in a \
+     Docker or Daytona sandbox.";
+
+/// Where [`LocalSandbox`] gets its Bash executable.
+///
+/// The non-default variants exist so tests can exercise missing and non-Bash
+/// interpreters without mutating the process-global `PATH`, which would make
+/// parallel tests racy.
+enum BashExecutable {
+    /// Resolve `bash` through the worker's `PATH`.
+    ResolveFromPath,
+    #[cfg(test)]
+    Fixed(PathBuf),
+    #[cfg(test)]
+    Unavailable,
+}
 
 pub struct LocalSandbox {
     working_directory: PathBuf,
     event_callback:    Option<SandboxEventCallback>,
     rg_available:      std::sync::OnceLock<bool>,
+    bash_executable:   BashExecutable,
+    bash_path:         std::sync::OnceLock<PathBuf>,
 }
 
 impl LocalSandbox {
@@ -32,7 +59,76 @@ impl LocalSandbox {
             working_directory,
             event_callback: None,
             rg_available: std::sync::OnceLock::new(),
+            bash_executable: BashExecutable::ResolveFromPath,
+            bash_path: std::sync::OnceLock::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_bash_executable(working_directory: PathBuf, bash_executable: BashExecutable) -> Self {
+        Self {
+            bash_executable,
+            ..Self::new(working_directory)
+        }
+    }
+
+    /// Resolve, and then remember, the Bash executable this sandbox runs
+    /// commands with.
+    ///
+    /// Every command path — non-streaming, streaming, and stdio — goes through
+    /// here so a single sandbox can never split across two interpreters.
+    fn bash(&self) -> crate::Result<PathBuf> {
+        if let Some(path) = self.bash_path.get() {
+            return Ok(path.clone());
+        }
+
+        let resolved = match &self.bash_executable {
+            BashExecutable::ResolveFromPath => Self::binary_path_on_path("bash")
+                .ok_or_else(|| crate::Error::message(LOCAL_BASH_REMEDIATION))?,
+            #[cfg(test)]
+            BashExecutable::Fixed(path) => path.clone(),
+            #[cfg(test)]
+            BashExecutable::Unavailable => {
+                return Err(crate::Error::message(LOCAL_BASH_REMEDIATION));
+            }
+        };
+
+        Ok(self.bash_path.get_or_init(|| resolved).clone())
+    }
+
+    /// Verify the resolved executable is non-login Bash.
+    ///
+    /// Runs on fresh initialization and again on resume, so a worker that lost
+    /// its Bash between runs fails before the first command instead of during
+    /// it.
+    async fn probe_bash(&self) -> crate::Result<()> {
+        let bash = self.bash()?;
+        let remediation = format!(
+            "{} is not usable as non-login Bash. {LOCAL_BASH_REMEDIATION}",
+            bash.display()
+        );
+        let result = self
+            .exec_command(BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, None, None, None)
+            .await
+            .map_err(|err| {
+                crate::Error::context(
+                    format!("Failed to run the local Bash check. {remediation}"),
+                    err,
+                )
+            })?;
+        validate_bash_probe(result, remediation)
+    }
+
+    /// Ensure command execution has a working directory and a usable Bash.
+    ///
+    /// Fresh initialization and resumed starts share this path so they report
+    /// directory failures with the same context before attempting the Bash
+    /// probe.
+    async fn prepare_command_environment(&self) -> crate::Result<()> {
+        fs::create_dir_all(&self.working_directory)
+            .await
+            .map_err(|error| crate::Error::context("Failed to create working directory", error))?;
+        self.probe_bash().await
     }
 
     pub fn set_event_callback(&mut self, cb: SandboxEventCallback) {
@@ -80,14 +176,16 @@ impl LocalSandbox {
         }
     }
 
+    fn binary_on_path(binary: &str) -> bool {
+        Self::binary_path_on_path(binary).is_some()
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "Local sandbox command execution checks PATH/PATHEXT to select optional helpers."
     )]
-    fn binary_on_path(binary: &str) -> bool {
-        let Some(paths) = std::env::var_os(EnvVars::PATH) else {
-            return false;
-        };
+    fn binary_path_on_path(binary: &str) -> Option<PathBuf> {
+        let paths = std::env::var_os(EnvVars::PATH)?;
 
         #[cfg(windows)]
         let extensions: Vec<String> = std::env::var_os(EnvVars::PATHEXT)
@@ -103,22 +201,23 @@ impl LocalSandbox {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(binary);
             if candidate.is_file() {
-                return true;
+                return Some(candidate);
             }
 
             #[cfg(windows)]
             {
                 if candidate.extension().is_none() {
                     for ext in &extensions {
-                        if dir.join(format!("{binary}{ext}")).is_file() {
-                            return true;
+                        let with_ext = dir.join(format!("{binary}{ext}"));
+                        if with_ext.is_file() {
+                            return Some(with_ext);
                         }
                     }
                 }
             }
         }
 
-        false
+        None
     }
 }
 
@@ -142,13 +241,14 @@ fn filtered_env_vars(
 ) -> Vec<(String, String)> {
     let mut filtered_env: Vec<(String, String)> = process_env_vars()
         .into_iter()
-        .filter(|(key, _)| !LocalSandbox::should_filter_env_var(key))
+        .filter(|(key, _)| key != BASH_ENV_VAR && !LocalSandbox::should_filter_env_var(key))
         .collect();
 
     if let Some(extra) = env_vars {
         for (key, value) in extra {
-            if matches!(explicit_policy, ExplicitEnvPolicy::TrustCaller)
-                || !LocalSandbox::should_filter_env_var(key)
+            if key != BASH_ENV_VAR
+                && (matches!(explicit_policy, ExplicitEnvPolicy::TrustCaller)
+                    || !LocalSandbox::should_filter_env_var(key))
             {
                 filtered_env.push((key.clone(), value.clone()));
             }
@@ -351,12 +451,13 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(self.bash()?);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&effective_dir)
             .env_clear()
             .envs(filtered_env)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -414,13 +515,17 @@ impl Sandbox for LocalSandbox {
 
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&std::collections::HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
         let start = Instant::now();
 
         let filtered_env = filtered_env_vars(env_vars, ExplicitEnvPolicy::FilterSensitive);
@@ -428,14 +533,18 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(self.bash()?);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&effective_dir)
             .env_clear()
             .envs(filtered_env)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if stdin.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
 
         #[cfg(unix)]
         fabro_proc::pre_exec_setpgid(cmd.as_std_mut());
@@ -450,6 +559,17 @@ impl Sandbox for LocalSandbox {
 
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
+        let stdin_task = match stdin {
+            Some(stdin) => {
+                let stdin_pipe = child.stdin.take().ok_or_else(|| {
+                    crate::Error::message("Failed to open command standard input")
+                })?;
+                Some(tokio::spawn(async move {
+                    write_process_stdin(stdin_pipe, &stdin).await
+                }))
+            }
+            None => None,
+        };
         let stdout_callback = output_callback.clone();
         let stderr_callback = output_callback;
         let stdout_task = tokio::spawn(async move {
@@ -476,6 +596,23 @@ impl Sandbox for LocalSandbox {
         };
 
         let duration_ms = elapsed_ms(start);
+        if let Some(stdin_task) = stdin_task {
+            // The process is gone, so unwritten stdin bytes are unwanted.
+            // Abort instead of joining unbounded: a backgrounded grandchild
+            // that inherited the pipe could otherwise block the writer
+            // forever.
+            stdin_task.abort();
+            match stdin_task.await {
+                Ok(result) => result?,
+                Err(join_error) if join_error.is_cancelled() => {}
+                Err(join_error) => {
+                    return Err(crate::Error::context(
+                        "stdin stream task failed",
+                        join_error,
+                    ));
+                }
+            }
+        }
         let stdout_bytes = stdout_task
             .await
             .map_err(|e| crate::Error::context("stdout stream task failed", e))??;
@@ -508,8 +645,8 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        let mut cmd = Command::new(self.bash()?);
+        cmd.arg("-c")
             .arg(format!("exec {command}"))
             .current_dir(&effective_dir)
             .env_clear()
@@ -625,22 +762,14 @@ impl Sandbox for LocalSandbox {
         Ok(results)
     }
 
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base_dir =
-            path.map_or_else(|| self.working_directory.clone(), |p| self.resolve_path(p));
-        let base = base_dir.to_string_lossy().into_owned();
-        let traversal_root = PathBuf::from(glob_match::traversal_root(&base, pattern));
-        let matcher = glob_match::GlobMatcher::new(&base, pattern)?;
-        let mut matches = collect_local_files(traversal_root)
-            .await?
-            .into_iter()
-            .filter(|(path, _)| matcher.matches(path))
-            .collect::<Vec<_>>();
-
-        // Sort by mtime (newest first) using the metadata collected during traversal.
-        matches.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-
-        Ok(matches.into_iter().map(|(path, _)| path).collect())
+    async fn walk_files(
+        &self,
+        base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        let base = self.resolve_path(base);
+        walk_local_files(&base, relative_start, options).await
     }
 
     async fn download_file_to_local(
@@ -696,9 +825,7 @@ impl Sandbox for LocalSandbox {
             provider: "local".into(),
         });
         let start = Instant::now();
-        let result = fs::create_dir_all(&self.working_directory)
-            .await
-            .map_err(|e| crate::Error::context("Failed to create working directory", e));
+        let result = self.prepare_command_environment().await;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
             Ok(()) => self.emit(SandboxEvent::Ready {
@@ -717,6 +844,38 @@ impl Sandbox for LocalSandbox {
             }),
         }
         result
+    }
+
+    /// Re-verify Bash before a resumed workflow can issue commands.
+    ///
+    /// A worker that was rebuilt or reprovisioned between runs can lose the
+    /// Bash it initialized with; there is deliberately no fallback interpreter
+    /// when that happens.
+    async fn start(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StartStarted {
+            provider: "local".into(),
+        });
+        let start = Instant::now();
+        let result = self.prepare_command_environment().await;
+        match &result {
+            Ok(()) => self.emit(SandboxEvent::StartCompleted {
+                provider:    "local".into(),
+                duration_ms: elapsed_ms(start),
+            }),
+            Err(err) => self.emit(SandboxEvent::StartFailed {
+                provider: "local".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            }),
+        }
+        result
+    }
+
+    async fn activate(&self) -> crate::Result<()> {
+        // Local sandboxes have no provider resource that can stop or pause.
+        // Resume paths still call `start()` to recreate the directory and
+        // verify Bash.
+        Ok(())
     }
 
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
@@ -831,7 +990,7 @@ async fn sigterm_then_kill(child: &mut Child) {
 async fn drain_command_pipe<R>(
     mut reader: Option<R>,
     stream: CommandOutputStream,
-    output_callback: CommandOutputCallback,
+    output_callback: Option<CommandOutputCallback>,
 ) -> crate::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -851,33 +1010,70 @@ where
             return Ok(output);
         }
         output.extend_from_slice(&buf[..read]);
-        output_callback(stream, buf[..read].to_vec()).await?;
+        if let Some(output_callback) = output_callback.as_ref() {
+            output_callback(stream, buf[..read].to_vec()).await?;
+        }
     }
 }
 
-async fn collect_local_files(root: PathBuf) -> crate::Result<Vec<(String, SystemTime)>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root];
+async fn walk_local_files(
+    base: &Path,
+    relative_start: &str,
+    options: &WalkOptions,
+) -> crate::Result<Vec<SandboxFile>> {
+    if options.excludes_relative_path(relative_start) {
+        return Ok(Vec::new());
+    }
 
-    while let Some(path) = stack.pop() {
-        let metadata = match fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(crate::Error::context(
-                    format!("Failed to stat {}", path.display()),
-                    err,
-                ));
-            }
+    let Some((root, root_metadata)) = resolve_local_walk_root(base, relative_start).await? else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    let mut stack = vec![(root, Some(root_metadata))];
+
+    while let Some((path, known_metadata)) = stack.pop() {
+        let metadata = match known_metadata {
+            Some(metadata) => metadata,
+            None => match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(crate::Error::context(
+                        format!("Failed to stat {}", path.display()),
+                        err,
+                    ));
+                }
+            },
         };
 
         let file_type = metadata.file_type();
         if file_type.is_file() {
-            files.push((
-                path.to_string_lossy().into_owned(),
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-            ));
+            let relative_path = path.strip_prefix(base).map_err(|error| {
+                crate::Error::context(
+                    format!(
+                        "Failed to make {} relative to {}",
+                        path.display(),
+                        base.display()
+                    ),
+                    error,
+                )
+            })?;
+            files.push(SandboxFile {
+                path:          path.to_string_lossy().into_owned(),
+                relative_path: relative_path
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size:          metadata.len(),
+            });
         } else if file_type.is_dir() {
+            if path != base
+                && path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|file_name| options.excludes_name(file_name))
+            {
+                continue;
+            }
             let mut entries = match fs::read_dir(&path).await {
                 Ok(entries) => entries,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -894,12 +1090,64 @@ async fn collect_local_files(root: PathBuf) -> crate::Result<Vec<(String, System
                     err,
                 )
             })? {
-                stack.push(entry.path());
+                stack.push((entry.path(), None));
             }
         }
     }
 
     Ok(files)
+}
+
+async fn resolve_local_walk_root(
+    base: &Path,
+    relative_start: &str,
+) -> crate::Result<Option<(PathBuf, std::fs::Metadata)>> {
+    if relative_start.is_empty() {
+        return match fs::metadata(base).await {
+            Ok(metadata) => Ok(Some((base.to_path_buf(), metadata))),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(crate::Error::context(
+                format!("Failed to stat traversal base {}", base.display()),
+                error,
+            )),
+        };
+    }
+
+    let mut root = base.to_path_buf();
+    let mut metadata = None;
+    for segment in relative_start.split('/') {
+        root.push(segment);
+        let component_metadata = match fs::symlink_metadata(&root).await {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(crate::Error::context(
+                    format!("Failed to stat traversal root component {}", root.display()),
+                    error,
+                ));
+            }
+        };
+        if component_metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        metadata = Some(component_metadata);
+    }
+
+    Ok(metadata.map(|metadata| (root, metadata)))
 }
 
 #[cfg(test)]
@@ -912,6 +1160,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll};
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadBuf};
@@ -1099,6 +1348,291 @@ mod tests {
         assert_eq!(line.trim_end(), "test-key");
 
         process.handle.wait().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Bash-only syntax: `[[ ]]`, arrays, and `${arr[@]}` all fail under `sh`.
+    const BASH_ONLY_COMMAND: &str = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] && echo \
+                                     ${arr[1]}";
+
+    /// Prints `login` or `nonlogin` for the shell evaluating it.
+    const LOGIN_SHELL_REPORT: &str = "shopt -q login_shell && echo login || echo nonlogin";
+
+    #[tokio::test]
+    async fn exec_command_runs_bash_only_syntax() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        let result = sandbox
+            .exec_command(BASH_ONLY_COMMAND, 5000, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_command_streaming_runs_bash_only_syntax() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        let result = sandbox
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                output_callback: Some(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+                ..ExecStreamingRequest::new(BASH_ONLY_COMMAND)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.result.exit_code,
+            Some(0),
+            "stderr: {}",
+            result.result.stderr
+        );
+        assert_eq!(result.result.stdout.trim(), "two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_command_streaming_writes_exact_stdin_and_closes_it() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+        let stdin = b"first line\n$(touch must-not-run)\nlast line".to_vec();
+
+        let result = sandbox
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                stdin: Some(stdin.clone()),
+                ..ExecStreamingRequest::new("cat")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.result.exit_code, Some(0));
+        assert_eq!(result.result.stdout.as_bytes(), stdin);
+        assert!(!dir.join("must-not-run").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_process_evaluates_bash_before_exec() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        // The sandbox prepends `exec`; `exec` with only a redirection applies
+        // it without replacing the shell, so the Bash-only guard runs in the
+        // wrapping shell before it execs the requested process.
+        let process = sandbox
+            .spawn_stdio_process(
+                "3>&1; [[ -d / ]] || exit 9; exec python3 -u -c 'import sys; \
+                 [print(line.strip()[::-1], flush=True) for line in sys.stdin]'",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut stdin = process.stdin;
+        let mut stdout = BufReader::new(process.stdout);
+        stdin.write_all(b"abc\n").await.unwrap();
+        stdin.flush().await.unwrap();
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim_end(), "cba");
+
+        process.handle.terminate().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_command_path_uses_clean_non_login_bash() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+        let bash_env_path = dir.join("bash-env");
+        std::fs::write(&bash_env_path, "printf 'startup-source-loaded\\n'\n").unwrap();
+        let env_vars = HashMap::from([(
+            BASH_ENV_VAR.to_string(),
+            bash_env_path.to_string_lossy().into_owned(),
+        )]);
+
+        let non_streaming = sandbox
+            .exec_command(LOGIN_SHELL_REPORT, 5000, None, Some(&env_vars), None)
+            .await
+            .unwrap();
+        assert_eq!(non_streaming.stdout.trim(), "nonlogin");
+
+        let streaming = sandbox
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                env_vars: Some(&env_vars),
+                output_callback: Some(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+                ..ExecStreamingRequest::new(LOGIN_SHELL_REPORT)
+            })
+            .await
+            .unwrap();
+        assert_eq!(streaming.result.stdout.trim(), "nonlogin");
+
+        // `spawn_stdio_process` prepends `exec`, and `exec` with only a
+        // redirection applies it without replacing the shell — so the rest of
+        // this script reports on the wrapping shell itself.
+        let process = sandbox
+            .spawn_stdio_process(
+                &format!("3>&1; {LOGIN_SHELL_REPORT}; exec cat"),
+                None,
+                Some(&env_vars),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut stdout = BufReader::new(process.stdout);
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim_end(), "nonlogin");
+        process.handle.terminate().await.unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_fails_without_bash_instead_of_reporting_ready() {
+        use std::sync::Mutex;
+
+        use crate::SandboxEvent;
+
+        let dir = temp_dir();
+        let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let mut sandbox =
+            LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable);
+        sandbox.set_event_callback(Arc::new(move |e| {
+            events_clone.lock().unwrap().push(e);
+        }));
+
+        let err = sandbox
+            .initialize()
+            .await
+            .expect_err("initialize should fail without Bash");
+        assert!(
+            err.display_with_causes()
+                .contains("Bash on the worker PATH"),
+            "missing Bash should be actionable: {}",
+            err.display_with_causes()
+        );
+
+        let captured = events.lock().unwrap();
+        assert!(
+            matches!(&captured[0], SandboxEvent::Initializing { provider } if provider == "local")
+        );
+        assert!(matches!(
+            &captured[1],
+            SandboxEvent::InitializeFailed { provider, .. } if provider == "local"
+        ));
+        assert!(
+            !captured
+                .iter()
+                .any(|event| matches!(event, SandboxEvent::Ready { .. })),
+            "a sandbox without Bash must never report ready: {captured:?}"
+        );
+        drop(captured);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_fails_when_the_resolved_executable_is_not_bash() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::with_bash_executable(
+            dir.clone(),
+            BashExecutable::Fixed(PathBuf::from("/usr/bin/true")),
+        );
+
+        let err = sandbox
+            .initialize()
+            .await
+            .expect_err("a non-Bash interpreter should fail the probe");
+
+        assert!(
+            err.display_with_causes().contains("non-login Bash"),
+            "non-Bash interpreter should be named as the problem: {}",
+            err.display_with_causes()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_recreates_missing_working_directory_before_bash_probe() {
+        let dir = temp_dir();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        sandbox
+            .start()
+            .await
+            .expect("resume should recreate the working directory before probing Bash");
+
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_repeats_the_bash_probe_on_resume() {
+        use std::sync::Mutex;
+
+        let dir = temp_dir();
+        let successful_events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let successful_events_clone = Arc::clone(&successful_events);
+        let mut available = LocalSandbox::new(dir.clone());
+        available.set_event_callback(Arc::new(move |event| {
+            successful_events_clone.lock().unwrap().push(event);
+        }));
+
+        available
+            .start()
+            .await
+            .expect("resume should succeed when Bash is present");
+
+        let failed_events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let failed_events_clone = Arc::clone(&failed_events);
+        let mut unavailable =
+            LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable);
+        unavailable.set_event_callback(Arc::new(move |event| {
+            failed_events_clone.lock().unwrap().push(event);
+        }));
+        unavailable
+            .start()
+            .await
+            .expect_err("resume should fail when Bash disappeared between runs");
+
+        let successful_events = successful_events.lock().unwrap();
+        assert!(matches!(
+            &successful_events[..],
+            [
+                SandboxEvent::StartStarted { provider: started },
+                SandboxEvent::StartCompleted {
+                    provider: completed,
+                    ..
+                }
+            ] if started == "local" && completed == "local"
+        ));
+        let failed_events = failed_events.lock().unwrap();
+        assert!(matches!(
+            &failed_events[..],
+            [
+                SandboxEvent::StartStarted { provider: started },
+                SandboxEvent::StartFailed {
+                    provider: failed,
+                    ..
+                }
+            ] if started == "local" && failed == "local"
+        ));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1414,8 +1948,7 @@ mod tests {
         std::fs::write(dir.join("src/nested/readme.md"), "").unwrap();
 
         let env = LocalSandbox::new(dir.clone());
-        let mut results = env.glob("**/*.rs", None).await.unwrap();
-        results.sort();
+        let results = env.glob("**/*.rs", None).await.unwrap();
 
         assert_eq!(results, vec![
             dir.join("a.rs").to_string_lossy().into_owned(),
@@ -1460,6 +1993,64 @@ mod tests {
         let results = env.glob("linked/**/*.rs", None).await.unwrap();
 
         assert!(results.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_follows_the_declared_symlinked_search_root_only() {
+        let parent = temp_dir();
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        let search_root = parent.join("workspace-link");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("README.md"), "").unwrap();
+        std::fs::write(outside.join("outside.md"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("linked")).unwrap();
+        std::os::unix::fs::symlink(&workspace, &search_root).unwrap();
+
+        let env = LocalSandbox::new(search_root.clone());
+        let results = env.glob("**/*.md", None).await.unwrap();
+
+        assert_eq!(results, vec![
+            search_root.join("README.md").to_string_lossy().into_owned()
+        ]);
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn walk_files_returns_relative_paths_and_prunes_directories() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join(".ai/reports")).unwrap();
+        std::fs::create_dir_all(dir.join(".ai/target")).unwrap();
+        std::fs::write(dir.join(".ai/reports/result.md"), "report").unwrap();
+        std::fs::write(dir.join(".ai/reports/empty.md"), "").unwrap();
+        std::fs::write(dir.join(".ai/target/ignored.md"), "ignored").unwrap();
+
+        let sandbox = LocalSandbox::new(dir.clone());
+        let files = sandbox
+            .walk_files(sandbox.working_directory(), ".ai", &WalkOptions {
+                excluded_directory_names: vec!["target".to_string()],
+            })
+            .await
+            .unwrap();
+
+        let mut file_metadata = files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size))
+            .collect::<Vec<_>>();
+        file_metadata.sort_unstable();
+        assert_eq!(file_metadata, vec![
+            (".ai/reports/empty.md", 0),
+            (".ai/reports/result.md", 6),
+        ]);
+        let root = dir.to_string_lossy();
+        assert!(
+            files
+                .iter()
+                .all(|file| file.path.starts_with(root.as_ref()))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

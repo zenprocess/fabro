@@ -144,6 +144,7 @@ pub trait Sandbox: Send + Sync {
         cancel_token: Option<CancellationToken>,
     ) -> Result<ExecResult, String>;
     async fn grep(&self, pattern: &str, path: &str, options: &GrepOptions) -> Result<Vec<String>, String>;
+    async fn walk_files(&self, base: &str, relative_start: &str, options: &WalkOptions) -> Result<Vec<SandboxFile>, String>;
     async fn glob(&self, pattern: &str, path: Option<&str>) -> Result<Vec<String>, String>;
     async fn initialize(&self) -> Result<(), String>;
     async fn cleanup(&self) -> Result<(), String>;
@@ -160,7 +161,6 @@ pub trait Sandbox: Send + Sync {
 |---|---|
 | `LocalSandbox` | Executes directly on the local filesystem. |
 | `DockerSandbox` | Runs inside a Docker container (feature-gated: `docker`). |
-| `ReadBeforeWriteSandbox` | Decorator that blocks writes to files the agent hasn't read. Wraps any `Arc<dyn Sandbox>`. |
 
 The `DaytonaSandbox` implementation (feature-gated: `daytona`) runs inside a Daytona cloud sandbox.
 
@@ -366,14 +366,43 @@ For env-backed usage, `EnvCredentialSource` checks for API key environment varia
 | `ANTHROPIC_API_KEY` | Anthropic |
 | `OPENAI_API_KEY` | OpenAI |
 | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Gemini |
-| `KIMI_API_KEY` | Kimi |
+| `MOONSHOT_API_KEY` or `KIMI_API_KEY` | Moonshot AI; `MOONSHOT_API_KEY` takes precedence |
 | `ZAI_API_KEY` | ZAI |
 | `MINIMAX_API_KEY` | Minimax |
 | `INCEPTION_API_KEY` | Inception |
 | `POOLSIDE_API_KEY` | Poolside |
+| `DEEPSEEK_API_KEY` | DeepSeek |
 | `OPENROUTER_API_KEY` | OpenRouter, when enabled in settings |
 
 The first provider registered becomes the default. Provider base URLs come from the model catalog. For vault-backed usage inside Fabro, use `fabro_auth::VaultCredentialSource` instead.
+
+The built-in Modal definition reads two proxy-token headers from the vault, so `EnvCredentialSource` does not configure it automatically. For direct SDK use, enable Modal and set its endpoint URL in the catalog:
+
+```toml
+[llm.providers.modal]
+enabled = true
+base_url = "https://your-endpoint.modal.run/v1"
+```
+
+Then read the two environment variables explicitly and create a typed credential after constructing `catalog` from those settings:
+
+```rust
+use fabro_auth::ApiCredential;
+use fabro_llm::client::Client;
+use std::collections::HashMap;
+
+let credential = ApiCredential::with_extra_headers(
+    "modal",
+    HashMap::from([
+        ("Modal-Key".to_string(), std::env::var("MODAL_TOKEN_ID")?),
+        (
+            "Modal-Secret".to_string(),
+            std::env::var("MODAL_TOKEN_SECRET")?,
+        ),
+    ]),
+);
+let client = Client::from_credentials(vec![credential], catalog).await?;
+```
 
 #### Creating manually
 

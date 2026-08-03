@@ -52,6 +52,110 @@ mod daytona_streaming_live {
         Ok(())
     }
 
+    /// Both command paths must reach the same interpreter, so Bash-only syntax
+    /// that `sh` rejects has to behave identically through them. The two paths
+    /// build different requests — a direct process exec and a toolbox session —
+    /// so neither is evidence for the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires live Daytona credentials and provisions a sandbox"]
+    async fn daytona_runs_bash_only_syntax_through_both_command_paths() -> Result<()> {
+        ensure!(
+            daytona_api_key_present(),
+            "DAYTONA_API_KEY must be set to run this live smoke test"
+        );
+
+        let sandbox = DaytonaSandbox::new(
+            DaytonaConfig {
+                skip_clone: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        sandbox.initialize().await?;
+
+        // Arrays, `[[ ]]`, and `${arr[@]}` are Bash-only; `shopt -q
+        // login_shell` proves neither path ran under a login shell.
+        let command = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] || exit 1; \
+                       shopt -q login_shell && exit 2; echo ${arr[1]}";
+
+        let checks: Result<()> = async {
+            let non_streaming = sandbox
+                .exec_command(command, 30_000, None, None, None)
+                .await?;
+            ensure_eq(
+                &non_streaming.exit_code,
+                &Some(0),
+                &format!("exec_command should run Bash-only syntax: {non_streaming:?}"),
+            )?;
+            ensure_contains(
+                &non_streaming.stdout,
+                "two",
+                "exec_command should report the Bash-only result",
+            )?;
+
+            let (streaming, _) = run_captured(&sandbox, command, 30_000, None).await?;
+            ensure_eq(
+                &streaming.result.exit_code,
+                &Some(0),
+                &format!("exec_command_streaming should run Bash-only syntax: {streaming:?}"),
+            )?;
+            ensure_contains(
+                &streaming.result.stdout,
+                "two",
+                "exec_command_streaming should report the Bash-only result",
+            )?;
+
+            let stdin = "first line\n$(touch /tmp/must-not-run)\nlast line";
+            let (stdin_result, _) = run_captured_with_stdin(
+                &sandbox,
+                "cat",
+                30_000,
+                None,
+                Some(stdin.as_bytes().to_vec()),
+            )
+            .await?;
+            ensure_eq(
+                &stdin_result.result.exit_code,
+                &Some(0),
+                "exec_command_streaming should close stdin with a successful EOF",
+            )?;
+            ensure_eq(
+                &stdin_result.result.stdout,
+                &stdin.to_string(),
+                "exec_command_streaming should preserve exact stdin bytes",
+            )?;
+            let stdin_cleanup = sandbox
+                .exec_command(
+                    "test ! -e /tmp/must-not-run && \
+                     ! compgen -G '/tmp/fabro-command-stdin-*' >/dev/null",
+                    30_000,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            ensure!(
+                stdin_cleanup.is_success(),
+                "Daytona stdin data must stay inert and its temporary file must be deleted: {stdin_cleanup:?}"
+            );
+
+            Ok(())
+        }
+        .await;
+
+        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+
+        checks?;
+        cleanup_result?;
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires live Daytona credentials and provisions a sandbox"]
     async fn daytona_managed_labels_live_smoke() -> Result<()> {
@@ -259,14 +363,14 @@ mod daytona_streaming_live {
 
         let live_exec = tokio::spawn(async move {
             sandbox_for_exec
-                .exec_command_streaming(
-                    "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
-                    Some(60_000),
-                    None,
-                    None,
-                    Some(cancel_for_exec),
-                    callback,
-                )
+                .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
+                    timeout_ms: Some(60_000),
+                    cancel_token: Some(cancel_for_exec),
+                    output_callback: Some(callback),
+                    ..fabro_sandbox::ExecStreamingRequest::new(
+                        "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
+                    )
+                })
                 .await
         });
 
@@ -381,17 +485,26 @@ mod daytona_streaming_live {
         timeout_ms: u64,
         cancel_token: Option<CancellationToken>,
     ) -> Result<(ExecStreamingResult, Vec<CapturedChunk>)> {
+        run_captured_with_stdin(sandbox, command, timeout_ms, cancel_token, None).await
+    }
+
+    async fn run_captured_with_stdin(
+        sandbox: &DaytonaSandbox,
+        command: &str,
+        timeout_ms: u64,
+        cancel_token: Option<CancellationToken>,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<(ExecStreamingResult, Vec<CapturedChunk>)> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback = capture_callback(Arc::clone(&chunks));
         let result = sandbox
-            .exec_command_streaming(
-                command,
-                Some(timeout_ms),
-                None,
-                None,
+            .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
+                timeout_ms: Some(timeout_ms),
                 cancel_token,
-                callback,
-            )
+                stdin,
+                output_callback: Some(callback),
+                ..fabro_sandbox::ExecStreamingRequest::new(command)
+            })
             .await?;
         let chunks = chunks.lock().await.clone();
 

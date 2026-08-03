@@ -67,10 +67,28 @@ impl AsRef<str> for AdapterKind {
 #[strum(serialize_all = "snake_case")]
 pub enum AgentProfileKind {
     Anthropic,
+    /// Claude 5 models trained against Anthropic's current coding-agent
+    /// harness. This remains model-scoped so older Claude models keep the
+    /// established Anthropic profile.
+    #[serde(rename = "claude-5")]
+    #[strum(to_string = "claude-5")]
+    Claude5,
     #[serde(rename = "openai")]
     #[strum(to_string = "openai")]
     OpenAi,
     Gemini,
+    /// Kimi (Moonshot) models, wherever they are served from. Selected per
+    /// model rather than per provider, so a Kimi model reached through a
+    /// gateway such as OpenRouter gets the same profile as one reached
+    /// directly at `api.moonshot.ai`.
+    Kimi,
+    /// GPT-5.6 models (Sol, Terra, Luna), which Codex drives with a narrower
+    /// core tool set than earlier GPT models: a shell, a file editor, and
+    /// `update_plan`, plus optional web search. The profile omits dedicated
+    /// file-read, discovery, and fetch tools. Selected per model rather than
+    /// per provider, so other models on the `openai` provider keep
+    /// [`Self::OpenAi`].
+    Gpt56,
 }
 
 #[cfg(test)]
@@ -100,17 +118,13 @@ mod tests {
 
     #[test]
     fn agent_profile_kind_round_trips_as_settings_strings() {
-        for (kind, expected) in [
-            (AgentProfileKind::Anthropic, "anthropic"),
-            (AgentProfileKind::OpenAi, "openai"),
-            (AgentProfileKind::Gemini, "gemini"),
-        ] {
+        for kind in AgentProfileKind::VARIANTS {
+            let expected = kind.to_string();
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
             let parsed: AgentProfileKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, kind);
-            assert_eq!(expected.parse::<AgentProfileKind>().unwrap(), kind);
-            assert_eq!(kind.to_string(), expected);
+            assert_eq!(parsed, *kind);
+            assert_eq!(expected.parse::<AgentProfileKind>().unwrap(), *kind);
         }
     }
 }

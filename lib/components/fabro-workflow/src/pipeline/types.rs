@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fabro_graphviz::graph::Graph;
 use fabro_interview::Interviewer;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, FallbackTarget, ProviderId};
+use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxSpec;
 use fabro_template::TemplateContext;
 use fabro_types::settings::run::{PullRequestSettings, RunModelControls};
@@ -20,6 +20,7 @@ use crate::error::Error;
 use crate::event::Emitter;
 use crate::file_resolver::FileResolver;
 use crate::handler::HandlerRegistry;
+use crate::model_fallback::ModelFallbackPolicy;
 use crate::outcome::Outcome;
 use crate::records::{Checkpoint, Conclusion, RunSpec};
 use crate::run_control::RunControlState;
@@ -28,7 +29,7 @@ use crate::runtime_store::RunStoreHandle;
 use crate::services::{EngineServices, FabroRunToolServices, RunServices};
 use crate::stage_execution::StageExecutionSeed;
 use crate::steering_hub::SteeringHub;
-use crate::transforms::{RenderMode, Transform};
+use crate::transforms::{ModelResolutionTransform, RenderMode, Transform};
 use crate::workflow_bundle::WorkflowBundle;
 
 /// Output of the PARSE phase.
@@ -236,7 +237,7 @@ impl Persisted {
 pub struct LlmSpec {
     pub model:          String,
     pub provider_id:    ProviderId,
-    pub fallback_chain: Vec<FallbackTarget>,
+    pub fallbacks:      ModelFallbackPolicy,
     pub mcp_servers:    Vec<McpServerSettings>,
     pub model_controls: RunModelControls,
     pub dry_run:        bool,
@@ -299,7 +300,7 @@ pub struct InitOptions {
     pub workflow_bundle:   Option<Arc<WorkflowBundle>>,
     pub hooks:             fabro_hooks::HookSettings,
     pub sandbox_env:       SandboxEnvSpec,
-    pub vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:             Arc<AsyncRwLock<Vault>>,
     pub git:               Option<GitCheckpointOptions>,
     pub registry_override: Option<Arc<HandlerRegistry>>,
     pub artifact_sink:     Option<ArtifactSink>,
@@ -337,17 +338,41 @@ pub struct Executed {
     pub model:         String,
 }
 
-/// Output of the FINALIZE phase.
+/// Output of the CONCLUDE phase.
 #[non_exhaustive]
 pub struct Concluded {
-    pub outcome:     Result<Outcome, Error>,
-    pub conclusion:  Conclusion,
-    pub graph:       Graph,
-    pub run_options: RunOptions,
-    pub services:    Arc<RunServices>,
+    pub outcome:        Result<Outcome, Error>,
+    pub conclusion:     Conclusion,
+    pub artifact_count: usize,
+    pub graph:          Graph,
+    pub run_options:    RunOptions,
+    pub services:       Arc<RunServices>,
 }
 
-/// Output of the PULL_REQUEST phase.
+/// What the PUBLISH phase actually accomplished.
+///
+/// Recorded separately from the phase's error so a branch that reached the
+/// remote is still reported when a later step, such as pull request creation,
+/// fails. An all-`None` value means publish had nothing to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishOutcome {
+    pub pushed_branch: Option<String>,
+    pub pr_url:        Option<String>,
+}
+
+/// Output of the PUBLISH phase.
+#[non_exhaustive]
+pub struct Published {
+    pub execution_outcome: Result<Outcome, Error>,
+    pub publish_outcome:   PublishOutcome,
+    pub publish_error:     Option<Error>,
+    pub conclusion:        Conclusion,
+    pub artifact_count:    usize,
+    pub run_options:       RunOptions,
+    pub services:          Arc<RunServices>,
+}
+
+/// Output of the FINALIZE phase.
 #[non_exhaustive]
 pub struct Finalized {
     pub run_id:        RunId,
@@ -359,18 +384,15 @@ pub struct Finalized {
 
 /// Options for the TRANSFORM phase.
 pub struct TransformOptions {
-    pub current_dir:        Option<PathBuf>,
-    pub file_resolver:      Option<Arc<dyn FileResolver>>,
-    pub template_context:   TemplateContext,
-    pub source_name:        Option<String>,
-    pub render_mode:        RenderMode,
-    pub custom_transforms:  Vec<Box<dyn Transform>>,
-    pub catalog:            Arc<fabro_model::Catalog>,
-    pub default_provider:   Option<ProviderId>,
-    pub eligible_providers: HashSet<ProviderId>,
-    /// Fall back to the full catalog when the eligible providers cannot
-    /// supply a requested model, instead of erroring.
-    pub catalog_fallback:   bool,
+    pub current_dir:       Option<PathBuf>,
+    pub file_resolver:     Option<Arc<dyn FileResolver>>,
+    pub template_context:  TemplateContext,
+    pub source_name:       Option<String>,
+    pub render_mode:       RenderMode,
+    pub custom_transforms: Vec<Box<dyn Transform>>,
+    /// Catalog-backed model resolution to perform. `None` preserves authored
+    /// model and provider selectors for catalog-free structural validation.
+    pub model_resolution:  Option<ModelResolutionTransform>,
 }
 
 /// Options for the FINALIZE phase.
@@ -383,8 +405,8 @@ pub struct FinalizeOptions {
     pub last_git_sha:     Option<String>,
 }
 
-/// Options for the PULL_REQUEST phase.
-pub struct PullRequestOptions {
+/// Options for the PUBLISH phase.
+pub struct PublishOptions {
     pub pr_config:  Option<PullRequestSettings>,
     pub github_app: Option<fabro_github::GitHubCredentials>,
     pub origin_url: Option<String>,

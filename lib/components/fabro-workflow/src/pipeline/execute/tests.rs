@@ -12,10 +12,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_agent::Sandbox;
+use fabro_auth::test_support as auth_test_support;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_hooks::HookSettings;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_sandbox::SandboxSpec;
+use fabro_sandbox::test_support::MockSandbox;
 use fabro_store::Database;
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{
@@ -26,9 +28,11 @@ use object_store::memory::InMemory;
 use super::*;
 use crate::context::{self, Context};
 use crate::error::Error;
-use crate::event::{Emitter, Event, StoreProgressLogger, append_event};
+use crate::event::{Emitter, Event, StageScope, StoreProgressLogger, append_event};
 use crate::handler::start::StartHandler;
 use crate::handler::{Handler as HandlerTrait, HandlerRegistry};
+use crate::interview_runtime::RunInterviewBlocker;
+use crate::model_fallback::ModelFallbackPolicy;
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::initialize;
 use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, ResumeState, SandboxEnvSpec};
@@ -267,7 +271,7 @@ async fn execute_test_run_with_options(
             llm: LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -288,7 +292,7 @@ async fn execute_test_run_with_options(
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: git_options,
             run_control: None,
             registry_override,
@@ -327,7 +331,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
             llm: LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -350,7 +354,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: None,
@@ -468,7 +472,7 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
             llm: LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -489,7 +493,7 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: Some(Arc::new(make_registry())),
@@ -582,7 +586,7 @@ async fn run_with_lifecycle(
             llm: LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -600,7 +604,7 @@ async fn run_with_lifecycle(
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: Some(Arc::new(registry)),
@@ -645,6 +649,81 @@ impl HandlerTrait for SlowHandler {
         _services: &crate::handler::EngineServices,
     ) -> std::result::Result<Outcome, Error> {
         tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+        Ok(Outcome::success())
+    }
+}
+
+struct InterviewWaitHandler {
+    wait_ms:   u64,
+    active_ms: u64,
+}
+
+#[async_trait]
+impl HandlerTrait for InterviewWaitHandler {
+    async fn execute(
+        &self,
+        node: &Node,
+        context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        services: &crate::handler::EngineServices,
+    ) -> std::result::Result<Outcome, Error> {
+        let stage_id = StageScope::for_handler(context, &node.id).stage_id();
+        let guard = services
+            .run
+            .interview_blocker
+            .block(Arc::clone(&services.run.emitter), stage_id);
+        tokio::time::sleep(Duration::from_millis(self.wait_ms)).await;
+        guard.resolve();
+        tokio::time::sleep(Duration::from_millis(self.active_ms)).await;
+        Ok(Outcome::success())
+    }
+}
+
+fn interview_wait_graph(stall_timeout: Duration, node_timeout: Option<Duration>) -> Graph {
+    let mut graph = simple_graph();
+    graph.attrs.insert(
+        "stall_timeout".to_string(),
+        AttrValue::Duration(stall_timeout),
+    );
+    graph
+        .attrs
+        .insert("default_max_retries".to_string(), AttrValue::Integer(0));
+
+    let mut work = Node::new("work");
+    work.attrs.insert(
+        "type".to_string(),
+        AttrValue::String("interview_wait".to_string()),
+    );
+    if let Some(timeout) = node_timeout {
+        work.attrs
+            .insert("timeout".to_string(), AttrValue::Duration(timeout));
+    }
+    graph.nodes.insert("work".to_string(), work);
+    graph.edges.clear();
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+    graph
+}
+
+struct StopsSandboxHandler {
+    sandbox: Arc<MockSandbox>,
+}
+
+#[async_trait]
+impl HandlerTrait for StopsSandboxHandler {
+    async fn execute(
+        &self,
+        _node: &Node,
+        _context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        _services: &crate::handler::EngineServices,
+    ) -> std::result::Result<Outcome, Error> {
+        self.sandbox
+            .stop()
+            .await
+            .map_err(|err| Error::handler_with_source("failed to stop test sandbox", err))?;
         Ok(Outcome::success())
     }
 }
@@ -802,6 +881,65 @@ async fn execute_runs_simple_workflow() {
     .await
     .unwrap();
     assert_eq!(outcome.status, StageOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn execute_preserves_sandbox_activation_error_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(MockSandbox::linux().with_activate_error("provider unavailable"));
+
+    let error = run_graph(
+        make_registry(),
+        test_emitter_arc("test-run"),
+        sandbox,
+        &simple_graph(),
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect_err("sandbox activation should fail");
+
+    assert_eq!(error.causes(), vec![
+        "failed to activate sandbox before node start",
+        "Mock sandbox activation failed",
+        "provider unavailable",
+    ]);
+}
+
+#[tokio::test]
+async fn execute_reactivates_sandbox_after_a_stage_can_leave_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(MockSandbox::linux());
+    let mut registry = make_registry();
+    registry.register(
+        "start",
+        Box::new(StopsSandboxHandler {
+            sandbox: Arc::clone(&sandbox),
+        }),
+    );
+    let sandbox_for_run: Arc<dyn Sandbox> = sandbox.clone();
+    let mut run_options = test_run_options(dir.path(), "test-run");
+    run_options
+        .settings
+        .run
+        .artifacts
+        .include
+        .push("**/*".to_string());
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        sandbox_for_run,
+        &simple_graph(),
+        &run_options,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+    assert_eq!(sandbox.stop_count(), 1);
+    assert!(sandbox.walk_files_was_called());
+    assert!(!sandbox.walked_while_inactive());
 }
 
 #[tokio::test]
@@ -1287,6 +1425,94 @@ async fn stall_watchdog_triggers_on_hung_handler() {
     .await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("stall watchdog"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_watchdog_starts_a_fresh_deadline_after_human_input() {
+    let emitter = Arc::new(Emitter::default());
+    let blocker = Arc::new(RunInterviewBlocker::new());
+    let stall_token = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let watchdog = tokio::spawn(monitor_for_stall(
+        Duration::from_millis(50),
+        stall_token.clone(),
+        shutdown.clone(),
+        Arc::clone(&emitter),
+        blocker.subscribe(),
+    ));
+    tokio::task::yield_now().await;
+
+    let guard = blocker.block(Arc::clone(&emitter), fabro_types::StageId::new("work", 1));
+    tokio::time::advance(Duration::from_millis(200)).await;
+    assert!(!stall_token.is_cancelled());
+
+    guard.resolve();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(49)).await;
+    assert!(!stall_token.is_cancelled());
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    tokio::task::yield_now().await;
+    assert!(stall_token.is_cancelled());
+
+    shutdown.cancel();
+    watchdog.await.unwrap();
+}
+
+#[tokio::test]
+async fn stall_watchdog_suspends_while_run_waits_for_human_input() {
+    let dir = tempfile::tempdir().unwrap();
+    // The blocked wait outruns the stall timeout, so this only passes if the
+    // watchdog stays suspended and then restarts on a fresh deadline.
+    let graph = interview_wait_graph(Duration::from_millis(300), None);
+    let mut registry = make_registry();
+    registry.register(
+        "interview_wait",
+        Box::new(InterviewWaitHandler {
+            wait_ms:   500,
+            active_ms: 10,
+        }),
+    );
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        local_env(),
+        &graph,
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect("human input wait should not trigger the stall watchdog");
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn node_timeout_excludes_human_input_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    // The blocked wait outruns the node timeout, but the active work is well
+    // inside it, so this only fails if the interview wait is being charged.
+    let graph = interview_wait_graph(Duration::ZERO, Some(Duration::from_millis(300)));
+    let mut registry = make_registry();
+    registry.register(
+        "interview_wait",
+        Box::new(InterviewWaitHandler {
+            wait_ms:   500,
+            active_ms: 20,
+        }),
+    );
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        local_env(),
+        &graph,
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect("human input wait should not consume the node timeout");
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
 }
 
 #[tokio::test]

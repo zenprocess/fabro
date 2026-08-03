@@ -424,7 +424,7 @@ Emitted when a workflow node finishes execution.
 | `failure_signature` | string? | Dedup key for repeated failures |
 | `context_updates` | object? | Context delta written by this stage |
 | `jump_to_node` | string? | Non-edge jump target |
-| `context_values` | object? | Full context snapshot after the stage |
+| `context_values` | object? | Context snapshot after the stage, minus runtime-only keys such as `current.preamble`. Artifact pointers are not normalized to blob refs — use `checkpoint.completed` for the durable projection |
 | `node_visits` | object? | Node visit counts after the stage |
 | `loop_failure_signatures` | object? | Loop failure signature counts |
 | `restart_failure_signatures` | object? | Restart failure signature counts |
@@ -968,43 +968,62 @@ No properties.
 |----------|------|-------------|
 | `text` | string | User input text |
 
-### `agent.output.start`
+### `agent.llm.started`
 
-Signals the beginning of assistant text output.
+An inference request is about to be dispatched for this round. Emitted once
+per round, after the request is built and compaction has run, immediately
+before the stream is opened.
 
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.start",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {}
-}
-```
-
-No properties.
-
-### `agent.output.replace`
-
-Replaces the current in-progress assistant output buffers.
+`requested_model` is the canonical requested target, including an optional
+speed tier. Failover can re-target mid-stage, so `agent.message` remains
+authoritative for what actually answered. No usage or cost fields: neither
+exists yet at this point.
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.replace",
+  "event": "agent.llm.started",
   "node_id": "code", "node_label": "code",
   "session_id": "ses_abc",
   "properties": {
-    "text": "I'll fix the login bug by...",
-    "reasoning": "The user wants..."
+    "requested_model": {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5",
+      "speed": "fast"
+    },
+    "visit": 1
   }
 }
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `text` | string | Replacement assistant text |
-| `reasoning` | string? | Replacement reasoning text |
+| `requested_model` | object | Requested provider, model ID, and optional speed tier |
+| `visit` | number | Graph visit |
+
+### `agent.llm.first_output`
+
+The provider produced its first output for the current attempt. Edge-triggered
+once per stream attempt; the latch re-arms when a broken or finish-less stream
+replays the turn.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.llm.first_output",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "properties": {
+    "kind": "reasoning",
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `kind` | string | `reasoning`, `text`, or `tool_call` — observed, not inferred |
+| `visit` | number | Graph visit |
 
 ### `agent.message`
 
@@ -1047,46 +1066,6 @@ Emitted when the assistant produces a complete message.
 | `usage.raw` | object? | Raw provider-specific usage |
 | `tool_call_count` | number | Number of tool calls in this turn |
 
-### `agent.text.delta`
-
-Streaming text chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.text.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "I'll start by reading"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Text chunk |
-
-### `agent.reasoning.delta`
-
-Streaming reasoning/thinking chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.reasoning.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "The user needs me to..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Reasoning text chunk |
-
 ### `agent.tool.started`
 
 Emitted when the agent begins a tool call.
@@ -1110,26 +1089,6 @@ Emitted when the agent begins a tool call.
 | `tool_name` | string | Tool name |
 | `tool_call_id` | string | Unique tool call id |
 | `arguments` | object | Tool call arguments |
-
-### `agent.tool.output.delta`
-
-Streaming tool output chunk.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.tool.output.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "fn login(user: &str)..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Output text chunk |
 
 ### `agent.tool.completed`
 
@@ -1156,6 +1115,45 @@ Emitted when a tool call finishes.
 | `tool_call_id` | string | Unique tool call id |
 | `output` | any | Tool output (string or structured) |
 | `is_error` | boolean | Whether the tool returned an error |
+
+### `agent.tool.process.completed`
+
+Subordinate diagnostic for a tool call that ran a process, emitted between
+`agent.tool.started` and `agent.tool.completed`. It explains the underlying
+process outcome; `agent.tool.completed.is_error` remains the protocol and UI
+truth. Absent when the tool never produced a process result (setup, transport,
+or launch failure) and when the tool ran without a session-bound emitter.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.tool.process.completed",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "tool_call_id": "call_abc123",
+  "properties": {
+    "exit_code": 7,
+    "termination": "exited",
+    "duration_ms": 812,
+    "streams_separated": true,
+    "exec_output_tail": {"stdout": "...", "stderr": "..."},
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `exit_code` | integer | Process exit code; omitted for timeout and cancellation |
+| `termination` | string | `exited`, `timed_out`, or `cancelled` |
+| `duration_ms` | integer | Process duration |
+| `streams_separated` | boolean | `false` when the provider could not separate stdout from stderr; the combined output is then in `exec_output_tail.stdout` |
+| `exec_output_tail` | object | Bounded, redacted output tails; omitted when both streams were empty |
+| `exec_output_tail.stdout` | string | Bounded stdout tail, or combined-output tail when `streams_separated` is `false`; omitted when empty |
+| `exec_output_tail.stderr` | string | Bounded stderr tail; omitted when empty |
+| `exec_output_tail.stdout_truncated` | boolean | `true` when earlier stdout bytes were omitted; omitted when `false` |
+| `exec_output_tail.stderr_truncated` | boolean | `true` when earlier stderr bytes were omitted; omitted when `false` |
+| `visit` | integer | Stage visit |
 
 ### `agent.error`
 
@@ -1214,24 +1212,6 @@ Emitted when the agent detects a tool-use loop.
 ```
 
 No properties.
-
-### `agent.skill.expanded`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.skill.expanded",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "skill_name": "read_file"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `skill_name` | string | Expanded skill name |
 
 ### `agent.steering.injected`
 
@@ -1297,7 +1277,9 @@ No properties.
 
 ### `agent.llm.retry`
 
-Emitted when an LLM API call is retried.
+Emitted when an attempt fails to open **or sustain** a stream and the turn is
+replayed. The finish-less-stream case carries a synthetic `Stream` error and a
+zero delay: the turn restarts even though no error was reported.
 
 ```json
 {
@@ -1310,6 +1292,7 @@ Emitted when an LLM API call is retried.
     "model": "claude-sonnet-4-20250514",
     "attempt": 2,
     "delay_secs": 1.5,
+    "phase": "open",
     "error": { ... }
   }
 }
@@ -1319,8 +1302,9 @@ Emitted when an LLM API call is retried.
 |----------|------|-------------|
 | `provider` | string | LLM provider name |
 | `model` | string | Model identifier |
-| `attempt` | number | Retry attempt number |
+| `attempt` | number | Retry attempt number, 0-based within the loop named by `phase` |
 | `delay_secs` | number | Delay before retry in seconds |
+| `phase` | string? | `open` (stream failed to open) or `consume` (stream broke or ended without a finish event). Absent on events stored before the discriminator existed |
 | `error` | object | SdkError (serialized) |
 
 ### `agent.sub.spawned`
@@ -1576,10 +1560,10 @@ Emitted whenever a skill is activated in the running session. Sources:
 | `source` | string | `"slash"` for `/skill-name` expansion, `"tool"` for `use_skill` activations |
 | `visit` | number | Stage visit count |
 
-> `agent.skill.expanded` is no longer surfaced as a durable run event. The
-> internal `AgentEvent::SkillExpanded` variant remains classified as streaming
-> noise and is not persisted; slash-skill expansion is reported through
-> `agent.skill.activated` with `source == "slash"` instead.
+> `agent.skill.expanded` does not exist. The `AgentEvent::SkillExpanded`
+> variant this note once described has since been removed from the code
+> entirely; slash-skill expansion is reported through `agent.skill.activated`
+> with `source == "slash"` instead.
 
 ### `agent.failover`
 
@@ -1608,6 +1592,25 @@ Emitted when the agent fails over to a different LLM provider/model.
 | `to_provider` | string | Failover provider |
 | `to_model` | string | Failover model |
 | `error` | string | Error that triggered failover |
+
+### Agent events that are never serialized
+
+`AgentEvent` also has variants that exist only on the agent session's
+in-process broadcast channel. `is_streaming_noise()` filters them out before
+the workflow emitter builds a `RunEvent`, so they never reach the run store,
+SSE, `fabro events`, or a JSONL sink — they have no envelope, and no external
+consumer can observe them:
+
+- `AssistantOutputReplace` — clears in-progress output buffers when a turn is
+  replayed
+- `TextDelta`, `ReasoningDelta` — streaming assistant chunks
+- `ToolCallOutputDelta` — streaming tool output chunks
+
+They were previously documented here as though they were durable events, with
+full envelope examples. If any of them ever needs to be durable, it belongs in
+a separate transient stream rather than the canonical persisted contract —
+long autonomous runs would generate orders of magnitude more delta traffic
+than the interactive sessions surface handles.
 
 ---
 
@@ -2113,6 +2116,7 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
   "properties": {
     "pr_url": "https://github.com/org/repo/pull/42",
     "pr_number": 42,
+    "head_sha": "d34db33f",
     "draft": true
   }
 }
@@ -2122,6 +2126,7 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 |----------|------|-------------|
 | `pr_url` | string | Pull request URL |
 | `pr_number` | number | Pull request number |
+| `head_sha` | string (optional) | Verified commit SHA at the remote PR head; absent on older events |
 | `draft` | boolean | Whether the PR is a draft |
 
 ### `pull_request.linked`
@@ -2183,14 +2188,14 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 |----------|------|-------------|
 | `error` | string | Error message |
 
-## Asset events
+## Artifact events
 
-### `asset.captured`
+### `artifact.captured`
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "asset.captured",
+  "event": "artifact.captured",
   "node_id": "code",
   "node_label": "code",
   "properties": {

@@ -15,11 +15,12 @@ use fabro_llm::{Error as LlmError, retry};
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_mcp::connection_manager::McpConnectionManager;
 use fabro_mcp::http_transport;
-use fabro_model::{AgentProfileKind, Catalog, ModelRef, Speed, UsdMicros};
+use fabro_model::{AgentProfileKind, Catalog, ModelId, ModelRef, Speed, UsdMicros};
 use fabro_types::{
-    AgentToolSummary, PermissionLevel, Principal, SessionMessage, SessionRecord,
-    StageContextWindowProjection, SteeringMessage,
+    AgentToolSummary, LlmOutputKind, LlmRetryPhase, PermissionLevel, Principal, SessionMessage,
+    SessionRecord, StageContextWindowProjection, SteeringMessage,
 };
+use fabro_util::shell;
 use futures::StreamExt;
 use tokio::sync::{Notify, broadcast};
 use tokio::time;
@@ -38,14 +39,17 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::memory::{BUDGET_BYTES, MemoryDocument, discover_memory};
+use crate::native_tool::NativeTool;
 use crate::profiles::EnvContext;
 use crate::question_tools::AgentToolRuntime;
 use crate::sandbox::Sandbox;
 use crate::skills::{
-    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill, make_use_skill_tool,
+    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill,
+    make_use_skill_tool_for_vocabulary,
 };
 use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
 use crate::tool_execution::execute_tool_calls;
+use crate::tool_permissions::canonical_tool_name;
 use crate::tool_registry::ToolDefinitionWithSource;
 use crate::types::{
     AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
@@ -89,6 +93,25 @@ pub enum SessionShutdownReason {
 fn record_elapsed(start: &mut Option<Instant>, total: &mut Duration) {
     if let Some(s) = start.take() {
         *total = total.saturating_add(s.elapsed());
+    }
+}
+
+/// Classify a stream event as the first unit of provider output, or `None`
+/// when it carries no output.
+///
+/// `StreamStart` is deliberately excluded because it proves only that the
+/// provider responded, not what kind of output followed. The start/delta/end
+/// events below identify the first observed content kind.
+fn first_output_kind(event: &StreamEvent) -> Option<LlmOutputKind> {
+    match event {
+        StreamEvent::ReasoningStart | StreamEvent::ReasoningDelta { .. } => {
+            Some(LlmOutputKind::Reasoning)
+        }
+        StreamEvent::TextStart { .. } | StreamEvent::TextDelta { .. } => Some(LlmOutputKind::Text),
+        StreamEvent::ToolCallStart { .. }
+        | StreamEvent::ToolCallDelta { .. }
+        | StreamEvent::ToolCallEnd { .. } => Some(LlmOutputKind::ToolCall),
+        _ => None,
     }
 }
 
@@ -343,6 +366,18 @@ impl ToolEnvProvider for StaticEnvProvider {
 struct BuiltRequest {
     request:        Request,
     context_window: StageContextWindowProjection,
+}
+
+/// Whether an input's `/name` tokens should be treated as skill references.
+///
+/// Only text the user actually typed can invoke a skill. Harness-synthesized
+/// input carries whatever a child agent wrote, where `/tmp` is a path rather
+/// than an invocation: expanding it would either fail the parent turn on an
+/// unknown name or splice a skill template in place of the envelope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillExpansion {
+    Apply,
+    Skip,
 }
 
 pub struct Session {
@@ -649,9 +684,10 @@ impl Session {
         if !self.skills.is_empty() {
             let skills_arc = Arc::new(self.skills.clone());
             if let Some(profile) = Arc::get_mut(&mut self.provider_profile) {
+                let vocabulary = profile.tool_registry().vocabulary();
                 profile
                     .tool_registry_mut()
-                    .register(make_use_skill_tool(skills_arc));
+                    .register(make_use_skill_tool_for_vocabulary(skills_arc, vocabulary));
             }
         }
 
@@ -809,20 +845,7 @@ impl Session {
     ) -> Result<Result<(String, std::collections::HashMap<String, String>), String>, Error> {
         let sandbox = self.sandbox.as_ref();
 
-        let cmd_str = command
-            .iter()
-            .map(|arg| fabro_sandbox::shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Launch the server detached with setsid so Daytona's exec doesn't block.
-        // shell_quote the inner command for the outer `sh -c` so a single quote
-        // or metacharacter in any argv element can't break out of the wrapper.
-        let inner = format!("{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
-        let launch_script = format!(
-            "setsid sh -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
-            quoted = fabro_sandbox::shell_quote(&inner)
-        );
+        let launch_script = sandbox_mcp_launch_script(command);
         let env_ref = if env.is_empty() { None } else { Some(env) };
 
         if cancel_token.is_cancelled() {
@@ -1307,10 +1330,14 @@ impl Session {
             })
         });
 
-        // Process the initial input, then drain any followups
+        // Process the initial input, then drain followups. Claude-compatible
+        // background-agent results join this same boundary queue: they never
+        // interrupt inference or a tool call, and all results already ready at
+        // a boundary are delivered in one additional parent turn.
         let mut result = self
             .run_single_input(
                 input,
+                SkillExpansion::Apply,
                 &agent_tool_runtime,
                 &mut timing,
                 &mut usage,
@@ -1325,10 +1352,34 @@ impl Session {
                     .lock()
                     .expect("followup queue lock poisoned")
                     .pop_front();
-                let Some(followup) = followup else { break };
+                let next_input = if let Some(followup) = followup {
+                    Some((followup, SkillExpansion::Apply))
+                } else if let Some(supervisor) = self.subagent_supervisor.clone() {
+                    match supervisor
+                        .next_parent_notification_turn(&self.cancel_token)
+                        .await
+                    {
+                        Ok(Some(turn)) => Some((turn, SkillExpansion::Skip)),
+                        Ok(None) => None,
+                        Err(Error::Interrupted(InterruptReason::Cancelled)) => {
+                            result = Err(self.interrupted_error());
+                            None
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let Some((next_input, skill_expansion)) = next_input else {
+                    break;
+                };
                 result = self
                     .run_single_input(
-                        &followup,
+                        &next_input,
+                        skill_expansion,
                         &agent_tool_runtime,
                         &mut timing,
                         &mut usage,
@@ -1366,6 +1417,7 @@ impl Session {
     async fn run_single_input(
         &mut self,
         input: &str,
+        skill_expansion: SkillExpansion,
         agent_tool_runtime: &AgentToolRuntime,
         timing: &mut SessionInputTiming,
         usage_accumulator: &mut TokenCounts,
@@ -1380,7 +1432,7 @@ impl Session {
         self.transition(SessionState::Thinking);
 
         // Expand skill references in input
-        let expanded = if self.skills.is_empty() {
+        let expanded = if self.skills.is_empty() || skill_expansion == SkillExpansion::Skip {
             ExpandedInput {
                 text:       input.to_string(),
                 skill_name: None,
@@ -1407,6 +1459,12 @@ impl Session {
             .emit(self.id.clone(), AgentEvent::UserInput {
                 text: expanded_input.clone(),
             });
+
+        // A failed summarization is unlikely to improve within the same agent
+        // turn. Suppress further attempts until the next user/follow-up input
+        // so a provider returning empty responses cannot create a paid retry
+        // loop at both compaction checkpoints.
+        let mut compaction_failed = false;
 
         loop {
             // Top-of-loop: if the previous round's interrupt token fired,
@@ -1470,7 +1528,9 @@ impl Session {
                 .clone();
 
             // Pre-turn compaction: trim context before building the request
-            self.compact_if_needed().await;
+            if !compaction_failed {
+                compaction_failed = self.compact_if_needed().await;
+            }
 
             self.inject_task_reminder_if_needed();
 
@@ -1479,15 +1539,26 @@ impl Session {
             let local_context_window = built_request.context_window.clone();
             let request = built_request.request;
 
-            // Emit AssistantTextStart before LLM call
+            let requested_model = ModelRef {
+                provider: self.provider_profile.provider_id(),
+                model_id: ModelId::new(self.provider_profile.model()),
+                speed:    self.config.speed,
+            };
+
+            // Open the inference bracket for this round. The request is built
+            // and compaction has run, so this is the last point before the
+            // provider is contacted at which we still know nothing about the
+            // response.
             self.event_emitter
-                .emit(self.id.clone(), AgentEvent::AssistantTextStart);
+                .emit(self.id.clone(), AgentEvent::LlmRequestStarted {
+                    requested_model: requested_model.clone(),
+                });
 
             // Call LLM (streaming) with retry for transient errors
             let retry_emitter = self.event_emitter.clone();
             let retry_session_id = self.id.clone();
-            let retry_provider = self.provider_profile.provider_id().to_string();
-            let retry_model = self.provider_profile.model().to_string();
+            let retry_provider = requested_model.provider.to_string();
+            let retry_model = requested_model.model_id.to_string();
             let retry_policy = RetryPolicy {
                 max_retries: 3,
                 on_retry: Some(std::sync::Arc::new(move |err, attempt, delay| {
@@ -1497,6 +1568,7 @@ impl Session {
                         attempt:    attempt as usize,
                         delay_secs: delay.as_secs_f64(),
                         error:      err.clone(),
+                        phase:      LlmRetryPhase::Open,
                     });
                 })),
                 ..Default::default()
@@ -1542,6 +1614,10 @@ impl Session {
                 let mut accumulator = StreamAccumulator::new();
                 let mut attempt_emitted_output = false;
                 let mut stream_error = None;
+                // Re-armed per attempt: a replayed turn discards everything
+                // the previous attempt produced, so its first output is a new
+                // observation rather than a continuation.
+                let mut first_output_emitted = false;
 
                 loop {
                     let chunk = tokio::select! {
@@ -1560,6 +1636,13 @@ impl Session {
                     };
                     match event_result {
                         Ok(event) => {
+                            if !first_output_emitted {
+                                if let Some(kind) = first_output_kind(&event) {
+                                    first_output_emitted = true;
+                                    self.event_emitter
+                                        .emit(self.id.clone(), AgentEvent::LlmFirstOutput { kind });
+                                }
+                            }
                             match &event {
                                 StreamEvent::TextDelta { ref delta, .. } => {
                                     attempt_emitted_output = true;
@@ -1638,9 +1721,19 @@ impl Session {
                             );
                             visible_output_present = false;
                         }
-                        if let Some(ref on_retry) = retry_policy.on_retry {
-                            on_retry(&err, retry_attempt, delay);
-                        }
+                        // Emitted directly rather than through
+                        // `retry_policy.on_retry` so the event can name the
+                        // consume loop as the source of `attempt`; the policy
+                        // callback only ever runs for stream-open failures.
+                        self.event_emitter
+                            .emit(self.id.clone(), AgentEvent::LlmRetry {
+                                provider:   requested_model.provider.to_string(),
+                                model:      requested_model.model_id.to_string(),
+                                attempt:    stream_attempt,
+                                delay_secs: delay.as_secs_f64(),
+                                error:      err,
+                                phase:      LlmRetryPhase::Consume,
+                            });
 
                         let delay_outcome = tokio::select! {
                             biased;
@@ -1707,6 +1800,21 @@ impl Session {
                         );
                         visible_output_present = false;
                     }
+                    // The only mid-turn restart that reaches no error handler:
+                    // without this the round replays and discards its output
+                    // with nothing on the durable stream to show for it.
+                    self.event_emitter
+                        .emit(self.id.clone(), AgentEvent::LlmRetry {
+                            provider:   requested_model.provider.to_string(),
+                            model:      requested_model.model_id.to_string(),
+                            attempt:    stream_attempt,
+                            delay_secs: 0.0,
+                            error:      LlmError::Stream {
+                                message: "Stream ended without a finish event".to_string(),
+                                source:  None,
+                            },
+                            phase:      LlmRetryPhase::Consume,
+                        });
                     let cancel_token_for_select = self.cancel_token.clone();
                     let retry_outcome: Option<Result<StreamEventStream, Error>> = tokio::select! {
                         biased;
@@ -1762,6 +1870,8 @@ impl Session {
             // Record assistant turn
             let text = response.text();
             let tool_calls = response.tool_calls();
+            // Normalize before the response's content moves into history.
+            let reasoning = response.reasoning_output();
             let provider_parts: Vec<_> = response
                 .message
                 .content
@@ -1805,10 +1915,13 @@ impl Session {
                     cost_source: response.cost_source,
                     tool_call_count: tool_calls.len(),
                     context_window,
+                    reasoning,
                 });
 
             // Post-response compaction: trim context after appending assistant turn
-            self.compact_if_needed().await;
+            if !compaction_failed {
+                compaction_failed = self.compact_if_needed().await;
+            }
 
             // If no tool calls, natural completion. Consult the optional
             // completion coordinator: it can return `true` to force one more
@@ -1863,10 +1976,10 @@ impl Session {
             .await;
             timing.tool = timing.tool.saturating_add(tool_start.elapsed());
             composite_watcher.abort();
-            if tool_calls
-                .iter()
-                .any(|tool_call| tool_call.name == "use_skill")
-            {
+            if tool_calls.iter().zip(&results).any(|(tool_call, result)| {
+                !result.is_error
+                    && canonical_tool_name(&tool_call.name) == NativeTool::UseSkill.canonical_name()
+            }) {
                 self.activated_skill_context_observed = true;
             }
 
@@ -1910,7 +2023,12 @@ impl Session {
         }
     }
 
-    async fn compact_if_needed(&mut self) {
+    /// Attempt context compaction when the configured threshold is exceeded.
+    ///
+    /// Returns `true` when an attempted compaction failed so the current input
+    /// loop can suppress repeated paid summary calls. The next input starts
+    /// with a fresh retry opportunity.
+    async fn compact_if_needed(&mut self) -> bool {
         let Some(estimate) = check_context_usage(
             &self.system_prompt,
             &self.history,
@@ -1919,12 +2037,12 @@ impl Session {
             &self.event_emitter,
             &self.id,
         ) else {
-            return;
+            return false;
         };
         if !self.config.enable_context_compaction {
-            return;
+            return false;
         }
-        if let Err(e) = compact_context(
+        if let Err(error) = compact_context(
             &mut self.history,
             &self.llm_client,
             self.provider_profile.as_ref(),
@@ -1936,10 +2054,11 @@ impl Session {
         )
         .await
         {
-            self.event_emitter.emit(self.id.clone(), AgentEvent::Error {
-                error: Error::InvalidState(format!("Context compaction failed: {e}")),
-            });
+            self.event_emitter
+                .emit(self.id.clone(), AgentEvent::Error { error });
+            return true;
         }
+        false
     }
 
     fn drain_steering(&mut self) {
@@ -2049,6 +2168,7 @@ impl Session {
             system_prompt: &self.system_prompt,
             memory: &self.memory,
             skills: &self.skills,
+            tool_vocabulary: self.provider_profile.tool_registry().vocabulary(),
             activated_skill_context_observed: self.activated_skill_context_observed,
             provider: &provider,
             model: &model,
@@ -2083,6 +2203,35 @@ const fn is_auth_error(err: &LlmError) -> bool {
     )
 }
 
+/// Build the script that launches a sandbox MCP server detached and echoes its
+/// PID.
+///
+/// `setsid` fully detaches the server so Daytona's exec doesn't block on it.
+/// The inner command is shell-quoted for the wrapper so a single quote or
+/// metacharacter in any argv element can't break out, and the wrapper itself is
+/// the current `$BASH` because the sandbox evaluates this string as non-login
+/// Bash and may resolve that executable outside `/bin` (for example on NixOS).
+fn sandbox_mcp_launch_script(command: &[String]) -> String {
+    let command_source = match command {
+        // Sandbox MCP `script` entries resolve to this exact argv shape. The
+        // surrounding launcher is already the provider-selected Bash, so
+        // evaluate the source in that process instead of PATH-resolving a
+        // second interpreter. Grouping keeps the log redirections scoped to
+        // the whole script, including multi-command and trailing-comment
+        // forms.
+        [interpreter, flag, source] if interpreter == "bash" && flag == "-c" => {
+            format!("{{\n{source}\n}}")
+        }
+        _ => shell::shell_join(command),
+    };
+    let inner =
+        format!("{command_source} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
+    format!(
+        "setsid \"$BASH\" -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
+        quoted = shell::shell_quote(&inner)
+    )
+}
+
 /// Best-effort kill of a sandbox MCP server process group. Used when
 /// `start_sandbox_mcp_server` is cancelled after spawning a detached
 /// `setsid` child but before reporting readiness. Errors from the sandbox
@@ -2113,16 +2262,97 @@ mod tests {
         ContentPart, ReasoningEffort, Request, Response, Role, StreamEvent, TokenCounts, ToolCall,
         ToolDefinition,
     };
-    use fabro_types::StageContextWindowCountMethod;
+    use fabro_types::{ReasoningOutput, StageContextWindowCountMethod};
     use futures::stream;
     use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::config::{ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode};
+    use crate::error::CompactionError;
     use crate::skills::{Skill, make_use_skill_tool};
     use crate::subagent::{SubAgentStatus, make_wait_tool};
     use crate::test_support::*;
     use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_uses_bash() {
+        // The sandbox evaluates this string as non-login Bash, so the detached
+        // wrapper reuses the executable selected by the provider.
+        let script = sandbox_mcp_launch_script(&[
+            "npx".to_string(),
+            "@playwright/mcp@latest".to_string(),
+            "--port".to_string(),
+            "3100".to_string(),
+        ]);
+
+        assert!(
+            script.starts_with("setsid \"$BASH\" -c "),
+            "launch wrapper should detach through the provider-selected Bash: {script}"
+        );
+        assert!(
+            script.ends_with(" </dev/null >/dev/null 2>&1 &\necho $!"),
+            "launch wrapper should stay detached and report its PID: {script}"
+        );
+        assert!(
+            script.contains("/tmp/mcp_server_stdout.log")
+                && script.contains("2>/tmp/mcp_server_stderr.log"),
+            "launch wrapper should keep its log redirection: {script}"
+        );
+    }
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_evaluates_scripts_in_the_selected_bash() {
+        let source =
+            "PATH=/mcp-only\nprintf 'starting server\\n'\nexec my-server --port 3100 # ready";
+        let script =
+            sandbox_mcp_launch_script(&["bash".to_string(), "-c".to_string(), source.to_string()]);
+
+        let wrapper_argument = script
+            .strip_prefix("setsid \"$BASH\" -c ")
+            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
+            .expect("launch wrapper should have the canonical shape");
+        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
+
+        assert_eq!(unwrapped, vec![format!(
+            "{{\n{source}\n}} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
+        )]);
+        assert!(
+            !unwrapped[0].contains("bash -c"),
+            "script entries must not PATH-resolve a nested Bash: {}",
+            unwrapped[0]
+        );
+    }
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_quotes_arbitrary_argv() {
+        // A quote or metacharacter in any argv element must not break out of
+        // the wrapper; it has to arrive as one argument.
+        let script = sandbox_mcp_launch_script(&[
+            "my-server".to_string(),
+            "--flag=it's a value".to_string(),
+            "$(touch /tmp/pwned)".to_string(),
+        ]);
+
+        let wrapper_argument = script
+            .strip_prefix("setsid \"$BASH\" -c ")
+            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
+            .expect("launch wrapper should have the canonical shape");
+
+        // Unwrap the wrapper's own quoting: the whole inner script must arrive
+        // as one argument to `bash -c`, with each argv element still quoted so
+        // the substitution stays inert.
+        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
+        assert_eq!(
+            unwrapped.len(),
+            1,
+            "the command must stay a single argument"
+        );
+        assert_eq!(
+            unwrapped[0],
+            "my-server \"--flag=it's a value\" '$(touch /tmp/pwned)' > \
+             /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
+        );
+    }
 
     struct NamedToolAccessPolicy {
         decisions: Vec<(&'static str, ToolAccess)>,
@@ -2849,6 +3079,121 @@ mod tests {
         assert!(
             matches!(&turns[3], Message::Assistant { content, .. } if content == "Followup response")
         );
+    }
+
+    #[tokio::test]
+    async fn background_agent_notifications_are_batched_into_one_parent_turn() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let first = make_session(vec![text_response("first result")]).await;
+        let second = make_session(vec![text_response("second result")]).await;
+        let first_id = supervisor
+            .spawn_with_parent_notification(
+                first,
+                "first task".to_string(),
+                "Inspect first".to_string(),
+                0,
+            )
+            .unwrap();
+        let second_id = supervisor
+            .spawn_with_parent_notification(
+                second,
+                "second task".to_string(),
+                "Inspect second".to_string(),
+                0,
+            )
+            .unwrap();
+
+        // Make both results ready before the parent reaches its safe turn
+        // boundary so batching is deterministic.
+        supervisor
+            .wait_with_cancel(&first_id, &CancellationToken::new())
+            .await
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&second_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Parent is waiting"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Synthesized both results"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+
+        let output = parent
+            .process_input_with_output("Delegate both tasks")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Synthesized both results"));
+        let turns = parent.history().turns();
+        assert_eq!(turns.len(), 4);
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background results");
+        };
+        assert_eq!(notification.matches("<task-notification>").count(), 2);
+        assert!(notification.contains(&first_id));
+        assert!(notification.contains(&second_id));
+        assert!(notification.contains("first result"));
+        assert!(notification.contains("second result"));
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn background_agent_output_is_not_parsed_for_skill_references() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("Cleaned up /tmp and exited")]).await;
+        let child_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "clean up".to_string(),
+                "Clean scratch files".to_string(),
+                0,
+            )
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&child_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Delegated"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Acknowledged"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+        parent.skills = vec![Skill {
+            name:        "commit".to_string(),
+            description: "Make a commit".to_string(),
+            template:    "Review changes and commit.".to_string(),
+        }];
+
+        // A child that mentions a bare path must not fail the parent turn on
+        // `Unknown skill: /tmp`, nor have its report replaced by a skill body.
+        let output = parent
+            .process_input_with_output("Delegate the cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Acknowledged"));
+        let turns = parent.history().turns();
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background result");
+        };
+        assert!(notification.contains("Cleaned up /tmp and exited"));
+        assert!(!notification.contains("Review changes and commit."));
+
+        supervisor.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -3924,6 +4269,111 @@ mod tests {
         ]);
     }
 
+    /// Builds a response whose provider parts carry both reasoning channels.
+    fn reasoning_response(text: &str, summary: &str, trace: &str) -> Response {
+        let mut response = text_response(text);
+        let mut content = vec![ContentPart::Other {
+            kind: ContentPart::OPENAI_COMPAT_REASONING_DETAILS.to_string(),
+            data: serde_json::json!([
+                {"type": "reasoning.summary", "summary": summary},
+                {"type": "reasoning.text", "text": trace},
+            ]),
+        }];
+        content.extend(response.message.content);
+        response.message.content = content;
+        response
+    }
+
+    fn collect_message_reasoning(
+        rx: &mut broadcast::Receiver<SessionEvent>,
+    ) -> Vec<Option<ReasoningOutput>> {
+        let mut collected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::AssistantMessage { reasoning, .. } = event.event {
+                collected.push(reasoning);
+            }
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn completed_response_emits_normalized_reasoning_once() {
+        let mut session = make_session(vec![reasoning_response(
+            "4.",
+            "the user wants 2+2",
+            "2+2 is 4",
+        )])
+        .await;
+        let mut rx = session.subscribe();
+
+        session.process_input("What is 2+2?").await.unwrap();
+
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput::new(
+            "the user wants 2+2",
+            "2+2 is 4",
+        ))]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_response_with_no_visible_text_still_carries_reasoning() {
+        let mut tool_call = tool_call_response("nonexistent_tool", "call_1", serde_json::json!({}));
+        // Drop the visible text so only the tool call and reasoning remain.
+        tool_call.message.content = vec![
+            ContentPart::Other {
+                kind: ContentPart::OPENAI_COMPAT_REASONING_DETAILS.to_string(),
+                data: serde_json::json!([{"type": "reasoning.summary", "summary": "call the tool"}]),
+            },
+            ContentPart::ToolCall(ToolCall::new(
+                "call_1",
+                "nonexistent_tool",
+                serde_json::json!({}),
+            )),
+        ];
+
+        let mut session = make_session(vec![tool_call, text_response("OK")]).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Do something").await.unwrap();
+
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![
+            Some(ReasoningOutput::from_summary("call the tool")),
+            None,
+        ]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_final_response_contributes_reasoning_after_a_retry() {
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ReasoningDelta {
+                    delta: "discarded thinking".to_string(),
+                }),
+                Err(LlmError::Stream {
+                    message: "connection reset".into(),
+                    source:  None,
+                }),
+            ]),
+            ScriptedStreamCall::Response(Box::new(reasoning_response(
+                "Recovered",
+                "final summary",
+                "final trace",
+            ))),
+        ]));
+        let mut session = make_session_with_provider(provider.clone()).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hello").await.unwrap();
+
+        assert_eq!(provider.call_index.load(Ordering::SeqCst), 2);
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput::new(
+            "final summary",
+            "final trace"
+        ))]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stream_quota_error_does_not_replay() {
         let quota_error = LlmError::Provider {
@@ -4097,6 +4547,125 @@ mod tests {
         assert_eq!(tool_completed_count, 0);
     }
 
+    /// Drain the receiver into `(label, detail)` pairs for the inference
+    /// bracket events, ignoring everything else.
+    fn collect_bracket_events(rx: &mut broadcast::Receiver<SessionEvent>) -> Vec<(String, String)> {
+        let mut observed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event.event {
+                AgentEvent::LlmRequestStarted { requested_model } => {
+                    observed.push((
+                        "started".to_string(),
+                        format!("{}/{}", requested_model.provider, requested_model.model_id),
+                    ));
+                }
+                AgentEvent::LlmFirstOutput { kind } => {
+                    observed.push(("first_output".to_string(), kind.to_string()));
+                }
+                AgentEvent::AssistantMessage { text, .. } => {
+                    observed.push(("message".to_string(), text));
+                }
+                _ => {}
+            }
+        }
+        observed
+    }
+
+    #[tokio::test]
+    async fn inference_bracket_wraps_a_text_first_turn() {
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Hello"))),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hi").await.unwrap();
+
+        // `started` carries the requested provider/model, and precedes any
+        // knowledge of what the response will contain.
+        assert_eq!(collect_bracket_events(&mut rx), vec![
+            ("started".to_string(), "anthropic/mock-model".to_string()),
+            ("first_output".to_string(), "text".to_string()),
+            ("message".to_string(), "Hello".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn first_output_reports_reasoning_when_reasoning_arrives_first() {
+        let response = text_response("Hello");
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ReasoningDelta {
+                    delta: "weighing options".to_string(),
+                }),
+                Ok(StreamEvent::text_delta("Hello", None)),
+                Ok(StreamEvent::finish(
+                    response.finish_reason.clone(),
+                    response.usage.clone(),
+                    response,
+                )),
+            ]),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hi").await.unwrap();
+
+        // Edge-triggered: the later text delta does not re-fire the latch.
+        assert_eq!(collect_bracket_events(&mut rx), vec![
+            ("started".to_string(), "anthropic/mock-model".to_string()),
+            ("first_output".to_string(), "reasoning".to_string()),
+            ("message".to_string(), "Hello".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn first_output_reports_tool_call_for_a_turn_with_no_text_or_reasoning() {
+        let tool_call = ToolCall::new("call_1", "nonexistent_tool", serde_json::json!({}));
+        let mut response = tool_call_response("nonexistent_tool", "call_1", serde_json::json!({}));
+        // Strip the visible text so the turn produces neither a text nor a
+        // reasoning delta — the case a latch keyed on those two would miss
+        // entirely, leaving tool-heavy rounds silent.
+        response.message.content = vec![ContentPart::ToolCall(tool_call.clone())];
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ToolCallStart {
+                    tool_call: tool_call.clone(),
+                }),
+                Ok(StreamEvent::ToolCallEnd {
+                    tool_call: tool_call.clone(),
+                }),
+                Ok(StreamEvent::finish(
+                    response.finish_reason.clone(),
+                    response.usage.clone(),
+                    response,
+                )),
+            ]),
+            ScriptedStreamCall::Response(Box::new(text_response("Done"))),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Use the tool").await.unwrap();
+
+        let observed = collect_bracket_events(&mut rx);
+        let kinds: Vec<&str> = observed
+            .iter()
+            .filter(|(label, _)| label == "first_output")
+            .map(|(_, kind)| kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["tool_call", "text"]);
+        // One bracket per round: the tool round and the round that follows it.
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(label, _)| label == "started")
+                .count(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn stream_retries_when_stream_ends_without_finish_before_any_deltas() {
         let provider = Arc::new(ScriptedStreamProvider::new(vec![
@@ -4115,24 +4684,33 @@ mod tests {
             Some(Message::Assistant { content, .. }) if content == "Recovered"
         ));
 
-        let mut assistant_text_start_count = 0;
+        let mut request_started_count = 0;
         let mut replace_count = 0;
         let mut deltas = Vec::new();
         let mut assistant_messages = Vec::new();
+        let mut consume_retries = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => assistant_text_start_count += 1,
+                AgentEvent::LlmRequestStarted { .. } => request_started_count += 1,
                 AgentEvent::AssistantOutputReplace { .. } => replace_count += 1,
                 AgentEvent::TextDelta { delta } => deltas.push(delta),
                 AgentEvent::AssistantMessage { text, .. } => assistant_messages.push(text),
+                AgentEvent::LlmRetry { attempt, phase, .. } => {
+                    consume_retries.push((attempt, phase));
+                }
                 _ => {}
             }
         }
 
-        assert_eq!(assistant_text_start_count, 1);
+        // One round, so one bracket open — the finish-less stream is replayed
+        // inside the round rather than starting a new one.
+        assert_eq!(request_started_count, 1);
         assert_eq!(replace_count, 0);
         assert_eq!(deltas, vec!["Recovered".to_string()]);
         assert_eq!(assistant_messages, vec!["Recovered".to_string()]);
+        // The finish-less restart is the one mid-turn path with no error to
+        // report; without this event it would be invisible downstream.
+        assert_eq!(consume_retries, vec![(0, LlmRetryPhase::Consume)]);
     }
 
     #[tokio::test]
@@ -4156,10 +4734,14 @@ mod tests {
         let mut observed = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => observed.push("start".to_string()),
+                AgentEvent::LlmRequestStarted { .. } => observed.push("start".to_string()),
+                AgentEvent::LlmFirstOutput { kind } => observed.push(format!("first:{kind}")),
                 AgentEvent::TextDelta { delta } => observed.push(format!("delta:{delta}")),
                 AgentEvent::AssistantOutputReplace { text, reasoning } => {
                     observed.push(format!("replace:{text}:{reasoning:?}"));
+                }
+                AgentEvent::LlmRetry { phase, .. } => {
+                    observed.push(format!("retry:{phase}"));
                 }
                 AgentEvent::AssistantMessage { text, .. } => {
                     observed.push(format!("message:{text}"));
@@ -4168,10 +4750,15 @@ mod tests {
             }
         }
 
+        // The latch re-arms on restart: the replayed attempt's first delta is
+        // a fresh observation, not a continuation of the discarded one.
         assert_eq!(observed, vec![
             "start".to_string(),
+            "first:text".to_string(),
             "delta:Hel".to_string(),
             "replace::None".to_string(),
+            "retry:consume".to_string(),
+            "first:text".to_string(),
             "delta:Hello".to_string(),
             "message:Hello".to_string(),
         ]);
@@ -4209,7 +4796,7 @@ mod tests {
         let mut found_auth_error_event = false;
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => observed.push("start".to_string()),
+                AgentEvent::LlmRequestStarted { .. } => observed.push("start".to_string()),
                 AgentEvent::TextDelta { delta } => observed.push(format!("delta:{delta}")),
                 AgentEvent::AssistantOutputReplace { text, reasoning } => {
                     observed.push(format!("replace:{text}:{reasoning:?}"));
@@ -4472,8 +5059,9 @@ mod tests {
         // provider that errors on complete() but succeeds on stream().
 
         struct StreamOnlyProvider {
-            responses:  Vec<Response>,
-            call_index: AtomicUsize,
+            responses:      Vec<Response>,
+            stream_index:   AtomicUsize,
+            complete_calls: AtomicUsize,
         }
 
         #[async_trait::async_trait]
@@ -4483,6 +5071,7 @@ mod tests {
             }
 
             async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
+                self.complete_calls.fetch_add(1, Ordering::SeqCst);
                 Err(LlmError::Stream {
                     message: "summarization failed".into(),
                     source:  None,
@@ -4490,7 +5079,7 @@ mod tests {
             }
 
             async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
-                let idx = self.call_index.fetch_add(1, Ordering::SeqCst);
+                let idx = self.stream_index.fetch_add(1, Ordering::SeqCst);
                 let response = if idx < self.responses.len() {
                     self.responses[idx].clone()
                 } else {
@@ -4519,16 +5108,20 @@ mod tests {
         }
 
         let large_input = "x".repeat(400);
-        let responses = vec![response_with_usage(
+        let responses = vec![
+            response_with_input_tokens(
+                tool_call_response("nonexistent_tool", "call_1", serde_json::json!({})),
+                90,
+            ),
             text_response("OK"),
-            TokenCounts::default(),
-        )];
+        ];
 
         let provider = Arc::new(StreamOnlyProvider {
             responses,
-            call_index: AtomicUsize::new(0),
+            stream_index: AtomicUsize::new(0),
+            complete_calls: AtomicUsize::new(0),
         });
-        let client = make_client(provider as Arc<dyn ProviderAdapter>).await;
+        let client = make_client(provider.clone() as Arc<dyn ProviderAdapter>).await;
         let registry = ToolRegistry::new();
         let profile = Arc::new(TestProfile::with_context_window(registry, 100));
         let env = Arc::new(MockSandbox::default());
@@ -4546,15 +5139,20 @@ mod tests {
             result.is_ok(),
             "Session should continue despite compaction failure"
         );
+        assert_eq!(
+            provider.complete_calls.load(Ordering::SeqCst),
+            1,
+            "a failed compaction should suppress retries for the rest of the input"
+        );
 
-        // Should emit an Error event for the failed compaction
+        // Should emit the structured compaction error without flattening the
+        // underlying LLM failure.
         let mut found_error = false;
         while let Ok(event) = rx.try_recv() {
-            if let AgentEvent::Error { error } = &event.event {
-                let msg = error.to_string();
-                if msg.contains("compaction") || msg.contains("summarization") {
-                    found_error = true;
-                }
+            if matches!(event.event, AgentEvent::Error {
+                error: Error::Compaction(CompactionError::Llm(_)),
+            }) {
+                found_error = true;
             }
         }
         assert!(found_error, "Should emit Error event for failed compaction");

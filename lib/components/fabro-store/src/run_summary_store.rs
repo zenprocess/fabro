@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{BilledTokenCounts, Run, RunId, RunSize, RunStatusKind, RunTiming};
+use fabro_types::{BilledTokenCounts, Run, RunId, RunSize, RunStatusKind, RunTiming, timing};
 use sqlx::sqlite::{SqliteConnection, SqliteRow};
 use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
 use strum::VariantArray as _;
@@ -152,6 +152,11 @@ impl RunSummaryStore {
         let mut connection = self.pool.acquire().await?;
         upsert_run(&mut connection, &record).await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_pool(&self) {
+        self.pool.close().await;
     }
 
     pub(crate) async fn reconcile(&self, entries: &[CachedRunProjection]) -> Result<()> {
@@ -545,7 +550,7 @@ fn overlay_live_wall_time(run: &mut Run, now: DateTime<Utc>) {
     let Some(started_at) = run.timestamps.started_at else {
         return;
     };
-    let wall_time_ms = RunTiming::wall_time_ms_since(started_at, now);
+    let wall_time_ms = timing::elapsed_ms(started_at, now);
     run.timing = Some(
         run.timing
             .unwrap_or_else(|| RunTiming::wall_only(wall_time_ms))
@@ -571,7 +576,7 @@ mod tests {
         RunSummaryVisibility,
     };
     use crate::slate::CachedRunProjection;
-    use crate::test_util;
+    use crate::test_support as store_test_support;
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -609,7 +614,7 @@ mod tests {
     }
 
     async fn store() -> (tempfile::TempDir, RunSummaryStore) {
-        test_util::sqlite_summary_store().await
+        store_test_support::sqlite_summary_store().await
     }
 
     fn sample_status(kind: RunStatusKind) -> RunStatus {

@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
 use fabro_model::{CostSource, ModelRef};
-use fabro_types::{SessionMessage, StageContextWindowProjection};
+use fabro_types::{
+    CommandTermination, ExecOutputTail, LlmOutputKind, LlmRetryPhase, ReasoningOutput,
+    SessionMessage, StageContextWindowProjection,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -234,7 +237,20 @@ pub enum AgentEvent {
     UserInput {
         text: String,
     },
-    AssistantTextStart,
+    /// An inference request is about to be dispatched for this round. Emitted
+    /// after the request is built and compaction has run, immediately before
+    /// the stream is opened. `provider` and `model` are the requested target;
+    /// failover can re-target, so `AssistantMessage` stays authoritative for
+    /// what actually answered.
+    LlmRequestStarted {
+        requested_model: ModelRef,
+    },
+    /// The provider produced its first output for the current attempt.
+    /// Edge-triggered: emitted once per stream attempt, re-armed when a
+    /// broken or finish-less stream restarts the turn.
+    LlmFirstOutput {
+        kind: LlmOutputKind,
+    },
     /// Replaces the current in-progress assistant output buffers.
     AssistantOutputReplace {
         text:      String,
@@ -254,6 +270,11 @@ pub enum AgentEvent {
         tool_call_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window:  Option<StageContextWindowProjection>,
+        /// Readable reasoning normalized from the final response. Derived
+        /// once the response is complete, so retried or replaced streaming
+        /// buffers never become durable reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning:       Option<ReasoningOutput>,
     },
     TextDelta {
         delta: String,
@@ -274,6 +295,19 @@ pub enum AgentEvent {
         tool_call_id: String,
         output:       serde_json::Value,
         is_error:     bool,
+    },
+    /// Subordinate process outcome for a tool call that ran a command.
+    /// Emitted before the owning `ToolCallCompleted`, which stays the single
+    /// tool-protocol completion and the authoritative owner of `is_error`.
+    /// Session and tool-call identity come from the emitting envelope.
+    ToolProcessCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code:         Option<i32>,
+        termination:       CommandTermination,
+        duration_ms:       u64,
+        streams_separated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_output_tail:  Option<ExecOutputTail>,
     },
     Error {
         error: Error,
@@ -307,32 +341,49 @@ pub enum AgentEvent {
         summary_token_estimate: usize,
         tracked_file_count:     usize,
     },
+    /// An attempt failed to open **or sustain** a stream and the turn is
+    /// being replayed. `phase` names which retry loop `attempt` counts.
     LlmRetry {
         provider:   String,
         model:      String,
         attempt:    usize,
         delay_secs: f64,
         error:      LlmError,
+        phase:      LlmRetryPhase,
     },
     SubAgentSpawned {
-        agent_id: String,
-        depth:    usize,
-        task:     String,
+        agent_id:   String,
+        depth:      usize,
+        task:       String,
+        #[serde(default = "fabro_types::initial_subagent_generation")]
+        generation: u64,
+    },
+    SubAgentTurnStarted {
+        agent_id:   String,
+        depth:      usize,
+        task:       String,
+        generation: u64,
     },
     SubAgentCompleted {
         agent_id:   String,
         depth:      usize,
+        #[serde(default = "fabro_types::initial_subagent_generation")]
+        generation: u64,
         success:    bool,
         turns_used: usize,
     },
     SubAgentFailed {
-        agent_id: String,
-        depth:    usize,
-        error:    Error,
+        agent_id:   String,
+        depth:      usize,
+        #[serde(default = "fabro_types::initial_subagent_generation")]
+        generation: u64,
+        error:      Error,
     },
     SubAgentClosed {
-        agent_id: String,
-        depth:    usize,
+        agent_id:   String,
+        depth:      usize,
+        #[serde(default = "fabro_types::initial_subagent_generation")]
+        generation: u64,
     },
     McpServerReady {
         server_name: String,
@@ -375,8 +426,7 @@ impl AgentEvent {
     pub fn is_streaming_noise(&self) -> bool {
         matches!(
             self,
-            Self::AssistantTextStart
-                | Self::AssistantOutputReplace { .. }
+            Self::AssistantOutputReplace { .. }
                 | Self::TextDelta { .. }
                 | Self::ReasoningDelta { .. }
                 | Self::ToolCallOutputDelta { .. }
@@ -403,8 +453,17 @@ impl AgentEvent {
             Self::UserInput { text } => {
                 debug!(session_id, text_len = text.len(), "User input received");
             }
-            Self::AssistantTextStart => {
-                debug!(session_id, "Assistant response started");
+            Self::LlmRequestStarted { requested_model } => {
+                debug!(
+                    session_id,
+                    provider = %requested_model.provider,
+                    model = %requested_model.model_id,
+                    speed = requested_model.speed.map_or("", <&'static str>::from),
+                    "LLM request started"
+                );
+            }
+            Self::LlmFirstOutput { kind } => {
+                debug!(session_id, kind = %kind, "LLM produced first output");
             }
             Self::AssistantMessage {
                 model,
@@ -450,6 +509,28 @@ impl AgentEvent {
                     tool_call_id,
                     is_error,
                     "Tool call completed"
+                );
+            }
+            Self::ToolProcessCompleted {
+                exit_code,
+                termination,
+                duration_ms,
+                streams_separated,
+                exec_output_tail,
+            } => {
+                let tail = ExecOutputTail::trace_summary(exec_output_tail.as_ref());
+                debug!(
+                    session_id,
+                    exit_code = ?exit_code,
+                    termination = termination.as_str(),
+                    duration_ms,
+                    streams_separated,
+                    output_tail_present = tail.present,
+                    stdout_bytes = tail.stdout_bytes,
+                    stderr_bytes = tail.stderr_bytes,
+                    stdout_truncated = tail.stdout_truncated,
+                    stderr_truncated = tail.stderr_truncated,
+                    "Tool process completed"
                 );
             }
             Self::Error { error } => {
@@ -502,6 +583,7 @@ impl AgentEvent {
                 attempt,
                 delay_secs,
                 error,
+                phase,
             } => {
                 warn!(
                     session_id,
@@ -509,6 +591,7 @@ impl AgentEvent {
                     model,
                     attempt,
                     delay_secs,
+                    phase = %phase,
                     error = %error,
                     "LLM request failed, retrying"
                 );
@@ -517,35 +600,57 @@ impl AgentEvent {
                 agent_id,
                 depth,
                 task,
+                generation,
             } => {
-                debug!(session_id, agent_id, depth, task, "Sub-agent spawned");
+                debug!(
+                    session_id,
+                    agent_id, depth, generation, task, "Sub-agent spawned"
+                );
+            }
+            Self::SubAgentTurnStarted {
+                agent_id,
+                depth,
+                task,
+                generation,
+            } => {
+                debug!(
+                    session_id,
+                    agent_id, depth, generation, task, "Sub-agent turn started"
+                );
             }
             Self::SubAgentCompleted {
                 agent_id,
                 depth,
+                generation,
                 success,
                 turns_used,
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, success, turns_used, "Sub-agent completed"
+                    agent_id, depth, generation, success, turns_used, "Sub-agent completed"
                 );
             }
             Self::SubAgentFailed {
                 agent_id,
                 depth,
+                generation,
                 error,
             } => {
                 warn!(
                     session_id,
                     agent_id,
                     depth,
+                    generation,
                     error = %error,
                     "Sub-agent failed"
                 );
             }
-            Self::SubAgentClosed { agent_id, depth } => {
-                debug!(session_id, agent_id, depth, "Sub-agent closed");
+            Self::SubAgentClosed {
+                agent_id,
+                depth,
+                generation,
+            } => {
+                debug!(session_id, agent_id, depth, generation, "Sub-agent closed");
             }
             Self::McpServerReady {
                 server_name,
@@ -696,9 +801,10 @@ mod tests {
     #[test]
     fn subagent_spawned_constructible() {
         let event = AgentEvent::SubAgentSpawned {
-            agent_id: "sa-1".into(),
-            depth:    1,
-            task:     "list files".into(),
+            agent_id:   "sa-1".into(),
+            depth:      1,
+            task:       "list files".into(),
+            generation: 1,
         };
         assert!(matches!(event, AgentEvent::SubAgentSpawned {
             depth: 1,
@@ -711,6 +817,7 @@ mod tests {
         let event = AgentEvent::SubAgentCompleted {
             agent_id:   "sa-1".into(),
             depth:      1,
+            generation: 1,
             success:    true,
             turns_used: 5,
         };
@@ -724,9 +831,10 @@ mod tests {
     #[test]
     fn subagent_failed_constructible() {
         let event = AgentEvent::SubAgentFailed {
-            agent_id: "sa-1".into(),
-            depth:    0,
-            error:    Error::ToolExecution("timeout".into()),
+            agent_id:   "sa-1".into(),
+            depth:      0,
+            generation: 1,
+            error:      Error::ToolExecution("timeout".into()),
         };
         assert!(matches!(event, AgentEvent::SubAgentFailed { depth: 0, .. }));
     }
@@ -734,8 +842,9 @@ mod tests {
     #[test]
     fn subagent_closed_constructible() {
         let event = AgentEvent::SubAgentClosed {
-            agent_id: "sa-1".into(),
-            depth:    2,
+            agent_id:   "sa-1".into(),
+            depth:      2,
+            generation: 1,
         };
         assert!(matches!(event, AgentEvent::SubAgentClosed { depth: 2, .. }));
     }
@@ -744,29 +853,52 @@ mod tests {
     fn subagent_events_serde_round_trip() {
         let events = vec![
             AgentEvent::SubAgentSpawned {
-                agent_id: "sa-1".into(),
-                depth:    0,
-                task:     "test".into(),
+                agent_id:   "sa-1".into(),
+                depth:      0,
+                task:       "test".into(),
+                generation: 1,
+            },
+            AgentEvent::SubAgentTurnStarted {
+                agent_id:   "sa-1".into(),
+                depth:      0,
+                task:       "fix it".into(),
+                generation: 2,
             },
             AgentEvent::SubAgentCompleted {
                 agent_id:   "sa-1".into(),
                 depth:      0,
+                generation: 2,
                 success:    true,
                 turns_used: 3,
             },
             AgentEvent::SubAgentFailed {
-                agent_id: "sa-1".into(),
-                depth:    0,
-                error:    Error::ToolExecution("oops".into()),
+                agent_id:   "sa-1".into(),
+                depth:      0,
+                generation: 2,
+                error:      Error::ToolExecution("oops".into()),
             },
             AgentEvent::SubAgentClosed {
-                agent_id: "sa-1".into(),
-                depth:    0,
+                agent_id:   "sa-1".into(),
+                depth:      0,
+                generation: 2,
             },
         ];
         let json = serde_json::to_string(&events).unwrap();
         let deserialized: Vec<AgentEvent> = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.len(), 4);
+        assert_eq!(deserialized.len(), 5);
+    }
+
+    #[test]
+    fn legacy_subagent_event_defaults_to_the_initial_generation() {
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"SubAgentSpawned":{"agent_id":"sa-1","depth":0,"task":"test"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(event, AgentEvent::SubAgentSpawned {
+            generation: 1,
+            ..
+        }));
     }
 
     #[test]
@@ -892,6 +1024,7 @@ mod tests {
             cost_source:     Some(CostSource::Authoritative),
             tool_call_count: 2,
             context_window:  None,
+            reasoning:       None,
         };
         match &event {
             AgentEvent::AssistantMessage {
@@ -957,6 +1090,7 @@ mod tests {
             model:      "gpt-4".into(),
             attempt:    1,
             delay_secs: 2.0,
+            phase:      LlmRetryPhase::Open,
             error:      LlmError::Provider {
                 kind:   ProviderErrorKind::RateLimit,
                 detail: Box::new(ProviderErrorDetail {
@@ -983,9 +1117,10 @@ mod tests {
     #[test]
     fn subagent_failed_carries_agent_error() {
         let event = AgentEvent::SubAgentFailed {
-            agent_id: "sa-1".into(),
-            depth:    0,
-            error:    Error::ToolExecution("cmd failed".into()),
+            agent_id:   "sa-1".into(),
+            depth:      0,
+            generation: 1,
+            error:      Error::ToolExecution("cmd failed".into()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();

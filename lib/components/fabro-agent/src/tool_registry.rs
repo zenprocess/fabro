@@ -8,6 +8,7 @@ use fabro_types::{AgentToolCategory, AgentToolSource, AgentToolSummary};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ToolAccessPolicy, ToolExposureMode};
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::session::ToolEnvProvider;
 use crate::tool_permissions;
@@ -125,28 +126,78 @@ fn agent_tool_source(source: &ToolSource) -> AgentToolSource {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<String, RegisteredTool>,
+    tools:      HashMap<String, RegisteredTool>,
+    /// Naming scheme applied to built-in tools as they are registered.
+    ///
+    /// Held by the registry rather than applied as a pass after construction,
+    /// so tools registered later — subagent tools, skills — cannot miss it and
+    /// leave the model with a mixed-vocabulary tool set.
+    vocabulary: ToolVocabulary,
 }
 
 impl ToolRegistry {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_vocabulary(ToolVocabulary::Fabro)
+    }
+
+    /// A registry that exposes built-in tools under `vocabulary`.
+    #[must_use]
+    pub fn with_vocabulary(vocabulary: ToolVocabulary) -> Self {
         Self {
             tools: HashMap::new(),
+            vocabulary,
         }
     }
 
-    pub fn register(&mut self, tool: RegisteredTool) {
+    #[must_use]
+    pub fn vocabulary(&self) -> ToolVocabulary {
+        self.vocabulary
+    }
+
+    pub fn register(&mut self, mut tool: RegisteredTool) {
+        let native = match &tool.source {
+            ToolSource::Native => NativeTool::from_canonical_name(&tool.definition.name),
+            ToolSource::Skill if tool.definition.name == NativeTool::UseSkill.canonical_name() => {
+                Some(NativeTool::UseSkill)
+            }
+            ToolSource::Skill | ToolSource::Mcp { .. } => None,
+        };
+        if let Some(native) = native {
+            tool.definition.name = native.name(self.vocabulary).to_string();
+        }
         self.tools.insert(tool.definition.name.clone(), tool);
+    }
+
+    /// Replace a built-in tool's description, keeping its executor and schema.
+    ///
+    /// Resolves through the registry's vocabulary, so callers name the tool by
+    /// identity rather than by whatever string it is currently exposed under.
+    pub fn redescribe(&mut self, tool: NativeTool, description: impl Into<String>) {
+        let exposed = tool.name(self.vocabulary);
+        if let Some(registered) = self.tools.get_mut(exposed) {
+            registered.definition.description = description.into();
+        }
     }
 
     pub fn unregister(&mut self, name: &str) -> Option<RegisteredTool> {
         self.tools.remove(name)
     }
 
+    /// Remove a built-in tool by identity, regardless of the registry's
+    /// exposed vocabulary.
+    pub(crate) fn unregister_native(&mut self, tool: NativeTool) -> Option<RegisteredTool> {
+        self.tools.remove(tool.name(self.vocabulary))
+    }
+
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&RegisteredTool> {
         self.tools.get(name)
+    }
+
+    #[must_use]
+    pub(crate) fn get_native(&self, tool: NativeTool) -> Option<&RegisteredTool> {
+        self.tools.get(tool.name(self.vocabulary))
     }
 
     #[must_use]
@@ -265,6 +316,31 @@ mod tests {
     }
 
     #[test]
+    fn kimi_registry_renames_canonical_native_tools_only() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
+        registry.register(make_tool("read_file"));
+        registry.register(make_tool("Read"));
+
+        assert!(registry.get("Read").is_some());
+        assert!(registry.get("read_file").is_none());
+    }
+
+    #[test]
+    fn registry_does_not_reinterpret_mcp_names_as_native_tools() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
+        let mut tool = make_tool("read_file");
+        tool.source = ToolSource::Mcp {
+            server_name:   "files".to_string(),
+            original_name: "read_file".to_string(),
+        };
+
+        registry.register(tool);
+
+        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("Read").is_none());
+    }
+
+    #[test]
     fn get_missing_returns_none() {
         let registry = ToolRegistry::new();
         assert!(registry.get("nonexistent").is_none());
@@ -283,6 +359,21 @@ mod tests {
     fn unregister_missing_returns_none() {
         let mut registry = ToolRegistry::new();
         assert!(registry.unregister("nonexistent").is_none());
+    }
+
+    #[test]
+    fn unregister_native_resolves_the_exposed_vocabulary() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
+        registry.register(make_tool("shell"));
+        assert!(registry.get("shell_command").is_some());
+
+        let removed = registry.unregister_native(NativeTool::Shell);
+
+        assert_eq!(
+            removed.map(|tool| tool.definition.name),
+            Some("shell_command".to_string())
+        );
+        assert!(registry.get("shell_command").is_none());
     }
 
     #[test]

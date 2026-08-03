@@ -109,7 +109,9 @@ permissions = "read-write""#,
             r#"[run.model]
 provider = "anthropic"
 name = "claude-sonnet-4-5"
-fallbacks = ["openai", "gpt-5.4"]"#,
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["openrouter:kimi-k3", "gpt-terra"]"#,
         ),
         Section::of::<fabro_config::CliLoggingLayer>(
             "[cli.logging]",
@@ -129,9 +131,8 @@ enabled = true",
         ),
         Section::of::<fabro_config::RunAgentLayer>(
             "[run.agent]",
-            r#"[run.agent]
-fabro_tools = true
-permissions = "read-write""#,
+            r"[run.agent]
+fabro_tools = true",
         ),
     ]
 }
@@ -231,7 +232,7 @@ aliases = ["gateway"]
 credentials = ["env:ACME_GATEWAY_API_KEY", "vault:ACME_GATEWAY_API_KEY"]
 
 [llm.providers.proxy.extra_headers]
-x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}"
+x-portkey-api-key = "{{ secrets.portkey_api_key }}"
 x-portkey-config = "@bedrock-prod"
 x-team-secret = "{{ secrets.gateway_team_secret }}"
 ```
@@ -246,7 +247,7 @@ x-team-secret = "{{ secrets.gateway_team_secret }}"
 | `auth` | table | omitted | API-key auth config. Omit the table entirely for providers that need no API key; any `extra_headers` are still attached. |
 | `auth.credentials` | array<string> | required when `auth` present | Ordered credential refs. Accepted forms are `vault:<NAME>`, `env:<NAME>`, and `aws_sigv4` (sign requests from the AWS default credential chain — Bedrock). Literal secret strings are rejected. |
 | `auth.header` | `"bearer"` or `{ custom = "Header-Name" }` | `"bearer"` | Primary API-key header policy. Omit when the provider uses a standard bearer token. |
-| `extra_headers` | table | `{}` | Additional headers attached to provider requests. Values are interpolation strings: literal text, an `{{ env.NAME }}` token, or a `{{ secrets.NAME }}` token. Put credentials in a secret and reference them with a `{{ secrets.NAME }}` token, not a bare literal. |
+| `extra_headers` | table | `{}` | Additional headers attached to provider requests. Values are literal text or `{{ secrets.NAME }}` interpolation strings. Put credentials in a secret and reference them with a token, not a bare literal. |
 | `priority` | integer | `0` | Higher-priority ready providers win unqualified model and default selection; ties use canonical provider ID. |
 | `enabled` | boolean | `true` | Set `false` to disable a provider after lower-precedence layers define it. |
 | `aliases` | array<string> | `[]` | Additional provider names accepted by model routing and fallback config. |
@@ -326,6 +327,7 @@ cache_input_cost_per_mtok = 0.60
 | `tools` | boolean | `false` | Whether the model supports tool calls. |
 | `vision` | boolean | `false` | Whether the model accepts image inputs. |
 | `reasoning` | boolean | `false` | Whether the model has reasoning behavior. |
+| `reasoning_by_default` | boolean | effort-capable models: `true`; other models: `false` | Whether requests reason when no `reasoning_effort` is supplied. Set this explicitly for always-reasoning routes that do not expose an effort control, or for effort-capable routes whose provider defaults reasoning off. |
 | `reasoning_effort` | `"levels"` \| `"always_adaptive"` \| `"none"` | `"none"` | Whether the model endpoint supports a native reasoning-effort parameter. `levels` accepts discrete effort levels; `always_adaptive` accepts effort levels with natively always-on adaptive thinking; `none` has no native effort parameter. |
 | `prompt_cache` | boolean | `false` | Whether prompt cache pricing/usage applies. |
 | `sampling_params` | boolean | `true` | Whether the model accepts classic sampling parameters (`temperature`, `top_p`). |
@@ -375,7 +377,7 @@ tool_timeout = "90s"
 |---|---|---|---|
 | `type` | `"stdio"` \| `"http"` \| `"sandbox"` | None | MCP transport type. |
 | `command` | array<string> | None | Command and arguments for `stdio` or `sandbox` transports. |
-| `script` | string | None | Shell script alternative to `command` for process-launching transports. |
+| `script` | string | None | Shell script alternative to `command` for process-launching transports. A `stdio` script runs on the host through `sh -c`; a `sandbox` script is evaluated inside the sandbox by non-login Bash. |
 | `url` | string | None | Remote MCP URL for `http` transport. |
 | `port` | integer | None | Sandbox port for `sandbox` transport. |
 | `env` | table | `{}` | Additional environment variables for process-launching transports. |

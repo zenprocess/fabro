@@ -120,8 +120,12 @@ async fn main() {
             "{:?}",
             miette::Report::new(CliDiagnostic::new(err, !json_mode))
         );
-        std::process::exit(exit_code);
     }
+
+    // Exit rather than returning. A command can leave a blocked worker thread
+    // behind — `mcp start` parks Tokio's stdin reader on a read only the MCP
+    // host can end — and dropping the runtime would wait on it forever.
+    std::process::exit(exit_code);
 }
 
 fn install_miette_hook() {
@@ -496,7 +500,7 @@ async fn pre_tracing_bootstrap(command: &Commands) -> Result<PreTracingBootstrap
             .await
         }
         Commands::RunCmd(RunCommands::RunWorker(args)) => {
-            prepare_run_worker_bootstrap(args.storage_dir.as_deref(), &args.run_dir)
+            prepare_run_worker_bootstrap(&args.storage_dir, &args.run_dir)
         }
         _ => Ok(PreTracingBootstrap::cli()),
     }
@@ -541,10 +545,10 @@ async fn prepare_server_bootstrap(
 }
 
 fn prepare_run_worker_bootstrap(
-    storage_dir: Option<&std::path::Path>,
+    storage_dir: &std::path::Path,
     run_dir: &std::path::Path,
 ) -> Result<PreTracingBootstrap> {
-    let local_config = local_server::LocalServerConfig::load_with_storage_dir(storage_dir)?;
+    let local_config = local_server::LocalServerConfig::load_with_storage_dir(Some(storage_dir))?;
     let runtime_directory = fabro_config::RuntimeDirectory::new(local_config.storage_dir());
     let log_destination = fabro_config::resolve_log_destination(
         local_config.config_log_destination().unwrap_or_default(),
@@ -1515,6 +1519,8 @@ destination = "{destination}"
             "__run-worker",
             "--server",
             "/tmp/fabro.sock",
+            "--storage-dir",
+            "/tmp/storage",
             "--run-dir",
             "/tmp/run",
             "--run-id",
@@ -1526,6 +1532,7 @@ destination = "{destination}"
         match *cli.command.unwrap() {
             Commands::RunCmd(RunCommands::RunWorker(args)) => {
                 assert_eq!(args.server, "/tmp/fabro.sock");
+                assert_eq!(args.storage_dir, std::path::PathBuf::from("/tmp/storage"));
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Start));
@@ -1541,6 +1548,8 @@ destination = "{destination}"
             "__run-worker",
             "--server",
             "http://127.0.0.1:3000",
+            "--storage-dir",
+            "/tmp/storage",
             "--run-dir",
             "/tmp/run",
             "--run-id",
@@ -1552,6 +1561,7 @@ destination = "{destination}"
         match *cli.command.unwrap() {
             Commands::RunCmd(RunCommands::RunWorker(args)) => {
                 assert_eq!(args.server, "http://127.0.0.1:3000");
+                assert_eq!(args.storage_dir, std::path::PathBuf::from("/tmp/storage"));
                 assert_eq!(args.run_dir, std::path::PathBuf::from("/tmp/run"));
                 assert_eq!(args.run_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap());
                 assert!(matches!(args.mode, args::RunWorkerMode::Resume));

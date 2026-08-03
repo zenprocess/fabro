@@ -1,32 +1,7 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use fabro_model::Catalog;
-use fabro_types::{
-    BilledTokenCounts, ModelRef, RunProjection, RunTiming, StageProjection, StageTiming,
-};
-
-fn stage_usage_with_cost<'a>(
-    catalog: Option<&Catalog>,
-    stage: &'a StageProjection,
-) -> Cow<'a, BilledTokenCounts> {
-    let Some(catalog) = catalog else {
-        return Cow::Borrowed(&stage.usage);
-    };
-    let Some(model) = stage.model.as_ref() else {
-        return Cow::Borrowed(&stage.usage);
-    };
-    if stage.usage.total_usd_micros.is_some() {
-        return Cow::Borrowed(&stage.usage);
-    }
-
-    let Some(total_usd_micros) = catalog.price_tokens(model, &stage.usage.token_counts()) else {
-        return Cow::Borrowed(&stage.usage);
-    };
-    let mut usage = stage.usage.clone();
-    usage.total_usd_micros = Some(total_usd_micros);
-    Cow::Owned(usage)
-}
+use fabro_types::{BilledTokenCounts, ModelRef, RunProjection, RunTiming, StageTiming};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionBillingStage {
@@ -77,10 +52,10 @@ pub fn billing_rollup_from_projection(
     let mut billed_visit_count = 0_usize;
 
     for (stage_id, stage) in projection.iter_stages() {
-        if is_boundary_stage(projection, stage_id.node_id()) {
+        if projection.is_boundary_stage(stage_id.node_id()) {
             continue;
         }
-        let usage = stage_usage_with_cost(catalog, stage);
+        let usage = stage.billed_usage(catalog);
         let usage = usage.as_ref();
         if stage.completion.is_none() && stage.timing.is_none() && usage.is_zero() {
             continue;
@@ -147,15 +122,6 @@ pub fn billing_rollup_from_projection(
         timing: run_timing,
         billed_visit_count,
     }
-}
-
-fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {
-    projection
-        .spec()
-        .graph()
-        .nodes
-        .get(node_id)
-        .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
 }
 
 #[cfg(test)]

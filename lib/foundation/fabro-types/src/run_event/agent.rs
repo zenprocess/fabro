@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::{Display, EnumString, IntoStaticStr};
 
-use super::BilledTokenCounts;
+use super::{BilledTokenCounts, ExecOutputTail};
 use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
 use crate::{
-    MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind, PermissionLevel,
-    StageContextWindowProjection, TurnId,
+    CommandTermination, MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind,
+    PermissionLevel, ReasoningOutput, StageContextWindowProjection, TurnId,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +135,11 @@ pub struct AgentMessageProps {
     /// computed from the request that produced this assistant response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window:  Option<StageContextWindowProjection>,
+    /// Readable reasoning the provider returned with this response, if any.
+    /// Absent when the provider returned none or returned only opaque
+    /// material, so events without reasoning keep their previous shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning:       Option<ReasoningOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +179,25 @@ pub struct AgentToolCompletedProps {
     /// Turn that owned this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id:      Option<TurnId>,
+}
+
+/// Subordinate diagnostic for a tool call that ran a process: the real
+/// termination, exit code, duration, and bounded redacted output tails.
+///
+/// This never replaces `agent.tool.completed`, which remains the single
+/// tool-protocol completion and the authoritative owner of `is_error`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentToolProcessCompletedProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code:         Option<i32>,
+    pub termination:       CommandTermination,
+    pub duration_ms:       u64,
+    /// `false` when the provider could not separate stdout from stderr. The
+    /// combined output is then carried in `exec_output_tail.stdout`.
+    pub streams_separated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_output_tail:  Option<ExecOutputTail>,
+    pub visit:             u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +290,33 @@ pub struct AgentCompactionCompletedProps {
     pub visit:                  u32,
 }
 
+/// Which loop produced the `attempt` index on an `agent.llm.retry` event.
+///
+/// `attempt` is a 0-based counter fed by two independent loops: the retry
+/// policy inside `open_stream_with_retry` (`Open`) and the stream-consume
+/// loop that replays a turn whose stream broke or ended without a finish
+/// event (`Consume`). Without this discriminator a reader cannot tell which
+/// counter an index belongs to.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LlmRetryPhase {
+    Open,
+    Consume,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentLlmRetryProps {
     pub provider:   String,
@@ -273,21 +324,83 @@ pub struct AgentLlmRetryProps {
     pub attempt:    usize,
     pub delay_secs: f64,
     pub error:      Value,
+    /// Which retry loop `attempt` counts. Absent on events stored before the
+    /// discriminator existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase:      Option<LlmRetryPhase>,
     pub visit:      u32,
+}
+
+/// Kind of output a provider produced first for an inference attempt.
+///
+/// Observed, never inferred: a turn that opens with a tool call emits no text
+/// or reasoning delta, so all three variants are required for the first-output
+/// edge to fire on every turn.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LlmOutputKind {
+    Reasoning,
+    Text,
+    ToolCall,
+}
+
+/// An inference request is about to be dispatched for this round.
+///
+/// `requested_model` is the requested target from the session's provider
+/// profile. Failover can re-target mid-stage, so `agent.message` remains
+/// authoritative for what actually answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentLlmStartedProps {
+    pub requested_model: ModelRef,
+    pub visit:           u32,
+}
+
+/// The provider produced its first output for the current attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentLlmFirstOutputProps {
+    /// Which kind of output arrived first — observed, not inferred.
+    pub kind:  LlmOutputKind,
+    pub visit: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubSpawnedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub task:     String,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    pub task:       String,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub visit:      u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubTurnStartedProps {
+    pub agent_id:   String,
+    pub depth:      usize,
+    pub task:       String,
+    pub generation: u64,
+    pub visit:      u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubCompletedProps {
     pub agent_id:   String,
     pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
     pub success:    bool,
     pub turns_used: usize,
     pub visit:      u32,
@@ -295,17 +408,32 @@ pub struct AgentSubCompletedProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubFailedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub error:    Value,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub error:      Value,
+    pub visit:      u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubClosedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub visit:      u32,
+}
+
+/// The generation of a subagent's first turn. Events stored before subagent
+/// session reuse existed carry no generation, so they read back as this.
+pub const INITIAL_SUBAGENT_GENERATION: u64 = 1;
+
+/// Serde default for the generation of a stored subagent event. Public so
+/// crates with their own subagent event types share this one definition.
+#[must_use]
+pub const fn initial_subagent_generation() -> u64 {
+    INITIAL_SUBAGENT_GENERATION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -409,6 +537,33 @@ mod tests {
         assert!(props.cost_source.is_none());
         assert!(props.message.is_none());
         assert!(props.context_window.is_none());
+        assert!(props.reasoning.is_none());
+    }
+
+    #[test]
+    fn agent_message_props_round_trips_reasoning_with_both_fields() {
+        let props = AgentMessageProps {
+            text:            String::new(),
+            model:           sample_model_ref(),
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 1,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       Some(ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
+        };
+        let v = serde_json::to_value(&props).unwrap();
+        assert_eq!(
+            v["reasoning"]["summary"],
+            "inspect the implementation first"
+        );
+        assert_eq!(v["reasoning"]["trace"], "read convert.rs, then the sink");
+        let back: AgentMessageProps = serde_json::from_value(v).unwrap();
+        assert_eq!(back, props);
     }
 
     #[test]
@@ -425,6 +580,7 @@ mod tests {
             visit:           1,
             message:         Some(msg.clone()),
             context_window:  None,
+            reasoning:       None,
         };
         let v = serde_json::to_value(&props).unwrap();
         assert_eq!(v["message"]["kind"], "agent");

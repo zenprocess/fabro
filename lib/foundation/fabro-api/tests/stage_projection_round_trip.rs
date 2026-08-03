@@ -6,7 +6,7 @@ use fabro_api::types::{
     AgentSkillActivationSource as ApiAgentSkillActivationSource,
     AgentSkillSummary as ApiAgentSkillSummary, AgentToolCategory as ApiAgentToolCategory,
     AgentToolSource as ApiAgentToolSource, AgentToolSummary as ApiAgentToolSummary,
-    AgentToolsAvailableProps as ApiAgentToolsAvailableProps,
+    AgentToolsAvailableProps as ApiAgentToolsAvailableProps, LlmOutputKind as ApiLlmOutputKind,
     McpServerProjection as ApiMcpServerProjection, McpServerStatus as ApiMcpServerStatus,
     ParallelBranchResult as ApiParallelBranchResult, PermissionLevel as ApiPermissionLevel,
     SkillsProjection as ApiSkillsProjection, StageContextWindow as ApiStageContextWindow,
@@ -17,17 +17,21 @@ use fabro_api::types::{
     StageContextWindowStaleness as ApiStageContextWindowStaleness,
     StageContextWindowUnavailableReason as ApiStageContextWindowUnavailableReason,
     StageContextWindowWarning as ApiStageContextWindowWarning,
-    StageProjection as ApiStageProjection, SubAgentProjection as ApiSubAgentProjection,
-    SubAgentStatus as ApiSubAgentStatus, TodoListProjection as ApiTodoListProjection,
+    StageInferenceProjection as ApiStageInferenceProjection, StageProjection as ApiStageProjection,
+    StageToolBatchProjection as ApiStageToolBatchProjection,
+    SubAgentProjection as ApiSubAgentProjection, SubAgentStatus as ApiSubAgentStatus,
+    TodoListProjection as ApiTodoListProjection,
 };
+use fabro_model::{ModelId, ModelRef, ProviderId, Speed};
 use fabro_types::{
     ActivatedSkill, AgentControlState, AgentMcpToolSummary, AgentSkillActivationSource,
     AgentSkillSummary, AgentToolCategory, AgentToolSource, AgentToolSummary,
-    AgentToolsAvailableProps, McpServerProjection, McpServerStatus, ParallelBranchResult,
-    PermissionLevel, SkillsProjection, StageContextWindow, StageContextWindowBreakdownItem,
-    StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
-    StageContextWindowStaleness, StageContextWindowUnavailableReason, StageContextWindowWarning,
-    StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
+    AgentToolsAvailableProps, LlmOutputKind, McpServerProjection, McpServerStatus,
+    ParallelBranchId, ParallelBranchResult, PermissionLevel, SkillsProjection, StageContextWindow,
+    StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
+    StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
+    StageContextWindowWarning, StageId, StageInferenceProjection, StageProjection,
+    StageToolBatchProjection, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
 };
 use serde_json::json;
 
@@ -64,6 +68,115 @@ fn stage_projection_reuses_nested_agent_state_types() {
     assert_same_type::<ApiStageContextWindowUnavailableReason, StageContextWindowUnavailableReason>(
     );
     assert_same_type::<ApiStageContextWindowWarning, StageContextWindowWarning>();
+    assert_same_type::<ApiStageInferenceProjection, StageInferenceProjection>();
+    assert_same_type::<ApiStageToolBatchProjection, StageToolBatchProjection>();
+    assert_same_type::<ApiLlmOutputKind, LlmOutputKind>();
+}
+
+#[test]
+fn stage_tool_batch_projection_matches_openapi_json_shape() {
+    let batch = StageToolBatchProjection {
+        session_id:    "ses_root".to_string(),
+        started_at:    "2026-04-29T12:34:00Z".parse().unwrap(),
+        open_call_ids: ["call_1".to_string(), "call_2".to_string()]
+            .into_iter()
+            .collect(),
+    };
+    let value = serde_json::to_value(&batch).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "ses_root",
+            "started_at": "2026-04-29T12:34:00Z",
+            "open_call_ids": ["call_1", "call_2"]
+        })
+    );
+    let api_batch: ApiStageToolBatchProjection = serde_json::from_value(value).unwrap();
+    assert_eq!(api_batch, batch);
+}
+
+#[test]
+fn stage_inference_projection_matches_openapi_json_shape() {
+    let inference = StageInferenceProjection {
+        session_id:        "ses_root".to_string(),
+        started_at:        "2026-04-29T12:34:00Z".parse().unwrap(),
+        requested_model:   ModelRef {
+            provider: ProviderId::new("anthropic"),
+            model_id: ModelId::new("claude-fable-5"),
+            speed:    Some(Speed::Fast),
+        },
+        first_output_at:   Some("2026-04-29T12:34:07Z".parse().unwrap()),
+        first_output_kind: Some(LlmOutputKind::Reasoning),
+        retries:           1,
+    };
+    let value = serde_json::to_value(&inference).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "ses_root",
+            "started_at": "2026-04-29T12:34:00Z",
+            "requested_model": {
+                "provider": "anthropic",
+                "model_id": "claude-fable-5",
+                "speed": "fast"
+            },
+            "first_output_at": "2026-04-29T12:34:07Z",
+            "first_output_kind": "reasoning",
+            "retries": 1
+        })
+    );
+    let api_inference: ApiStageInferenceProjection = serde_json::from_value(value).unwrap();
+    assert_eq!(api_inference, inference);
+}
+
+#[test]
+fn llm_enums_match_openapi_json_shape() {
+    for (kind, wire) in [
+        (LlmOutputKind::Reasoning, "reasoning"),
+        (LlmOutputKind::Text, "text"),
+        (LlmOutputKind::ToolCall, "tool_call"),
+    ] {
+        let value = serde_json::to_value(kind).unwrap();
+        assert_eq!(value, json!(wire));
+        let api_kind: ApiLlmOutputKind = serde_json::from_value(value).unwrap();
+        assert_eq!(api_kind, kind);
+    }
+}
+
+/// A stage projection written before `inference` existed must still
+/// deserialize, and must not gain a phantom open bracket.
+#[test]
+fn stage_projection_without_inference_round_trips() {
+    let value = json!({
+        "first_event_seq": 1,
+        "prompt": null,
+        "response": null,
+        "completion": null,
+        "provider_used": null,
+        "diff": null,
+        "script_invocation": null,
+        "script_timing": null,
+        "parallel_results": null,
+        "output": null,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0
+        },
+        "agent_control": "running",
+        "state": "running"
+    });
+
+    let stage: StageProjection = serde_json::from_value(value.clone()).unwrap();
+    assert!(stage.inference.is_none());
+    assert!(stage.acp_started_at.is_none());
+    assert!(stage.tool_batch.is_none());
+    assert_eq!(stage.live_inference_ms, 0);
+    assert_eq!(stage.live_tool_ms, 0);
+    assert_eq!(serde_json::to_value(stage).unwrap(), value);
 }
 
 #[test]
@@ -91,6 +204,8 @@ fn stage_projection_round_trips_representative_json() {
         "parallel_results": [
             {
                 "id": "review_api",
+                "index": 0,
+                "item_label": "api",
                 "status": "succeeded",
                 "context_updates": {
                     "response.review_api": "looks good",
@@ -99,10 +214,12 @@ fn stage_projection_round_trips_representative_json() {
             },
             {
                 "id": "review_ux",
+                "index": 1,
                 "status": "failed",
                 "context_updates": {}
             }
         ],
+        "parallel_branch_id": "review_fork@3:1",
         "output": "ok",
         "termination": "exited",
         "started_at": "2026-04-29T12:34:00Z",
@@ -215,11 +332,27 @@ fn stage_projection_round_trips_representative_json() {
             ],
             "warnings": []
         },
+        "inference": {
+            "session_id": "ses_root",
+            "started_at": "2026-04-29T12:34:00Z",
+            "requested_model": {
+                "provider": "anthropic",
+                "model_id": "claude-fable-5"
+            },
+            "first_output_at": "2026-04-29T12:34:07Z",
+            "first_output_kind": "text",
+            "retries": 0
+        },
+        "acp_started_at": "2026-04-29T12:34:00Z",
         "agent_control": "running",
         "state": "succeeded"
     });
 
     let state: StageProjection = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        state.parallel_branch_id,
+        Some(ParallelBranchId::new(StageId::new("review_fork", 3), 1))
+    );
     assert_eq!(serde_json::to_value(state).unwrap(), value);
 }
 
@@ -269,18 +402,27 @@ fn permission_level_matches_openapi_json_shape() {
 
 #[test]
 fn nested_agent_state_types_match_openapi_json_shape() {
-    let todo_list = TodoListProjection::new(TodoListKind::OpenAiPlan, "openai_plan:ses_root");
-    let todo_json = serde_json::to_value(&todo_list).unwrap();
-    assert_eq!(
-        todo_json,
-        json!({
-            "kind": "openai_plan",
-            "list_id": "openai_plan:ses_root",
-            "items": []
-        })
-    );
-    let api_todo_list: ApiTodoListProjection = serde_json::from_value(todo_json).unwrap();
-    assert_eq!(api_todo_list, todo_list);
+    for (kind, list_id, wire_kind) in [
+        (
+            TodoListKind::OpenAiPlan,
+            "openai_plan:ses_root",
+            "openai_plan",
+        ),
+        (TodoListKind::KimiTodos, "kimi_todos:ses_root", "kimi_todos"),
+    ] {
+        let todo_list = TodoListProjection::new(kind, list_id);
+        let todo_json = serde_json::to_value(&todo_list).unwrap();
+        assert_eq!(
+            todo_json,
+            json!({
+                "kind": wire_kind,
+                "list_id": list_id,
+                "items": []
+            })
+        );
+        let api_todo_list: ApiTodoListProjection = serde_json::from_value(todo_json).unwrap();
+        assert_eq!(api_todo_list, todo_list);
+    }
 
     let subagent = SubAgentProjection {
         agent_id: "sub-1".to_string(),

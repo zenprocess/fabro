@@ -3,6 +3,7 @@
     reason = "Live provider integration tests read required API keys from process env."
 )]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fabro_auth::ApiCredential;
@@ -37,6 +38,48 @@ fn make_request(model: &str) -> Request {
         metadata:         None,
         provider_options: None,
     }
+}
+
+/// Build the built-in catalog with `provider` enabled, plus an operator base
+/// URL for providers such as Modal that do not ship one.
+fn enabled_provider_catalog(provider: &ProviderId, base_url: Option<String>) -> Arc<Catalog> {
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            base_url,
+            ..ProviderCatalogSettings::default()
+        });
+    Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .unwrap_or_else(|err| panic!("enabled {provider} catalog should build: {err}")),
+    )
+}
+
+/// Drive the shared deep tool round trip for one catalog offering.
+async fn assert_deep_tool_round_trip(
+    catalog: &Arc<Catalog>,
+    provider: &ProviderId,
+    model_id: &str,
+    credential: ApiCredential,
+) {
+    let client = Arc::new(
+        Client::from_credentials(vec![credential], Arc::clone(catalog))
+            .await
+            .unwrap_or_else(|err| panic!("{provider} client should build from the catalog: {err}")),
+    );
+    let model = catalog
+        .get_on_provider(provider, model_id)
+        .unwrap_or_else(|| panic!("{provider} {model_id} should be present"));
+
+    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    assert_eq!(
+        outcome.status,
+        ModelTestStatus::Ok,
+        "{provider} {model_id} deep test failed: {:?}",
+        outcome.error_message
+    );
 }
 
 #[fabro_macros::e2e_test(live("ANTHROPIC_API_KEY"))]
@@ -135,7 +178,7 @@ async fn openai_gpt_5_5_pro_complete() {
 async fn kimi_k3_reasoning_tool_round_trip() {
     let api_key = std::env::var(EnvVars::KIMI_API_KEY).expect("KIMI_API_KEY must be set");
     let adapter = OpenAiCompatibleAdapter::new(api_key, "https://api.moonshot.ai/v1")
-        .with_name("kimi")
+        .with_name("moonshot")
         .with_catalog(Arc::new(Catalog::from_builtin().unwrap()));
     let tool = ToolDefinition::function(
         "multiply",
@@ -317,25 +360,11 @@ async fn bedrock_openai_frontier_complete() {
 async fn poolside_laguna_xs_deep_tool_round_trip() {
     let api_key = std::env::var(EnvVars::POOLSIDE_API_KEY).expect("POOLSIDE_API_KEY must be set");
     let provider = ProviderId::new("poolside");
-    let catalog = Arc::new(Catalog::from_builtin().expect("built-in catalog should be valid"));
-    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+    let catalog = enabled_provider_catalog(&provider, None);
+    let credential = ApiCredential::from_api_key(provider.clone(), api_key, &catalog)
         .expect("Poolside credential should resolve from the catalog");
-    let client = Arc::new(
-        Client::from_credentials(vec![credential], Arc::clone(&catalog))
-            .await
-            .expect("Poolside client should build from the catalog"),
-    );
-    let model = catalog
-        .get_on_provider(&ProviderId::new("poolside"), "laguna-xs-2.1")
-        .expect("direct Poolside Laguna XS should be present");
 
-    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
-    assert_eq!(
-        outcome.status,
-        ModelTestStatus::Ok,
-        "direct Poolside Laguna XS deep test failed: {:?}",
-        outcome.error_message
-    );
+    assert_deep_tool_round_trip(&catalog, &provider, "laguna-xs-2.1", credential).await;
 }
 
 #[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
@@ -344,7 +373,7 @@ async fn openrouter_complete() {
         std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
     let adapter = OpenAiCompatibleAdapter::new(api_key, "https://openrouter.ai/api/v1")
         .with_name("openrouter");
-    let request = make_request("deepseek/deepseek-v4-flash");
+    let request = make_request("deepseek/deepseek-v4-flash-0731");
     let response = adapter.complete(&request).await.unwrap();
 
     assert!(
@@ -570,39 +599,48 @@ async fn fireworks_complete() {
     assert_eq!(response.provider, "fireworks");
 }
 
+#[fabro_macros::e2e_test(live("DEEPSEEK_API_KEY"))]
+async fn deepseek_complete() {
+    let api_key = std::env::var(EnvVars::DEEPSEEK_API_KEY).expect("DEEPSEEK_API_KEY must be set");
+    let adapter =
+        OpenAiCompatibleAdapter::new(api_key, "https://api.deepseek.com").with_name("deepseek");
+    let request = Request {
+        // Thinking mode is enabled by default and shares this budget with the
+        // visible answer.
+        max_tokens: Some(1024),
+        ..make_request("deepseek-v4-flash")
+    };
+    let response = adapter.complete(&request).await.unwrap();
+
+    assert!(
+        !response.text().is_empty(),
+        "response text should not be empty"
+    );
+    assert!(response.usage.input_tokens > 0);
+    assert!(response.usage.output_tokens > 0 || response.usage.reasoning_tokens > 0);
+    assert_eq!(response.provider, "deepseek");
+}
+
+#[fabro_macros::e2e_test(live("DEEPSEEK_API_KEY"))]
+async fn deepseek_v4_flash_deep_tool_round_trip() {
+    let api_key = std::env::var(EnvVars::DEEPSEEK_API_KEY).expect("DEEPSEEK_API_KEY must be set");
+    let provider = ProviderId::new("deepseek");
+    let catalog = enabled_provider_catalog(&provider, None);
+    let credential = ApiCredential::from_api_key(provider.clone(), api_key, &catalog)
+        .expect("DeepSeek credential should resolve from the catalog");
+
+    assert_deep_tool_round_trip(&catalog, &provider, "deepseek-v4-flash", credential).await;
+}
+
 #[fabro_macros::e2e_test(live("FIREWORKS_API_KEY"))]
 async fn fireworks_kimi_k2_7_code_deep_tool_round_trip() {
     let api_key = std::env::var(EnvVars::FIREWORKS_API_KEY).expect("FIREWORKS_API_KEY must be set");
     let provider = ProviderId::new("fireworks");
-    let mut settings = LlmCatalogSettings::default();
-    settings
-        .providers
-        .insert(provider.to_string(), ProviderCatalogSettings {
-            enabled: Some(true),
-            ..ProviderCatalogSettings::default()
-        });
-    let catalog = Arc::new(
-        Catalog::from_builtin_with_overrides(&settings)
-            .expect("enabled Fireworks catalog should build"),
-    );
-    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+    let catalog = enabled_provider_catalog(&provider, None);
+    let credential = ApiCredential::from_api_key(provider.clone(), api_key, &catalog)
         .expect("Fireworks credential should resolve from the catalog");
-    let client = Arc::new(
-        Client::from_credentials(vec![credential], Arc::clone(&catalog))
-            .await
-            .expect("Fireworks client should build from the catalog"),
-    );
-    let model = catalog
-        .get_on_provider(&ProviderId::new("fireworks"), "kimi-k2.7-code")
-        .expect("Fireworks Kimi K2.7 Code should be present");
 
-    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
-    assert_eq!(
-        outcome.status,
-        ModelTestStatus::Ok,
-        "Fireworks Kimi K2.7 Code deep test failed: {:?}",
-        outcome.error_message
-    );
+    assert_deep_tool_round_trip(&catalog, &provider, "kimi-k2.7-code", credential).await;
 }
 
 #[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
@@ -610,35 +648,35 @@ async fn openrouter_kimi_k3_deep_tool_round_trip() {
     let api_key =
         std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
     let provider = ProviderId::new("openrouter");
-    let mut settings = LlmCatalogSettings::default();
-    settings
-        .providers
-        .insert(provider.to_string(), ProviderCatalogSettings {
-            enabled: Some(true),
-            ..ProviderCatalogSettings::default()
-        });
-    let catalog = Arc::new(
-        Catalog::from_builtin_with_overrides(&settings)
-            .expect("enabled OpenRouter catalog should build"),
-    );
-    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+    let catalog = enabled_provider_catalog(&provider, None);
+    let credential = ApiCredential::from_api_key(provider.clone(), api_key, &catalog)
         .expect("OpenRouter credential should resolve from the catalog");
-    let client = Arc::new(
-        Client::from_credentials(vec![credential], Arc::clone(&catalog))
-            .await
-            .expect("OpenRouter client should build from the catalog"),
-    );
-    let model = catalog
-        .get_on_provider(&ProviderId::new("openrouter"), "kimi-k3")
-        .expect("OpenRouter Kimi K3 should be present");
 
-    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
-    assert_eq!(
-        outcome.status,
-        ModelTestStatus::Ok,
-        "OpenRouter Kimi K3 deep test failed: {:?}",
-        outcome.error_message
+    assert_deep_tool_round_trip(&catalog, &provider, "kimi-k3", credential).await;
+}
+
+#[fabro_macros::e2e_test(
+    live("MODAL_KIMI_K3_BASE_URL"),
+    live("MODAL_TOKEN_ID"),
+    live("MODAL_TOKEN_SECRET")
+)]
+async fn modal_kimi_k3_deep_tool_round_trip() {
+    let base_url =
+        std::env::var("MODAL_KIMI_K3_BASE_URL").expect("MODAL_KIMI_K3_BASE_URL must be set");
+    let token_id = std::env::var(EnvVars::MODAL_TOKEN_ID).expect("MODAL_TOKEN_ID must be set");
+    let token_secret =
+        std::env::var(EnvVars::MODAL_TOKEN_SECRET).expect("MODAL_TOKEN_SECRET must be set");
+    let provider = ProviderId::new("modal");
+    let catalog = enabled_provider_catalog(&provider, Some(base_url));
+    let credential = ApiCredential::with_extra_headers(
+        provider.clone(),
+        HashMap::from([
+            ("Modal-Key".to_string(), token_id),
+            ("Modal-Secret".to_string(), token_secret),
+        ]),
     );
+
+    assert_deep_tool_round_trip(&catalog, &provider, "kimi-k3", credential).await;
 }
 
 async fn run_multi_turn_cache_test(

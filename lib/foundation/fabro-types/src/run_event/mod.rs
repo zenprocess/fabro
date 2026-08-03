@@ -208,6 +208,8 @@ pub enum EventBody {
     AgentToolStarted(AgentToolStartedProps),
     #[serde(rename = "agent.tool.completed")]
     AgentToolCompleted(AgentToolCompletedProps),
+    #[serde(rename = "agent.tool.process.completed")]
+    AgentToolProcessCompleted(AgentToolProcessCompletedProps),
     #[serde(rename = "agent.error")]
     AgentError(AgentErrorProps),
     #[serde(rename = "agent.warning")]
@@ -232,10 +234,16 @@ pub enum EventBody {
     AgentCompactionStarted(AgentCompactionStartedProps),
     #[serde(rename = "agent.compaction.completed")]
     AgentCompactionCompleted(AgentCompactionCompletedProps),
+    #[serde(rename = "agent.llm.started")]
+    AgentLlmStarted(AgentLlmStartedProps),
+    #[serde(rename = "agent.llm.first_output")]
+    AgentLlmFirstOutput(AgentLlmFirstOutputProps),
     #[serde(rename = "agent.llm.retry")]
     AgentLlmRetry(AgentLlmRetryProps),
     #[serde(rename = "agent.sub.spawned")]
     AgentSubSpawned(AgentSubSpawnedProps),
+    #[serde(rename = "agent.sub.turn.started")]
+    AgentSubTurnStarted(AgentSubTurnStartedProps),
     #[serde(rename = "agent.sub.completed")]
     AgentSubCompleted(AgentSubCompletedProps),
     #[serde(rename = "agent.sub.failed")]
@@ -487,6 +495,7 @@ impl EventBody {
             Self::AgentMessage(_) => "agent.message",
             Self::AgentToolStarted(_) => "agent.tool.started",
             Self::AgentToolCompleted(_) => "agent.tool.completed",
+            Self::AgentToolProcessCompleted(_) => "agent.tool.process.completed",
             Self::AgentError(_) => "agent.error",
             Self::AgentWarning(_) => "agent.warning",
             Self::AgentLoopDetected(_) => "agent.loop.detected",
@@ -499,8 +508,11 @@ impl EventBody {
             Self::AgentSteerDropped(_) => "agent.steer.dropped",
             Self::AgentCompactionStarted(_) => "agent.compaction.started",
             Self::AgentCompactionCompleted(_) => "agent.compaction.completed",
+            Self::AgentLlmStarted(_) => "agent.llm.started",
+            Self::AgentLlmFirstOutput(_) => "agent.llm.first_output",
             Self::AgentLlmRetry(_) => "agent.llm.retry",
             Self::AgentSubSpawned(_) => "agent.sub.spawned",
+            Self::AgentSubTurnStarted(_) => "agent.sub.turn.started",
             Self::AgentSubCompleted(_) => "agent.sub.completed",
             Self::AgentSubFailed(_) => "agent.sub.failed",
             Self::AgentSubClosed(_) => "agent.sub.closed",
@@ -656,6 +668,7 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.message"
             | "agent.tool.started"
             | "agent.tool.completed"
+            | "agent.tool.process.completed"
             | "agent.error"
             | "agent.warning"
             | "agent.loop.detected"
@@ -668,8 +681,11 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.steer.dropped"
             | "agent.compaction.started"
             | "agent.compaction.completed"
+            | "agent.llm.started"
+            | "agent.llm.first_output"
             | "agent.llm.retry"
             | "agent.sub.spawned"
+            | "agent.sub.turn.started"
             | "agent.sub.completed"
             | "agent.sub.failed"
             | "agent.sub.closed"
@@ -914,14 +930,12 @@ impl<'de> Deserialize<'de> for RunEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use serde_json::json;
 
     use super::*;
     use crate::{
-        AuthMethod, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId, WorkflowSettings,
-        fixtures, test_support,
+        AuthMethod, CommandTermination, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId,
+        WorkflowSettings, fixtures, test_support,
     };
 
     fn user_principal(login: &str) -> Principal {
@@ -980,20 +994,9 @@ mod tests {
     #[test]
     fn run_event_deserializes_adjacent_layout() {
         let settings = WorkflowSettings::default();
-        let graph = Graph {
-            name:  "test".to_string(),
-            nodes: HashMap::from([("start".to_string(), Node {
-                id:      "start".to_string(),
-                attrs:   HashMap::new(),
-                classes: Vec::new(),
-            })]),
-            edges: vec![Edge {
-                from:  "start".to_string(),
-                to:    "done".to_string(),
-                attrs: HashMap::new(),
-            }],
-            attrs: HashMap::new(),
-        };
+        let mut graph = Graph::new("test");
+        graph.nodes.insert("start".to_string(), Node::new("start"));
+        graph.edges.push(Edge::new("start", "done"));
 
         let line = json!({
             "id": "evt_2",
@@ -1012,6 +1015,33 @@ mod tests {
 
         let parsed = RunEvent::from_value(line).unwrap();
         assert!(matches!(parsed.body, EventBody::RunCreated(_)));
+    }
+
+    #[test]
+    fn historical_failover_event_defaults_new_route_context() {
+        let line = json!({
+            "id": "evt_failover",
+            "ts": "2026-04-04T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "event": "agent.failover",
+            "properties": {
+                "from_provider": "anthropic",
+                "from_model": "claude-fable-5",
+                "to_provider": "openai",
+                "to_model": "gpt-5.6-sol",
+                "error": "provider unavailable"
+            }
+        });
+
+        let parsed = RunEvent::from_value(line).unwrap();
+        let EventBody::Failover(props) = parsed.body else {
+            panic!("expected agent.failover");
+        };
+        assert_eq!(props.original_provider, None);
+        assert_eq!(props.original_model, None);
+        assert_eq!(props.attempt, None);
+        assert_eq!(props.requested_reasoning_effort, None);
+        assert_eq!(props.effective_reasoning_effort, None);
     }
 
     #[test]
@@ -2155,6 +2185,7 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  None,
+            reasoning:       None,
         });
 
         let value = serde_json::to_value(&body).unwrap();
@@ -2168,6 +2199,68 @@ mod tests {
         );
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.event_name(), "agent.message");
+    }
+
+    #[test]
+    fn agent_message_omits_reasoning_when_absent() {
+        let body = EventBody::AgentMessage(AgentMessageProps {
+            text:            "ok".to_string(),
+            model:           crate::ModelRef {
+                provider: fabro_model::ProviderId::openai(),
+                model_id: "gpt-5.4".into(),
+                speed:    None,
+            },
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 0,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       None,
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+        assert!(
+            value["properties"]
+                .as_object()
+                .unwrap()
+                .get("reasoning")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_message_carries_reasoning_through_canonical_json() {
+        let body = EventBody::AgentMessage(AgentMessageProps {
+            text:            String::new(),
+            model:           crate::ModelRef {
+                provider: fabro_model::ProviderId::openai(),
+                model_id: "gpt-5.4".into(),
+                speed:    None,
+            },
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 1,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       Some(crate::ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["event"], "agent.message");
+        assert_eq!(
+            value["properties"]["reasoning"],
+            serde_json::json!({
+                "summary": "inspect the implementation first",
+                "trace": "read convert.rs, then the sink",
+            })
+        );
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
     }
 
     #[test]
@@ -2208,6 +2301,7 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  Some(context_window),
+            reasoning:       None,
         });
 
         let value = serde_json::to_value(&body).unwrap();
@@ -2343,6 +2437,99 @@ mod tests {
 
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn agent_tool_process_completed_round_trips_as_a_known_typed_event() {
+        let value = json!({
+            "id": "evt_process",
+            "ts": "2026-04-08T16:21:11.106Z",
+            "run_id": fixtures::RUN_1,
+            "event": "agent.tool.process.completed",
+            "node_id": "code",
+            "session_id": "ses_child",
+            "tool_call_id": "call_1",
+            "properties": {
+                "exit_code": 7,
+                "termination": "exited",
+                "duration_ms": 12,
+                "streams_separated": true,
+                "exec_output_tail": {"stdout": "out", "stderr": "err"},
+                "visit": 1
+            }
+        });
+
+        let parsed = RunEvent::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.event_name(), "agent.tool.process.completed");
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("call_1"));
+        let EventBody::AgentToolProcessCompleted(props) = &parsed.body else {
+            panic!("expected a typed process event, got {:?}", parsed.body);
+        };
+        assert_eq!(props.exit_code, Some(7));
+        assert_eq!(props.termination, CommandTermination::Exited);
+        assert_eq!(props.duration_ms, 12);
+        assert!(props.streams_separated);
+        assert_eq!(
+            props.exec_output_tail.as_ref().unwrap().stdout.as_deref(),
+            Some("out")
+        );
+
+        assert_eq!(parsed.to_value().unwrap(), value);
+    }
+
+    #[test]
+    fn agent_tool_process_completed_omits_absent_exit_code_and_output_tail() {
+        let body = EventBody::AgentToolProcessCompleted(AgentToolProcessCompletedProps {
+            exit_code:         None,
+            termination:       CommandTermination::TimedOut,
+            duration_ms:       10_000,
+            streams_separated: false,
+            exec_output_tail:  None,
+            visit:             1,
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(value["event"], "agent.tool.process.completed");
+        assert_eq!(value["properties"]["termination"], "timed_out");
+        assert_eq!(value["properties"]["streams_separated"], false);
+        let properties = value["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("exit_code"));
+        assert!(!properties.contains_key("exec_output_tail"));
+
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn subagent_generations_are_typed_and_legacy_events_default_to_one() {
+        let started = EventBody::AgentSubTurnStarted(AgentSubTurnStartedProps {
+            agent_id:   "sub-1".to_string(),
+            depth:      1,
+            task:       "fix the review findings".to_string(),
+            generation: 2,
+            visit:      1,
+        });
+        let value = serde_json::to_value(&started).unwrap();
+        assert_eq!(value["event"], "agent.sub.turn.started");
+        assert_eq!(value["properties"]["generation"], 2);
+        assert_eq!(serde_json::from_value::<EventBody>(value).unwrap(), started);
+
+        let legacy: EventBody = serde_json::from_value(json!({
+            "event": "agent.sub.completed",
+            "properties": {
+                "agent_id": "sub-1",
+                "depth": 1,
+                "success": true,
+                "turns_used": 3,
+                "visit": 1
+            }
+        }))
+        .unwrap();
+        let EventBody::AgentSubCompleted(props) = legacy else {
+            panic!("expected subagent completion");
+        };
+        assert_eq!(props.generation, 1);
     }
 
     #[test]

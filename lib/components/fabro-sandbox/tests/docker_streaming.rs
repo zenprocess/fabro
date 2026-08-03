@@ -3,8 +3,20 @@
 use std::sync::Arc;
 
 use bollard::Docker;
-use fabro_sandbox::{CommandOutputCallback, DockerSandbox, DockerSandboxOptions, Sandbox};
+use fabro_sandbox::{
+    CommandOutputCallback, DockerSandbox, DockerSandboxOptions, ExecStreamingRequest, Sandbox,
+};
 use tokio::sync::Mutex;
+
+fn capture_bytes(chunks: Arc<Mutex<Vec<u8>>>) -> CommandOutputCallback {
+    Arc::new(move |_stream, bytes| {
+        let chunks = Arc::clone(&chunks);
+        Box::pin(async move {
+            chunks.lock().await.extend(bytes);
+            Ok(())
+        })
+    })
+}
 
 #[tokio::test]
 #[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
@@ -36,25 +48,15 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
         .expect("docker sandbox should initialize");
 
     let chunks = Arc::new(Mutex::new(Vec::new()));
-    let callback_chunks = Arc::clone(&chunks);
-    let callback: CommandOutputCallback = Arc::new(move |_stream, bytes| {
-        let callback_chunks = Arc::clone(&callback_chunks);
-        Box::pin(async move {
-            callback_chunks.lock().await.extend(bytes);
-            Ok(())
-        })
-    });
 
     let marker = "fabro_streaming_timeout_sentinel";
+    let command = format!("trap '' HUP TERM; echo start; sleep 5 # {marker}");
     let result = sandbox
-        .exec_command_streaming(
-            &format!("trap '' HUP TERM; echo start; sleep 5 # {marker}"),
-            Some(200),
-            None,
-            None,
-            None,
-            callback,
-        )
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(200),
+            output_callback: Some(capture_bytes(Arc::clone(&chunks))),
+            ..ExecStreamingRequest::new(&command)
+        })
         .await
         .expect("streaming command should return a timeout result");
 
@@ -85,6 +87,67 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
         !probe.stdout.contains(marker),
         "timed-out docker exec should be terminated before returning, found: {}",
         probe.stdout
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
+async fn streaming_command_receives_exact_stdin_and_eof() {
+    let image = "buildpack-deps:noble";
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return;
+    };
+    if docker.inspect_image(image).await.is_err() {
+        return;
+    }
+
+    let sandbox = DockerSandbox::new(
+        DockerSandboxOptions {
+            image: image.to_string(),
+            auto_pull: false,
+            skip_clone: true,
+            ..DockerSandboxOptions::default()
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("docker sandbox should construct");
+    sandbox
+        .initialize()
+        .await
+        .expect("docker sandbox should initialize");
+
+    let stdin = b"first line\n$(touch /tmp/must-not-run)\nlast line".to_vec();
+    let result = sandbox
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(10_000),
+            stdin: Some(stdin.clone()),
+            ..ExecStreamingRequest::new("cat")
+        })
+        .await
+        .expect("streaming command should read stdin and finish at EOF");
+    let injection_probe = sandbox
+        .exec_command("test ! -e /tmp/must-not-run", 10_000, None, None, None)
+        .await
+        .expect("injection probe should run");
+
+    sandbox
+        .cleanup()
+        .await
+        .expect("docker cleanup should succeed");
+
+    assert!(
+        result.result.is_success(),
+        "stdin command failed: stdout={} stderr={}",
+        result.result.stdout,
+        result.result.stderr
+    );
+    assert_eq!(result.result.stdout.as_bytes(), stdin);
+    assert!(
+        injection_probe.is_success(),
+        "stdin bytes must not be evaluated as shell source"
     );
 }
 
@@ -146,6 +209,98 @@ async fn cloned_docker_sandbox_uses_repos_checkout_and_workspace_symlink() {
         result.stderr
     );
     assert!(result.stdout.contains("true"));
+}
+
+// Both command paths must evaluate the same interpreter, so Bash-only syntax
+// that `sh` rejects has to behave identically through `exec_command` and
+// `exec_command_streaming`. Neither path is evidence for the other: they build
+// separate exec invocations, and the streaming one wraps the user command in a
+// controlled child.
+#[tokio::test]
+#[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
+async fn docker_runs_clean_bash_through_both_command_paths() {
+    let image = "buildpack-deps:noble";
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return;
+    };
+    if docker.inspect_image(image).await.is_err() {
+        return;
+    }
+
+    let sandbox = DockerSandbox::new(
+        DockerSandboxOptions {
+            image: image.to_string(),
+            auto_pull: false,
+            env_vars: vec!["BASH_ENV=/tmp/fabro-bash-env".to_string()],
+            skip_clone: true,
+            ..DockerSandboxOptions::default()
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("docker sandbox should construct");
+    sandbox
+        .initialize()
+        .await
+        .expect("docker sandbox should initialize");
+
+    // If the image-level BASH_ENV survives either exec boundary, every
+    // subsequent Bash process prints this line before the requested command.
+    let setup = sandbox
+        .exec_command(
+            "printf \"printf 'startup-source-loaded\\\\n'\\n\" > /tmp/fabro-bash-env",
+            10_000,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("startup-file fixture should be created");
+    assert!(setup.is_success());
+
+    // Arrays, `[[ ]]`, and `${arr[@]}` are Bash-only; `shopt -q login_shell`
+    // proves the command did not run under a login shell. Exact output also
+    // proves the image's BASH_ENV startup file was not sourced.
+    let command = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] || exit 1; \
+                   shopt -q login_shell && exit 2; echo ${arr[1]}";
+
+    let non_streaming = sandbox
+        .exec_command(command, 10_000, None, None, None)
+        .await
+        .expect("non-streaming command should run");
+
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let streaming = sandbox
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(10_000),
+            output_callback: Some(capture_bytes(Arc::clone(&chunks))),
+            ..ExecStreamingRequest::new(command)
+        })
+        .await
+        .expect("streaming command should run");
+
+    sandbox
+        .cleanup()
+        .await
+        .expect("docker cleanup should succeed");
+
+    assert!(
+        non_streaming.is_success(),
+        "non-streaming Bash-only command failed: stdout={} stderr={}",
+        non_streaming.stdout,
+        non_streaming.stderr
+    );
+    assert_eq!(non_streaming.stdout.trim(), "two");
+    assert!(
+        streaming.result.is_success(),
+        "streaming Bash-only command failed: stdout={} stderr={}",
+        streaming.result.stdout,
+        streaming.result.stderr
+    );
+    assert_eq!(streaming.result.stdout.trim(), "two");
+    assert_eq!(String::from_utf8_lossy(&chunks.lock().await).trim(), "two");
 }
 
 // Regression test for glob patterns that contain a path separator. Before the

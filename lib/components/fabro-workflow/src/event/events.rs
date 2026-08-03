@@ -4,9 +4,9 @@ use ::fabro_types::{
     AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary,
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
     PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
-    PullRequestLink, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunOrigin, RunPairEndedReason,
-    RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming, SandboxProviderKind, StageId,
-    StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
+    PullRequestLink, ReviewTarget, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunOrigin,
+    RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming,
+    SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
 use fabro_model::{ReasoningEffort, Speed};
@@ -323,6 +323,8 @@ pub enum Event {
         branch:                String,
         index:                 usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_label:            Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         graph_visit:           Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from_stage_id: Option<StageId>,
@@ -332,6 +334,8 @@ pub enum Event {
         parallel_branch_id: ParallelBranchId,
         branch:             String,
         index:              usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_label:         Option<String>,
         duration_ms:        u64,
         status:             StageOutcome,
     },
@@ -357,6 +361,8 @@ pub enum Event {
         timeout_seconds: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_display: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_target:   Option<ReviewTarget>,
     },
     InterviewCompleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -578,12 +584,8 @@ pub enum Event {
         ssh_command: String,
     },
     Failover {
-        stage:         String,
-        from_provider: String,
-        from_model:    String,
-        to_provider:   String,
-        to_model:      String,
-        error:         String,
+        stage: String,
+        props: fabro_types::FailoverProps,
     },
     CommandStarted {
         node_id:    String,
@@ -732,6 +734,9 @@ pub enum Event {
         repo:        String,
         base_branch: String,
         head_branch: String,
+        /// Absent on events written before the head SHA was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha:    Option<String>,
         title:       String,
         draft:       bool,
     },
@@ -771,6 +776,7 @@ impl Event {
         record: &PullRequestLink,
         base_branch: &str,
         head_branch: &str,
+        head_sha: &str,
         title: &str,
         draft: bool,
     ) -> Self {
@@ -781,6 +787,7 @@ impl Event {
             repo: record.repo.clone(),
             base_branch: base_branch.to_string(),
             head_branch: head_branch.to_string(),
+            head_sha: Some(head_sha.to_string()),
             title: title.to_string(),
             draft,
         }
@@ -1383,21 +1390,19 @@ impl Event {
             Self::SshAccessReady { ssh_command } => {
                 info!(ssh_command, "SSH access ready");
             }
-            Self::Failover {
-                stage,
-                from_provider,
-                from_model,
-                to_provider,
-                to_model,
-                error,
-            } => {
+            Self::Failover { stage, props } => {
                 warn!(
                     stage,
-                    from_provider,
-                    from_model,
-                    to_provider,
-                    to_model,
-                    error,
+                    original_provider = ?props.original_provider,
+                    original_model = ?props.original_model,
+                    attempt = ?props.attempt,
+                    from_provider = %props.from_provider,
+                    from_model = %props.from_model,
+                    to_provider = %props.to_provider,
+                    to_model = %props.to_model,
+                    requested_reasoning_effort = ?props.requested_reasoning_effort,
+                    effective_reasoning_effort = ?props.effective_reasoning_effort,
+                    error = %props.error,
                     "LLM provider failover"
                 );
             }

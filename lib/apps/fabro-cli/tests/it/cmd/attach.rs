@@ -927,8 +927,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
             "run": {
               "agent": {
                 "fabro_tools": false,
-                "mcps": {},
-                "permissions": null
+                "mcps": {}
               },
               "artifacts": {
                 "include": []
@@ -997,7 +996,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                   "reasoning_effort": null,
                   "speed": null
                 },
-                "fallbacks": [],
+                "fallbacks": {},
                 "name": "[DEFAULT_MODEL]",
                 "provider": "openai"
               },
@@ -1190,7 +1189,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
         "properties": {
           "attempt": 1,
           "context_values": {
-            "current.preamble": "Goal: Wait for approval/n",
             "current_node": "start",
             "graph.goal": "Wait for approval",
             "internal.fidelity": "compact",

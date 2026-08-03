@@ -2,7 +2,6 @@ pub mod config;
 pub mod error;
 #[cfg(any(feature = "docker", feature = "daytona", feature = "forkd"))]
 pub mod from_environment;
-mod glob_match;
 pub mod provider;
 pub mod sandbox;
 pub mod sandbox_spec;
@@ -11,9 +10,10 @@ pub mod sandbox_spec;
 mod clone_source;
 
 #[cfg(any(feature = "docker", feature = "daytona", test))]
-mod managed_labels;
+mod clone_retry;
 
-pub mod read_guard;
+#[cfg(any(feature = "docker", feature = "daytona", test))]
+mod managed_labels;
 
 #[cfg(any(feature = "docker", feature = "daytona", test))]
 pub mod redact;
@@ -56,14 +56,13 @@ pub use provider::{
     LocalSandboxProvider, SandboxCreateSpec, SandboxLookupError, SandboxProvider,
     SandboxProviderRegistry,
 };
-pub use read_guard::ReadBeforeWriteSandbox;
 pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
 pub use sandbox::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions, RefreshOutcome, Sandbox,
-    SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination, format_lines_numbered, git_push_via_exec, redacted_output_tail,
-    setup_git_via_exec, shell_quote,
+    ExecStreamingRequest, ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions,
+    RefreshOutcome, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StderrCollector,
+    StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions, format_lines_numbered,
+    git_push_via_exec, redacted_output_tail, setup_git_via_exec, shell_quote,
 };
 pub use sandbox_spec::SandboxSpec;
 pub use terminal::{TerminalSession, TerminalSize, open_terminal_for_run};

@@ -77,13 +77,18 @@ pub fn docker_config_from_environment(
     settings: &RunEnvironmentSettings,
     skip_clone: bool,
 ) -> DockerSandboxOptions {
-    // No vault is available on this path (server preflight / manifest), so
-    // resolve `{{ env.* }}` against the process environment and let every other
-    // token (including `{{ secrets.* }}`) fall back to its source form.
+    // No vault is available on this path (server preflight / manifest), so a
+    // `{{ secrets.* }}` value keeps its source form. Nothing else is left to
+    // resolve: `{{ vars.* }}` is substituted at run creation.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "preflight has no vault, so an unresolved secret token is carried in source \
+                  form; the real value is resolved by docker_config_from_environment_with_secrets"
+    )]
     let env = settings
         .env
         .iter()
-        .map(|(key, value)| (key.clone(), value.resolve_or_source(process_env_var)))
+        .map(|(key, value)| (key.clone(), value.as_source()))
         .collect();
     docker_config_from_environment_env(settings, skip_clone, env)
 }
@@ -94,7 +99,7 @@ pub fn docker_config_from_environment_with_secrets(
     skip_clone: bool,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<DockerSandboxOptions, ResolveError> {
-    let env = settings.resolve_env(process_env_var, secrets_lookup)?;
+    let env = settings.resolve_env(secrets_lookup)?;
     Ok(docker_config_from_environment_env(
         settings, skip_clone, env,
     ))

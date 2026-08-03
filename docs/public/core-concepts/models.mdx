@@ -57,15 +57,17 @@ Fabro performs this selection once when creating a run and persists the chosen p
 | `gemini-3.5-flash` | gemini | `gemini-35-flash` | 1M | $1.50 / $9.00 | 150 tok/s |
 | `gemini-3-flash-preview` | gemini | `gemini-flash` | 1M | $0.50 / $3.00 | 150 tok/s |
 | `gemini-3.1-flash-lite` | gemini | `gemini-flash-lite`, `gemini-3.1-flash-lite-preview` | 1M | $0.25 / $1.50 | 200 tok/s |
-| `kimi-k2.5` | kimi | | 262K | $0.60 / $3.00 | 50 tok/s |
-| `kimi-k3` | kimi | `kimi` | 1M | $3.00 / $15.00 | n/a |
+| `kimi-k2.5` | moonshot | | 262K | $0.60 / $3.00 | 50 tok/s |
+| `kimi-k3` | moonshot | `kimi` | 1M | $3.00 / $15.00 | n/a |
+| `deepseek-v4-flash` | deepseek | `deepseek`, `deepseek-v4`, `deepseek-flash` | 1,048,576 | $0.14 / $0.28 | n/a |
+| `deepseek-v4-pro` | deepseek | | 1,048,576 | $0.435 / $0.87 | n/a |
 | `laguna-s-2.1` | poolside | `laguna`, `laguna-s` | 1M | $0.10 / $0.20 | n/a |
 | `laguna-xs-2.1` | poolside | `laguna-xs` | 262K | $0.10 / $0.20 | n/a |
 | `glm-5.2` | zai | `glm`, `glm5`, `glm52`, `glm5.2` | 1M | $1.40 / $4.40 | n/a |
 | `minimax-m2.5` | minimax | `minimax` | 197K | $0.30 / $1.20 | 45 tok/s |
 | `mercury-2` | inception | `mercury` | 131K | $0.25 / $0.75 | 1000 tok/s |
 
-Each provider requires its own API key. Server-backed workflows read provider credentials from the server vault (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or `POOLSIDE_API_KEY` set with `fabro secret set` or `fabro provider login`). Standalone SDK/CLI flows can opt into env-backed credential sources explicitly. See the [Quick Start](/getting-started/quick-start) for setup.
+Each provider requires its own API key. Server-backed workflows read provider credentials from the server vault (for example `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, or `POOLSIDE_API_KEY` set with `fabro secret set` or `fabro provider login`). Standalone SDK/CLI flows can opt into env-backed credential sources explicitly. See the [Quick Start](/getting-started/quick-start) for setup.
 
 Claude Fable 5 is available as an explicit model but is not the default Anthropic model. If Fable refuses a request, Fabro reports the refusal as a content-filter LLM error and applies the configured `run.model.fallbacks` chain when one is present.
 
@@ -84,7 +86,7 @@ aliases = ["gateway"]
 credentials = ["env:ACME_GATEWAY_API_KEY", "vault:ACME_GATEWAY_API_KEY"]
 
 [llm.providers.proxy.extra_headers]
-x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}"
+x-portkey-api-key = "{{ secrets.PORTKEY_API_KEY }}"
 x-portkey-config = "@bedrock-prod"
 
 [llm.providers.proxy.models."team-code-large"]
@@ -153,11 +155,13 @@ Historical built-in catalog keys that exposed provider API IDs remain accepted a
 
 Model roles are separate: `default = true` controls normal model selection for workflow execution, while `small_default = true` marks the provider's small/cheap utility model for metadata tasks such as generated run titles. If a provider has no small default, Fabro falls back to that provider's normal default.
 
-Provider auth is declared in `[llm.providers.<id>.auth]` with ordered `env:<NAME>` or `vault:<NAME>` refs. The primary auth header defaults to `bearer`; override with `header = { custom = "Header-Name" }` for providers like Anthropic that use `x-api-key`. Omit the `[llm.providers.<id>.auth]` block entirely for providers that need no API key (e.g. Ollama). Custom headers for any provider — including providers that need only interpolation headers and no API-key auth — go in `extra_headers` as literal text, `{{ env.NAME }}` tokens, or `{{ secrets.NAME }}` tokens. Put credentials in secrets and reference them with `{{ secrets.NAME }}` instead of a bare literal.
+Provider auth is declared in `[llm.providers.<id>.auth]` with ordered `env:<NAME>` or `vault:<NAME>` refs. The primary auth header defaults to `bearer`; override with `header = { custom = "Header-Name" }` for providers like Anthropic that use `x-api-key`. Omit the `[llm.providers.<id>.auth]` block entirely for providers that need no API key (e.g. Ollama). Custom headers for any provider — including providers that need only interpolation headers and no API-key auth — go in `extra_headers` as literal text or `{{ secrets.NAME }}` tokens. Put credentials in secrets and reference them with `{{ secrets.NAME }}` instead of a bare literal.
 
 Workflow runs also add `x-session-id: <run-id>` to every LLM request so compatible gateways can group requests from the same run. An explicitly configured `x-session-id` in provider `extra_headers` takes precedence.
 
-Provider `agent_profile` defaults from `adapter` and controls profile-specific behavior such as project-memory filenames, CLI/ACP command selection, and native session routing. Valid values are `anthropic`, `openai`, and `gemini`; model-level values override provider-level values.
+Provider `agent_profile` defaults from `adapter` and controls profile-specific behavior such as which tools the agent registers, project-memory filenames, CLI/ACP command selection, and native session routing. Valid values are `anthropic`, `openai`, `gemini`, `kimi`, and `gpt56`; model-level values override provider-level values.
+
+Two profiles are selected per model rather than per provider, because they follow the model wherever it is served: `kimi` for Kimi models, and `gpt56` for the GPT-5.6 models (Sol, Terra, Luna). The `gpt56` profile uses Codex's narrow core surface — `shell_command`, `apply_patch`, and `update_plan`, plus optional Brave-backed `web_search` — instead of fabro's dedicated file-read, discovery, and `web_fetch` tools. On OpenAI-compatible routes that cannot carry the freeform `apply_patch` grammar, it substitutes the JSON-schema `edit_file` tool. Session features may add their own question, skill, or subagent tools separately.
 
 Provider `billing_policy` defaults from `adapter` and controls usage-cost estimation. Use `openai`, `anthropic`, `gemini`, or `none`. Model rows may override it for models whose billing family differs from their provider's — for example, Claude models served through OpenRouter set `billing_policy = "anthropic"` so cache reads and writes price correctly.
 
@@ -176,6 +180,23 @@ Fabro ships an [OpenRouter](/integrations/openrouter) provider definition with a
 ```toml title="settings.toml"
 [llm.providers.openrouter]
 enabled = true
+```
+
+### Modal
+
+Fabro ships a [Modal](/integrations/modal) provider definition for Kimi K3, disabled by default. Modal assigns the endpoint URL and authenticates requests with a two-part proxy token:
+
+```toml title="settings.toml"
+[llm.providers.modal]
+enabled = true
+base_url = "https://your-endpoint.modal.run/v1"
+```
+
+Store both token values in the Fabro server vault:
+
+```bash
+fabro secret set MODAL_TOKEN_ID wk-...
+fabro secret set MODAL_TOKEN_SECRET ws-...
 ```
 
 ### Amazon Bedrock
@@ -208,7 +229,7 @@ When no model or provider is specified, Fabro chooses the default offering on th
 | `anthropic` | `claude-sonnet-4-6` |
 | `openai` | `gpt-5.6-sol` |
 | `gemini` | `gemini-3.5-flash` |
-| `kimi` | `kimi-k3` |
+| `moonshot` | `kimi-k3` |
 | `poolside` | `laguna-s-2.1` |
 | `zai` | `glm-5.2` |
 | `minimax` | `minimax-m2.5` |
@@ -266,7 +287,9 @@ goal = "Implement the feature"
 
 [run.model]
 name = "claude-sonnet-4-5"
-fallbacks = ["gemini", "openai"]
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["gemini", "openai"]
 ```
 
 Then launch with:
@@ -275,7 +298,9 @@ Then launch with:
 fabro run run.toml
 ```
 
-The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model alias (like `"gpt-5.4"`), or a qualified `"provider/model"` reference. Fabro tries them in order when the primary provider is unavailable. In this field, qualified references keep their established provider-pin meaning: `"openai/gpt-5.6-sol"` selects the direct OpenAI offering.
+The `[run.model.fallbacks]` table is optional. Each key names the originally requested model. Its value is the ordered list to try after that model's active provider fails. An entry may be a bare provider token (like `"gemini"`), a bare model ID or alias (like `"gpt-terra"`), or a qualified `"provider:selector"` reference. A qualified selector may be the provider's canonical model ID, alias, or API ID, including API IDs with slashes such as `"openrouter:moonshotai/kimi-k3"`.
+
+Fabro selects one chain from the original request. It does not switch to the chain configured for a fallback target. When the requested reasoning level is unavailable on a fallback target, Fabro uses the nearest supported level. Equal-distance choices round up.
 
 <Note>
 The precedence order is: node-level stylesheet > run config TOML > CLI flags > server defaults. More specific settings always win.

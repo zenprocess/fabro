@@ -1,7 +1,7 @@
 //! Request encoding: canonical `Request` → Chat Completions body.
 
 use super::translate;
-use super::wire::{ApiRequest, ChatMessage};
+use super::wire::{ApiRequest, ChatMessage, StreamOptions};
 use crate::codec::{CodecCtx, EncodedRequest, cache, merge_named_provider_options};
 use crate::error::Error;
 
@@ -10,8 +10,10 @@ use crate::error::Error;
 const KNOWN_OPTION_KEYS: &[&str] = &["auto_cache"];
 
 /// Build the Chat Completions request for `ctx.request`. `stream` toggles the
-/// `stream` body field. The body is assembled as a `serde_json::Value` so
-/// `provider_options.<provider_name>` fields can be merged in before sending.
+/// `stream` body field and the `stream_options.include_usage` opt-in that makes
+/// providers emit the trailing usage chunk. The body is assembled as a
+/// `serde_json::Value` so `provider_options.<provider_name>` fields can be
+/// merged in before sending.
 ///
 /// Returns an error when the request contains a custom tool definition, which
 /// the Chat Completions tool envelope cannot represent.
@@ -55,6 +57,9 @@ pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest,
         tool_choice,
         response_format,
         stream: stream.then_some(true),
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let mut body = serde_json::to_value(&api_request).unwrap_or_default();
@@ -105,7 +110,7 @@ fn apply_cache_breakpoints(messages: &mut [ChatMessage]) {
 /// Merge `provider_options.<provider_name>` fields into the serialized API
 /// request body.
 ///
-/// The provider name is configurable (e.g. "groq", "together", "kimi"),
+/// The provider name is configurable (e.g. "groq", "together", "moonshot"),
 /// allowing each instance to have its own namespace in `provider_options`.
 pub(super) fn merge_provider_options(
     body: &mut serde_json::Value,
@@ -172,6 +177,7 @@ mod tests {
             tool_choice:      None,
             response_format:  None,
             stream:           Some(true),
+            stream_options:   None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream"], true);
@@ -188,6 +194,7 @@ mod tests {
             tool_choice:      None,
             response_format:  None,
             stream:           None,
+            stream_options:   None,
         };
         let json_no_stream = serde_json::to_value(&req_no_stream).unwrap();
         assert!(json_no_stream.get("stream").is_none());
@@ -214,7 +221,7 @@ mod tests {
         let mut request = minimal_request();
         request.reasoning_effort = Some(ReasoningEffort::High);
 
-        let body = encode_body(&request, "kimi", false);
+        let body = encode_body(&request, "moonshot", false);
 
         assert_eq!(body["reasoning_effort"], "high");
     }
@@ -222,7 +229,7 @@ mod tests {
     #[test]
     fn encode_omits_sampling_params_for_models_that_reject_them() {
         let model = Catalog::builtin()
-            .get_on_provider(&ProviderId::new("kimi"), "kimi-k3")
+            .get_on_provider(&ProviderId::new("moonshot"), "kimi-k3")
             .unwrap();
         let mut request = minimal_request();
         request.model = model.id.to_string();
@@ -231,7 +238,7 @@ mod tests {
         let params = CodecParams::default();
         let ctx = CodecCtx {
             request:       &request,
-            provider_name: "kimi",
+            provider_name: "moonshot",
             deployment_id: model.id.as_str(),
             model:         Some(model),
             params:        &params,
@@ -255,7 +262,7 @@ mod tests {
         let deployment_id = request.model.clone();
         let ctx = CodecCtx {
             request:       &request,
-            provider_name: "kimi",
+            provider_name: "moonshot",
             deployment_id: &deployment_id,
             model:         None,
             params:        &params,
