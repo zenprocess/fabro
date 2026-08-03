@@ -37,7 +37,9 @@ pub(crate) const REPOS_ROOT: &str = "/home/fabro/repos";
 const PROVIDER: &str = "forkd";
 
 /// Default snapshot tag used when `FORKD_SNAPSHOT_TAG` is not set.
-pub const DEFAULT_SNAPSHOT_TAG: &str = "zen-gate-base";
+/// Generic, non-host-specific example value; operators override via
+/// the `FORKD_SNAPSHOT_TAG` env var or per-sandbox `ForkdSettings`.
+pub const DEFAULT_SNAPSHOT_TAG: &str = "forkd-base";
 
 /// Maximum number of retry attempts for transient HTTP failures (5xx /
 /// connect).

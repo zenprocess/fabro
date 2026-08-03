@@ -21,7 +21,42 @@ use tracing::{info, warn};
 use super::{GateBackend, GateOutput};
 use crate::types::{Acceptance, TaskSpec, Verdict};
 
-const FORKD_TOKEN_FILE: &str = "/home/vvladescu/fabro-run/.forkd-token";
+/// Default forkd token file path. Used only when the `FORKD_TOKEN_FILE`
+/// env var is unset or empty. Keep this a generic, non-host-specific
+/// example; operators must override it for their deployment.
+const FORKD_TOKEN_FILE_DEFAULT: &str = "/etc/forkd/token";
+
+/// Default forkd snapshot tag. Used only when the `FORKD_SNAPSHOT_TAG`
+/// env var is unset or empty. Keep this a generic, non-host-specific
+/// example; the value here is the example the public spec uses.
+const FORKD_SNAPSHOT_TAG_DEFAULT: &str = "forkd-base";
+
+/// Resolve the path to the forkd bearer-token file. The operator can
+/// override the default with the `FORKD_TOKEN_FILE` env var. The
+/// returned path is the one [`forkd_token`] will read.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync scorer binary: one-shot environment lookup for the token-file path"
+)]
+pub fn forkd_token_file() -> std::path::PathBuf {
+    match std::env::var("FORKD_TOKEN_FILE") {
+        Ok(value) if !value.trim().is_empty() => std::path::PathBuf::from(value.trim()),
+        _ => std::path::PathBuf::from(FORKD_TOKEN_FILE_DEFAULT),
+    }
+}
+
+/// Resolve the default forkd snapshot tag. The operator can override
+/// the default with the `FORKD_SNAPSHOT_TAG` env var.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync scorer binary: one-shot environment lookup for the default snapshot tag"
+)]
+pub fn forkd_snapshot_tag() -> String {
+    match std::env::var("FORKD_SNAPSHOT_TAG") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => FORKD_SNAPSHOT_TAG_DEFAULT.to_string(),
+    }
+}
 
 /// Resolve the forkd bearer token without exposing its value in errors/logs.
 #[expect(
@@ -36,7 +71,8 @@ pub fn forkd_token() -> Result<String> {
         }
     }
 
-    match std::fs::read_to_string(FORKD_TOKEN_FILE) {
+    let token_path = forkd_token_file();
+    match std::fs::read_to_string(&token_path) {
         Ok(contents) => {
             let token = contents.trim().to_string();
             if !token.is_empty() {
@@ -45,18 +81,19 @@ pub fn forkd_token() -> Result<String> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("read forkd token file {FORKD_TOKEN_FILE}"));
+            return Err(error).with_context(|| format!("read forkd token file {}", token_path.display()));
         }
     }
 
-    bail!("forkd token unavailable: set FORKD_TOKEN or provide {FORKD_TOKEN_FILE}")
+    bail!("forkd token unavailable: set FORKD_TOKEN or provide {}", token_path.display())
 }
 
 /// The real forkd controller at `forkd.internal.example:8891`. The scorer only uses the
-/// existing score/read path: it creates a `zen-gate-base` sandbox, executes
-/// the apply-and-acceptance pipeline, and deletes that sandbox. It never
-/// activates, reconfigures, restarts, or re-baselines the controller or its
-/// golden rootfs.
+/// existing score/read path: it creates a snapshot from the configured
+/// tag (env `FORKD_SNAPSHOT_TAG`, default "forkd-base"), executes the
+/// apply-and-acceptance pipeline, and deletes that sandbox. It never
+/// activates, reconfigures, restarts, or re-baselines the controller or
+/// its golden rootfs.
 pub struct ForkdController {
     /// The controller endpoint, e.g. `http://forkd.internal.example:8891`.
     endpoint: String,
@@ -101,7 +138,7 @@ impl GateBackend for ForkdController {
 
         // 1. create a sandbox from the golden snapshot.
         let create = auth(self.client.post(format!("{base}/v1/sandboxes")))
-            .json(&serde_json::json!({ "snapshot_tag": "zen-gate-base" }))
+            .json(&serde_json::json!({ "snapshot_tag": forkd_snapshot_tag() }))
             .send()
             .with_context(|| format!("forkd create sandbox @ {base}"))?;
         let cstatus = create.status();

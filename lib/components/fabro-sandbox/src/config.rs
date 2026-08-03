@@ -161,8 +161,9 @@ pub enum ForkdNetwork {
 #[cfg(feature = "forkd")]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ForkdSettings {
-    /// forkd snapshot tag to boot from (e.g. `"zen-gate-base"`).
-    /// Resolved from `FORKD_SNAPSHOT_TAG` env var; default `"zen-gate-base"`.
+    /// forkd snapshot tag to boot from (e.g. `"forkd-base"`).
+    /// Resolved from `FORKD_SNAPSHOT_TAG` env var; default
+    /// `"forkd-base"` (see [`crate::forkd::DEFAULT_SNAPSHOT_TAG`]).
     #[serde(default = "ForkdSettings::default_snapshot_tag")]
     pub snapshot_tag:      String,
     /// Legacy VM image/kernel/memory settings — retained for deserialization
