@@ -22,6 +22,7 @@ pub mod pair;
 pub mod parallel;
 pub mod principal;
 pub mod pull_request;
+pub mod reasoning;
 pub mod repository;
 pub mod run;
 pub mod run_blob_id;
@@ -72,10 +73,12 @@ pub use event_envelope::EventEnvelope;
 pub use fabro_model::ReasoningEffort;
 pub use failure_signature::FailureSignature;
 pub use graph::{
-    AttrValue, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type, is_llm_handler_type,
-    shape_to_handler_type,
+    AttrValue, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type,
+    is_llm_handler_type, shape_to_handler_type,
 };
-pub use interview::{InterviewQuestionRecord, QuestionType};
+pub use interview::{
+    InterviewQuestionRecord, QuestionType, ReviewTarget, ReviewTargetError, ReviewTargetKind,
+};
 pub use llm_backend::AgentBackend;
 pub use manifest_path::{ManifestPath, ManifestPathParseError};
 pub use mcp_store::{
@@ -102,6 +105,7 @@ pub use pull_request::{
     PullRequestDetailsUnavailableReason, PullRequestGithubDetail, PullRequestLink, PullRequestMeta,
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };
+pub use reasoning::ReasoningOutput;
 pub use repository::{RepositoryProvider, RepositoryRef};
 pub use run::{
     DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunClientProvenance, RunProvenance,
@@ -111,9 +115,10 @@ pub use run_blob_id::RunBlobId;
 pub use run_event::{
     AgentMcpToolSummary, AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary,
     AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody,
-    ExecOutputTail, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent,
-    RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource,
-    SessionCapability, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+    ExecOutputTail, FailoverProps, INITIAL_SUBAGENT_GENERATION, InterviewOption, LlmOutputKind,
+    LlmRetryPhase, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent, RunNoticeCode,
+    RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource, SessionCapability,
+    TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps, initial_subagent_generation,
 };
 pub use run_failure::RunFailure;
 pub use run_id::{RunId, fixtures};
@@ -122,8 +127,8 @@ pub use run_projection::{
     PendingInterviewRecord, RunProjection, SkillsProjection, StageContextWindow,
     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
-    StageContextWindowWarning, StageModelUsage, StageProjection, SubAgentProjection,
-    SubAgentStatus, first_event_seq,
+    StageContextWindowWarning, StageInferenceProjection, StageModelUsage, StageProjection,
+    StageToolBatchProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
 };
 pub use run_sandbox::{
     RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind, RunSandboxPlan,

@@ -73,9 +73,13 @@ pub trait AgentProfile: Send + Sync {
 ```
 
 Built-in profiles:
-- **`AnthropicProfile`** -- 200K context, extended thinking beta headers, tools: `read_file`, `write_file`, `edit_file`, `shell`, `grep`, `glob`
-- **`OpenAiProfile`** -- 128K context, reasoning effort support, tools: `read_file`, `write_file`, `shell`, `grep`, `glob`, `apply_patch` (Codex apply_patch format)
-- **`GeminiProfile`** -- 1M context, safety settings, tools: all Anthropic tools plus `read_many_files`, `list_dir`, `web_search`, `web_fetch`
+- **`AnthropicProfile`** -- 200K context, extended thinking beta headers, and Anthropic task tools
+- **`OpenAiProfile`** -- 128K context, reasoning effort support, and `apply_patch` (Codex apply_patch format)
+- **`GeminiProfile`** -- 1M context, safety settings, plus `read_many_files` and `list_dir`
+
+All profiles include the common file, shell, search, and `web_fetch` tools.
+`web_search` is included only when a Brave Search API key is supplied while
+building the profile.
 
 ### `Sandbox`
 
@@ -87,6 +91,7 @@ pub trait Sandbox: Send + Sync {
     async fn write_file(&self, path: &str, content: &str) -> Result<(), String>;
     async fn exec_command(&self, command: &str, timeout_ms: u64, ...) -> Result<ExecResult, String>;
     async fn grep(&self, pattern: &str, path: &str, options: &GrepOptions) -> Result<Vec<String>, String>;
+    async fn walk_files(&self, base: &str, relative_start: &str, options: &WalkOptions) -> Result<Vec<SandboxFile>, String>;
     async fn glob(&self, pattern: &str, path: Option<&str>) -> Result<Vec<String>, String>;
     // ... plus delete_file, file_exists, list_directory, initialize, cleanup, platform info
 }

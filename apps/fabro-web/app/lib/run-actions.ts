@@ -41,7 +41,7 @@ const CANCELABLE_STATUSES = new Set<RunStatus>([
   "blocked",
 ]);
 
-const ARCHIVABLE_STATUSES = new Set<RunStatus>([
+const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   "succeeded",
   "failed",
   "dead",
@@ -111,10 +111,7 @@ export async function deleteRuns(
   request?: Request,
 ): Promise<BatchDeleteRunsResponse> {
   try {
-    // See `batchRunLifecycleAction` for the `as unknown as` rationale:
-    // openapi-generator types `uniqueItems` arrays as `Set<T>` while the wire
-    // contract is a JSON array.
-    const body = { run_ids: runIds, force } as unknown as BatchDeleteRunsRequest;
+    const body: BatchDeleteRunsRequest = { run_ids: runIds, force };
     return await apiData(() => runsApi.batchDeleteRuns(body, requestSignalOptions(request)));
   } catch (error) {
     throw lifecycleActionErrorFromError(error);
@@ -143,7 +140,7 @@ export function canApprove(run: Run | null | undefined): boolean {
 }
 
 export function canArchive(status: string | null | undefined): boolean {
-  return !!status && ARCHIVABLE_STATUSES.has(status as RunStatus);
+  return isTerminalRunStatus(status);
 }
 
 export function canUnarchive(status: string | null | undefined): boolean {
@@ -152,8 +149,13 @@ export function canUnarchive(status: string | null | undefined): boolean {
 
 export function canRetry(run: Pick<Run, "lifecycle"> | null | undefined): boolean {
   if (!run || run.lifecycle.archived) return false;
-  const status = run.lifecycle.status;
-  return status.kind === "succeeded" || status.kind === "failed" || status.kind === "dead";
+  return isTerminalRunStatus(run.lifecycle.status.kind);
+}
+
+export function isTerminalRunStatus(
+  status: string | null | undefined,
+): boolean {
+  return !!status && TERMINAL_RUN_STATUSES.has(status as RunStatus);
 }
 
 export function canDelete(status: string | null | undefined): boolean {
@@ -279,10 +281,7 @@ async function batchRunLifecycleAction(
   request?: Request,
 ): Promise<BatchRunLifecycleResponse> {
   try {
-    // openapi-generator's TypeScript client represents `uniqueItems` arrays as
-    // Set<T>, but the HTTP wire contract is still a JSON array. Keep an array
-    // here so Axios serializes the request body correctly.
-    const body = { run_ids: runIds } as unknown as BatchRunLifecycleRequest;
+    const body: BatchRunLifecycleRequest = { run_ids: runIds };
     switch (action) {
       case "archive":
         return await apiData(() => runsApi.batchArchiveRuns(body, requestSignalOptions(request)));

@@ -9,8 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fabro_types::{CommandOutputStream, CommandTermination};
 use fabro_util::shell;
+use fabro_util::workspace_glob::WorkspaceGlob;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -20,6 +21,83 @@ use tokio_util::sync::CancellationToken;
 const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
 
 pub const DEFAULT_EXEC_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
+
+/// Maximum time a sandbox lifecycle check may spend proving Bash is usable.
+pub(crate) const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// Bash path required by Linux-backed remote sandbox providers.
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) const REMOTE_BASH: &str = "/bin/bash";
+
+/// Timeout for provider-neutral remote file traversal.
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) const REMOTE_WALK_TIMEOUT_MS: u64 = 30_000;
+
+/// Environment variable Bash consults for non-interactive startup source.
+///
+/// Sandbox providers must remove or blank this before invoking `bash -c`;
+/// otherwise ambient worker or image configuration can execute code before the
+/// requested command.
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
+
+/// Marker a successful [`BASH_PROBE_SCRIPT`] run prints on stdout.
+///
+/// Providers validate the marker rather than trusting a zero exit: a non-Bash
+/// shell can exit zero for simple scripts without satisfying the contract.
+pub(crate) const BASH_PROBE_MARKER: &str = "fabro-bash-ready";
+
+/// Deterministic probe proving a sandbox's interpreter is non-login Bash.
+///
+/// Run as the argument to `bash -c` during fresh initialization and on
+/// resume/start, before the sandbox is reported usable. It fails when the
+/// interpreter has an ambient `BASH_ENV` startup source, is not Bash, was
+/// started as a login shell, or is in POSIX mode. Bash invoked under the name
+/// `sh` still sets `BASH_VERSION` while enabling POSIX behavior, so the full
+/// interpreter contract is checked rather than assumed.
+pub(crate) const BASH_PROBE_SCRIPT: &str = r#"if [ -n "${BASH_ENV:-}" ]; then
+  echo 'sandbox interpreter has BASH_ENV startup source configured' >&2
+  exit 1
+fi
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo 'sandbox interpreter is not bash' >&2
+  exit 1
+fi
+if shopt -q login_shell; then
+  echo 'sandbox interpreter is a login shell' >&2
+  exit 1
+fi
+if shopt -qo posix; then
+  echo 'sandbox interpreter is bash in posix mode' >&2
+  exit 1
+fi
+printf '%s\n' 'fabro-bash-ready'"#;
+
+/// Whether a [`BASH_PROBE_SCRIPT`] run succeeded.
+///
+/// A zero exit without exactly the marker is not a successful probe.
+pub(crate) fn bash_probe_passed(exit_code: Option<i32>, stdout: &str) -> bool {
+    exit_code == Some(0) && stdout.trim() == BASH_PROBE_MARKER
+}
+
+/// Validate a completed Bash probe without flattening its raw output into an
+/// error message.
+///
+/// [`Error::Exec`](crate::Error::Exec) retains stdout/stderr for the existing
+/// redacted-tail diagnostics while its display form exposes only bounded,
+/// classified metadata safe for lifecycle events and tracing.
+pub(crate) fn validate_bash_probe(
+    result: ExecResult,
+    remediation: impl Into<String>,
+) -> crate::Result<()> {
+    if result.is_success() && bash_probe_passed(result.exit_code, &result.stdout) {
+        return Ok(());
+    }
+
+    Err(crate::Error::context(
+        remediation,
+        result.into_exec_error("Sandbox Bash probe"),
+    ))
+}
 
 /// Sleep for `timeout_ms` if `Some`, otherwise never resolves. Used by
 /// streaming `exec_command` impls to model "no timeout" without scheduling a
@@ -106,23 +184,9 @@ macro_rules! delegate_sandbox {
 
             async fn exec_command_streaming(
                 &self,
-                command: &str,
-                timeout_ms: Option<u64>,
-                working_dir: Option<&str>,
-                env_vars: Option<&std::collections::HashMap<String, String>>,
-                cancel_token: Option<tokio_util::sync::CancellationToken>,
-                output_callback: $crate::CommandOutputCallback,
+                request: $crate::ExecStreamingRequest<'_>,
             ) -> $crate::Result<$crate::ExecStreamingResult> {
-                self.$field
-                    .exec_command_streaming(
-                        command,
-                        timeout_ms,
-                        working_dir,
-                        env_vars,
-                        cancel_token,
-                        output_callback,
-                    )
-                    .await
+                self.$field.exec_command_streaming(request).await
             }
 
             async fn spawn_stdio_process(
@@ -139,6 +203,17 @@ macro_rules! delegate_sandbox {
 
             async fn glob(&self, pattern: &str, path: Option<&str>) -> $crate::Result<Vec<String>> {
                 self.$field.glob(pattern, path).await
+            }
+
+            async fn walk_files(
+                &self,
+                base: &str,
+                relative_start: &str,
+                options: &$crate::WalkOptions,
+            ) -> $crate::Result<Vec<$crate::SandboxFile>> {
+                self.$field
+                    .walk_files(base, relative_start, options)
+                    .await
             }
 
             async fn download_file_to_local(
@@ -159,6 +234,10 @@ macro_rules! delegate_sandbox {
 
             async fn initialize(&self) -> $crate::Result<()> {
                 self.$field.initialize().await
+            }
+
+            async fn activate(&self) -> $crate::Result<()> {
+                self.$field.activate().await
             }
 
             async fn start(&self) -> $crate::Result<()> {
@@ -680,6 +759,105 @@ pub type CommandOutputCallback = Arc<
         + Sync,
 >;
 
+/// Inputs for a streaming command execution.
+///
+/// Construct with a struct literal over [`ExecStreamingRequest::new`]:
+/// `ExecStreamingRequest { stdin, ..ExecStreamingRequest::new(command) }`.
+/// Providers should destructure exhaustively so a new field is a compile
+/// error rather than silently ignored input.
+///
+/// Standard input is owned so providers can move it into a writer task. This
+/// type does not implement `Debug` because standard input can contain
+/// sensitive workflow data.
+pub struct ExecStreamingRequest<'a> {
+    pub command:         &'a str,
+    pub timeout_ms:      Option<u64>,
+    pub working_dir:     Option<&'a str>,
+    pub env_vars:        Option<&'a HashMap<String, String>>,
+    pub cancel_token:    Option<CancellationToken>,
+    pub stdin:           Option<Vec<u8>>,
+    pub output_callback: Option<CommandOutputCallback>,
+}
+
+impl<'a> ExecStreamingRequest<'a> {
+    #[must_use]
+    pub fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            timeout_ms: None,
+            working_dir: None,
+            env_vars: None,
+            cancel_token: None,
+            stdin: None,
+            output_callback: None,
+        }
+    }
+}
+
+pub(crate) async fn write_process_stdin<W>(mut writer: W, stdin: &[u8]) -> crate::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    // A command that stops reading its input (`head -1`, an early exit) is
+    // not an error; its exit code is the authoritative result. Local pipes
+    // surface that as `BrokenPipe`, remote transports (a TCP Docker daemon)
+    // as `ConnectionReset`/`ConnectionAborted`.
+    fn command_stopped_reading(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        )
+    }
+
+    if let Err(err) = writer.write_all(stdin).await {
+        if !command_stopped_reading(&err) {
+            return Err(crate::Error::context(
+                "Failed to write command standard input",
+                err,
+            ));
+        }
+    }
+    if let Err(err) = writer.shutdown().await {
+        if !command_stopped_reading(&err) {
+            return Err(crate::Error::context(
+                "Failed to close command standard input",
+                err,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn replay_exec_result(
+    result: ExecResult,
+    streams_separated: bool,
+    output_callback: Option<&CommandOutputCallback>,
+) -> crate::Result<ExecStreamingResult> {
+    if let Some(output_callback) = output_callback {
+        if !result.stdout.is_empty() {
+            output_callback(
+                CommandOutputStream::Stdout,
+                result.stdout.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+        if !result.stderr.is_empty() {
+            output_callback(
+                CommandOutputStream::Stderr,
+                result.stderr.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+    }
+    Ok(ExecStreamingResult {
+        result,
+        streams_separated,
+        live_streaming: false,
+    })
+}
+
 pub struct StdioProcess {
     pub stdin:  Pin<Box<dyn AsyncWrite + Send>>,
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
@@ -795,6 +973,39 @@ pub struct DirEntry {
     pub size:   Option<u64>,
 }
 
+/// A regular file discovered inside a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxFile {
+    /// Provider-resolved path accepted by sandbox filesystem operations.
+    pub path:          String,
+    /// `/`-separated path relative to the requested traversal base.
+    pub relative_path: String,
+    pub size:          u64,
+}
+
+/// Provider-neutral controls for recursive file traversal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkOptions {
+    /// Directory basenames that providers must prune at every depth.
+    pub excluded_directory_names: Vec<String>,
+}
+
+impl WalkOptions {
+    #[must_use]
+    pub fn excludes_name(&self, name: &str) -> bool {
+        self.excluded_directory_names
+            .iter()
+            .any(|excluded| excluded == name)
+    }
+
+    #[must_use]
+    pub fn excludes_relative_path(&self, relative_path: &str) -> bool {
+        relative_path
+            .split('/')
+            .any(|segment| self.excludes_name(segment))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GrepOptions {
     pub glob_filter:      Option<String>,
@@ -844,6 +1055,21 @@ pub trait Sandbox: Send + Sync {
         path: &str,
         depth: Option<usize>,
     ) -> crate::Result<Vec<DirEntry>>;
+    /// Run `command` to completion and return its captured output.
+    ///
+    /// On Unix production sandboxes `command` is **Bash source**: it is
+    /// evaluated as a non-login Bash program, equivalent to `bash -c
+    /// <command>`. Implementations select the interpreter, not its options —
+    /// they must not add login mode, `errexit`, `pipefail`, or any other
+    /// implicit shell option, and must never fall back to `sh` or delegate
+    /// evaluation to a provider's ambient shell. A caller that wants different
+    /// semantics writes them into the command itself (`sh -c ...`, a
+    /// `#!/bin/sh` script, an explicit `set -o pipefail`), which then runs
+    /// beneath this Bash boundary.
+    ///
+    /// Providers resolve the Bash executable differently: the local sandbox
+    /// resolves `bash` through the worker's `PATH` (NixOS has no `/bin/bash`),
+    /// while the Linux remote providers require `/bin/bash`.
     async fn exec_command(
         &self,
         command: &str,
@@ -854,53 +1080,54 @@ pub trait Sandbox: Send + Sync {
     ) -> crate::Result<ExecResult>;
     /// Stream a command's output as it runs.
     ///
+    /// `command` carries exactly the same interpreter semantics as
+    /// [`exec_command`](Self::exec_command) — the two paths must not differ in
+    /// interpreter or shell options, so Bash-only syntax behaves identically
+    /// through both.
+    ///
+    /// When `request.stdin` is set, providers must write those exact bytes to
+    /// the process's standard input and then close it to deliver EOF. The bytes
+    /// must remain separate from command source and diagnostics.
+    ///
     /// **Production sandboxes must override this.** The default falls back to
     /// the non-streaming [`exec_command`](Self::exec_command) and replays its
-    /// output through `output_callback` at the end, marking
-    /// `live_streaming: false`. That's the right behavior for test mocks but
-    /// silently drops live output for any real sandbox that wraps another —
-    /// decorators in particular must forward to the inner sandbox's streaming
-    /// implementation rather than relying on this default.
+    /// output through `output_callback` at the end when one is supplied,
+    /// marking `live_streaming: false`. Passing `None` captures the final
+    /// result without paying per-chunk callback costs. That's the right
+    /// behavior for test mocks but silently drops live output for any real
+    /// sandbox that wraps another — decorators in particular must forward to
+    /// the inner sandbox's streaming implementation rather than relying on
+    /// this default. The fallback rejects `request.stdin` because
+    /// [`exec_command`](Self::exec_command) has no stdin channel.
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&std::collections::HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
-        let fallback_timeout_ms = timeout_ms.unwrap_or(u64::MAX);
+        if request.stdin.is_some() {
+            return Err(crate::Error::message(
+                "This sandbox does not support standard input for streaming commands",
+            ));
+        }
+        let fallback_timeout_ms = request.timeout_ms.unwrap_or(u64::MAX);
         let result = self
             .exec_command(
-                command,
+                request.command,
                 fallback_timeout_ms,
-                working_dir,
-                env_vars,
-                cancel_token,
+                request.working_dir,
+                request.env_vars,
+                request.cancel_token,
             )
             .await?;
-        if !result.stdout.is_empty() {
-            output_callback(
-                CommandOutputStream::Stdout,
-                result.stdout.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        if !result.stderr.is_empty() {
-            output_callback(
-                CommandOutputStream::Stderr,
-                result.stderr.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        Ok(ExecStreamingResult {
-            result,
-            streams_separated: true,
-            live_streaming: false,
-        })
+        replay_exec_result(result, true, request.output_callback.as_ref()).await
     }
 
+    /// Launch a long-lived process with bidirectional stdio attached.
+    ///
+    /// Where supported, `_command` is evaluated under the same non-login Bash
+    /// contract as [`exec_command`](Self::exec_command) before the shell
+    /// replaces itself with the requested process. Providers without
+    /// bidirectional stdio keep this default and report the capability as
+    /// unsupported rather than substituting another interpreter.
     async fn spawn_stdio_process(
         &self,
         _command: &str,
@@ -919,7 +1146,41 @@ pub trait Sandbox: Send + Sync {
         path: &str,
         options: &GrepOptions,
     ) -> crate::Result<Vec<String>>;
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>>;
+
+    /// Recursively enumerate regular files below a caller-declared base.
+    ///
+    /// `relative_start` is a normalized literal directory path relative to
+    /// `base`; it is an optimization boundary, not a matching expression.
+    /// Every returned `relative_path` remains relative to `base`.
+    /// Implementations resolve `base` itself but must not recurse through
+    /// symlinks encountered in `relative_start` or below it.
+    ///
+    /// Production providers that support filesystem search must override this.
+    async fn walk_files(
+        &self,
+        _base: &str,
+        _relative_start: &str,
+        _options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        Err(crate::Error::message(
+            "recursive file traversal is not supported by this sandbox",
+        ))
+    }
+
+    /// Match a workspace-relative glob using provider-independent semantics.
+    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
+        let glob = WorkspaceGlob::try_new(pattern)
+            .map_err(|error| crate::Error::context("Invalid glob pattern", error))?;
+        let base = path.unwrap_or_else(|| self.working_directory());
+        let mut files = self
+            .walk_files(base, glob.traversal_root(), &WalkOptions::default())
+            .await?
+            .into_iter()
+            .filter(|file| glob.is_match(&file.relative_path))
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(files.into_iter().map(|file| file.path).collect())
+    }
     /// Copy a file from the sandbox to a local filesystem path.
     /// Handles binary files correctly across all sandbox types.
     async fn download_file_to_local(
@@ -935,6 +1196,15 @@ pub trait Sandbox: Send + Sync {
         remote_path: &str,
     ) -> crate::Result<()>;
     async fn initialize(&self) -> crate::Result<()>;
+    /// Ensure the provider resource is running and not paused before access.
+    ///
+    /// This access-time operation must be idempotent. Providers that can stop
+    /// independently should avoid restarting an already-active sandbox. This
+    /// lightweight check does not require the full health verification done by
+    /// [`Sandbox::start`], and it does not keep a sandbox active between calls.
+    async fn activate(&self) -> crate::Result<()> {
+        self.start().await
+    }
     async fn start(&self) -> crate::Result<()> {
         Ok(())
     }
@@ -1016,12 +1286,6 @@ pub trait Sandbox: Send + Sync {
     ) -> crate::Result<Option<(String, HashMap<String, String>)>> {
         Ok(None)
     }
-
-    /// Record that the agent has explicitly read (seen) the given file path.
-    /// Called by tool executors after agent-visible reads (e.g. `read_file`,
-    /// `grep`). Default is a no-op; `ReadBeforeWriteSandbox` overrides to
-    /// populate its read set.
-    fn mark_agent_read(&self, _path: &str) {}
 }
 
 /// Resolve a path: relative paths are prepended with the working directory.
@@ -1031,8 +1295,93 @@ pub(crate) fn resolve_path(path: &str, working_dir: &str) -> String {
     if std::path::Path::new(path).is_absolute() {
         path.to_string()
     } else {
-        format!("{working_dir}/{path}")
+        join_sandbox_path(working_dir, path)
     }
+}
+
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) fn join_sandbox_path(base: &str, relative_path: &str) -> String {
+    if relative_path.is_empty() {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        return relative_path.to_string();
+    }
+    if base == "/" {
+        return format!("/{relative_path}");
+    }
+    format!("{}/{relative_path}", base.trim_end_matches('/'))
+}
+
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) fn build_remote_walk_command(
+    base: &str,
+    relative_start: &str,
+    options: &WalkOptions,
+) -> String {
+    let traversal_root = join_sandbox_path(base, relative_start);
+    let quoted_root = shell_quote(&traversal_root);
+    let mut command = format!("if [ -e {quoted_root} ]");
+    let mut component_path = base.to_string();
+    for segment in relative_start
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        component_path = join_sandbox_path(&component_path, segment);
+        let _ = write!(command, " && [ ! -L {} ]", shell_quote(&component_path));
+    }
+    let _ = write!(command, "; then find -H {quoted_root}");
+
+    if !options.excluded_directory_names.is_empty() {
+        command.push_str(" \\( -type d \\(");
+        for (index, directory_name) in options.excluded_directory_names.iter().enumerate() {
+            if index > 0 {
+                command.push_str(" -o");
+            }
+            let _ = write!(command, " -name {}", shell_quote(directory_name));
+        }
+        command.push_str(" \\) -prune \\) -o");
+    }
+
+    command.push_str(" -not -type l -type f -printf '%s\\0%P\\0'; fi");
+    command
+}
+
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) fn parse_remote_walk_output(
+    base: &str,
+    relative_start: &str,
+    output: &str,
+) -> crate::Result<Vec<SandboxFile>> {
+    let mut fields = output.split('\0');
+    let mut files = Vec::new();
+
+    while let Some(size) = fields.next() {
+        if size.is_empty() {
+            break;
+        }
+        let relative_to_start = fields.next().ok_or_else(|| {
+            crate::Error::message("Malformed recursive file traversal output: missing path")
+        })?;
+        let size = size.parse::<u64>().map_err(|error| {
+            crate::Error::context(
+                format!("Malformed recursive file traversal size {size:?}"),
+                error,
+            )
+        })?;
+        let relative_path = if relative_to_start.is_empty() {
+            relative_start.to_string()
+        } else {
+            join_sandbox_path(relative_start, relative_to_start)
+        };
+        files.push(SandboxFile {
+            path: join_sandbox_path(base, &relative_path),
+            relative_path,
+            size,
+        });
+    }
+
+    Ok(files)
 }
 
 /// Shell-quote a string using `shlex::try_quote`, with a fallback for edge
@@ -1361,13 +1710,13 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_tracing_events_do_not_log_raw_command_fields() {
+    fn sandbox_tracing_events_do_not_log_raw_command_or_stdin_fields() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut failures = Vec::new();
         scan_for_command_tracing(&root, &mut failures);
         assert!(
             failures.is_empty(),
-            "raw command/cmd tracing fields found:\n{}",
+            "raw command/cmd/stdin tracing fields found:\n{}",
             failures.join("\n")
         );
     }
@@ -1493,6 +1842,104 @@ mod tests {
         assert_eq!(shell_quote("hello world"), "'hello world'");
     }
 
+    #[test]
+    fn bash_probe_script_prints_the_marker_callers_validate() {
+        assert!(
+            BASH_PROBE_SCRIPT.contains(BASH_PROBE_MARKER),
+            "the probe must print the marker providers check for"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_probe_accepts_only_clean_non_login_bash() {
+        use tokio::process::Command;
+
+        async fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
+            let output = Command::new(program)
+                .args(args)
+                .arg(BASH_PROBE_SCRIPT)
+                .env_remove("BASH_ENV")
+                .output()
+                .await
+                .expect("probe should run");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        }
+
+        let (code, stdout) = run("bash", &["-c"]).await;
+        assert!(bash_probe_passed(code, &stdout), "non-login bash: {stdout}");
+
+        let (code, stdout) = run("bash", &["--noprofile", "-lc"]).await;
+        assert!(
+            !bash_probe_passed(code, &stdout),
+            "a login shell must fail the probe: {stdout}"
+        );
+
+        let output = Command::new("bash")
+            .args(["-c", BASH_PROBE_SCRIPT])
+            .env(BASH_ENV_VAR, "/dev/null")
+            .output()
+            .await
+            .expect("probe with BASH_ENV should run");
+        assert!(
+            !bash_probe_passed(
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout)
+            ),
+            "a shell with BASH_ENV must fail the probe"
+        );
+
+        // Where `/bin/sh` is really Bash (macOS), Bash enters POSIX mode and
+        // changes behavior; where it is dash (most Linux images),
+        // `BASH_VERSION` is unset. The probe rejects both.
+        let (code, stdout) = run("sh", &["-c"]).await;
+        assert!(
+            !bash_probe_passed(code, &stdout),
+            "sh must fail the probe: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bash_probe_requires_the_exact_marker_output() {
+        assert!(bash_probe_passed(
+            Some(0),
+            &format!("  {BASH_PROBE_MARKER}\n")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("prefix-{BASH_PROBE_MARKER}-suffix")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("{BASH_PROBE_MARKER}\nunexpected output")
+        ));
+    }
+
+    #[test]
+    fn bash_probe_failure_keeps_raw_output_out_of_the_error_chain() {
+        let err = validate_bash_probe(
+            ExecResult {
+                stdout:      String::new(),
+                stderr:      "raw-probe-output".to_string(),
+                exit_code:   Some(1),
+                termination: CommandTermination::Exited,
+                duration_ms: 1,
+            },
+            "Install Bash",
+        )
+        .expect_err("failed probe should return remediation");
+
+        assert!(!err.display_with_causes().contains("raw-probe-output"));
+        assert_eq!(
+            err.default_redacted_output_tail()
+                .and_then(|tail| tail.stderr),
+            Some("raw-probe-output".to_string())
+        );
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "unit test performs a small synchronous source scan of local Rust files"
@@ -1535,6 +1982,8 @@ mod tests {
                         || call.contains("command =")
                         || call.contains("cmd,")
                         || call.contains("cmd =")
+                        || call.contains("stdin,")
+                        || call.contains("stdin =")
                     {
                         failures.push(format!(
                             "{}: {}",

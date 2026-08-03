@@ -31,9 +31,16 @@ pub async fn discover_memory(
     let directories = build_directory_walk(git_root, working_dir);
 
     let candidate_filenames: Vec<&str> = match profile_kind {
-        AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
-        AgentProfileKind::OpenAi => vec!["AGENTS.md", ".codex/instructions.md"],
+        AgentProfileKind::Anthropic | AgentProfileKind::Claude5 => {
+            vec!["AGENTS.md", "CLAUDE.md"]
+        }
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
+            vec!["AGENTS.md", ".codex/instructions.md"]
+        }
         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
+        // Kimi Code reads only AGENTS.md; it has no vendor-specific
+        // instruction filename of its own.
+        AgentProfileKind::Kimi => vec!["AGENTS.md"],
     };
 
     let mut results: Vec<MemoryDocument> = Vec::new();
@@ -206,6 +213,23 @@ mod tests {
             files: files.clone(),
             ..Default::default()
         });
+        let claude5_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Claude5,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claude5_docs.len(), 2);
+        assert_eq!(claude5_docs[0].content, "agents");
+        assert_eq!(claude5_docs[1].content, "claude");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: files.clone(),
+            ..Default::default()
+        });
         let openai_docs = discover_memory(
             env.as_ref(),
             "/repo",
@@ -220,7 +244,24 @@ mod tests {
         assert_eq!(openai_docs[1].content, "copilot");
 
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
-            files,
+            files: files.clone(),
+            ..Default::default()
+        });
+        let gpt56_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Gpt56,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gpt56_docs.len(), 2);
+        assert_eq!(gpt56_docs[0].content, "agents");
+        assert_eq!(gpt56_docs[1].content, "copilot");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: files.clone(),
             ..Default::default()
         });
         let gemini_docs = discover_memory(
@@ -235,6 +276,22 @@ mod tests {
         assert_eq!(gemini_docs.len(), 2);
         assert_eq!(gemini_docs[0].content, "agents");
         assert_eq!(gemini_docs[1].content, "gemini");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files,
+            ..Default::default()
+        });
+        let kimi_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Kimi,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kimi_docs.len(), 1);
+        assert_eq!(kimi_docs[0].content, "agents");
     }
 
     #[tokio::test]

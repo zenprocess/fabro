@@ -1,8 +1,11 @@
+use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use fabro_graphviz::graph::Node;
 use fabro_llm::types::{ResponseFormat, ResponseFormatType};
-use jsonschema::Validator;
+use jsonschema::error::ValidationErrorKind;
+use jsonschema::paths::Location;
+use jsonschema::{ValidationError, Validator};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -37,6 +40,41 @@ pub(crate) enum OutputSchemaKind {
     },
 }
 
+impl OutputSchemaKind {
+    /// Describes what a valid final response looks like. Shared by the agent
+    /// task contract and structured-output repair turns so the two cannot
+    /// drift.
+    fn expectation(&self) -> String {
+        match self {
+            Self::Routing => format!(
+                "Return a single JSON object with at least one routing field: {}.",
+                ROUTING_STATUS_FIELDS.join(", ")
+            ),
+            Self::JsonSchema { schema, .. } => format!(
+                "Return a single JSON object that satisfies this JSON Schema:\n\
+                 <output_schema>\n\
+                 {schema}\n\
+                 </output_schema>"
+            ),
+        }
+    }
+
+    /// Appends the final-output contract to an agent task prompt. Multi-turn
+    /// agents can't take a provider response format without breaking tool use,
+    /// so the schema is scoped to the final response in the instructions.
+    #[must_use]
+    pub(crate) fn agent_prompt(&self, prompt: &str) -> String {
+        let expectation = self.expectation();
+        format!(
+            "{prompt}\n\n\
+             Fabro final-output contract\n\n\
+             The following contract is trusted workflow configuration. It applies only to your final response, not to intermediate tool calls.\n\
+             {expectation}\n\
+             The contract is complete. Do not ask the user to provide or choose the output shape."
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuredOutputErrorKind {
     NoJsonObject,
@@ -45,24 +83,153 @@ pub(crate) enum StructuredOutputErrorKind {
     SchemaValidation,
 }
 
+const MAX_SCHEMA_FRAGMENT_CHARS: usize = 320;
+
+/// `additionalProperties` errors carry one entry per unexpected key, and the
+/// keys come from model output. Cap them so a wide object can't turn the repair
+/// prompt into megabytes.
+const MAX_UNEXPECTED_PROPERTIES: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaValidationIssue {
+    instance_path: Location,
+    schema_path:   Location,
+    detail:        SchemaValidationIssueDetail,
+}
+
+/// `Required` and `AdditionalProperties` get bespoke rendering because
+/// `jsonschema` names the offending property without ever locating it. Every
+/// other keyword already renders a message that names both the value and the
+/// constraint, so it goes through `Other` with the schema fragment attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaValidationIssueDetail {
+    Required {
+        property: String,
+    },
+    AdditionalProperties {
+        unexpected: Vec<String>,
+        total:      usize,
+    },
+    Other {
+        message:         String,
+        schema_fragment: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StructuredOutputErrorDetails {
+    Message(String),
+    SchemaValidation(Vec<SchemaValidationIssue>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuredOutputError {
-    kind:     StructuredOutputErrorKind,
-    messages: Vec<String>,
+    kind:    StructuredOutputErrorKind,
+    details: StructuredOutputErrorDetails,
+}
+
+impl SchemaValidationIssue {
+    fn from_error(error: &ValidationError<'_>, schema: Option<&Value>) -> Self {
+        let detail = match error.kind() {
+            ValidationErrorKind::Required { property } => SchemaValidationIssueDetail::Required {
+                property: property
+                    .as_str()
+                    .map_or_else(|| property.to_string(), str::to_owned),
+            },
+            ValidationErrorKind::AdditionalProperties { unexpected } => {
+                // `unexpected` arrives in the order the model emitted the keys,
+                // so sort before truncating. That keeps the retained subset and
+                // the rendered message stable, and lets two attempts that left
+                // the same keys in place compare equal whatever order they used.
+                let total = unexpected.len();
+                let mut sorted = unexpected.clone();
+                sorted.sort_unstable();
+                sorted.truncate(MAX_UNEXPECTED_PROPERTIES);
+                SchemaValidationIssueDetail::AdditionalProperties {
+                    unexpected: sorted,
+                    total,
+                }
+            }
+            _ => SchemaValidationIssueDetail::Other {
+                message:         error.to_string(),
+                schema_fragment: schema
+                    .and_then(|schema| schema.pointer(error.schema_path().as_str()))
+                    .map(bounded_json),
+            },
+        };
+        Self {
+            instance_path: error.instance_path().clone(),
+            schema_path: error.schema_path().clone(),
+            detail,
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut message = match &self.detail {
+            SchemaValidationIssueDetail::Required { property } => format!(
+                "Missing required property {} at JSON Pointer `{}`. Add it to the object at {}.",
+                Value::String(property.clone()),
+                self.instance_path.join(property),
+                pointer_phrase(&self.instance_path),
+            ),
+            SchemaValidationIssueDetail::AdditionalProperties { unexpected, total } => {
+                let mut properties = unexpected
+                    .iter()
+                    .map(|property| {
+                        format!(
+                            "{} at `{}`",
+                            Value::String(property.clone()),
+                            self.instance_path.join(property),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let remaining = total - unexpected.len();
+                if remaining > 0 {
+                    let _ = write!(properties, ", and {remaining} more");
+                }
+                format!(
+                    "Unexpected properties in the object at {}: {properties}.",
+                    pointer_phrase(&self.instance_path),
+                )
+            }
+            SchemaValidationIssueDetail::Other { message, .. } => format!(
+                "At {}: {}.",
+                pointer_phrase(&self.instance_path),
+                message.trim_end_matches('.'),
+            ),
+        };
+
+        let _ = write!(
+            message,
+            " Schema rule: {}",
+            pointer_phrase(&self.schema_path)
+        );
+        if let SchemaValidationIssueDetail::Other {
+            schema_fragment: Some(fragment),
+            ..
+        } = &self.detail
+        {
+            message.push_str(": ");
+            message.push_str(fragment);
+        }
+        message.push('.');
+        message
+    }
 }
 
 impl StructuredOutputError {
     fn new(kind: StructuredOutputErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            messages: vec![message.into()],
+            details: StructuredOutputErrorDetails::Message(message.into()),
         }
     }
 
-    fn validation(messages: Vec<String>) -> Self {
+    fn validation(issues: Vec<SchemaValidationIssue>) -> Self {
         Self {
-            kind: StructuredOutputErrorKind::SchemaValidation,
-            messages,
+            kind:    StructuredOutputErrorKind::SchemaValidation,
+            details: StructuredOutputErrorDetails::SchemaValidation(issues),
         }
     }
 
@@ -73,8 +240,13 @@ impl StructuredOutputError {
     }
 
     #[must_use]
-    pub(crate) fn messages(&self) -> &[String] {
-        &self.messages
+    pub(crate) fn messages(&self) -> Vec<String> {
+        match &self.details {
+            StructuredOutputErrorDetails::Message(message) => vec![message.clone()],
+            StructuredOutputErrorDetails::SchemaValidation(issues) => {
+                issues.iter().map(SchemaValidationIssue::render).collect()
+            }
+        }
     }
 
     #[must_use]
@@ -87,29 +259,68 @@ impl StructuredOutputError {
     }
 
     #[must_use]
-    pub(crate) fn repair_message(&self, schema: &OutputSchemaKind) -> String {
-        let expectation = match schema {
-            OutputSchemaKind::Routing => format!(
-                "Return a single JSON object with at least one routing field: {}.",
-                ROUTING_STATUS_FIELDS.join(", ")
-            ),
-            OutputSchemaKind::JsonSchema { .. } => {
-                "Return a single JSON object that satisfies the configured JSON Schema.".to_string()
-            }
-        };
+    pub(crate) fn repair_message(
+        &self,
+        schema: &OutputSchemaKind,
+        previous_error: Option<&Self>,
+    ) -> String {
+        let expectation = schema.expectation();
         let errors = self
-            .messages
+            .messages()
             .iter()
             .map(|message| format!("- {message}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!(
-            "Your previous response did not satisfy the node's output_schema.\n\n\
-             Validation errors:\n{errors}\n\n\
-             {expectation}\n\
-             Do not include Markdown fences or explanatory prose; reply only with the corrected JSON object."
-        )
+        let mut sections =
+            vec!["Your previous response did not satisfy the node's output_schema.".to_string()];
+        if previous_error.is_some_and(|previous| self.shares_schema_issue_with(previous)) {
+            sections.push(
+                "At least one validation problem below is unchanged from your previous repair."
+                    .to_string(),
+            );
+        }
+        sections.push(format!("Validation errors:\n{errors}"));
+        sections.push(expectation);
+        if self.kind == StructuredOutputErrorKind::SchemaValidation {
+            sections.push(
+                "Apply each correction at the exact JSON Pointer shown and return the complete object."
+                    .to_string(),
+            );
+        }
+        sections.push(
+            "Do not include Markdown fences or explanatory prose; reply only with the corrected JSON object."
+                .to_string(),
+        );
+        sections.join("\n\n")
     }
+
+    fn shares_schema_issue_with(&self, other: &Self) -> bool {
+        let (
+            StructuredOutputErrorDetails::SchemaValidation(current),
+            StructuredOutputErrorDetails::SchemaValidation(previous),
+        ) = (&self.details, &other.details)
+        else {
+            return false;
+        };
+        current.iter().any(|issue| previous.contains(issue))
+    }
+}
+
+fn pointer_phrase(path: &Location) -> String {
+    if path.as_str().is_empty() {
+        "the document root".to_string()
+    } else {
+        format!("JSON Pointer `{path}`")
+    }
+}
+
+fn bounded_json(value: &Value) -> String {
+    let mut rendered = value.to_string();
+    if let Some((offset, _)) = rendered.char_indices().nth(MAX_SCHEMA_FRAGMENT_CHARS) {
+        rendered.truncate(offset);
+        rendered.push('…');
+    }
+    rendered
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,8 +413,8 @@ pub(crate) fn validate_response_text(
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
     match schema {
         OutputSchemaKind::Routing => validate_routing_response_text(text),
-        OutputSchemaKind::JsonSchema { validator, .. } => {
-            validate_custom_response_text(validator, text)
+        OutputSchemaKind::JsonSchema { schema, validator } => {
+            validate_custom_response_text(validator, schema, text)
         }
     }
 }
@@ -224,7 +435,12 @@ pub(crate) fn apply_validated_output(
     }
 }
 
-/// Find all balanced `{...}` JSON object substrings in the text.
+/// Find the outermost balanced `{...}` JSON object substrings in the text, in
+/// document order. Objects nested inside a match are skipped.
+///
+/// An unbalanced `{` does not suppress complete objects around or inside it:
+/// the scan only skips ahead past a *matched* object, so it still walks into a
+/// region that failed to close.
 fn find_json_objects(text: &str) -> Vec<&str> {
     let mut results = Vec::new();
     let bytes = text.as_bytes();
@@ -251,6 +467,7 @@ fn find_json_objects(text: &str) -> Vec<&str> {
                         depth -= 1;
                         if depth == 0 {
                             results.push(&text[start..=j]);
+                            i = j;
                             break;
                         }
                     }
@@ -269,7 +486,8 @@ pub(crate) fn terminal_json_object(text: &str) -> Option<&str> {
     let trimmed = text.trim_end();
     find_json_objects(trimmed)
         .into_iter()
-        .find(|candidate| trimmed.ends_with(candidate))
+        .next_back()
+        .filter(|candidate| trimmed.ends_with(candidate))
 }
 
 pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
@@ -317,7 +535,7 @@ fn validate_routing_response_text(
         if !contains_routing_field(obj) {
             continue;
         }
-        validate_value_against_validator(routing_validator(), &parsed)?;
+        validate_value_against_validator(routing_validator(), &parsed, None)?;
         return Ok(ValidatedStructuredOutput { value: parsed });
     }
 
@@ -332,38 +550,51 @@ fn validate_routing_response_text(
 
 fn validate_custom_response_text(
     validator: &Validator,
+    schema: &Value,
     text: &str,
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
+    // Prose after the object can contain braces, so the last candidate is not
+    // always JSON. Take the last one that parses; report its schema errors
+    // rather than falling back to an earlier object that happens to validate.
     let candidates = find_json_objects(text);
-    let Some(candidate) = candidates.last() else {
-        return Err(StructuredOutputError::new(
+    let mut invalid_json = None;
+    for candidate in candidates.iter().rev() {
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(parsed) => {
+                validate_value_against_validator(validator, &parsed, Some(schema))?;
+                return Ok(ValidatedStructuredOutput { value: parsed });
+            }
+            Err(err) if invalid_json.is_none() => invalid_json = Some(err.to_string()),
+            Err(_) => {}
+        }
+    }
+
+    Err(match invalid_json {
+        Some(message) => StructuredOutputError::new(
+            StructuredOutputErrorKind::InvalidJson,
+            format!("invalid JSON object: {message}"),
+        ),
+        None => StructuredOutputError::new(
             StructuredOutputErrorKind::NoJsonObject,
             "no JSON object found in response",
-        ));
-    };
-    let parsed = serde_json::from_str::<Value>(candidate).map_err(|err| {
-        StructuredOutputError::new(
-            StructuredOutputErrorKind::InvalidJson,
-            format!("invalid JSON object: {err}"),
-        )
-    })?;
-    validate_value_against_validator(validator, &parsed)?;
-    Ok(ValidatedStructuredOutput { value: parsed })
+        ),
+    })
 }
 
 fn validate_value_against_validator(
     validator: &Validator,
     value: &Value,
+    schema: Option<&Value>,
 ) -> Result<(), StructuredOutputError> {
-    let errors = validator
+    let issues = validator
         .iter_errors(value)
-        .map(|error| error.to_string())
         .take(5)
+        .map(|error| SchemaValidationIssue::from_error(&error, schema))
         .collect::<Vec<_>>();
-    if errors.is_empty() {
+    if issues.is_empty() {
         Ok(())
     } else {
-        Err(StructuredOutputError::validation(errors))
+        Err(StructuredOutputError::validation(issues))
     }
 }
 
@@ -464,6 +695,24 @@ mod tests {
         }
     }
 
+    /// A schema whose required field is itself an object, so validating the
+    /// innermost `{...}` in the response would fail.
+    fn issue_schema() -> OutputSchemaKind {
+        schema(serde_json::json!({
+            "type": "object",
+            "required": ["issue"],
+            "properties": {
+                "issue": {
+                    "type": "object",
+                    "required": ["number"],
+                    "properties": {
+                        "number": { "type": "integer" }
+                    }
+                }
+            }
+        }))
+    }
+
     #[test]
     fn validates_routing_json_and_applies_fields() {
         let validated = validate_response_text(
@@ -559,6 +808,71 @@ mod tests {
     }
 
     #[test]
+    fn validates_custom_schema_against_outermost_object() {
+        let validated =
+            validate_response_text(&issue_schema(), r#"{"issue":{"number":19}}"#).unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
+    }
+
+    #[test]
+    fn validates_last_outermost_object_when_response_has_trailing_prose() {
+        let validated = validate_response_text(
+            &issue_schema(),
+            r#"ignore {"issue":{"number":1}} final {"issue":{"number":19}} trailing"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
+    }
+
+    #[test]
+    fn validates_last_parsable_object_when_trailing_prose_contains_braces() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["passed"],
+            "properties": {
+                "passed": { "type": "boolean" }
+            }
+        }));
+
+        let validated = validate_response_text(
+            &schema,
+            "{\"passed\":true}\n\nLet me know if {this works} for you.",
+        )
+        .unwrap();
+
+        assert_eq!(validated.value, serde_json::json!({"passed": true}));
+    }
+
+    #[test]
+    fn find_json_objects_returns_outermost_objects_only() {
+        let cases = [
+            (r#"{"a":{"b":1}}"#, vec![r#"{"a":{"b":1}}"#]),
+            (r#"{"a":1} {"b":2}"#, vec![r#"{"a":1}"#, r#"{"b":2}"#]),
+            (r#"{"a":1}{"b":2}"#, vec![r#"{"a":1}"#, r#"{"b":2}"#]),
+            // An unclosed outer brace must not hide the complete object inside it.
+            (r#"{ {"a":1}"#, vec![r#"{"a":1}"#]),
+            (r#"{"a":1} {"#, vec![r#"{"a":1}"#]),
+            // An unterminated string swallows the rest of its own candidate.
+            (r#"{"a": "x} {"b":2}"#, vec![r#"{"b":2}"#]),
+            // Braces inside strings are not delimiters.
+            (r#"{"a":"} {"}"#, vec![r#"{"a":"} {"}"#]),
+            ("no json here", vec![]),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(find_json_objects(text), expected, "input: {text}");
+        }
+    }
+
+    #[test]
     fn custom_schema_validation_errors_are_reported() {
         let schema = schema(serde_json::json!({
             "type": "object",
@@ -578,6 +892,151 @@ mod tests {
                 .any(|message| message.contains("boolean")),
             "unexpected messages: {:?}",
             error.messages(),
+        );
+    }
+
+    #[test]
+    fn missing_nested_property_reports_the_required_target_pointer() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["findings"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["rationale"],
+                        "properties": {
+                            "rationale": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let error = validate_response_text(&schema, r#"{"findings":[{}]}"#).unwrap_err();
+
+        assert_eq!(error.messages(), vec![
+            "Missing required property \"rationale\" at JSON Pointer `/findings/0/rationale`. \
+             Add it to the object at JSON Pointer `/findings/0`. Schema rule: JSON Pointer \
+             `/properties/findings/items/required`."
+                .to_string(),
+        ],);
+    }
+
+    #[test]
+    fn type_and_enum_errors_report_instance_and_schema_pointers() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "line": { "type": "integer" },
+                "severity": { "enum": ["HIGH", "MEDIUM", "LOW"] }
+            }
+        }));
+
+        let error =
+            validate_response_text(&schema, r#"{"line":"85","severity":"CRITICAL"}"#).unwrap_err();
+
+        assert_eq!(error.messages(), vec![
+            "At JSON Pointer `/line`: \"85\" is not of type \"integer\". \
+             Schema rule: JSON Pointer `/properties/line/type`: \"integer\"."
+                .to_string(),
+            "At JSON Pointer `/severity`: \"CRITICAL\" is not one of \"HIGH\", \"MEDIUM\" or \
+             \"LOW\". Schema rule: JSON Pointer `/properties/severity/enum`: \
+             [\"HIGH\",\"MEDIUM\",\"LOW\"]."
+                .to_string(),
+        ],);
+    }
+
+    #[test]
+    fn additional_property_error_reports_each_property_pointer() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "findings": { "type": "array" }
+            }
+        }));
+
+        let error = validate_response_text(&schema, r#"{"findings":[],"rationale":"wrong level"}"#)
+            .unwrap_err();
+
+        assert_eq!(error.messages(), vec![
+            "Unexpected properties in the object at the document root: \"rationale\" at \
+             `/rationale`. Schema rule: JSON Pointer `/additionalProperties`."
+                .to_string(),
+        ],);
+    }
+
+    #[test]
+    fn repeated_schema_error_calls_out_the_unchanged_pointer() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["findings"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["rationale"]
+                    }
+                }
+            }
+        }));
+        let previous = validate_response_text(&schema, r#"{"findings":[{}]}"#).unwrap_err();
+        let current = validate_response_text(&schema, r#"{"findings":[{}]}"#).unwrap_err();
+
+        let repair = current.repair_message(&schema, Some(&previous));
+
+        assert!(
+            repair.contains(
+                "At least one validation problem below is unchanged from your previous repair."
+            ),
+            "unexpected repair message: {repair}",
+        );
+        assert!(
+            repair.contains("JSON Pointer `/findings/0/rationale`"),
+            "unexpected repair message: {repair}",
+        );
+    }
+
+    #[test]
+    fn the_same_unexpected_properties_in_a_new_order_are_still_unchanged() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "findings": { "type": "array" }
+            }
+        }));
+        let previous = validate_response_text(&schema, r#"{"beta":1,"alpha":1}"#).unwrap_err();
+        let current = validate_response_text(&schema, r#"{"alpha":1,"beta":1}"#).unwrap_err();
+
+        let repair = current.repair_message(&schema, Some(&previous));
+
+        assert!(
+            repair.contains("unchanged from your previous repair"),
+            "unexpected repair message: {repair}",
+        );
+    }
+
+    #[test]
+    fn a_different_problem_at_the_same_location_is_not_called_unchanged() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "findings": { "type": "array" }
+            }
+        }));
+        let previous = validate_response_text(&schema, r#"{"stray":1}"#).unwrap_err();
+        let current = validate_response_text(&schema, r#"{"different":1}"#).unwrap_err();
+
+        let repair = current.repair_message(&schema, Some(&previous));
+
+        assert!(
+            !repair.contains("unchanged from your previous repair"),
+            "unexpected repair message: {repair}",
         );
     }
 
@@ -626,6 +1085,32 @@ mod tests {
         let parsed = parse_node_output_schema(&node).unwrap();
 
         assert!(matches!(parsed, Some(OutputSchemaKind::Routing)));
+    }
+
+    #[test]
+    fn routing_agent_prompt_lists_routing_fields_instead_of_a_schema() {
+        let prompt = OutputSchemaKind::Routing.agent_prompt("Pick the next step");
+
+        assert!(prompt.starts_with("Pick the next step\n\n"));
+        assert!(prompt.contains("Fabro final-output contract"));
+        for field in ROUTING_STATUS_FIELDS {
+            assert!(prompt.contains(field), "{field} missing from: {prompt}");
+        }
+        assert!(
+            !prompt.contains("<output_schema>"),
+            "routing has no JSON Schema to embed, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn json_schema_agent_prompt_embeds_the_resolved_schema() {
+        let prompt = schema(serde_json::json!({"type": "object", "required": ["passed"]}))
+            .agent_prompt("Audit the result");
+
+        assert!(prompt.starts_with("Audit the result\n\n"));
+        assert!(prompt.contains("<output_schema>"));
+        assert!(prompt.contains(r#""required":["passed"]"#));
+        assert!(prompt.contains("</output_schema>"));
     }
 
     #[test]

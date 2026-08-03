@@ -2684,6 +2684,16 @@ client_id = "client-id"
         );
     }
 
+    #[test]
+    fn manifest_excludes_workflows_permission() {
+        let manifest = build_github_app_manifest("Fabro-test", 12345, "https://app.example.com");
+
+        assert!(
+            manifest["default_permissions"].get("workflows").is_none(),
+            "GitHub App must not be able to write workflow files"
+        );
+    }
+
     #[tokio::test]
     async fn persist_install_outputs_persists_vault_secrets_via_server_when_autostarting() {
         let dir = tempfile::tempdir().unwrap();
@@ -3505,12 +3515,13 @@ root = "{}"
         assert!(ids.contains(&ProviderId::anthropic()));
         assert!(ids.contains(&ProviderId::openai()));
         assert!(ids.contains(&ProviderId::gemini()));
-        assert!(ids.contains(&ProviderId::new("kimi")));
+        assert!(ids.contains(&ProviderId::new("moonshot")));
         assert!(ids.contains(&ProviderId::new("zai")));
         assert!(ids.contains(&ProviderId::new("minimax")));
         assert!(ids.contains(&ProviderId::new("inception")));
         assert!(ids.contains(&ProviderId::new("venice")));
         assert!(ids.contains(&ProviderId::new("poolside")));
+        assert!(ids.contains(&ProviderId::new("deepseek")));
         assert!(!ids.contains(&ProviderId::new("fireworks")));
         assert!(!ids.contains(&ProviderId::new("ollama")));
         assert!(!ids.contains(&ProviderId::new("litellm")));

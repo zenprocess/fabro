@@ -61,6 +61,45 @@ fn run_model_controls_default_to_none() {
 }
 
 #[test]
+fn run_artifact_globs_are_validated_during_resolve() {
+    let error = workflow_settings_from_toml(
+        r#"
+_version = 1
+
+[run.artifacts]
+include = ["/tmp/*.md", "../reports/*.md", "src/[abc"]
+"#,
+    )
+    .expect_err("invalid artifact workspace globs should not resolve");
+
+    let errors = match error {
+        crate::Error::Resolve { errors, .. } => errors,
+        other => panic!("expected structured resolve errors, got {other:#}"),
+    };
+    let invalid = errors
+        .into_iter()
+        .map(|error| match error {
+            crate::ResolveError::Invalid { path, reason } => (path, reason),
+            other => panic!("expected invalid-value error, got {other}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invalid
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "run.artifacts.include[0]",
+            "run.artifacts.include[1]",
+            "run.artifacts.include[2]",
+        ]
+    );
+    assert!(invalid[0].1.contains("must be relative"));
+    assert!(invalid[1].1.contains("parent directory"));
+    assert!(invalid[2].1.contains("invalid workspace glob"));
+}
+
+#[test]
 fn resolves_run_defaults_from_empty_settings() {
     let settings = super::workflow_settings_from_layer(SettingsLayer::default())
         .expect("empty settings should resolve")
@@ -840,7 +879,7 @@ issues = "{{ env.GH_PERM_LEVEL }}"
     }
 }
 
-mod run_agent_fabro_tools {
+mod run_agent {
     use crate::SettingsLayer;
     use crate::layers::Combine;
 
@@ -857,6 +896,23 @@ mod run_agent_fabro_tools {
             .run;
 
         assert!(!settings.agent.fabro_tools);
+    }
+
+    #[test]
+    fn rejects_removed_permissions_setting() {
+        let err = r#"
+_version = 1
+
+[run.agent]
+permissions = "read-only"
+"#
+        .parse::<SettingsLayer>()
+        .expect_err("removed run.agent.permissions must be unknown");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field `permissions`"),
+            "expected unknown-field error for run.agent.permissions, got: {message}"
+        );
     }
 
     #[test]
@@ -1106,6 +1162,101 @@ mod run_agent_mcps {
             },
             ..McpServerSettings::default()
         })])
+    }
+
+    fn sandbox_command(entry: &ResolvedMcpEntry) -> &[String] {
+        let server = entry.as_resolved().expect("expected resolved inline entry");
+        match &server.transport {
+            McpTransport::Sandbox { command, .. } => command,
+            other => panic!("expected sandbox transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_interpreter_differs_between_stdio_and_sandbox_transports() {
+        // A stdio script runs on the host, outside the sandbox API, and keeps
+        // its documented `sh -c` contract. A sandbox script is evaluated by the
+        // sandbox's Bash, and uses the PATH-resolved `bash` token so local
+        // sandboxes keep working on NixOS.
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.host]
+type = "stdio"
+script = "exec my-server --stdio"
+
+[run.agent.mcps.inside]
+type = "sandbox"
+script = "exec my-server --port 3100"
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(stdio_command(&mcps["host"]), &[
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec my-server --stdio".to_string(),
+        ]);
+        assert_eq!(sandbox_command(&mcps["inside"]), &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "exec my-server --port 3100".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn argv_commands_are_unchanged_by_the_script_interpreter() {
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.inside]
+type = "sandbox"
+command = ["npx", "@playwright/mcp@latest", "--port", "3100"]
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(sandbox_command(&mcps["inside"]), &[
+            "npx".to_string(),
+            "@playwright/mcp@latest".to_string(),
+            "--port".to_string(),
+            "3100".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn sandbox_script_keeps_interpolation_tokens_in_source_form() {
+        // Interpolation still resolves at the run boundary, not at config
+        // resolution — switching the interpreter must not change that timing.
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.inside]
+type = "sandbox"
+script = "exec my-server --token {{ env.MY_TOKEN }}"
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(
+            sandbox_command(&mcps["inside"])[2],
+            "exec my-server --token {{ env.MY_TOKEN }}"
+        );
     }
 
     #[test]

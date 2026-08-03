@@ -14,11 +14,14 @@
 
 
 
+/**
+ * Kind of output a provider produced first for an inference attempt. Observed, never inferred.
+ */
 
-export const AgentPermissions = {
-    READ_ONLY: 'read-only',
-    READ_WRITE: 'read-write',
-    FULL: 'full'
+export const LlmOutputKind = {
+    REASONING: 'reasoning',
+    TEXT: 'text',
+    TOOL_CALL: 'tool_call'
 } as const;
 
-export type AgentPermissions = typeof AgentPermissions[keyof typeof AgentPermissions];
+export type LlmOutputKind = typeof LlmOutputKind[keyof typeof LlmOutputKind];

@@ -420,6 +420,7 @@ fn model_features_to_catalog(features: &LlmModelFeatures) -> model_catalog::Sett
         tools:                     features.tools,
         vision:                    features.vision,
         reasoning:                 features.reasoning,
+        reasoning_by_default:      features.reasoning_by_default,
         reasoning_effort:          features.reasoning_effort,
         prompt_cache:              features.prompt_cache,
         cache_control_breakpoints: features.cache_control_breakpoints,
@@ -745,7 +746,7 @@ command = ["demo-mcp"]
                 model: Some(RunModelLayer {
                     provider:  Some("openai".to_string()),
                     name:      Some("gpt-5".to_string()),
-                    fallbacks: Vec::new(),
+                    fallbacks: crate::MergeMap::default(),
                     controls:  None,
                 }),
                 execution: Some(RunExecutionLayer {

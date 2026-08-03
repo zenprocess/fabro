@@ -163,14 +163,45 @@ impl RunEventLogger {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
+            // A dropped run event is unrecoverable history loss, so the first
+            // one is an ERROR worth investigating. A broken sink fails for
+            // every event that follows, so report the rest as a count at flush
+            // instead of one ERROR per event. Flush runs per stage and per
+            // agent turn, so only losses since the last summary are reported.
+            let mut write_failures: u64 = 0;
+            let mut summarized_failures: u64 = 0;
             while let Some(command) = rx.recv().await {
                 match command {
                     RunEventCommand::Event(event) => {
                         if let Err(err) = sink.write_run_event(&event).await {
-                            tracing::warn!(error = %err, "Failed to write run event");
+                            write_failures += 1;
+                            if write_failures == 1 {
+                                tracing::error!(
+                                    run_id = %event.run_id,
+                                    event = %event.body.event_name(),
+                                    error = %err,
+                                    "Failed to write run event",
+                                );
+                            } else {
+                                tracing::debug!(
+                                    run_id = %event.run_id,
+                                    event = %event.body.event_name(),
+                                    failures = write_failures,
+                                    error = %err,
+                                    "Failed to write run event",
+                                );
+                            }
                         }
                     }
                     RunEventCommand::Flush(tx) => {
+                        if write_failures > summarized_failures {
+                            tracing::error!(
+                                lost = write_failures - summarized_failures,
+                                total = write_failures,
+                                "Run events were lost to write failures",
+                            );
+                            summarized_failures = write_failures;
+                        }
                         let _ = tx.send(());
                     }
                 }
@@ -308,6 +339,55 @@ mod tests {
         let payload = event_payload_from_redacted_json(line.trim_end(), &fixtures::RUN_7).unwrap();
         assert_eq!(payload.as_value()["event"], "run.pause.requested");
         assert_eq!(payload.as_value()["properties"]["action"], "pause");
+    }
+
+    #[tokio::test]
+    async fn run_event_sink_json_lines_carries_agent_message_reasoning() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (writer, reader) = tokio::io::duplex(4096);
+        let sink = RunEventSink::json_lines(writer);
+        let event = to_run_event(&fixtures::RUN_7, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             fabro_agent::AgentEvent::AssistantMessage {
+                text:            String::new(),
+                model:           fabro_model::ModelRef {
+                    provider: fabro_model::ProviderId::openai(),
+                    model_id: "gpt-5.4".into(),
+                    speed:    None,
+                },
+                usage:           fabro_llm::types::TokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
+                tool_call_count: 1,
+                context_window:  None,
+                reasoning:       Some(::fabro_types::ReasoningOutput::new(
+                    "inspect the sink first",
+                    "write the line, then read it back",
+                )),
+            },
+            session_id:        Some("ses_agent".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        sink.write_run_event(&event).await.unwrap();
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        let payload = event_payload_from_redacted_json(line.trim_end(), &fixtures::RUN_7).unwrap();
+        assert_eq!(payload.as_value()["event"], "agent.message");
+        assert_eq!(
+            payload.as_value()["properties"]["reasoning"]["summary"],
+            "inspect the sink first"
+        );
+        assert_eq!(
+            payload.as_value()["properties"]["reasoning"]["trace"],
+            "write the line, then read it back"
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_auth::auth_issue_message;
-use fabro_config::parse::{self, SettingsSource};
+use fabro_config::parse::SettingsSource;
 use fabro_config::{
-    CliLayer, CliOutputLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer,
-    MergeMap, RunLayer, SettingsLayer, WorkflowSettingsBuilder, parse_input_overrides,
-    parse_labels, project,
+    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, RunLayer, SettingsLayer,
+    WorkflowSettingsBuilder, parse_input_overrides, parse_labels, project,
 };
 use fabro_graphviz::graph::{Graph, is_llm_handler_type};
 use fabro_graphviz::render::apply_direction;
@@ -27,17 +26,19 @@ use fabro_sandbox::from_environment::{
 use fabro_sandbox::redact::redact_auth_url;
 use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
 use fabro_static::EnvVars;
+use fabro_types::settings::ModelRef;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{EnvironmentProvider, McpServerSettings, RunGoal, RunNamespace};
 use fabro_types::{
-    ManifestPath, RunId, RunProvenance, SandboxProviderKind, ServerSettings, WorkflowSettings,
+    ManifestPath, RunId, RunNoticeLevel, SandboxProviderKind, ServerSettings, WorkflowSettings,
 };
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
+use fabro_workflow::model_fallback::resolve_model_fallbacks;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
+    ValidateInput, WorkflowInput, validate, validate_with_catalog, validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
@@ -46,7 +47,7 @@ use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
 use tokio::time;
 
-use crate::interp::process_env_var;
+use crate::run_compiler;
 use crate::server::AppState;
 use crate::server_secrets::LlmClientResult;
 
@@ -55,21 +56,17 @@ pub(crate) struct PreparedManifest {
     pub cwd:              PathBuf,
     pub git:              Option<types::GitContext>,
     pub root_source:      String,
-    pub run_id:           Option<RunId>,
-    pub parent_id:        Option<RunId>,
-    pub title:            Option<String>,
     pub settings:         WorkflowSettings,
     pub target_path:      ManifestPath,
-    pub workflow_bundle:  WorkflowBundle,
     pub workflow_input:   BundledWorkflow,
     pub source_directory: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ManifestSettingsOverrides {
-    run:             Option<RunLayer>,
-    cli:             Option<CliLayer>,
-    input_overrides: HashMap<String, toml::Value>,
+pub(crate) struct ManifestSettingsOverrides {
+    pub(crate) run:             Option<RunLayer>,
+    pub(crate) cli:             Option<CliLayer>,
+    pub(crate) input_overrides: HashMap<String, toml::Value>,
 }
 
 #[cfg(test)]
@@ -156,34 +153,33 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
     {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal.text)));
     }
-    let title = manifest
+    manifest
         .title
         .as_ref()
         .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
         .transpose()?;
+    manifest
+        .run_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid run ID")?;
+    manifest
+        .parent_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid parent run ID")?;
 
+    let source_directory = project::resolve_working_directory_from_run(&settings.run, &cwd);
     Ok(PreparedManifest {
-        cwd: cwd.clone(),
+        cwd,
         git: manifest.git.clone(),
         root_source,
-        run_id: manifest
-            .run_id
-            .as_deref()
-            .map(str::parse::<RunId>)
-            .transpose()
-            .context("invalid run ID")?,
-        parent_id: manifest
-            .parent_id
-            .as_deref()
-            .map(str::parse::<RunId>)
-            .transpose()
-            .context("invalid parent run ID")?,
-        title,
-        settings: settings.clone(),
+        settings,
         target_path,
-        workflow_bundle,
         workflow_input,
-        source_directory: project::resolve_working_directory_from_run(&settings.run, &cwd),
+        source_directory,
     })
 }
 
@@ -194,12 +190,18 @@ pub(crate) fn validate_prepared_manifest(
     validate_prepared_manifest_with_vars(prepared, catalog, HashMap::new())
 }
 
+pub(crate) fn validate_prepared_manifest_structural(
+    prepared: &PreparedManifest,
+) -> Result<Validated, WorkflowError> {
+    validate(manifest_validate_input(prepared, HashMap::new()))
+}
+
 pub(crate) fn validate_prepared_manifest_with_vars(
     prepared: &PreparedManifest,
     catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(manifest_validate_input(prepared, catalog, vars))
+    validate_with_catalog(manifest_validate_input(prepared, vars), catalog)
 }
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
@@ -209,14 +211,14 @@ pub(crate) fn validate_prepared_manifest_for_preflight(
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
     validate_with_ready_providers(
-        manifest_validate_input(prepared, catalog, vars),
+        manifest_validate_input(prepared, vars),
+        catalog,
         ready_providers,
     )
 }
 
 fn manifest_validate_input(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> ValidateInput {
     ValidateInput {
@@ -225,35 +227,6 @@ fn manifest_validate_input(
         vars,
         cwd: prepared.cwd.clone(),
         custom_transforms: Vec::new(),
-        catalog,
-    }
-}
-
-pub(crate) fn create_run_input(
-    prepared: PreparedManifest,
-    configured_providers: Vec<ProviderId>,
-    provenance: RunProvenance,
-    web_url: Option<String>,
-    vars: HashMap<String, String>,
-) -> CreateRunInput {
-    CreateRunInput {
-        workflow: WorkflowInput::Bundled(prepared.workflow_input),
-        settings: prepared.settings,
-        vars,
-        cwd: prepared.cwd,
-        workflow_slug: None,
-        workflow_path: Some(prepared.target_path),
-        workflow_bundle: Some(prepared.workflow_bundle),
-        submitted_manifest_bytes: None,
-        run_id: prepared.run_id,
-        title: prepared.title,
-        automation: None,
-        git: prepared.git,
-        fork_source_ref: None,
-        parent_id: prepared.parent_id,
-        provenance,
-        configured_providers,
-        web_url,
     }
 }
 
@@ -369,19 +342,16 @@ fn settings_layer_with_resolved_dockerfiles(
     files: &HashMap<ManifestPath, String>,
     settings_source: SettingsSource,
 ) -> Result<SettingsLayer> {
-    // Parse via `SettingsLayer` so unknown nested keys (like a stale
-    // `[server.integrations.github.permissions]` after the move to
-    // `[run.integrations.github.permissions]`) trip `deny_unknown_fields`.
-    let mut layer = source
-        .parse::<SettingsLayer>()
-        .context("Failed to parse run config TOML")?;
-    parse::validate_settings_source(&layer, settings_source)
-        .context("Failed to parse run config TOML")?;
-    resolve_manifest_dockerfiles(&mut layer, config_path, files)?;
-    Ok(layer)
+    run_compiler::settings_layer_with_resolved_dockerfiles(
+        source,
+        config_path,
+        files,
+        settings_source,
+    )
+    .map_err(anyhow::Error::new)
 }
 
-fn manifest_args_overrides(
+pub(crate) fn manifest_args_overrides(
     args: Option<&types::ManifestArgs>,
 ) -> Result<ManifestSettingsOverrides> {
     let Some(args) = args else {
@@ -393,7 +363,6 @@ fn manifest_args_overrides(
         model:            args.model.as_deref(),
         provider:         args.provider.as_deref(),
         environment:      args.environment.as_deref(),
-        docker_image:     args.docker_image.as_deref(),
         preserve_sandbox: args.preserve_sandbox,
         dry_run:          args.dry_run,
         auto_approve:     args.auto_approve,
@@ -416,50 +385,6 @@ fn manifest_args_overrides(
         cli,
         input_overrides: parse_input_overrides(&args.input)?,
     })
-}
-
-fn resolve_manifest_dockerfiles(
-    layer: &mut SettingsLayer,
-    config_path: &ManifestPath,
-    files: &HashMap<ManifestPath, String>,
-) -> Result<()> {
-    for environment in layer.environments.values_mut() {
-        if let Some(image) = environment.image.as_mut() {
-            resolve_manifest_dockerfile(image, config_path, files)?;
-        }
-    }
-    if let Some(image) = layer
-        .run
-        .as_mut()
-        .and_then(|run| run.environment.as_mut())
-        .and_then(|environment| environment.image.as_mut())
-    {
-        resolve_manifest_dockerfile(image, config_path, files)?;
-    }
-    Ok(())
-}
-
-fn resolve_manifest_dockerfile(
-    image: &mut EnvironmentImageLayer,
-    config_path: &ManifestPath,
-    files: &HashMap<ManifestPath, String>,
-) -> Result<()> {
-    let source = image.dockerfile.as_mut();
-    let Some(source) = source else {
-        return Ok(());
-    };
-    let EnvironmentDockerfileLayer::Path { path } = &*source else {
-        return Ok(());
-    };
-    let path_owned = path.clone();
-    let manifest_path = ManifestPath::from_reference(config_path.parent_or_dot(), &path_owned)
-        .ok_or_else(|| anyhow!("unsupported dockerfile reference: {path_owned}"))?;
-    let content = files
-        .get(&manifest_path)
-        .cloned()
-        .ok_or_else(|| anyhow!("missing bundled dockerfile: {manifest_path}"))?;
-    *source = EnvironmentDockerfileLayer::Inline(content);
-    Ok(())
 }
 
 fn manifest_project_config_path(
@@ -541,6 +466,12 @@ async fn build_preflight_report(
         ));
     }
     run_environment_capability_check(&mut checks, &resolved_run);
+    let model_fallbacks_ok = run_model_fallback_check(
+        &mut checks,
+        catalog.as_ref(),
+        &ready_providers,
+        &resolved_run.model.fallbacks,
+    );
     let needs_github_credentials =
         sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
@@ -586,9 +517,11 @@ async fn build_preflight_report(
         llm_result,
     )
     .await;
-    run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
+    let github_token_ok =
+        run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
 
-    let checks_ok = sandbox_ok && repository_access_ok && llm_ok;
+    let checks_ok =
+        model_fallbacks_ok && sandbox_ok && repository_access_ok && llm_ok && github_token_ok;
 
     Ok((
         CheckReport {
@@ -600,6 +533,72 @@ async fn build_preflight_report(
         },
         checks_ok,
     ))
+}
+
+fn run_model_fallback_check(
+    checks: &mut Vec<CheckResult>,
+    catalog: &Catalog,
+    ready_providers: &[ProviderId],
+    configured: &BTreeMap<String, Vec<ModelRef>>,
+) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+
+    let resolved = match resolve_model_fallbacks(catalog, ready_providers, configured) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            checks.push(CheckResult {
+                name:        "Model Fallbacks".into(),
+                status:      CheckStatus::Error,
+                summary:     "invalid".into(),
+                details:     configured
+                    .keys()
+                    .map(|model| CheckDetail::new(format!("Requested model: {model}")))
+                    .collect(),
+                remediation: Some(error.to_string()),
+            });
+            return false;
+        }
+    };
+
+    let has_warning = resolved
+        .notices
+        .iter()
+        .any(|notice| notice.level() != RunNoticeLevel::Info);
+    let mut details = resolved
+        .policy
+        .iter()
+        .map(|(model, targets)| {
+            let chain = if targets.is_empty() {
+                "(none)".to_string()
+            } else {
+                targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            };
+            CheckDetail::new(format!("{model}: {chain}"))
+        })
+        .collect::<Vec<_>>();
+    details.extend(resolved.notices.iter().map(|notice| CheckDetail {
+        text: notice.message(),
+        warn: notice.level() != RunNoticeLevel::Info,
+    }));
+
+    checks.push(CheckResult {
+        name: "Model Fallbacks".into(),
+        status: if has_warning {
+            CheckStatus::Warning
+        } else {
+            CheckStatus::Pass
+        },
+        summary: format!("{} requested model chain(s)", resolved.policy.len()),
+        details,
+        remediation: None,
+    });
+    true
 }
 
 fn base_preflight_checks(prepared: &PreparedManifest, graph: &Graph) -> Vec<CheckResult> {
@@ -1235,48 +1234,63 @@ async fn run_github_token_check(
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
-) {
+) -> bool {
     if !resolved_run.integrations.github.is_token_requested() {
-        return;
+        return true;
     }
 
     // Resolve InterpString permission values eagerly for token minting and
     // for display in the preflight report.
-    let github_permissions = resolved_run
-        .integrations
-        .github
-        .resolve_permissions(process_env_var);
+    let github_permissions = match resolved_run.integrations.github.resolve_permissions() {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            checks.push(CheckResult {
+                name:        "GitHub Token".into(),
+                status:      CheckStatus::Error,
+                summary:     "invalid permissions".into(),
+                details:     vec![],
+                remediation: Some(format!("Failed to resolve GitHub permissions: {err}")),
+            });
+            return false;
+        }
+    };
 
     let perm_details = github_permissions
         .iter()
         .map(|(key, value)| CheckDetail::new(format!("{key}: {value}")))
         .collect::<Vec<_>>();
-    match (&github_app, prepared.git.as_ref()) {
-        (Some(creds), Some(git)) => {
-            match mint_github_token(creds, &git.origin_url, &github_permissions).await {
-                Ok(_) => checks.push(CheckResult {
+    if let (Some(creds), Some(git)) = (&github_app, prepared.git.as_ref()) {
+        match mint_github_token(creds, &git.origin_url, &github_permissions).await {
+            Ok(_) => {
+                checks.push(CheckResult {
                     name:        "GitHub Token".into(),
                     status:      CheckStatus::Pass,
                     summary:     "minted".into(),
                     details:     perm_details,
                     remediation: None,
-                }),
-                Err(err) => checks.push(CheckResult {
+                });
+                true
+            }
+            Err(err) => {
+                checks.push(CheckResult {
                     name:        "GitHub Token".into(),
                     status:      CheckStatus::Error,
                     summary:     "failed".into(),
                     details:     perm_details,
                     remediation: Some(format!("Failed to mint GitHub token: {err}")),
-                }),
+                });
+                false
             }
         }
-        _ => checks.push(CheckResult {
+    } else {
+        checks.push(CheckResult {
             name:        "GitHub Token".into(),
             status:      CheckStatus::Warning,
             summary:     "skipped".into(),
             details:     perm_details,
             remediation: Some("No GitHub credentials or origin URL available".to_string()),
-        }),
+        });
+        true
     }
 }
 
@@ -1505,6 +1519,105 @@ mod tests {
         Arc::new(Catalog::from_builtin().unwrap())
     }
 
+    fn openrouter_catalog() -> Catalog {
+        let overrides = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .expect("catalog override should parse");
+        Catalog::from_builtin_with_overrides(&overrides).expect("catalog should build")
+    }
+
+    fn model_refs(values: &[&str]) -> Vec<fabro_types::settings::ModelRef> {
+        values
+            .iter()
+            .map(|value| value.parse().expect("fallback reference should parse"))
+            .collect()
+    }
+
+    #[test]
+    fn model_fallback_preflight_resolves_each_requested_model_chain() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([
+            ("gpt-sol".to_string(), model_refs(&["claude-opus"])),
+            (
+                "claude-fable".to_string(),
+                model_refs(&["gpt-sol", "claude-opus"]),
+            ),
+        ]);
+
+        assert!(run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.text == "gpt-5.6-sol: openrouter:claude-opus-5")
+        );
+        assert!(check.details.iter().any(|detail| {
+            detail.text == "claude-fable-5: openrouter:gpt-5.6-sol -> openrouter:claude-opus-5"
+        }));
+    }
+
+    #[test]
+    fn model_fallback_preflight_warns_when_a_provider_is_not_ready() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([(
+            "kimi-k3".to_string(),
+            model_refs(&["moonshot:kimi-k3", "openrouter:kimi-k3"]),
+        )]);
+
+        assert!(run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(check.details.iter().any(|detail| {
+            detail.warn
+                && detail
+                    .text
+                    .contains("provider `moonshot` is not configured")
+        }));
+    }
+
+    #[test]
+    fn model_fallback_preflight_rejects_duplicate_canonical_keys() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([
+            ("gpt-sol".to_string(), model_refs(&["claude-opus"])),
+            ("gpt-5.6-sol".to_string(), model_refs(&["claude-fable"])),
+        ]);
+
+        assert!(!run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("both resolve to requested model"))
+        );
+    }
+
     fn openai_compatible_completion(model: &str) -> serde_json::Value {
         serde_json::json!({
             "id": "chatcmpl_preflight",
@@ -1520,15 +1633,15 @@ mod tests {
         })
     }
 
-    fn ready_kimi_and_openrouter_state(
+    fn ready_moonshot_and_openrouter_state(
         server: &httpmock::MockServer,
     ) -> Arc<crate::server::AppState> {
-        let kimi_url = server.url("/kimi/v1");
+        let moonshot_url = server.url("/moonshot/v1");
         let openrouter_url = server.url("/openrouter/v1");
         let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
             r#"
-[providers.kimi]
-base_url = "{kimi_url}"
+[providers.moonshot]
+base_url = "{moonshot_url}"
 
 [providers.openrouter]
 base_url = "{openrouter_url}"
@@ -1540,7 +1653,7 @@ enabled = true
         crate::test_support::TestAppStateBuilder::new()
             .llm_catalog_settings(llm_catalog_settings)
             .vault_entries([
-                (EnvVars::KIMI_API_KEY, "test-kimi-key"),
+                (EnvVars::KIMI_API_KEY, "test-moonshot-key"),
                 (EnvVars::OPENROUTER_API_KEY, "test-openrouter-key"),
             ])
             .build()
@@ -1557,7 +1670,7 @@ enabled = true
             .unwrap_or_default();
         ready_providers.sort();
         assert_eq!(ready_providers, vec![
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             ProviderId::new("openrouter")
         ]);
 
@@ -1984,7 +2097,6 @@ root = "/srv/fabro"
             preserve_sandbox: None,
             provider:         None,
             environment:      None,
-            docker_image:     None,
             input:            Vec::new(),
             verbose:          None,
         });
@@ -2017,7 +2129,6 @@ override = "server"
             preserve_sandbox: None,
             provider:         None,
             environment:      None,
-            docker_image:     None,
             input:            vec!["override=cli".to_string()],
             verbose:          None,
         });
@@ -2292,6 +2403,55 @@ issues = "read"
     }
 
     #[tokio::test]
+    async fn preflight_rejects_unresolved_github_permissions() {
+        let state = crate::test_support::test_app_state();
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().config =
+            Some(types::ManifestWorkflowConfig {
+                path:   "workflow.toml".to_string(),
+                source: r#"_version = 1
+
+[run.environment]
+id = "local"
+
+[run.integrations.github.permissions]
+issues = "{{ env.GITHUB_ISSUES_PERMISSION }}"
+"#
+                .to_string(),
+            });
+
+        let prepared = prepare_manifest(
+            &manifest_run_defaults(Some(&default_settings_fixture())),
+            &manifest,
+        )
+        .unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        assert!(!validated.has_errors());
+
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
+        let github_token_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "GitHub Token")
+            .expect("GitHub Token check should report invalid permissions");
+
+        assert!(!ok);
+        assert_eq!(
+            github_token_check.status,
+            types::PreflightCheckResultStatus::Error
+        );
+        assert_eq!(github_token_check.summary, "invalid permissions");
+        assert!(
+            github_token_check
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("GITHUB_ISSUES_PERMISSION"))
+        );
+    }
+
+    #[tokio::test]
     async fn preflight_allows_pull_request_enabled_without_github_credentials() {
         let state = crate::test_support::test_app_state();
         let source_dir = tempfile::tempdir().unwrap();
@@ -2533,7 +2693,7 @@ digraph Demo {
                     .json_body(openai_compatible_completion("anthropic/claude-fable-5"));
             })
             .await;
-        let state = ready_kimi_and_openrouter_state(&server);
+        let state = ready_moonshot_and_openrouter_state(&server);
 
         let (response, _ok) = preflight_for_model(&state, "claude-fable").await;
 
@@ -2557,18 +2717,18 @@ digraph Demo {
     #[tokio::test]
     async fn preflight_uses_ready_providers_for_unknown_unqualified_model() {
         let server = httpmock::MockServer::start_async().await;
-        let kimi_probe = server
+        let moonshot_probe = server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
-                    .path("/kimi/v1/chat/completions")
-                    .header("authorization", "Bearer test-kimi-key")
+                    .path("/moonshot/v1/chat/completions")
+                    .header("authorization", "Bearer test-moonshot-key")
                     .json_body_includes(r#"{"model":"provider-private-preview"}"#);
                 then.status(200)
                     .header("content-type", "application/json")
                     .json_body(openai_compatible_completion("provider-private-preview"));
             })
             .await;
-        let state = ready_kimi_and_openrouter_state(&server);
+        let state = ready_moonshot_and_openrouter_state(&server);
 
         let (response, _ok) = preflight_for_model(&state, "provider-private-preview").await;
 
@@ -2587,10 +2747,10 @@ digraph Demo {
                 .iter()
                 .map(|detail| detail.text.as_str())
                 .find(|detail| detail.starts_with("Provider: ")),
-            Some("Provider: kimi")
+            Some("Provider: moonshot")
         );
         assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
-        kimi_probe.assert_async().await;
+        moonshot_probe.assert_async().await;
     }
 
     #[test]

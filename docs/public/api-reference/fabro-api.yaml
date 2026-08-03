@@ -3347,6 +3347,53 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/runs/{id}/artifacts/download:
+    get:
+      operationId: downloadRunArtifacts
+      tags: [Run Internals]
+      summary: Download Run Artifacts
+      description: |
+        Streams a ZIP archive with the latest captured version of each artifact path.
+        Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page.
+        Captures from the graph's boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.
+
+        The archive streams, so the response status is sent before the first artifact is read.
+        A failure after that point aborts the transfer rather than returning `500`.
+        The ZIP central directory is written last, so a truncated download does not open as a valid archive.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: ZIP archive containing the latest artifact files
+          headers:
+            Content-Disposition:
+              description: Attachment filename for the ZIP archive
+              schema:
+                type: string
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Artifact archive could not be prepared
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/v1/runs/{id}/files:
     get:
       operationId: listRunFiles
@@ -8006,8 +8053,13 @@ components:
         model:
           type: string
           description: |
-            Catalog model ID or alias. The server selects among ready
-            providers and stores the canonical model ID.
+            Catalog model ID or alias, optionally qualified as
+            `provider:selector`. A provider-qualified selector may be a
+            canonical model ID, alias, or provider API ID. A value counts as
+            qualified only when the text before the first `:` names a known
+            provider, so model IDs containing a colon stay whole. Legacy
+            `provider/model` references remain accepted. The server stores the
+            canonical model ID.
         provider:
           $ref: "#/components/schemas/ProviderId"
           description: Optional provider pin. Provider-qualified model references remain accepted for compatibility.
@@ -8959,6 +9011,7 @@ components:
       type: string
       enum:
         - workflow_error
+        - publish_failed
         - cancelled
         - approval_denied
         - terminated
@@ -9243,9 +9296,6 @@ components:
         environment:
           type: string
           description: Named environment slug to select for the run.
-        docker_image:
-          type: string
-          description: Per-run environment image override.
         verbose:
           type: boolean
         dry_run:
@@ -9662,6 +9712,11 @@ components:
           type: ["string", "null"]
           description: Optional contextual text shown alongside the question.
           example: Latest draft
+        review_target:
+          description: Optional validated external resource that is the primary subject of this review question.
+          oneOf:
+            - $ref: "#/components/schemas/ReviewTarget"
+            - type: "null"
 
     QuestionType:
       description: The interaction type of a human-in-the-loop question.
@@ -10016,10 +10071,9 @@ components:
             Durable identity of one execution of a parallel node, formatted as
             "{node_id}@{visit}".
         parallel_branch_id:
-          type: ["string", "null"]
-          description: >
-            Durable identity of one branch within a parallel execution,
-            formatted as "{parallel_group_id}:{index}".
+          oneOf:
+            - $ref: "#/components/schemas/ParallelBranchId"
+            - type: "null"
         session_id:
           type: ["string", "null"]
         parent_session_id:
@@ -10110,6 +10164,46 @@ components:
             - $ref: "#/components/schemas/StageContextWindowProjection"
             - type: "null"
           description: Latest content-free context-window projection for this agent stage.
+        reasoning:
+          oneOf:
+            - $ref: "#/components/schemas/ReasoningOutput"
+            - type: "null"
+          description: Readable reasoning the provider returned with this response, if any.
+
+    ReasoningOutput:
+      description: >-
+        Readable model reasoning normalized into a provider-neutral shape.
+        Both members may be present for the same response, and at least one is
+        present whenever the object is emitted. Opaque provider material
+        (signatures, item IDs, encrypted or redacted payloads) never appears
+        here.
+      oneOf:
+        - $ref: "#/components/schemas/ReasoningOutputWithSummary"
+        - $ref: "#/components/schemas/ReasoningOutputTraceOnly"
+
+    ReasoningOutputWithSummary:
+      type: object
+      required:
+        - summary
+      properties:
+        summary:
+          type: string
+          description: Model-authored summary of its reasoning.
+        trace:
+          type: string
+          description: Verbatim readable reasoning text, when the provider returns it.
+
+    ReasoningOutputTraceOnly:
+      type: object
+      required:
+        - trace
+      not:
+        required:
+          - summary
+      properties:
+        trace:
+          type: string
+          description: Verbatim readable reasoning text, when the provider returns it.
 
     AgentToolsAvailableProps:
       description: Properties for the `agent.tools.available` event.
@@ -10632,6 +10726,17 @@ components:
       properties:
         id:
           type: string
+        index:
+          type: integer
+          minimum: 0
+          description: >-
+            Zero-based input item or outgoing-edge position. Absent only on
+            parallel results written before indexed branch identity was added.
+        item_label:
+          type: string
+          description: >-
+            Human-readable for_each item identity, derived from name, then
+            label, then the zero-based input index.
         status:
           $ref: "#/components/schemas/StageOutcome"
         context_updates:
@@ -10677,6 +10782,10 @@ components:
           items:
             $ref: "#/components/schemas/ParallelBranchResult"
           description: Ordered per-branch results produced by a parallel stage.
+        parallel_branch_id:
+          oneOf:
+            - $ref: "#/components/schemas/ParallelBranchId"
+            - type: "null"
         output:
           type: ["string", "null"]
         output_bytes:
@@ -10698,7 +10807,38 @@ components:
             - type: "null"
           description: |
             Per-attempt timing breakdown for the latest terminal attempt:
-            wall time plus the active inference/tool breakdown.
+            wall time plus the active inference/tool breakdown. Null while the
+            stage is still in flight; the live estimate is derived from
+            `live_inference_ms`, `live_tool_ms`, and any open bracket.
+        live_inference_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+          description: |
+            Inference time accumulated from closed brackets during the current
+            attempt. Live estimate only — the authoritative value arrives with
+            the terminal event and lands in `timing`. Excludes the currently
+            open bracket, whose span is measured from `inference.started_at`.
+          example: 78230
+        live_tool_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+          description: |
+            Tool time accumulated from closed tool batches during the current
+            attempt. A batch spans the first dispatched call through the
+            completion that drains the last outstanding one, so tools running
+            concurrently within a turn are counted once.
+          example: 7588
+        tool_batch:
+          oneOf:
+            - $ref: "#/components/schemas/StageToolBatchProjection"
+            - type: "null"
+          description: |
+            Open tool batch: when the batch started and which calls have not
+            yet reported completion.
         usage:
           $ref: "#/components/schemas/BilledTokenCounts"
         model:
@@ -10744,12 +10884,110 @@ components:
             - $ref: "#/components/schemas/StageContextWindowProjection"
             - type: "null"
           description: Latest content-free context-window snapshot for this agent stage.
+        inference:
+          oneOf:
+            - $ref: "#/components/schemas/StageInferenceProjection"
+            - type: "null"
+          description: >
+            Open inference bracket, if the event log contains one. Present means
+            a model request was dispatched and no closing event has been seen —
+            not that the model is computing right now.
+        acp_started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: >
+            Start of an external ACP agent process, if one is running. ACP
+            agents do not expose Fabro's internal LLM brackets, so the process
+            lifetime supplies their live inference estimate.
         agent_control:
           $ref: "#/components/schemas/AgentControlState"
           description: Whether the agent is executing normally or waiting for steering after an interrupt.
         state:
           $ref: "#/components/schemas/StageState"
           description: Lifecycle state of the stage projection.
+
+    StageToolBatchProjection:
+      description: >
+        One open tool batch: tool calls dispatched together that have not all
+        reported completion. `open_call_ids` is a set rather than a count so a
+        duplicated completion in a replayed log cannot drain the batch early.
+      type: object
+      required:
+        - session_id
+        - started_at
+        - open_call_ids
+      properties:
+        session_id:
+          type: string
+          description: >
+            Root agent session that dispatched the batch. Transitions are
+            gated on it so delayed events from a replaced session cannot
+            mutate the current batch.
+        started_at:
+          type: string
+          format: date-time
+          description: >
+            When the batch opened — the first dispatched call observed while no
+            other calls were outstanding.
+        open_call_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+          description: Calls dispatched but not yet completed, by tool call id.
+
+    StageInferenceProjection:
+      description: >
+        One open inference bracket: a dispatched LLM request that has not yet
+        produced a message, error, or interrupt. Carries no usage or cost — none
+        exists until the turn completes.
+      type: object
+      required:
+        - session_id
+        - started_at
+        - requested_model
+        - retries
+      properties:
+        session_id:
+          type: string
+          description: >
+            Agent session that opened the bracket, copied from the event
+            envelope. Transitions are gated on it so sub-agent rounds cannot
+            overwrite the root session's bracket.
+        started_at:
+          type: string
+          format: date-time
+          description: When the request was dispatched.
+        requested_model:
+          $ref: "#/components/schemas/BillingModelRef"
+          description: >
+            Provider and model the request was sent to. Failover can re-target,
+            so `StageProjection.model` stays authoritative for what answered.
+        first_output_at:
+          type: ["string", "null"]
+          format: date-time
+          description: When the provider produced its first output, if it has.
+        first_output_kind:
+          oneOf:
+            - $ref: "#/components/schemas/LlmOutputKind"
+            - type: "null"
+          description: Kind of the first output observed for the current attempt.
+        retries:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Attempts that failed and restarted within this bracket.
+
+    LlmOutputKind:
+      description: >
+        Kind of output a provider produced first for an inference attempt.
+        Observed, never inferred.
+      type: string
+      enum:
+        - reasoning
+        - text
+        - tool_call
 
     SubAgentProjection:
       description: Current projected state for one subagent spawned by an agent stage.
@@ -11067,6 +11305,36 @@ components:
           type: ["string", "null"]
           description: Optional untrusted model-authored option preview captured for clients.
 
+    ReviewTargetKind:
+      description: The type of resource presented for human review.
+      type: string
+      enum:
+        - document
+
+    ReviewTarget:
+      description: A validated external resource presented as the primary subject of a human review question.
+      type: object
+      required:
+        - label
+        - url
+        - kind
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Human-readable link label.
+          example: Quarry review exercise
+        url:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+          description: Absolute HTTP or HTTPS URL opened by the reviewer.
+          example: https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef
+        kind:
+          $ref: "#/components/schemas/ReviewTargetKind"
+
     InterviewQuestionRecord:
       description: Storage shape of an interview question recorded in the event log.
       type: object
@@ -11096,6 +11364,10 @@ components:
           format: double
         context_display:
           type: ["string", "null"]
+        review_target:
+          oneOf:
+            - $ref: "#/components/schemas/ReviewTarget"
+            - type: "null"
 
     PendingInterviewRecord:
       description: Pending interview question plus the time it entered the unresolved set.
@@ -11358,7 +11630,7 @@ components:
 
     TodoListKind:
       type: string
-      enum: [openai_plan, anthropic_tasks]
+      enum: [openai_plan, anthropic_tasks, kimi_todos]
       description: |-
         Tool surface a todo list belongs to. Determines the `list_id`
         prefix and scoping convention.
@@ -12397,9 +12669,17 @@ components:
         observed LLM request/stream elapsed time; `tool_time_ms` is tool or
         command execution elapsed time; `active_time_ms` equals
         `inference_time_ms + tool_time_ms`.
+
+        For a terminal stage these come from the worker's own stopwatch and are
+        authoritative. For a stage still in flight they are a live estimate
+        reconstructed from the event log, and `active_time_ms` is clamped to
+        `wall_time_ms`. The estimate is replaced by the authoritative
+        breakdown when the stage reaches a terminal event.
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:
@@ -12431,9 +12711,16 @@ components:
         Timing rollup for an entire run. Active fields sum work across stage
         visits, so `active_time_ms` can exceed `wall_time_ms` when parallel
         branches run concurrently.
+
+        For a running run, stages still in flight contribute a live estimate
+        rather than nothing, so wall and active both advance continuously.
+        Unlike `StageTiming`, active is not clamped to wall here — concurrent
+        branches can legitimately sum past run wall time.
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:
@@ -12723,6 +13010,13 @@ components:
       type: string
       example: verify@2
 
+    ParallelBranchId:
+      description: >-
+        Durable identity of one branch within a parallel execution, in
+        `{parallel_group_id}:{index}` form.
+      type: string
+      example: review_fork@3:1
+
     StageState:
       description: Lifecycle projection state of a workflow stage.
       type: string
@@ -12762,6 +13056,7 @@ components:
         - status
         - node_id
         - visit
+        - billing
       properties:
         id:
           $ref: "#/components/schemas/StageId"
@@ -12811,6 +13106,22 @@ components:
             StageId of the prior post-checkpoint execution superseded by this
             replay after the run was resumed.
           example: verify@1
+        parallel_group_id:
+          allOf:
+            - $ref: "#/components/schemas/StageId"
+          description: >-
+            Exact StageId of the parent parallel execution. Clients can compare
+            this directly with the `id` of a parallel stage. Omitted for stages
+            that are not parallel branches.
+          example: review_fork@1
+        parallel_branch_index:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: >-
+            Zero-based outgoing-edge index within the parent parallel
+            execution. Omitted for stages that are not parallel branches.
+          example: 1
         provider_used:
           oneOf:
             - $ref: "#/components/schemas/StageModelUsage"
@@ -12821,6 +13132,15 @@ components:
           format: date-time
           description: Wall-clock time the latest attempt of this stage started, if known.
           example: "2026-04-29T12:34:56Z"
+        billing:
+          $ref: "#/components/schemas/BilledTokenCounts"
+          description: >-
+            Token counts for this stage execution alone. `total_usd_micros` is
+            the provider-reported cost when there is one, otherwise the server
+            catalog's price for these tokens — the same pricing the
+            `/runs/{id}/billing` rows use. All-zero counts mean the stage made
+            no model calls. Unlike the billing rows, which sum every visit of a
+            node, this covers only this visit.
 
     # ── File Diff Schemas ──────────────────────────────────────────────
 
@@ -14114,7 +14434,7 @@ components:
           $ref: "#/components/schemas/RunNamespace"
 
     InterpString:
-      description: Resolved config string that may contain env interpolation tokens.
+      description: Config string that can contain typed interpolation tokens.
       type: string
 
     StringMap:
@@ -14272,6 +14592,16 @@ components:
 
     ModelRef:
       type: string
+      description: |
+        A fallback model reference. Bare values name a provider, canonical
+        model ID, or alias. Provider-qualified values use
+        `provider:selector`; the selector may be a canonical model ID, alias,
+        or provider API ID and may contain `/` or additional colons. A value
+        is treated as qualified only when the text before the first `:` names
+        a known provider, so model IDs that contain a colon — ollama
+        `name:tag` values, Bedrock inference-profile IDs — stay whole. Legacy
+        `provider/model` references remain accepted.
+      example: openrouter:moonshotai/kimi-k3
 
     RunModelSettings:
       type: object
@@ -14282,9 +14612,29 @@ components:
         name:
           type: ["string", "null"]
         fallbacks:
-          type: array
-          items:
-            $ref: "#/components/schemas/ModelRef"
+          type: object
+          description: >
+            Ordered fallback targets keyed by the originally requested model.
+            Each chain is independent; selecting a fallback target does not
+            activate that target model's own chain.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/ModelRef"
+        controls:
+          $ref: "#/components/schemas/RunModelControls"
+
+    RunModelControls:
+      type: object
+      description: >
+        Run-level default values for typed model controls. Node and style
+        attributes still win over these defaults.
+      required: [reasoning_effort, speed]
+      properties:
+        reasoning_effort:
+          type: ["string", "null"]
+        speed:
+          type: ["string", "null"]
 
     RunGitSettings:
       type: object
@@ -14322,7 +14672,7 @@ components:
         script-vs-argv distinction via the `type` discriminator: a `script`
         is a raw shell snippet kept verbatim, while a `command` is an argv
         whose elements are shell-quoted and joined at the run boundary (after
-        `{{ env.* }}` resolution) so an interpolated value cannot inject shell
+        `{{ secrets.* }}` resolution) so an interpolated value cannot inject shell
         syntax. Optional per-step `env` is shared by both shapes.
       type: object
       required: [type]
@@ -14594,20 +14944,14 @@ components:
 
     RunAgentSettings:
       type: object
-      required: [permissions, mcps]
+      required: [fabro_tools, mcps]
       properties:
-        permissions:
-          oneOf:
-            - $ref: "#/components/schemas/AgentPermissions"
-            - type: "null"
+        fabro_tools:
+          type: boolean
         mcps:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/McpServerSettings"
-
-    AgentPermissions:
-      type: string
-      enum: [read-only, read-write, full]
 
     McpServerSettings:
       type: object
@@ -14727,17 +15071,9 @@ components:
             - type: "null"
           description: >-
             Optional HTTP headers for an http hook. Values support
-            `{{ env.NAME }}` interpolation, scoped to the names listed in
-            `allowed_env_vars`; a token for any other env var fails to resolve
-            and the hook blocks (fail-closed).
-        allowed_env_vars:
-          type: array
-          items:
-            type: string
-          description: >-
-            Allowlist of environment variable names that an http hook header may
-            read via `{{ env.NAME }}`. An empty list (the default) permits no env
-            vars in headers.
+            `{{ vars.NAME }}` interpolation, substituted when the run is
+            created; a token left unresolved at fire time blocks the hook
+            (fail-closed).
         tls:
           $ref: "#/components/schemas/TlsMode"
         prompt:

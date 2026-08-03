@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,11 +10,11 @@ use tokio::io::{DuplexStream, duplex};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::StdioProcessControl;
+use crate::sandbox::{self, StdioProcessControl};
 use crate::{
-    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, GrepOptions, Sandbox, SandboxEvent,
-    SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination,
+    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, ExecStreamingRequest, GrepOptions,
+    Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess,
+    StdioProcessHandle, StdioProcessTermination, WalkOptions,
 };
 
 // --- MockSandbox ---
@@ -38,12 +39,29 @@ pub struct MockSandbox {
     pub captured_working_dirs: Mutex<Vec<Option<String>>>,
     /// Captures the `env_vars` argument from `exec_command` calls.
     pub captured_env_vars:     Mutex<Option<HashMap<String, String>>>,
+    /// Captures the bytes passed to a streaming command's standard input.
+    pub captured_stdin:        Mutex<Option<Vec<u8>>>,
+    pub active:                AtomicBool,
+    pub activate_error:        Option<String>,
+    pub activate_calls:        Mutex<u32>,
     pub start_calls:           Mutex<u32>,
     pub stop_calls:            Mutex<u32>,
     pub delete_calls:          Mutex<u32>,
     pub event_callback:        Option<SandboxEventCallback>,
     pub stdio_process_error:   Option<String>,
     pub stdio_process:         Mutex<Option<MockStdioProcess>>,
+    /// Fails `exec_command` and `exec_command_streaming` before any process
+    /// runs, so callers see a transport error rather than an `ExecResult`.
+    pub exec_error:            Option<String>,
+    /// Files returned by `walk_files`, before traversal-root and exclusion
+    /// filtering.
+    pub walk_files:            Vec<SandboxFile>,
+    pub walk_files_error:      Option<String>,
+    pub walk_files_called:     AtomicBool,
+    pub walked_while_inactive: AtomicBool,
+    /// Reported by `exec_command_streaming`. Set to `false` to model a
+    /// provider that cannot separate stdout from stderr.
+    pub streams_separated:     bool,
 }
 
 impl MockSandbox {
@@ -60,8 +78,23 @@ impl MockSandbox {
         *self.start_calls.lock().expect("start_calls lock poisoned")
     }
 
+    pub fn activate_count(&self) -> u32 {
+        *self
+            .activate_calls
+            .lock()
+            .expect("activate_calls lock poisoned")
+    }
+
     pub fn stop_count(&self) -> u32 {
         *self.stop_calls.lock().expect("stop_calls lock poisoned")
+    }
+
+    pub fn walk_files_was_called(&self) -> bool {
+        self.walk_files_called.load(Ordering::Relaxed)
+    }
+
+    pub fn walked_while_inactive(&self) -> bool {
+        self.walked_while_inactive.load(Ordering::Relaxed)
     }
 
     pub fn delete_count(&self) -> u32 {
@@ -76,6 +109,24 @@ impl MockSandbox {
             .stdio_process
             .lock()
             .expect("stdio_process lock poisoned") = Some(process);
+    }
+
+    #[must_use]
+    pub fn with_walk_files(mut self, files: Vec<SandboxFile>) -> Self {
+        self.walk_files = files;
+        self
+    }
+
+    #[must_use]
+    pub fn with_walk_files_error(mut self, error: impl Into<String>) -> Self {
+        self.walk_files_error = Some(error.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_activate_error(mut self, error: impl Into<String>) -> Self {
+        self.activate_error = Some(error.into());
+        self
     }
 }
 
@@ -110,12 +161,22 @@ impl Default for MockSandbox {
             captured_commands:     Mutex::new(Vec::new()),
             captured_working_dirs: Mutex::new(Vec::new()),
             captured_env_vars:     Mutex::new(None),
+            captured_stdin:        Mutex::new(None),
+            active:                AtomicBool::new(true),
+            activate_error:        None,
+            activate_calls:        Mutex::new(0),
             start_calls:           Mutex::new(0),
             stop_calls:            Mutex::new(0),
             delete_calls:          Mutex::new(0),
             event_callback:        None,
             stdio_process_error:   None,
             stdio_process:         Mutex::new(None),
+            exec_error:            None,
+            walk_files:            Vec::new(),
+            walk_files_error:      None,
+            walk_files_called:     AtomicBool::new(false),
+            walked_while_inactive: AtomicBool::new(false),
+            streams_separated:     true,
         }
     }
 }
@@ -233,7 +294,39 @@ impl Sandbox for MockSandbox {
             .captured_env_vars
             .lock()
             .expect("captured_env_vars lock poisoned") = env_vars.cloned();
-        Ok(self.exec_result.clone())
+        match &self.exec_error {
+            Some(error) => Err(crate::Error::message(error.clone())),
+            None => Ok(self.exec_result.clone()),
+        }
+    }
+
+    async fn exec_command_streaming(
+        &self,
+        request: ExecStreamingRequest<'_>,
+    ) -> crate::Result<crate::ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
+        *self
+            .captured_stdin
+            .lock()
+            .expect("captured_stdin lock poisoned") = stdin;
+        let result = self
+            .exec_command(
+                command,
+                timeout_ms.unwrap_or(u64::MAX),
+                working_dir,
+                env_vars,
+                cancel_token,
+            )
+            .await?;
+        sandbox::replay_exec_result(result, self.streams_separated, output_callback.as_ref()).await
     }
 
     async fn spawn_stdio_process(
@@ -311,6 +404,43 @@ impl Sandbox for MockSandbox {
         Ok(self.glob_results.clone())
     }
 
+    async fn walk_files(
+        &self,
+        _base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        self.walk_files_called.store(true, Ordering::Relaxed);
+        if !self.active.load(Ordering::Relaxed) {
+            self.walked_while_inactive.store(true, Ordering::Relaxed);
+            return Err(crate::Error::message("Sandbox is stopped"));
+        }
+        if let Some(error) = &self.walk_files_error {
+            return Err(crate::Error::message(error.clone()));
+        }
+
+        Ok(self
+            .walk_files
+            .iter()
+            .filter(|file| {
+                relative_start.is_empty()
+                    || file.relative_path == relative_start
+                    || file
+                        .relative_path
+                        .strip_prefix(relative_start)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .filter(|file| {
+                let parent = file
+                    .relative_path
+                    .rsplit_once('/')
+                    .map_or("", |(parent, _)| parent);
+                !options.excludes_relative_path(parent)
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn download_file_to_local(
         &self,
         remote_path: &str,
@@ -348,6 +478,7 @@ impl Sandbox for MockSandbox {
     }
 
     async fn initialize(&self) -> crate::Result<()> {
+        self.active.store(true, Ordering::Relaxed);
         self.emit(SandboxEvent::Initializing {
             provider: "mock".into(),
         });
@@ -362,13 +493,29 @@ impl Sandbox for MockSandbox {
         Ok(())
     }
 
+    async fn activate(&self) -> crate::Result<()> {
+        *self
+            .activate_calls
+            .lock()
+            .expect("activate_calls lock poisoned") += 1;
+        if let Some(error) = &self.activate_error {
+            return Err(crate::Error::context(
+                "Mock sandbox activation failed",
+                std::io::Error::other(error.clone()),
+            ));
+        }
+        self.start().await
+    }
+
     async fn start(&self) -> crate::Result<()> {
         *self.start_calls.lock().expect("start_calls lock poisoned") += 1;
+        self.active.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     async fn stop(&self) -> crate::Result<()> {
         *self.stop_calls.lock().expect("stop_calls lock poisoned") += 1;
+        self.active.store(false, Ordering::Relaxed);
         Ok(())
     }
 

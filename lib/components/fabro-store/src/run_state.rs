@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fabro_types::run_event::{
-    CheckpointCompletedProps, RunCompletedProps, RunFailedProps, StageCompletedProps,
-    TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+    AgentLlmStartedProps, CheckpointCompletedProps, RunCompletedProps, RunFailedProps,
+    StageCompletedProps, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
 };
 use fabro_types::settings::run::{EnvironmentProvider, RunEnvironmentSettings};
 use fabro_types::{
@@ -334,6 +334,7 @@ impl RunProjectionReducer for RunProjection {
                             allow_freeform:  props.allow_freeform,
                             timeout_seconds: props.timeout_seconds,
                             context_display: props.context_display.clone(),
+                            review_target:   props.review_target.clone(),
                         },
                         started_at: ts,
                     });
@@ -405,7 +406,7 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.response = response;
                 stage.completion = Some(completion);
-                stage.timing = Some(props.timing);
+                stage.set_authoritative_timing(props.timing);
                 if let Some(billing) = &props.billing {
                     stage.usage.replace_with_billed_usage(billing);
                     stage.model = Some(billing.model().clone());
@@ -428,7 +429,7 @@ impl RunProjectionReducer for RunProjection {
                     failure_reason,
                     timestamp: ts,
                 });
-                stage.timing = Some(props.timing);
+                stage.set_authoritative_timing(props.timing);
                 if let Some(billing) = &props.billing {
                     stage.usage.replace_with_billed_usage(billing);
                     stage.model = Some(billing.model().clone());
@@ -449,6 +450,39 @@ impl RunProjectionReducer for RunProjection {
                     context_window.event_seq = Some(event.seq);
                     stage.context_window = Some(context_window);
                 }
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
+            }
+            EventBody::AgentLlmStarted(props) => {
+                open_inference_bracket(self, stored, props, event.seq, ts);
+            }
+            EventBody::AgentLlmFirstOutput(props) => {
+                let Some(inference) =
+                    matching_inference_bracket(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                inference.first_output_at = Some(ts);
+                inference.first_output_kind = Some(props.kind);
+            }
+            EventBody::AgentLlmRetry(props) => {
+                let Some(inference) =
+                    matching_inference_bracket(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                inference.retries = inference.retries.saturating_add(1);
+                // A retry discards whatever the failed attempt produced.
+                // Replay is driven purely by events, so resetting the
+                // in-process latch is not enough: without this the projection
+                // keeps asserting output the agent already threw away.
+                inference.first_output_at = None;
+                inference.first_output_kind = None;
+            }
+            EventBody::AgentError(props) => {
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
+            }
+            EventBody::AgentSessionEnded(_) => {
+                close_active_brackets_for_session(self, stored, ts);
             }
             EventBody::AgentSessionActivated(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -464,6 +498,7 @@ impl RunProjectionReducer for RunProjection {
                     return Ok(());
                 };
                 stage.agent_control = AgentControlState::WaitingForSteer;
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
             }
             EventBody::AgentSteeringInjected(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -486,12 +521,17 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.agent_tools.clone_from(&props.tools);
             }
-            // `AgentAcpStarted` is the start-of-process signal for an external
-            // ACP agent. `provider_used` is intentionally sourced from the
-            // subsequent `AgentSessionActivated` event, which carries the
-            // canonical provider/model. ACP runs without a steering hub never
-            // emit activation and so legitimately leave `provider_used`
-            // unset — matching legacy ACP behavior.
+            EventBody::AgentAcpStarted(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.open_acp_inference(ts);
+                // `provider_used` is intentionally sourced from the subsequent
+                // `AgentSessionActivated` event, which carries the canonical
+                // provider/model. ACP runs without a steering hub never emit
+                // activation and legitimately leave it unset.
+            }
             EventBody::CommandStarted(props) => {
                 let script_invocation = serde_json::to_value(props).map_err(|err| {
                     Error::InvalidEvent(format!("invalid command.started payload: {err}"))
@@ -518,6 +558,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -530,6 +571,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -542,6 +584,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -560,6 +603,11 @@ impl RunProjectionReducer for RunProjection {
                 // Branches bypass the engine's StageStarted/StageCompleted
                 // lifecycle. Seed started_at so the branch stage drives a live
                 // wall-clock timer while it runs (the entry is created Running).
+                let handler = stored
+                    .node_id
+                    .as_deref()
+                    .and_then(|node_id| self.spec().graph.nodes.get(node_id))
+                    .map(|node| StageHandler::from_handler_type(node.handler_type()));
                 let is_new = stored
                     .stage_id
                     .as_ref()
@@ -570,11 +618,17 @@ impl RunProjectionReducer for RunProjection {
                 if stage.started_at.is_none() {
                     stage.started_at = Some(ts);
                 }
+                if stage.handler.is_none() {
+                    stage.handler = handler;
+                }
                 if is_new {
                     stage.graph_visit = props.graph_visit;
                     stage
                         .resumed_from_stage_id
                         .clone_from(&props.resumed_from_stage_id);
+                    stage
+                        .parallel_branch_id
+                        .clone_from(&stored.parallel_branch_id);
                 }
                 stage.state = StageState::Running;
             }
@@ -634,37 +688,54 @@ impl RunProjectionReducer for RunProjection {
                     status:   SubAgentStatus::Running,
                 });
             }
+            // A reused subagent stays one projected row: the spawn task and
+            // generation 1 identify it, and every later generation only moves
+            // its status. The per-turn task and generation stay in the event
+            // log for consumers that need each turn.
+            EventBody::AgentSubTurnStarted(props) => {
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Running,
+                );
+            }
             EventBody::AgentSubCompleted(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Completed {
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Completed {
                         success:    props.success,
                         turns_used: props.turns_used,
-                    };
-                }
+                    },
+                );
             }
             EventBody::AgentSubFailed(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Failed {
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Failed {
                         error: props.error.clone(),
-                    };
-                }
+                    },
+                );
             }
             EventBody::AgentSubClosed(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Closed;
-                }
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Closed,
+                );
             }
             EventBody::AgentSkillsDiscovered(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -712,6 +783,11 @@ impl RunProjectionReducer for RunProjection {
                 });
             }
             EventBody::AgentToolStarted(props) => {
+                let root_session_id = if stored.parent_session_id.is_none() {
+                    stored.session_id.clone()
+                } else {
+                    None
+                };
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
                 else {
                     return Ok(());
@@ -732,6 +808,25 @@ impl RunProjectionReducer for RunProjection {
                         projection.invoked = true;
                     }
                 }
+                // A subagent's tools run inside the root session's tool call,
+                // so the root batch already covers them. Timing them again
+                // would double-count that span.
+                if let Some(session_id) = root_session_id {
+                    stage.open_tool_call(session_id, props.tool_call_id.clone(), ts);
+                }
+            }
+            EventBody::AgentToolCompleted(props) => {
+                if stored.parent_session_id.is_some() {
+                    return Ok(());
+                }
+                let Some(session_id) = stored.session_id.as_deref() else {
+                    return Ok(());
+                };
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.close_tool_call(session_id, &props.tool_call_id, ts);
             }
             _ => {}
         }
@@ -746,12 +841,13 @@ impl RunProjectionReducer for RunProjection {
 /// OpenAI plan lists are scoped per agent session (`openai_plan:<session_id>`),
 /// so a child/subagent session emits its own list events on the same stage.
 /// The root-agent projection excludes those child plans, while the underlying
-/// events remain in the run event log. Anthropic task lists are root-scoped
-/// (`anthropic_tasks:<root_session_id>`) and intentionally shared with
-/// subagents, so they always project.
+/// events remain in the run event log. Kimi todo lists
+/// (`kimi_todos:<session_id>`) are scoped the same way. Anthropic task lists
+/// are root-scoped (`anthropic_tasks:<root_session_id>`) and intentionally
+/// shared with subagents, so they always project.
 fn should_project_root_agent_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
     match list_kind {
-        TodoListKind::OpenAiPlan => stored.parent_session_id.is_none(),
+        TodoListKind::OpenAiPlan | TodoListKind::KimiTodos => stored.parent_session_id.is_none(),
         TodoListKind::AnthropicTasks => true,
     }
 }
@@ -806,6 +902,25 @@ fn apply_todo_deleted(stage: &mut StageProjection, props: &TodoDeletedProps) {
     list.remove(&props.todo_id);
     if list.items.is_empty() {
         stage.root_agent_todos = None;
+    }
+}
+
+/// Move an already-projected subagent to a new lifecycle status. Every
+/// subagent event after the spawn updates the same row, so reuse shows one
+/// agent returning to running rather than a second agent appearing.
+fn set_subagent_status(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+    agent_id: &str,
+    status: SubAgentStatus,
+) {
+    let Some(stage) = stage_at_stored_or_visit(state, stored, visit, seq) else {
+        return;
+    };
+    if let Some(subagent) = subagent_mut(stage, agent_id) {
+        subagent.status = status;
     }
 }
 
@@ -964,6 +1079,139 @@ fn stage_at_stored_or_visit<'a>(
         return Some(stage_at_stored_stage_id(state, stage_id, seq));
     }
     stage_at_visit(state, stored, visit, seq)
+}
+
+/// Open the inference bracket for the stage this event names.
+///
+/// Only root-session events open a bracket: forwarded child events carry a
+/// parent session and must not overwrite the parent's bracket. The session id
+/// is copied from the envelope so every later transition can be gated on it.
+fn open_inference_bracket(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    props: &AgentLlmStartedProps,
+    seq: u32,
+    ts: DateTime<Utc>,
+) {
+    if stored.parent_session_id.is_some() {
+        return;
+    }
+    let Some(session_id) = stored.session_id.clone() else {
+        return;
+    };
+    let Some(stage) = stage_at_stored_or_visit(state, stored, props.visit, seq) else {
+        return;
+    };
+    stage.inference = Some(StageInferenceProjection {
+        session_id,
+        started_at: ts,
+        requested_model: props.requested_model.clone(),
+        first_output_at: None,
+        first_output_kind: None,
+        retries: 0,
+    });
+}
+
+/// Resolve the stage owning a bracket this event is allowed to mutate,
+/// borrowing the whole projection so the caller can also fold elapsed time
+/// into the stage's live accumulators.
+///
+/// Returns `None` for child-session events, for a stage with no open bracket,
+/// and for a bracket belonging to a different session (which is what
+/// post-failover events look like).
+fn matching_inference_stage<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+) -> Option<&'a mut StageProjection> {
+    if stored.parent_session_id.is_some() {
+        return None;
+    }
+    let session_id = stored.session_id.as_deref()?;
+    let stage = stage_at_stored_or_visit(state, stored, visit, seq)?;
+    let opened_here = stage
+        .inference
+        .as_ref()
+        .is_some_and(|inference| inference.session_id == session_id);
+    opened_here.then_some(stage)
+}
+
+/// Resolve the open inference bracket this event is allowed to mutate.
+fn matching_inference_bracket<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+) -> Option<&'a mut StageInferenceProjection> {
+    matching_inference_stage(state, stored, visit, seq)?
+        .inference
+        .as_mut()
+}
+
+/// Close the bracket on a stage-addressed terminal event, folding its elapsed
+/// time into the stage's live inference accumulator.
+fn close_inference_bracket(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+    ts: DateTime<Utc>,
+) {
+    let Some(stage) = matching_inference_stage(state, stored, visit, seq) else {
+        return;
+    };
+    close_bracket_on_stage(stage, ts);
+}
+
+/// Take the open bracket and add its span to `live_inference_ms`.
+///
+/// Retries inside the bracket are deliberately included: the in-process
+/// stopwatch counts a retried attempt's elapsed time as inference, and
+/// `agent.llm.retry` keeps the bracket open rather than reopening it.
+fn close_bracket_on_stage(stage: &mut StageProjection, ts: DateTime<Utc>) {
+    let Some(inference) = stage.inference.take() else {
+        return;
+    };
+    stage.accumulate_inference_ms(timing::elapsed_ms(inference.started_at, ts));
+}
+
+/// Close every active bracket opened by the session that just ended.
+///
+/// `agent.session.ended` is the only ordering-safe backstop for terminal
+/// cancel and wall-clock timeout, which tear the session down through
+/// `discard_session` without emitting a message, error, or interrupt. It is
+/// emitted after the forwarder drains queued agent events, unlike
+/// `agent.session.deactivated`, which is emitted before the drain and so can
+/// be followed by a queued `agent.llm.started` that would re-open the bracket.
+///
+/// The tradeoff is that it carries no stage identity — its props are empty and
+/// its envelope has only session ids. So the close takes ordering from the
+/// event and identity from the projection, scanning for brackets this session
+/// opened. Implemented as a normal stage lookup it would find no target and
+/// silently no-op, leaving the bracket open forever on exactly the path it
+/// exists to cover.
+fn close_active_brackets_for_session(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    ts: DateTime<Utc>,
+) {
+    if stored.parent_session_id.is_some() {
+        return;
+    }
+    let Some(session_id) = stored.session_id.as_deref() else {
+        return;
+    };
+    for (_, stage) in state.iter_stages_unordered_mut() {
+        let opened_here = stage
+            .inference
+            .as_ref()
+            .is_some_and(|inference| inference.session_id == session_id);
+        if opened_here {
+            close_bracket_on_stage(stage, ts);
+        }
+        stage.close_tool_batch_for_session(session_id, ts);
+    }
 }
 
 fn stage_at_stored_or_current_visit<'a>(
@@ -1151,20 +1399,11 @@ pub(crate) fn projected_billing(state: &RunProjection) -> BilledTokenCounts {
 
     let mut billing = BilledTokenCounts::default();
     for (stage_id, stage) in state.iter_stages() {
-        if !is_boundary_stage(state, stage_id.node_id()) {
+        if !state.is_boundary_stage(stage_id.node_id()) {
             billing.add_counts(&stage.usage);
         }
     }
     billing
-}
-
-fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {
-    projection
-        .spec()
-        .graph()
-        .nodes
-        .get(node_id)
-        .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
 }
 
 fn run_models(state: &RunProjection) -> Vec<RunModel> {
@@ -1272,23 +1511,26 @@ fn finalize_unfinished_stages_after_run_failed(
         StageState::Failed
     };
 
-    for (_, stage) in state.iter_stages_mut() {
+    for (_, stage) in state.iter_stages_unordered_mut() {
         if stage.state.is_terminal() {
             continue;
         }
 
+        // Close any brackets still open so their spans are not dropped on the
+        // floor when the live estimate is frozen into `timing` below.
+        close_bracket_on_stage(stage, timestamp);
+        stage.close_open_acp_inference(timestamp);
+        stage.close_open_tool_batch(timestamp);
+
+        // Freeze the live estimate before flipping to a terminal state:
+        // `live_timing` reads `effective_state` and would return wall-only
+        // once the stage no longer looks in-flight.
+        let frozen = stage.live_timing(timestamp);
         stage.state = terminal_state;
-        if stage.timing.is_none() {
-            if let Some(started_at) = stage.started_at {
-                let wall_time_ms = u64::try_from(
-                    timestamp
-                        .signed_duration_since(started_at)
-                        .num_milliseconds()
-                        .max(0),
-                )
-                .expect("non-negative milliseconds fit in u64");
-                stage.timing = Some(fabro_types::StageTiming::wall_only(wall_time_ms));
-            }
+        if stage.timing.is_none() && stage.started_at.is_some() {
+            stage.set_authoritative_timing(frozen);
+        } else {
+            stage.clear_live_timing();
         }
     }
 }
@@ -1396,29 +1638,528 @@ mod tests {
         AgentSessionDeactivatedProps, AgentSessionEndedProps, AgentSessionStartedProps,
         AgentSkillActivatedProps, AgentSkillActivationSource, AgentSkillSummary,
         AgentSkillsDiscoveredProps, AgentSteeringInjectedProps, AgentSubClosedProps,
-        AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps, AgentToolCategory,
-        AgentToolSource, AgentToolStartedProps, AgentToolSummary, AgentToolsAvailableProps,
-        CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
+        AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps,
+        AgentSubTurnStartedProps, AgentToolCategory, AgentToolSource, AgentToolStartedProps,
+        AgentToolSummary, AgentToolsAvailableProps, CheckpointCompletedProps,
+        InterviewCompletedProps, InterviewOption, InterviewStartedProps,
         ParallelBranchCompletedProps, ParallelBranchStartedProps, RunCompletedProps,
         RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
         StageRetryingProps, StageStartedProps,
     };
     use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider};
     use fabro_types::{
-        AgentBackend, AgentControlState, AutomationRef, BilledModelUsage, BilledTokenCounts,
-        BlockedReason, Checkpoint, CheckpointRecord, CommandTermination, EventBody,
-        FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Outcome,
-        PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
-        RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
-        RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
+        AgentBackend, AgentControlState, AttrValue, AutomationRef, BilledModelUsage,
+        BilledTokenCounts, BlockedReason, Checkpoint, CheckpointRecord, CommandTermination,
+        EventBody, FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Node,
+        Outcome, ParallelBranchId, PendingReason, PermissionLevel, PullRequestLink, QuestionType,
+        ReasoningEffort, RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize,
+        RunSpec, RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
         StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
-        StageContextWindowWarning, StageModelUsage, StageOutcome, StageState, SubAgentStatus,
-        SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
+        StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageState,
+        StageTiming, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+        test_support,
     };
     use serde_json::json;
 
     use super::{RunProjection, RunProjectionReducer, build_summary};
     use crate::{Error, EventEnvelope, StageId};
+
+    /// Live accumulation of inference and tool time while a stage is in
+    /// flight. The finalized breakdown still arrives with the terminal event
+    /// and replaces these; these exist so a long-running stage is not reported
+    /// as doing no work.
+    mod live_active_accumulation {
+        use fabro_types::run_event::{
+            AgentLlmFirstOutputProps, AgentLlmRetryProps, AgentLlmStartedProps,
+            AgentToolCompletedProps, AgentToolStartedProps,
+        };
+        use fabro_types::{
+            LlmOutputKind, LlmRetryPhase, ModelRef, Speed, StageOutcome, StageProjection,
+        };
+
+        use super::*;
+
+        fn stage_id() -> StageId {
+            StageId::new("plan", 1)
+        }
+
+        fn session_event(seq: u32, ts: &str, session_id: &str, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event_at(seq, ts, body, stage_id());
+            event.event.session_id = Some(session_id.to_string());
+            event
+        }
+
+        fn agent_event(seq: u32, ts: &str, body: EventBody) -> EventEnvelope {
+            session_event(seq, ts, "session-1", body)
+        }
+
+        /// An event from a sub-agent session nested under the root session.
+        fn child_event(seq: u32, ts: &str, body: EventBody) -> EventEnvelope {
+            let mut event = agent_event(seq, ts, body);
+            event.event.session_id = Some("session-child".to_string());
+            event.event.parent_session_id = Some("session-1".to_string());
+            event
+        }
+
+        fn llm_started() -> EventBody {
+            EventBody::AgentLlmStarted(AgentLlmStartedProps {
+                requested_model: ModelRef {
+                    provider: "anthropic".parse().unwrap(),
+                    model_id: "claude-fable-5".into(),
+                    speed:    Some(Speed::Fast),
+                },
+                visit:           1,
+            })
+        }
+
+        fn tool_started(tool_call_id: &str) -> EventBody {
+            EventBody::AgentToolStarted(AgentToolStartedProps {
+                tool_name:         "Bash".to_string(),
+                tool_call_id:      tool_call_id.to_string(),
+                arguments:         json!({}),
+                visit:             1,
+                tool_call:         None,
+                turn_id:           None,
+                parent_message_id: None,
+            })
+        }
+
+        fn tool_completed(tool_call_id: &str) -> EventBody {
+            EventBody::AgentToolCompleted(AgentToolCompletedProps {
+                tool_name:    "Bash".to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                output:       json!("ok"),
+                is_error:     false,
+                visit:        1,
+                tool_result:  None,
+                turn_id:      None,
+            })
+        }
+
+        fn agent_message() -> EventBody {
+            EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5)))
+        }
+
+        fn started_state() -> RunProjection {
+            let mut state = initialized_projection();
+            state
+                .apply_event(&test_stage_event_at(
+                    1,
+                    "2026-04-07T12:00:00Z",
+                    EventBody::StageStarted(started_props()),
+                    stage_id(),
+                ))
+                .unwrap();
+            state
+        }
+
+        fn stage(state: &RunProjection) -> &StageProjection {
+            state.stage(&stage_id()).unwrap()
+        }
+
+        #[test]
+        fn closing_an_inference_bracket_accumulates_its_span() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:06Z",
+                    EventBody::AgentLlmFirstOutput(AgentLlmFirstOutputProps {
+                        kind:  LlmOutputKind::Text,
+                        visit: 1,
+                    }),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(4, "2026-04-07T12:00:12Z", agent_message()))
+                .unwrap();
+
+            // 12:00:05 -> 12:00:12; first_output is a marker, not the close.
+            assert_eq!(stage(&state).live_inference_ms, 7_000);
+            assert!(stage(&state).inference.is_none());
+        }
+
+        #[test]
+        fn concurrent_tool_calls_count_once_not_per_call() {
+            let mut state = started_state();
+            for (seq, id) in [(2, "call-a"), (3, "call-b"), (4, "call-c")] {
+                state
+                    .apply_event(&agent_event(seq, "2026-04-07T12:00:00Z", tool_started(id)))
+                    .unwrap();
+            }
+            // All three finish 10s later. Summing per-call spans would report
+            // 30s; the batch actually occupied 10s of wall time.
+            for (seq, id) in [(5, "call-a"), (6, "call-b"), (7, "call-c")] {
+                state
+                    .apply_event(&agent_event(
+                        seq,
+                        "2026-04-07T12:00:10Z",
+                        tool_completed(id),
+                    ))
+                    .unwrap();
+            }
+
+            assert_eq!(stage(&state).live_tool_ms, 10_000);
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn a_batch_stays_open_until_its_last_call_reports() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:02Z",
+                    tool_started("call-b"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:05Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            assert_eq!(
+                stage(&state).live_tool_ms,
+                0,
+                "batch must not close while call-b is outstanding"
+            );
+
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:09Z",
+                    tool_completed("call-b"),
+                ))
+                .unwrap();
+
+            // Measured from the batch open, not from the last call's start.
+            assert_eq!(stage(&state).live_tool_ms, 9_000);
+        }
+
+        #[test]
+        fn successive_batches_accumulate() {
+            let mut state = started_state();
+            for (seq, ts, body) in [
+                (2, "2026-04-07T12:00:00Z", tool_started("call-a")),
+                (3, "2026-04-07T12:00:04Z", tool_completed("call-a")),
+                (4, "2026-04-07T12:00:10Z", tool_started("call-b")),
+                (5, "2026-04-07T12:00:16Z", tool_completed("call-b")),
+            ] {
+                state.apply_event(&agent_event(seq, ts, body)).unwrap();
+            }
+
+            assert_eq!(stage(&state).live_tool_ms, 10_000);
+        }
+
+        #[test]
+        fn a_duplicate_completion_does_not_drain_the_batch_early() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-b"),
+                ))
+                .unwrap();
+            // call-a reports twice, as a replayed or duplicated log can.
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:03Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:04Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 0);
+            assert!(stage(&state).tool_batch.is_some());
+        }
+
+        #[test]
+        fn a_foreign_session_completion_does_not_mutate_the_open_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&session_event(
+                    3,
+                    "2026-04-07T12:00:05Z",
+                    "session-2",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            let batch = stage(&state).tool_batch.as_ref().unwrap();
+            assert_eq!(batch.session_id, "session-1");
+            assert!(batch.open_call_ids.contains("call-a"));
+            assert_eq!(stage(&state).live_tool_ms, 0);
+        }
+
+        #[test]
+        fn a_replacement_session_starts_a_separate_tool_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("old-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&session_event(
+                    3,
+                    "2026-04-07T12:00:05Z",
+                    "session-2",
+                    tool_started("new-call"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 5_000);
+            let batch = stage(&state).tool_batch.as_ref().unwrap();
+            assert_eq!(batch.session_id, "session-2");
+            assert_eq!(
+                batch.open_call_ids,
+                ["new-call".to_string()].into_iter().collect()
+            );
+
+            // A delayed completion from the old session cannot close the new
+            // session's batch even when call ids happen to collide.
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:07Z",
+                    tool_completed("new-call"),
+                ))
+                .unwrap();
+            assert!(stage(&state).tool_batch.is_some());
+
+            state
+                .apply_event(&session_event(
+                    5,
+                    "2026-04-07T12:00:09Z",
+                    "session-2",
+                    tool_completed("new-call"),
+                ))
+                .unwrap();
+            assert_eq!(stage(&state).live_tool_ms, 9_000);
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn subagent_tool_calls_do_not_double_count_against_the_root_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("root-call"),
+                ))
+                .unwrap();
+            // The sub-agent's own tools run inside the root call's span.
+            state
+                .apply_event(&child_event(
+                    3,
+                    "2026-04-07T12:00:01Z",
+                    tool_started("child-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&child_event(
+                    4,
+                    "2026-04-07T12:00:02Z",
+                    tool_completed("child-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:08Z",
+                    tool_completed("root-call"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 8_000);
+        }
+
+        #[test]
+        fn session_end_accumulates_every_open_active_bracket() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:07Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+
+            let mut ended = test_stage_event_at(
+                4,
+                "2026-04-07T12:00:20Z",
+                EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+                stage_id(),
+            );
+            ended.event.session_id = Some("session-1".to_string());
+            state.apply_event(&ended).unwrap();
+
+            assert_eq!(stage(&state).live_inference_ms, 15_000);
+            assert_eq!(stage(&state).live_tool_ms, 13_000);
+            assert!(stage(&state).inference.is_none());
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn a_foreign_session_close_leaves_the_bracket_and_accumulator_alone() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+
+            // Post-failover: a new session emits the message, so the old
+            // bracket is not this event's to close or bill.
+            let mut foreign =
+                test_stage_event_at(3, "2026-04-07T12:00:20Z", agent_message(), stage_id());
+            foreign.event.session_id = Some("session-2".to_string());
+            state.apply_event(&foreign).unwrap();
+
+            assert_eq!(stage(&state).live_inference_ms, 0);
+            assert!(stage(&state).inference.is_some());
+        }
+
+        #[test]
+        fn a_retry_keeps_accumulating_within_one_bracket() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:00Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:04Z",
+                    EventBody::AgentLlmRetry(AgentLlmRetryProps {
+                        provider:   "anthropic".to_string(),
+                        model:      "claude-fable-5".to_string(),
+                        attempt:    0,
+                        delay_secs: 0.0,
+                        error:      json!({ "kind": "stream" }),
+                        phase:      Some(LlmRetryPhase::Consume),
+                        visit:      1,
+                    }),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(4, "2026-04-07T12:00:11Z", agent_message()))
+                .unwrap();
+
+            // The whole bracket counts, retry included, matching the
+            // in-process stopwatch.
+            assert_eq!(stage(&state).live_inference_ms, 11_000);
+            assert_eq!(stage(&state).inference, None);
+        }
+
+        #[test]
+        fn stage_completion_replaces_the_live_estimate_with_finalized_timing() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:00Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(3, "2026-04-07T12:00:09Z", agent_message()))
+                .unwrap();
+            assert_eq!(stage(&state).live_inference_ms, 9_000);
+
+            state
+                .apply_event(&test_stage_event_at(
+                    4,
+                    "2026-04-07T12:00:10Z",
+                    EventBody::StageCompleted(completed_props(10_000, StageOutcome::Succeeded)),
+                    stage_id(),
+                ))
+                .unwrap();
+
+            let stage = stage(&state);
+            assert_eq!(
+                stage.live_timing(test_dt("2026-04-07T12:30:00Z")),
+                stage.timing.unwrap(),
+                "a terminal stage reports its finalized breakdown, not a live estimate"
+            );
+            assert_eq!(stage.live_inference_ms, 0);
+            assert_eq!(stage.live_tool_ms, 0);
+            assert!(stage.inference.is_none());
+            assert!(stage.tool_batch.is_none());
+        }
+
+        #[test]
+        fn run_failure_freezes_open_work_and_clears_live_bookkeeping() {
+            let mut state = started_state();
+            state.status = RunStatus::Running;
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:01Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(3, "2026-04-07T12:00:04Z", agent_message()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:05Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+
+            let mut failed = test_event(
+                5,
+                EventBody::RunFailed(run_failed_props(FailureReason::WorkflowError)),
+                None,
+            );
+            failed.event.ts = test_dt("2026-04-07T12:00:10Z");
+            state.apply_event(&failed).unwrap();
+
+            let stage = stage(&state);
+            assert_eq!(
+                stage.timing,
+                Some(fabro_types::StageTiming::new(10_000, 3_000, 5_000))
+            );
+            assert_eq!(stage.state, StageState::Failed);
+            assert_eq!(stage.live_inference_ms, 0);
+            assert_eq!(stage.live_tool_ms, 0);
+            assert!(stage.inference.is_none());
+            assert!(stage.tool_batch.is_none());
+        }
+    }
 
     fn test_event(seq: u32, body: EventBody, node_id: Option<&str>) -> EventEnvelope {
         let event = RunEvent {
@@ -1443,6 +2184,18 @@ mod tests {
     fn test_stage_event(seq: u32, body: EventBody, stage_id: StageId) -> EventEnvelope {
         let mut event = test_event(seq, body, Some(stage_id.node_id()));
         event.event.stage_id = Some(stage_id);
+        event
+    }
+
+    fn test_branch_event(
+        seq: u32,
+        body: EventBody,
+        stage_id: StageId,
+        branch_id: ParallelBranchId,
+    ) -> EventEnvelope {
+        let mut event = test_stage_event(seq, body, stage_id);
+        event.event.parallel_group_id = Some(branch_id.group().clone());
+        event.event.parallel_branch_id = Some(branch_id);
         event
     }
 
@@ -2139,6 +2892,55 @@ mod tests {
     }
 
     #[test]
+    fn parallel_branch_started_projects_identity_without_churning_it() {
+        let mut state = initialized_projection();
+        let group_id = StageId::new("review_fork", 1);
+        let branch_stage_id = StageId::new("review_glm", 1);
+        let branch_id = ParallelBranchId::new(group_id.clone(), 0);
+        let started = test_branch_event(
+            3,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 0,
+                item_label:            None,
+                graph_visit:           Some(1),
+                resumed_from_stage_id: None,
+            }),
+            branch_stage_id.clone(),
+            branch_id.clone(),
+        );
+
+        state.apply_event(&started).unwrap();
+
+        assert_eq!(
+            state
+                .stage(&branch_stage_id)
+                .unwrap()
+                .parallel_branch_id
+                .as_ref(),
+            Some(&branch_id)
+        );
+
+        let reobserved = test_branch_event(
+            4,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 1,
+                item_label:            None,
+                graph_visit:           Some(2),
+                resumed_from_stage_id: Some(StageId::new("review_glm", 2)),
+            }),
+            branch_stage_id.clone(),
+            ParallelBranchId::new(group_id, 1),
+        );
+
+        state.apply_event(&reobserved).unwrap();
+
+        let stage = state.stage(&branch_stage_id).unwrap();
+        assert_eq!(stage.parallel_branch_id.as_ref(), Some(&branch_id));
+        assert_eq!(stage.graph_visit, Some(1));
+        assert!(stage.resumed_from_stage_id.is_none());
+    }
+
+    #[test]
     fn parallel_branch_completed_finalizes_branch_stage() {
         // A parallel branch never runs through the engine's StageStarted/
         // StageCompleted lifecycle: its stage entry is created Running by the
@@ -2154,6 +2956,7 @@ mod tests {
                 "2026-04-07T12:00:00Z",
                 EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                     index:                 0,
+                    item_label:            None,
                     graph_visit:           None,
                     resumed_from_stage_id: None,
                 }),
@@ -2169,6 +2972,7 @@ mod tests {
                 4,
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
+                    item_label:  None,
                     duration_ms: 1234,
                     status:      StageOutcome::Succeeded,
                 }),
@@ -2195,6 +2999,7 @@ mod tests {
                 3,
                 EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                     index:                 0,
+                    item_label:            None,
                     graph_visit:           None,
                     resumed_from_stage_id: None,
                 }),
@@ -2206,6 +3011,7 @@ mod tests {
                 4,
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
+                    item_label:  None,
                     duration_ms: 500,
                     status:      StageOutcome::Failed {
                         retry_requested: false,
@@ -2224,6 +3030,50 @@ mod tests {
                 retry_requested: false,
             }
         );
+    }
+
+    #[test]
+    fn parallel_branch_started_uses_the_graph_handler_for_live_timing() {
+        for (handler_type, handler, expected) in [
+            (
+                "prompt",
+                StageHandler::Prompt,
+                StageTiming::new(5_000, 5_000, 0),
+            ),
+            (
+                "command",
+                StageHandler::Command,
+                StageTiming::new(5_000, 0, 5_000),
+            ),
+        ] {
+            let mut spec = test_run_spec();
+            let mut node = Node::new("review");
+            node.attrs.insert(
+                "type".to_string(),
+                AttrValue::String(handler_type.to_string()),
+            );
+            spec.graph.nodes.insert(node.id.clone(), node);
+            let mut state = RunProjection::new("Test run".to_string(), spec, Utc::now());
+            let branch = StageId::new("review", 1);
+
+            state
+                .apply_event(&test_stage_event_at(
+                    3,
+                    "2026-04-07T12:00:00Z",
+                    EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                        index:                 0,
+                        item_label:            None,
+                        graph_visit:           None,
+                        resumed_from_stage_id: None,
+                    }),
+                    branch.clone(),
+                ))
+                .unwrap();
+
+            let stage = state.stage(&branch).unwrap();
+            assert_eq!(stage.handler, Some(handler));
+            assert_eq!(stage.live_timing(test_dt("2026-04-07T12:00:05Z")), expected);
+        }
     }
 
     fn start_stage(state: &mut RunProjection, stage_id: &StageId) {
@@ -2368,6 +3218,66 @@ mod tests {
         assert_eq!(provider_used.mode, StageModelUsage::MODE_ACP);
         assert_eq!(provider_used.provider.as_deref(), Some("acp"));
         assert_eq!(provider_used.model.as_deref(), Some("fake"));
+    }
+
+    #[test]
+    fn acp_events_accumulate_live_inference_time() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+
+        state
+            .apply_event(&test_stage_event_at(
+                3,
+                "2026-04-07T12:00:00Z",
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event_at(
+                4,
+                "2026-04-07T12:00:05Z",
+                EventBody::AgentAcpStarted(AgentAcpStartedProps {
+                    visit:       1,
+                    command:     "python fake_agent.py".to_string(),
+                    config_name: Some("fake".to_string()),
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(
+            stage.live_timing(test_dt("2026-04-07T12:00:15Z")),
+            StageTiming::new(15_000, 10_000, 0)
+        );
+
+        state
+            .apply_event(&test_stage_event_at(
+                5,
+                "2026-04-07T12:00:17Z",
+                EventBody::AgentAcpCompleted(AgentAcpCompletedProps {
+                    stdout:      "done".to_string(),
+                    stderr:      String::new(),
+                    stop_reason: "end_turn".to_string(),
+                    duration_ms: 12_000,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(
+            stage.live_timing(test_dt("2026-04-07T12:00:20Z")),
+            StageTiming::new(20_000, 12_000, 0)
+        );
     }
 
     #[test]
@@ -2720,6 +3630,14 @@ mod tests {
                     allow_freeform:  true,
                     timeout_seconds: Some(30.0),
                     context_display: Some("Latest draft".to_string()),
+                    review_target:   Some(
+                        fabro_types::ReviewTarget::new(
+                            "Quarry review exercise",
+                            "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                            fabro_types::ReviewTargetKind::Document,
+                        )
+                        .unwrap(),
+                    ),
                 }),
                 Some("gate"),
             ))
@@ -2746,6 +3664,14 @@ mod tests {
         assert_eq!(
             pending.question.context_display.as_deref(),
             Some("Latest draft")
+        );
+        assert_eq!(
+            pending
+                .question
+                .review_target
+                .as_ref()
+                .map(fabro_types::ReviewTarget::url),
+            Some("https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef")
         );
 
         state
@@ -3654,6 +4580,7 @@ mod tests {
                     repo:        "fabro".to_string(),
                     base_branch: "main".to_string(),
                     head_branch: "fabro/run/demo".to_string(),
+                    head_sha:    Some("final-sha".to_string()),
                     title:       "Add run PR chip".to_string(),
                     draft:       false,
                 }),
@@ -3703,6 +4630,7 @@ mod tests {
                     repo:        github_pull_request.repo.clone(),
                     base_branch: "main".to_string(),
                     head_branch: "fabro/run/demo".to_string(),
+                    head_sha:    Some("final-sha".to_string()),
                     title:       "Add run PR chip".to_string(),
                     draft:       false,
                 }),
@@ -4036,6 +4964,7 @@ mod tests {
             visit: 1,
             message: None,
             context_window: None,
+            reasoning: None,
         }
     }
 
@@ -5262,35 +6191,34 @@ mod tests {
         }
 
         #[test]
-        fn child_openai_plan_does_not_project_when_root_has_no_plan() {
-            let mut state = initialized_projection();
-            let stage_id = stage_id();
-            state
-                .apply_event(&test_stage_event(
-                    1,
-                    EventBody::StageStarted(started_props()),
-                    stage_id.clone(),
-                ))
-                .unwrap();
-            state
-                .apply_event(&child_stage_event(
-                    2,
-                    created(
-                        "openai_plan:child_session",
-                        TodoListKind::OpenAiPlan,
-                        "c-a",
-                        0,
-                        "child work",
-                    ),
-                    stage_id.clone(),
-                ))
-                .unwrap();
+        fn child_session_whole_lists_do_not_project_when_root_has_no_list() {
+            for (kind, child_list) in [
+                (TodoListKind::OpenAiPlan, "openai_plan:child_session"),
+                (TodoListKind::KimiTodos, "kimi_todos:child_session"),
+            ] {
+                let mut state = initialized_projection();
+                let stage_id = stage_id();
+                state
+                    .apply_event(&test_stage_event(
+                        1,
+                        EventBody::StageStarted(started_props()),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
+                state
+                    .apply_event(&child_stage_event(
+                        2,
+                        created(child_list, kind, "c-a", 0, "child work"),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
 
-            let stage = state.stage(&stage_id).expect("stage projection present");
-            assert!(
-                stage.root_agent_todos.is_none(),
-                "a child session's plan must not become the stage's root plan"
-            );
+                let stage = state.stage(&stage_id).expect("stage projection present");
+                assert!(
+                    stage.root_agent_todos.is_none(),
+                    "a child session's {kind} list must not become the stage's root list"
+                );
+            }
         }
 
         #[test]
@@ -5537,10 +6465,11 @@ mod tests {
                 .apply_event(&test_stage_event(
                     1,
                     EventBody::AgentSubSpawned(AgentSubSpawnedProps {
-                        agent_id: "sub-1".to_string(),
-                        depth:    1,
-                        task:     "write tests".to_string(),
-                        visit:    1,
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        task:       "write tests".to_string(),
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
@@ -5558,6 +6487,7 @@ mod tests {
                     EventBody::AgentSubCompleted(AgentSubCompletedProps {
                         agent_id:   "sub-1".to_string(),
                         depth:      1,
+                        generation: 1,
                         success:    true,
                         turns_used: 3,
                         visit:      1,
@@ -5574,23 +6504,64 @@ mod tests {
             state
                 .apply_event(&test_stage_event(
                     3,
+                    EventBody::AgentSubTurnStarted(AgentSubTurnStartedProps {
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        task:       "fix the review findings".to_string(),
+                        generation: 2,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.subagents.len(), 1);
+            assert_eq!(stage.subagents[0].task, "write tests");
+            assert_eq!(stage.subagents[0].status, SubAgentStatus::Running);
+
+            state
+                .apply_event(&test_stage_event(
+                    4,
+                    EventBody::AgentSubCompleted(AgentSubCompletedProps {
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        generation: 2,
+                        success:    true,
+                        turns_used: 5,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.subagents.len(), 1);
+            assert_eq!(stage.subagents[0].status, SubAgentStatus::Completed {
+                success:    true,
+                turns_used: 5,
+            });
+
+            state
+                .apply_event(&test_stage_event(
+                    5,
                     EventBody::AgentSubSpawned(AgentSubSpawnedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        task:     "debug failure".to_string(),
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        task:       "debug failure".to_string(),
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
                 .unwrap();
             state
                 .apply_event(&test_stage_event(
-                    4,
+                    6,
                     EventBody::AgentSubFailed(AgentSubFailedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        error:    json!({ "message": "boom" }),
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        generation: 1,
+                        error:      json!({ "message": "boom" }),
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
@@ -5602,11 +6573,12 @@ mod tests {
 
             state
                 .apply_event(&test_stage_event(
-                    5,
+                    7,
                     EventBody::AgentSubClosed(AgentSubClosedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
@@ -6142,6 +7114,262 @@ mod tests {
                     message: "input token count is a local estimate".to_string(),
                 }],
             }
+        }
+    }
+
+    mod inference_bracket_reducer {
+        use fabro_types::run_event::{
+            AgentErrorProps, AgentLlmFirstOutputProps, AgentLlmRetryProps, AgentLlmStartedProps,
+        };
+        use fabro_types::{
+            LlmOutputKind, LlmRetryPhase, ModelRef, Speed, StageInferenceProjection,
+        };
+
+        use super::*;
+
+        const ROOT: &str = "ses_root";
+
+        fn stage_id() -> StageId {
+            StageId::new("code", 1)
+        }
+
+        /// Stage-addressed event attributed to a root session.
+        fn root_event(seq: u32, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event(seq, body, stage_id());
+            event.event.session_id = Some(ROOT.to_string());
+            event
+        }
+
+        /// Forwarded child-session event: same stage, but with a parent link.
+        fn child_event(seq: u32, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event(seq, body, stage_id());
+            event.event.session_id = Some("ses_child".to_string());
+            event.event.parent_session_id = Some(ROOT.to_string());
+            event
+        }
+
+        /// `agent.session.ended` as it is actually stored: session ids only,
+        /// no `node_id` and no `stage_id`.
+        fn session_ended_event(seq: u32, session_id: &str) -> EventEnvelope {
+            let mut event = test_event(
+                seq,
+                EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+                None,
+            );
+            event.event.session_id = Some(session_id.to_string());
+            event
+        }
+
+        fn started() -> EventBody {
+            EventBody::AgentLlmStarted(AgentLlmStartedProps {
+                requested_model: ModelRef {
+                    provider: "anthropic".parse().unwrap(),
+                    model_id: "claude-fable-5".into(),
+                    speed:    Some(Speed::Fast),
+                },
+                visit:           1,
+            })
+        }
+
+        fn first_output(kind: LlmOutputKind) -> EventBody {
+            EventBody::AgentLlmFirstOutput(AgentLlmFirstOutputProps { kind, visit: 1 })
+        }
+
+        fn retry(phase: LlmRetryPhase) -> EventBody {
+            EventBody::AgentLlmRetry(AgentLlmRetryProps {
+                provider:   "anthropic".to_string(),
+                model:      "claude-fable-5".to_string(),
+                attempt:    0,
+                delay_secs: 0.0,
+                error:      json!({ "kind": "stream" }),
+                phase:      Some(phase),
+                visit:      1,
+            })
+        }
+
+        fn open_bracket(state: &RunProjection) -> Option<&StageInferenceProjection> {
+            state.stage(&stage_id()).unwrap().inference.as_ref()
+        }
+
+        #[test]
+        fn started_opens_a_bracket_carrying_the_requested_model() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+
+            let inference = open_bracket(&state).expect("bracket should be open");
+            assert_eq!(inference.session_id, ROOT);
+            assert_eq!(inference.requested_model.provider.as_str(), "anthropic");
+            assert_eq!(
+                inference.requested_model.model_id.as_str(),
+                "claude-fable-5"
+            );
+            assert_eq!(inference.requested_model.speed, Some(Speed::Fast));
+            assert_eq!(inference.first_output_at, None);
+            assert_eq!(inference.first_output_kind, None);
+            assert_eq!(inference.retries, 0);
+        }
+
+        #[test]
+        fn first_output_records_the_observed_kind() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::ToolCall)))
+                .unwrap();
+
+            let inference = open_bracket(&state).unwrap();
+            assert!(inference.first_output_at.is_some());
+            assert_eq!(inference.first_output_kind, Some(LlmOutputKind::ToolCall));
+        }
+
+        #[test]
+        fn message_closes_the_bracket() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(
+                    3,
+                    EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5))),
+                ))
+                .unwrap();
+
+            assert!(open_bracket(&state).is_none());
+            // The close must not undo the rest of the message's work.
+            assert_eq!(state.stage(&stage_id()).unwrap().usage.input_tokens, 10);
+        }
+
+        #[test]
+        fn error_and_round_interrupt_close_the_bracket() {
+            for close in [
+                EventBody::AgentError(AgentErrorProps {
+                    error: json!({ "message": "boom" }),
+                    visit: 1,
+                }),
+                EventBody::AgentRoundInterrupted(AgentRoundInterruptedProps {
+                    generation: 1,
+                    visit:      1,
+                }),
+            ] {
+                let mut state = initialized_projection();
+                state.apply_event(&root_event(1, started())).unwrap();
+                state.apply_event(&root_event(2, close)).unwrap();
+                assert!(open_bracket(&state).is_none());
+            }
+        }
+
+        #[test]
+        fn retry_counts_the_attempt_and_clears_observed_output() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(3, retry(LlmRetryPhase::Consume)))
+                .unwrap();
+
+            // Replay is event-driven, so the projection must forget output the
+            // agent discarded rather than keep asserting it.
+            let inference = open_bracket(&state).unwrap();
+            assert_eq!(inference.retries, 1);
+            assert_eq!(inference.first_output_at, None);
+            assert_eq!(inference.first_output_kind, None);
+
+            state
+                .apply_event(&root_event(4, first_output(LlmOutputKind::Reasoning)))
+                .unwrap();
+            state
+                .apply_event(&root_event(5, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            let inference = open_bracket(&state).unwrap();
+            assert_eq!(inference.retries, 2);
+            assert_eq!(inference.first_output_kind, None);
+        }
+
+        #[test]
+        fn session_ended_closes_a_bracket_it_cannot_address_by_stage() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            assert!(open_bracket(&state).is_some());
+
+            // Terminal cancel path: no message, error, or interrupt is ever
+            // emitted. The envelope carries no node_id or stage_id, so a
+            // normal stage lookup would silently no-op and leave the bracket
+            // open forever.
+            state.apply_event(&session_ended_event(2, ROOT)).unwrap();
+            assert!(open_bracket(&state).is_none());
+        }
+
+        #[test]
+        fn session_ended_from_another_session_leaves_the_bracket_open() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&session_ended_event(2, "ses_other"))
+                .unwrap();
+            assert!(open_bracket(&state).is_some());
+        }
+
+        #[test]
+        fn a_start_queued_behind_deactivation_does_not_leave_a_phantom_bracket() {
+            let mut state = initialized_projection();
+
+            // `lease.release()` emits deactivation *before* the forwarder
+            // drains queued agent events, so a queued start legitimately
+            // arrives after it. Keying the close on deactivation would clear
+            // the bracket and then immediately re-open it.
+            state
+                .apply_event(&root_event(
+                    1,
+                    EventBody::AgentSessionDeactivated(AgentSessionDeactivatedProps { visit: 1 }),
+                ))
+                .unwrap();
+            state.apply_event(&root_event(2, started())).unwrap();
+            state.apply_event(&session_ended_event(3, ROOT)).unwrap();
+
+            assert!(open_bracket(&state).is_none());
+        }
+
+        #[test]
+        fn child_session_events_do_not_touch_the_root_bracket() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+
+            // A sub-agent runs its own rounds on the same stage. None of them
+            // may open, advance, or close the root session's bracket.
+            state.apply_event(&child_event(3, started())).unwrap();
+            state
+                .apply_event(&child_event(4, first_output(LlmOutputKind::ToolCall)))
+                .unwrap();
+            state
+                .apply_event(&child_event(5, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            state
+                .apply_event(&session_ended_event(6, "ses_child"))
+                .unwrap();
+
+            let inference = open_bracket(&state).expect("root bracket should survive");
+            assert_eq!(inference.session_id, ROOT);
+            assert_eq!(inference.first_output_kind, Some(LlmOutputKind::Text));
+            assert_eq!(inference.retries, 0);
+        }
+
+        #[test]
+        fn transitions_without_an_open_bracket_are_ignored() {
+            let mut state = initialized_projection();
+            state
+                .apply_event(&root_event(1, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(2, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            assert!(open_bracket(&state).is_none());
         }
     }
 }

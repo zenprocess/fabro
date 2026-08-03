@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::decode::{map_finish_reason, token_counts_from_api_usage, tool_call_from_item};
 use super::wire::ApiUsage;
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
-use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind};
+use crate::error::{self, Error, ProviderErrorDetail, ProviderErrorKind};
 use crate::types::{
     ContentPart, FinishReason, Message, RateLimitInfo, Response, Role, StreamEvent, TokenCounts,
     ToolCall,
@@ -36,35 +36,10 @@ fn provider_error_from_openai_error_json(error: &serde_json::Value, provider: &s
         .filter(|message| !message.is_empty())
         .map_or_else(|| "OpenAI stream error".to_string(), str::to_string);
 
-    let kind = match classifier {
-        Some("insufficient_quota" | "billing_hard_limit_reached") => {
-            ProviderErrorKind::QuotaExceeded
-        }
-        Some("rate_limit_error" | "rate_limit_exceeded" | "too_many_requests") => {
-            ProviderErrorKind::RateLimit
-        }
-        Some("authentication_error" | "invalid_api_key" | "invalid_authentication") => {
-            ProviderErrorKind::Authentication
-        }
-        Some(
-            "access_denied" | "account_deactivated" | "permission_denied" | "permission_error",
-        ) => ProviderErrorKind::AccessDenied,
-        Some("content_filter" | "content_policy_violation") => ProviderErrorKind::ContentFilter,
-        Some("context_length_exceeded") => ProviderErrorKind::ContextLength,
-        Some("server_error" | "internal_error" | "service_unavailable" | "engine_overloaded") => {
-            ProviderErrorKind::Server
-        }
-        Some(code) if code.ends_with("_not_found") => ProviderErrorKind::NotFound,
-        Some(code)
-            if code.starts_with("invalid_")
-                || code.starts_with("unsupported_")
-                || code.ends_with("_too_large")
-                || code.ends_with("_too_long") =>
-        {
-            ProviderErrorKind::InvalidRequest
-        }
-        Some(_) | None => ProviderErrorKind::Server,
-    };
+    // Unrecognized and absent codes are treated as transient.
+    let kind = classifier
+        .and_then(error::kind_from_error_code)
+        .unwrap_or(ProviderErrorKind::Server);
 
     Error::Provider {
         kind,
@@ -95,7 +70,6 @@ pub(super) struct SseAccumulator {
     message_items:           Vec<serde_json::Value>,
     usage:                   TokenCounts,
     finish_reason:           FinishReason,
-    emitted_start:           bool,
     emitted_text_start:      bool,
     emitted_reasoning_start: bool,
     rate_limit:              Option<RateLimitInfo>,
@@ -114,7 +88,6 @@ impl SseAccumulator {
             message_items: Vec::new(),
             usage: TokenCounts::default(),
             finish_reason: FinishReason::Stop,
-            emitted_start: false,
             emitted_text_start: false,
             emitted_reasoning_start: false,
             rate_limit,
@@ -129,11 +102,6 @@ impl SseAccumulator {
         data: &str,
     ) -> Result<Vec<StreamEvent>, Error> {
         let mut events = Vec::new();
-
-        if !self.emitted_start {
-            self.emitted_start = true;
-            events.push(StreamEvent::StreamStart);
-        }
 
         let json: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
@@ -446,8 +414,7 @@ mod tests {
 
     /// Build an accumulator without threading a `CodecCtx`/`Request`: the test
     /// module sees the private fields, so the few that matter are set
-    /// directly. `emitted_start` is true so event assertions don't see the
-    /// initial `StreamStart`.
+    /// directly.
     fn empty_accumulator() -> SseAccumulator {
         SseAccumulator {
             model:                   String::new(),
@@ -460,7 +427,6 @@ mod tests {
             message_items:           Vec::new(),
             usage:                   TokenCounts::default(),
             finish_reason:           FinishReason::Stop,
-            emitted_start:           true,
             emitted_text_start:      false,
             emitted_reasoning_start: false,
             rate_limit:              None,

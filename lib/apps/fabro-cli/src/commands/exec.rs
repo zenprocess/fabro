@@ -282,14 +282,6 @@ impl ProviderAdapter for AuthenticatedFabroServerAdapter {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "exec-boundary MCP transport InterpString resolution facade for {{ env.* }} values."
-)]
-fn process_env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
 fn run_mcp_servers_for_exec(
     mcps: &HashMap<String, ResolvedMcpEntry>,
 ) -> AnyResult<Vec<McpServerSettings>> {
@@ -309,19 +301,12 @@ fn run_mcp_servers_for_exec(
 }
 
 pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResult<()> {
-    use fabro_agent::cli::PermissionLevel as AgentPermissionLevel;
-    use fabro_types::settings::run::AgentPermissions;
-
     let cli = &ctx.user_settings().cli;
     #[cfg(feature = "sleep_inhibitor")]
     let _sleep_guard = sleep_inhibitor::guard(cli.exec.prevent_idle_sleep);
     let provider_str = cli.exec.model.provider.as_deref();
     let model_str = cli.exec.model.name.as_deref();
-    let permissions = cli.exec.agent.permissions.map(|p| match p {
-        AgentPermissions::ReadOnly => AgentPermissionLevel::ReadOnly,
-        AgentPermissions::ReadWrite => AgentPermissionLevel::ReadWrite,
-        AgentPermissions::Full => AgentPermissionLevel::Full,
-    });
+    let permissions = cli.exec.agent.permissions;
     let output_format = Some(match cli.output.format {
         SettingsOutputFormat::Text => OutputFormat::Text,
         SettingsOutputFormat::Json => OutputFormat::Json,
@@ -341,17 +326,14 @@ pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResu
             .transpose()?
             .unwrap_or_default(),
     };
-    // Resolve `{{ env.* }}` in MCP transport config at the exec boundary,
-    // against the CLI process env — the mirror of the `fabro run` worker
-    // boundary in `fabro_workflow::operations::start::runtime_mcp_server`.
-    // Both consumers read the same source-form settings; missing env is a hard
-    // error. `fabro exec` has no server vault, so secrets/inputs tokens surface
-    // loudly rather than leaking.
+    // Fully validate MCP transport config at the exec boundary. `fabro exec`
+    // has no server vault, so secret and unsupported tokens fail instead of
+    // reaching the transport.
     let mcp_servers = mcp_servers
         .into_iter()
         .map(|settings| {
             settings
-                .resolve_transport_env(process_env_var, |_| None)
+                .resolve_transport_secrets(|_| None)
                 .with_context(|| format!("failed to resolve MCP server {:?}", settings.name))
         })
         .collect::<AnyResult<Vec<_>>>()?;

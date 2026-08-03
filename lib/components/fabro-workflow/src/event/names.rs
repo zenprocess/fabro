@@ -67,7 +67,8 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::SessionEnded => "agent.session.ended",
             AgentEvent::ProcessingEnd => "agent.processing.end",
             AgentEvent::UserInput { .. } => "agent.input",
-            AgentEvent::AssistantTextStart => "agent.output.start",
+            AgentEvent::LlmRequestStarted { .. } => "agent.llm.started",
+            AgentEvent::LlmFirstOutput { .. } => "agent.llm.first_output",
             AgentEvent::AssistantOutputReplace { .. } => "agent.output.replace",
             AgentEvent::AssistantMessage { .. } => "agent.message",
             AgentEvent::TextDelta { .. } => "agent.text.delta",
@@ -75,6 +76,7 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::ToolCallStarted { .. } => "agent.tool.started",
             AgentEvent::ToolCallOutputDelta { .. } => "agent.tool.output.delta",
             AgentEvent::ToolCallCompleted { .. } => "agent.tool.completed",
+            AgentEvent::ToolProcessCompleted { .. } => "agent.tool.process.completed",
             AgentEvent::Error { .. } => "agent.error",
             AgentEvent::Warning { .. } => "agent.warning",
             AgentEvent::LoopDetected => "agent.loop.detected",
@@ -84,6 +86,7 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::CompactionCompleted { .. } => "agent.compaction.completed",
             AgentEvent::LlmRetry { .. } => "agent.llm.retry",
             AgentEvent::SubAgentSpawned { .. } => "agent.sub.spawned",
+            AgentEvent::SubAgentTurnStarted { .. } => "agent.sub.turn.started",
             AgentEvent::SubAgentCompleted { .. } => "agent.sub.completed",
             AgentEvent::SubAgentFailed { .. } => "agent.sub.failed",
             AgentEvent::SubAgentClosed { .. } => "agent.sub.closed",
@@ -173,6 +176,7 @@ mod tests {
                 parallel_branch_id:    ParallelBranchId::new(StageId::new("plan", 1), 0),
                 branch:                "fork".to_string(),
                 index:                 0,
+                item_label:            None,
             }),
             "parallel.branch.started"
         );
@@ -181,15 +185,32 @@ mod tests {
                 stage:             "code".to_string(),
                 visit:             1,
                 event:             AgentEvent::SubAgentSpawned {
-                    agent_id: "a1".to_string(),
-                    depth:    1,
-                    task:     "do it".to_string(),
+                    agent_id:   "a1".to_string(),
+                    depth:      1,
+                    task:       "do it".to_string(),
+                    generation: 1,
                 },
                 session_id:        None,
                 parent_session_id: None,
                 tool_call_id:      None,
             }),
             "agent.sub.spawned"
+        );
+        assert_eq!(
+            event_name(&Event::Agent {
+                stage:             "code".to_string(),
+                visit:             1,
+                event:             AgentEvent::SubAgentTurnStarted {
+                    agent_id:   "a1".to_string(),
+                    depth:      1,
+                    task:       "fix it".to_string(),
+                    generation: 2,
+                },
+                session_id:        None,
+                parent_session_id: None,
+                tool_call_id:      None,
+            }),
+            "agent.sub.turn.started"
         );
         assert_eq!(
             event_name(&Event::Agent {

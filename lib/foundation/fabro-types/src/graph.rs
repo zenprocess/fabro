@@ -116,6 +116,19 @@ pub fn shape_to_handler_type(shape: &str) -> Option<&'static str> {
     }
 }
 
+/// Presence and validity of a node attribute whose value names a workflow
+/// context key (`for_each`, `stdin_source`).
+///
+/// Consumers need three states: the attribute is not set, it is set but not a
+/// usable key (non-string or blank), or it carries a key. Modeling this once
+/// keeps lint rules and handlers agreeing on what "valid" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKeyAttr<'a> {
+    Absent,
+    Invalid,
+    Present(&'a str),
+}
+
 /// A node in the workflow graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -136,6 +149,25 @@ impl Node {
         }
     }
 
+    /// Appends a class, ignoring blank names and ones already present.
+    ///
+    /// Classes accumulate from several sources — the `class` attribute,
+    /// enclosing subgraphs, and import placeholders — so every caller needs the
+    /// same de-duplicating append.
+    ///
+    /// The name is trimmed, and a name that is empty or only whitespace is
+    /// dropped. Stylesheet selectors match class names exactly, so a padded
+    /// name would never match any rule.
+    ///
+    /// Order is preserved because the first class is meaningful: it supplies
+    /// the fallback thread ID for fidelity threading.
+    pub fn add_class(&mut self, class: &str) {
+        let class = class.trim();
+        if !class.is_empty() && !self.classes.iter().any(|existing| existing == class) {
+            self.classes.push(class.to_string());
+        }
+    }
+
     fn str_attr(&self, key: &str) -> Option<&str> {
         self.attrs.get(key).and_then(AttrValue::as_str)
     }
@@ -153,9 +185,20 @@ impl Node {
         self.str_attr("label").unwrap_or(&self.id)
     }
 
+    /// The node's Graphviz shape, which contributes to handler selection.
+    ///
+    /// An explicit `shape` or `type` attribute disables inference. Otherwise,
+    /// the presence of `script` infers `parallelogram`. Everything else falls
+    /// back to `box`.
     #[must_use]
     pub fn shape(&self) -> &str {
-        self.str_attr("shape").unwrap_or("box")
+        if let Some(shape) = self.str_attr("shape") {
+            return shape;
+        }
+        if self.node_type().is_none() && self.attrs.contains_key("script") {
+            return "parallelogram";
+        }
+        "box"
     }
 
     #[must_use]
@@ -166,6 +209,37 @@ impl Node {
     #[must_use]
     pub fn prompt(&self) -> Option<&str> {
         self.str_attr("prompt")
+    }
+
+    /// The shell or Python source a command node runs.
+    #[must_use]
+    pub fn script(&self) -> Option<&str> {
+        self.str_attr("script")
+    }
+
+    /// The prompt a handler should send, falling back to the node label when
+    /// `prompt` is absent or empty.
+    #[must_use]
+    pub fn prompt_or_label(&self) -> &str {
+        self.prompt()
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or_else(|| self.label())
+    }
+
+    #[must_use]
+    pub fn for_each(&self) -> Option<&str> {
+        self.str_attr("for_each")
+    }
+
+    #[must_use]
+    pub fn context_key_attr(&self, name: &str) -> ContextKeyAttr<'_> {
+        let Some(value) = self.attrs.get(name) else {
+            return ContextKeyAttr::Absent;
+        };
+        match value.as_str() {
+            Some(source) if !source.trim().is_empty() => ContextKeyAttr::Present(source),
+            _ => ContextKeyAttr::Invalid,
+        }
     }
 
     #[must_use]
@@ -194,6 +268,11 @@ impl Node {
     }
 
     #[must_use]
+    pub fn review_target(&self) -> bool {
+        self.bool_attr("review_target").unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn retry_target(&self) -> Option<&str> {
         self.str_attr("retry_target")
     }
@@ -211,11 +290,6 @@ impl Node {
     #[must_use]
     pub fn thread_id(&self) -> Option<&str> {
         self.str_attr("thread_id")
-    }
-
-    #[must_use]
-    pub fn class(&self) -> Option<&str> {
-        self.str_attr("class")
     }
 
     pub fn timeout(&self) -> Option<Duration> {
@@ -296,8 +370,10 @@ impl Node {
     /// mapping.
     #[must_use]
     pub fn handler_type(&self) -> Option<&str> {
-        if let Some(t) = self.node_type() {
-            return Some(t);
+        match self.node_type() {
+            Some("tool") => return Some("command"),
+            Some(node_type) => return Some(node_type),
+            None => {}
         }
         shape_to_handler_type(self.shape())
     }
@@ -586,15 +662,22 @@ mod tests {
         assert_eq!(node.shape(), "box");
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
+        assert_eq!(node.script(), None);
+        assert_eq!(node.for_each(), None);
+        assert_eq!(
+            node.context_key_attr("stdin_source"),
+            ContextKeyAttr::Absent
+        );
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
         assert!(!node.goal_gate());
+        assert!(!node.review_target());
         assert_eq!(node.retry_target(), None);
         assert_eq!(node.fallback_retry_target(), None);
         assert_eq!(node.fidelity(), None);
         assert_eq!(node.thread_id(), None);
-        assert_eq!(node.class(), None);
+        assert!(node.classes.is_empty());
         assert_eq!(node.timeout(), None);
         assert_eq!(node.model(), None);
         assert_eq!(node.provider(), None);
@@ -604,6 +687,78 @@ mod tests {
         assert_eq!(node.retry_policy(), None);
         assert_eq!(node.max_visits(), None);
         assert!(node.project_memory());
+    }
+
+    #[test]
+    fn add_class_trims_names_and_drops_blanks_and_duplicates() {
+        let mut node = Node::new("work");
+        node.add_class("coding");
+        node.add_class(" coding ");
+        node.add_class("");
+        node.add_class("   ");
+        node.add_class("\tcritical\n");
+
+        assert_eq!(node.classes, ["coding", "critical"]);
+    }
+
+    fn node_with(id: &str, attrs: &[(&str, &str)]) -> Node {
+        let mut node = Node::new(id);
+        for (key, value) in attrs {
+            node.attrs
+                .insert((*key).to_string(), AttrValue::String((*value).to_string()));
+        }
+        node
+    }
+
+    #[test]
+    fn shapeless_script_node_infers_command() {
+        let node = node_with("build", &[("script", "cargo build")]);
+        assert_eq!(node.shape(), "parallelogram");
+        assert_eq!(node.handler_type(), Some("command"));
+    }
+
+    #[test]
+    fn shapeless_node_without_script_stays_agent() {
+        let node = node_with("plan", &[("prompt", "Plan the work")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_shape_wins_over_script_inference() {
+        let node = node_with("odd", &[("shape", "box"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_type_wins_over_script_inference() {
+        let node = node_with("odd", &[("type", "agent"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn any_script_attribute_value_infers_command() {
+        // The command-requires-script lint reports this; inference only asks
+        // whether the attribute is present so the diagnostic lands on a
+        // command node rather than a silently-agent one.
+        let empty = node_with("empty", &[("script", "")]);
+        assert_eq!(empty.shape(), "parallelogram");
+        assert_eq!(empty.handler_type(), Some("command"));
+
+        let mut non_string = Node::new("non_string");
+        non_string
+            .attrs
+            .insert("script".to_string(), AttrValue::Integer(123));
+        assert_eq!(non_string.shape(), "parallelogram");
+        assert_eq!(non_string.handler_type(), Some("command"));
+    }
+
+    #[test]
+    fn legacy_tool_type_resolves_to_command() {
+        let node = node_with("build", &[("type", "tool")]);
+        assert_eq!(node.handler_type(), Some("command"));
     }
 
     #[test]
@@ -640,6 +795,55 @@ mod tests {
     }
 
     #[test]
+    fn node_prompt_or_label_falls_back_on_absent_and_empty_prompts() {
+        let mut node = Node::new("review");
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs
+            .insert("prompt".to_string(), AttrValue::String(String::new()));
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Review the diff.".to_string()),
+        );
+        assert_eq!(node.prompt_or_label(), "Review the diff.");
+    }
+
+    #[test]
+    fn node_for_each_returns_context_source() {
+        let mut node = Node::new("fanout");
+        node.attrs.insert(
+            "for_each".to_string(),
+            AttrValue::String("context.candidates".to_string()),
+        );
+
+        assert_eq!(node.for_each(), Some("context.candidates"));
+    }
+
+    #[test]
+    fn node_context_key_attr_classifies_presence_and_validity() {
+        let mut node = Node::new("merge");
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
+        );
+
+        assert_eq!(
+            node.context_key_attr("stdin_source"),
+            ContextKeyAttr::Present("context.parallel.results")
+        );
+
+        for invalid in [AttrValue::String("   ".to_string()), AttrValue::Integer(3)] {
+            node.attrs.insert("stdin_source".to_string(), invalid);
+            assert_eq!(
+                node.context_key_attr("stdin_source"),
+                ContextKeyAttr::Invalid
+            );
+        }
+    }
+
+    #[test]
     fn node_with_attrs() {
         let mut node = Node::new("plan");
         node.attrs.insert(
@@ -653,11 +857,14 @@ mod tests {
         node.attrs
             .insert("goal_gate".to_string(), AttrValue::Boolean(true));
         node.attrs
+            .insert("review_target".to_string(), AttrValue::Boolean(true));
+        node.attrs
             .insert("max_retries".to_string(), AttrValue::Integer(3));
 
         assert_eq!(node.label(), "Plan step");
         assert_eq!(node.shape(), "diamond");
         assert!(node.goal_gate());
+        assert!(node.review_target());
         assert_eq!(node.max_retries(), Some(3));
     }
 

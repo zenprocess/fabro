@@ -384,21 +384,25 @@ fn event_body_from_event(event: &Event) -> EventBody {
         }),
         Event::ParallelBranchStarted {
             index,
+            item_label,
             graph_visit,
             resumed_from_stage_id,
             ..
         } => EventBody::ParallelBranchStarted(fabro_types::ParallelBranchStartedProps {
             index: *index,
+            item_label: item_label.clone(),
             graph_visit: *graph_visit,
             resumed_from_stage_id: resumed_from_stage_id.clone(),
         }),
         Event::ParallelBranchCompleted {
             index,
+            item_label,
             duration_ms,
             status,
             ..
         } => EventBody::ParallelBranchCompleted(fabro_types::ParallelBranchCompletedProps {
             index:       *index,
+            item_label:  item_label.clone(),
             duration_ms: *duration_ms,
             status:      *status,
         }),
@@ -425,6 +429,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform,
             timeout_seconds,
             context_display,
+            review_target,
         } => EventBody::InterviewStarted(fabro_types::InterviewStartedProps {
             question_id:     question_id.clone(),
             question:        question.clone(),
@@ -434,6 +439,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform:  *allow_freeform,
             timeout_seconds: *timeout_seconds,
             context_display: context_display.clone(),
+            review_target:   review_target.clone(),
         }),
         Event::InterviewCompleted {
             actor: _,
@@ -614,6 +620,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 cost_source,
                 tool_call_count,
                 context_window,
+                reasoning,
             } => {
                 let billing = billed_token_counts_from_llm(usage)
                     .with_reported_cost(cost_usd.map(UsdMicros::from_usd));
@@ -626,6 +633,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                     visit: *visit,
                     message: None,
                     context_window: context_window.clone(),
+                    reasoning: reasoning.clone(),
                 })
             }
             AgentEvent::ToolCallStarted {
@@ -655,6 +663,22 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tool_result:  None,
                 turn_id:      None,
             }),
+            AgentEvent::ToolProcessCompleted {
+                exit_code,
+                termination,
+                duration_ms,
+                streams_separated,
+                exec_output_tail,
+            } => EventBody::AgentToolProcessCompleted(
+                fabro_types::AgentToolProcessCompletedProps {
+                    exit_code:         *exit_code,
+                    termination:       *termination,
+                    duration_ms:       *duration_ms,
+                    streams_separated: *streams_separated,
+                    exec_output_tail:  exec_output_tail.clone(),
+                    visit:             *visit,
+                },
+            ),
             AgentEvent::Error { error } => EventBody::AgentError(fabro_types::AgentErrorProps {
                 error: serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
                 visit: *visit,
@@ -704,38 +728,68 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tracked_file_count:     *tracked_file_count,
                 visit:                  *visit,
             }),
+            AgentEvent::LlmRequestStarted { requested_model } => {
+                EventBody::AgentLlmStarted(fabro_types::AgentLlmStartedProps {
+                    requested_model: requested_model.clone(),
+                    visit:           *visit,
+                })
+            }
+            AgentEvent::LlmFirstOutput { kind } => {
+                EventBody::AgentLlmFirstOutput(fabro_types::AgentLlmFirstOutputProps {
+                    kind:  *kind,
+                    visit: *visit,
+                })
+            }
             AgentEvent::LlmRetry {
                 provider,
                 model,
                 attempt,
                 delay_secs,
                 error,
+                phase,
             } => EventBody::AgentLlmRetry(fabro_types::AgentLlmRetryProps {
                 provider:   provider.clone(),
                 model:      model.clone(),
                 attempt:    *attempt,
                 delay_secs: *delay_secs,
                 error:      serde_json::to_value(error).expect("LLM SDK error derives Serialize with no custom logic that can fail"),
+                phase:      Some(*phase),
                 visit:      *visit,
             }),
             AgentEvent::SubAgentSpawned {
                 agent_id,
                 depth,
                 task,
+                generation,
             } => EventBody::AgentSubSpawned(fabro_types::AgentSubSpawnedProps {
-                agent_id: agent_id.clone(),
-                depth:    *depth,
-                task:     task.clone(),
-                visit:    *visit,
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                task:      task.clone(),
+                generation: *generation,
+                visit:     *visit,
+            }),
+            AgentEvent::SubAgentTurnStarted {
+                agent_id,
+                depth,
+                task,
+                generation,
+            } => EventBody::AgentSubTurnStarted(fabro_types::AgentSubTurnStartedProps {
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                task:      task.clone(),
+                generation: *generation,
+                visit:     *visit,
             }),
             AgentEvent::SubAgentCompleted {
                 agent_id,
                 depth,
+                generation,
                 success,
                 turns_used,
             } => EventBody::AgentSubCompleted(fabro_types::AgentSubCompletedProps {
                 agent_id:   agent_id.clone(),
                 depth:      *depth,
+                generation: *generation,
                 success:    *success,
                 turns_used: *turns_used,
                 visit:      *visit,
@@ -743,18 +797,25 @@ fn event_body_from_event(event: &Event) -> EventBody {
             AgentEvent::SubAgentFailed {
                 agent_id,
                 depth,
+                generation,
                 error,
             } => EventBody::AgentSubFailed(fabro_types::AgentSubFailedProps {
-                agent_id: agent_id.clone(),
-                depth:    *depth,
-                error:    serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
-                visit:    *visit,
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                generation: *generation,
+                error:     serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
+                visit:     *visit,
             }),
-            AgentEvent::SubAgentClosed { agent_id, depth } => {
+            AgentEvent::SubAgentClosed {
+                agent_id,
+                depth,
+                generation,
+            } => {
                 EventBody::AgentSubClosed(fabro_types::AgentSubClosedProps {
-                    agent_id: agent_id.clone(),
-                    depth:    *depth,
-                    visit:    *visit,
+                    agent_id:  agent_id.clone(),
+                    depth:     *depth,
+                    generation: *generation,
+                    visit:     *visit,
                 })
             }
             AgentEvent::McpServerReady {
@@ -833,8 +894,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             AgentEvent::TodoCreated(props) => EventBody::TodoCreated(props.clone()),
             AgentEvent::TodoUpdated(props) => EventBody::TodoUpdated(props.clone()),
             AgentEvent::TodoDeleted(props) => EventBody::TodoDeleted(props.clone()),
-            AgentEvent::AssistantTextStart
-            | AgentEvent::AssistantOutputReplace { .. }
+            AgentEvent::AssistantOutputReplace { .. }
             | AgentEvent::TextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolCallOutputDelta { .. }
@@ -1111,20 +1171,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 ssh_command: ssh_command.clone(),
             })
         }
-        Event::Failover {
-            from_provider,
-            from_model,
-            to_provider,
-            to_model,
-            error,
-            ..
-        } => EventBody::Failover(fabro_types::FailoverProps {
-            from_provider: from_provider.clone(),
-            from_model:    from_model.clone(),
-            to_provider:   to_provider.clone(),
-            to_model:      to_model.clone(),
-            error:         error.clone(),
-        }),
+        Event::Failover { props, .. } => EventBody::Failover(props.clone()),
         Event::CommandStarted {
             script,
             command,
@@ -1282,6 +1329,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo,
             base_branch,
             head_branch,
+            head_sha,
             title,
             draft,
         } => EventBody::PullRequestCreated(fabro_types::PullRequestCreatedProps {
@@ -1291,6 +1339,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo:        repo.clone(),
             base_branch: base_branch.clone(),
             head_branch: head_branch.clone(),
+            head_sha:    head_sha.clone(),
             title:       title.clone(),
             draft:       *draft,
         }),
@@ -1518,6 +1567,47 @@ mod tests {
     }
 
     #[test]
+    fn run_event_agent_tool_process_completed_carries_stage_session_and_actor() {
+        let stored = to_run_event(&fixtures::RUN_4, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             2,
+            event:             AgentEvent::ToolProcessCompleted {
+                exit_code:         Some(7),
+                termination:       ::fabro_types::CommandTermination::Exited,
+                duration_ms:       12,
+                streams_separated: true,
+                exec_output_tail:  Some(exec_tail()),
+            },
+            session_id:        Some("ses_child".to_string()),
+            parent_session_id: Some("ses_parent".to_string()),
+            tool_call_id:      Some("call_1".to_string()),
+        });
+
+        assert_eq!(stored.event_name(), "agent.tool.process.completed");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        assert_eq!(stored.stage_id, Some(StageId::new("code", 2)));
+        assert_eq!(stored.session_id.as_deref(), Some("ses_child"));
+        assert_eq!(stored.parent_session_id.as_deref(), Some("ses_parent"));
+        assert_eq!(stored.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            stored.actor,
+            Some(::fabro_types::Principal::Agent {
+                session_id:        Some("ses_child".to_string()),
+                parent_session_id: Some("ses_parent".to_string()),
+                model:             None,
+            })
+        );
+
+        let properties = stored.properties().unwrap();
+        assert_eq!(properties["exit_code"], 7);
+        assert_eq!(properties["termination"], "exited");
+        assert_eq!(properties["duration_ms"], 12);
+        assert_eq!(properties["streams_separated"], true);
+        assert_eq!(properties["exec_output_tail"]["stdout"], "last stdout line");
+        assert_eq!(properties["visit"], 2);
+    }
+
+    #[test]
     fn run_event_agent_tools_available_moves_session_and_stage_metadata_to_header() {
         let stored = to_run_event(&fixtures::RUN_4, &Event::AgentToolsAvailable {
             node_id:    "code".to_string(),
@@ -1741,6 +1831,7 @@ mod tests {
             parallel_branch_id: ParallelBranchId::new(group_id, 1),
             branch:             "review".to_string(),
             index:              1,
+            item_label:         Some("api".to_string()),
             duration_ms:        42,
             status:             StageOutcome::Succeeded,
         });
@@ -1749,6 +1840,7 @@ mod tests {
             stored.properties().unwrap(),
             serde_json::json!({
                 "index": 1,
+                "item_label": "api",
                 "duration_ms": 42,
                 "status": "succeeded",
             })
@@ -1766,6 +1858,8 @@ mod tests {
             results:       vec![
                 ::fabro_types::ParallelBranchResult {
                     id:              "review_api".to_string(),
+                    index:           Some(0),
+                    item_label:      Some("api".to_string()),
                     status:          StageOutcome::Succeeded,
                     context_updates: BTreeMap::from([(
                         "response.review_api".to_string(),
@@ -1774,6 +1868,8 @@ mod tests {
                 },
                 ::fabro_types::ParallelBranchResult {
                     id:              "review_ux".to_string(),
+                    index:           Some(1),
+                    item_label:      Some("ux".to_string()),
                     status:          StageOutcome::Failed {
                         retry_requested: false,
                     },
@@ -1795,11 +1891,15 @@ mod tests {
                 "results": [
                     {
                         "id": "review_api",
+                        "index": 0,
+                        "item_label": "api",
                         "status": "succeeded",
                         "context_updates": {"response.review_api": "looks good"},
                     },
                     {
                         "id": "review_ux",
+                        "index": 1,
+                        "item_label": "ux",
                         "status": "failed",
                         "context_updates": {"response.review_ux": "needs work"},
                     },
@@ -1817,6 +1917,7 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fanout", 2), 1),
             branch:                "review".to_string(),
             index:                 1,
+            item_label:            Some("api".to_string()),
         });
         assert_eq!(stored.parallel_group_id, Some(StageId::new("fanout", 2)));
         assert_eq!(
@@ -2232,6 +2333,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2266,6 +2368,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2303,6 +2406,7 @@ mod tests {
                 cost_source:     Some(fabro_model::CostSource::Authoritative),
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2353,6 +2457,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  Some(context_window),
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2367,6 +2472,52 @@ mod tests {
         assert_eq!(
             context_window.count_method,
             ::fabro_types::StageContextWindowCountMethod::LocalEstimate
+        );
+    }
+
+    #[test]
+    fn agent_assistant_message_copies_reasoning_into_canonical_event() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             AgentEvent::AssistantMessage {
+                text:            String::new(),
+                model:           ModelRef {
+                    provider: ProviderId::openai(),
+                    model_id: "gpt-5.4".into(),
+                    speed:    None,
+                },
+                usage:           LlmTokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
+                tool_call_count: 1,
+                context_window:  None,
+                reasoning:       Some(::fabro_types::ReasoningOutput::new(
+                    "inspect the conversion first",
+                    "read convert.rs, then the sink",
+                )),
+            },
+            session_id:        Some("ses_agent".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        let EventBody::AgentMessage(message) = &stored.body else {
+            panic!("expected agent message body");
+        };
+        let reasoning = message.reasoning.as_ref().expect("reasoning copied");
+        assert_eq!(reasoning.summary(), Some("inspect the conversion first"));
+        assert_eq!(reasoning.trace(), Some("read convert.rs, then the sink"));
+
+        let value = stored.to_value().unwrap();
+        assert_eq!(value["event"], "agent.message");
+        assert_eq!(
+            value["properties"]["reasoning"]["summary"],
+            "inspect the conversion first"
+        );
+        assert_eq!(
+            value["properties"]["reasoning"]["trace"],
+            "read convert.rs, then the sink"
         );
     }
 

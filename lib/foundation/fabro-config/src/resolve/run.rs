@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
@@ -10,6 +10,7 @@ use fabro_types::settings::run::{
     RunIntegrationsSettings, RunInterviewsSettings, RunMetaBranchSettings, RunModelControls,
     RunModelSettings, RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
+use fabro_util::workspace_glob::WorkspaceGlob;
 
 use super::{ResolveError, resolve_run_environment};
 use crate::{
@@ -83,7 +84,7 @@ pub fn resolve_run(
             .collect(),
         scm: resolve_scm(layer.scm.as_ref()),
         pull_request,
-        artifacts: resolve_artifacts(layer.artifacts.as_ref()),
+        artifacts: resolve_artifacts(layer.artifacts.as_ref(), errors),
         integrations: resolve_integrations(layer.integrations.as_ref()),
     }
 }
@@ -122,11 +123,17 @@ fn resolve_model(model: Option<&RunModelLayer>) -> RunModelSettings {
         fallbacks: model
             .fallbacks
             .iter()
-            .filter_map(|entry| match entry {
-                ModelRefOrSplice::ModelRef(model_ref) => Some(model_ref.clone()),
-                ModelRefOrSplice::Splice => None,
+            .map(|(requested_model, chain)| {
+                let chain = chain
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ModelRefOrSplice::ModelRef(model_ref) => Some(model_ref.clone()),
+                        ModelRefOrSplice::Splice => None,
+                    })
+                    .collect();
+                (requested_model.clone(), chain)
             })
-            .collect(),
+            .collect::<BTreeMap<_, _>>(),
         controls:  model
             .controls
             .as_ref()
@@ -155,8 +162,9 @@ fn resolve_git(git: Option<&RunGitLayer>) -> RunGitSettings {
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: prepare step commands and per-step env are carried \
-              in source form so `fabro validate` stays portable; their {{ env.* }} tokens resolve \
-              at the run boundary in fabro_types::settings::run::RunPrepareSettings::resolve_step_env"
+              in source form so `fabro validate` stays portable; secret tokens resolve and \
+              unsupported tokens fail at the run boundary in \
+              fabro_types::settings::run::RunPrepareSettings::resolve_step_secrets"
 )]
 fn resolve_prepare(
     prepare: Option<&RunPrepareLayer>,
@@ -167,18 +175,16 @@ fn resolve_prepare(
     let mut steps = Vec::new();
     for (index, step) in prepare.steps.iter().enumerate() {
         let run = match (&step.script, &step.command) {
-            // A `script` is a raw shell snippet: carry it verbatim so the shell
-            // interprets it. Its `{{ env.* }}` tokens resolve at the run
-            // boundary.
+            // A `script` is a raw shell snippet. Carry it verbatim so the shell
+            // interprets it after late secret resolution.
             (Some(script), None) => PreparedStepRun::Script {
                 script: script.as_source(),
             },
             // A `command` is an argv: carry it as a vector of element source
-            // strings — neither pre-joined nor shell-quoted here. Each element's
-            // `{{ env.* }}` token resolves at the run boundary, and only the
-            // resolved value is shell-quoted (resolve-then-quote), so an
-            // interpolated value can never break out of its argument and inject
-            // shell syntax.
+            // strings — neither pre-joined nor shell-quoted here. Secret tokens
+            // resolve at the run boundary, and only the resolved value is
+            // shell-quoted (resolve-then-quote), so an interpolated value can
+            // never break out of its argument and inject shell syntax.
             (None, Some(argv)) => PreparedStepRun::Command {
                 command: argv.iter().map(InterpString::as_source).collect(),
             },
@@ -318,7 +324,6 @@ fn resolve_agent(
 
     RunAgentSettings {
         fabro_tools: agent.fabro_tools.unwrap_or(false),
-        permissions: agent.permissions,
         mcps:        resolve_mcp_entries(&agent.mcps, mcp_server_catalog, errors),
     }
 }
@@ -385,8 +390,9 @@ pub(crate) fn resolve_enabled_mcps(
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: MCP transport strings are carried in source form \
-              so `fabro validate` stays portable; their {{ env.* }} tokens resolve at the run \
-              boundary in fabro_workflow::operations::start::runtime_mcp_server"
+              so `fabro validate` stays portable; secret tokens resolve and unsupported tokens \
+              fail at the run boundary in \
+              fabro_workflow::operations::start::runtime_mcp_server"
 )]
 pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerSettings {
     let transport = match entry {
@@ -396,7 +402,11 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
             env,
             ..
         } => McpTransport::Stdio {
-            command: resolve_mcp_command(script.as_ref(), command.as_ref()),
+            command: resolve_mcp_command(
+                script.as_ref(),
+                command.as_ref(),
+                ScriptInterpreter::HostShell,
+            ),
             env:     env
                 .iter()
                 .map(|(key, value)| (key.clone(), value.as_source()))
@@ -424,7 +434,11 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
             ..
         } => McpTransport::Sandbox {
             protocol: *protocol,
-            command:  resolve_mcp_command(script.as_ref(), command.as_ref()),
+            command:  resolve_mcp_command(
+                script.as_ref(),
+                command.as_ref(),
+                ScriptInterpreter::SandboxBash,
+            ),
             port:     *port,
             env:      env
                 .iter()
@@ -473,19 +487,38 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: MCP transport strings are carried in source form \
-              so `fabro validate` stays portable; their {{ env.* }} tokens resolve at the run \
-              boundary in fabro_workflow::operations::start::runtime_mcp_server"
+              so `fabro validate` stays portable; secret tokens resolve and unsupported tokens \
+              fail at the run boundary in \
+              fabro_workflow::operations::start::runtime_mcp_server"
 )]
 fn resolve_mcp_command(
     script: Option<&InterpString>,
     command: Option<&Vec<InterpString>>,
+    interpreter: ScriptInterpreter,
 ) -> Vec<String> {
     if let Some(script) = script {
-        return vec!["sh".to_string(), "-c".to_string(), script.as_source()];
+        let executable: &'static str = interpreter.into();
+        return vec![executable.to_string(), "-c".to_string(), script.as_source()];
     }
     command
         .map(|command| command.iter().map(InterpString::as_source).collect())
         .unwrap_or_default()
+}
+
+/// Which interpreter evaluates an MCP `script`.
+///
+/// The two transports run in different places, so they keep different
+/// contracts: a stdio script runs on the host outside the sandbox API, while a
+/// sandbox script is evaluated by the sandbox's Bash.
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+enum ScriptInterpreter {
+    /// Host shell, unchanged for `type = "stdio"` servers.
+    #[strum(serialize = "sh")]
+    HostShell,
+    /// The sandbox's non-login Bash. Resolved through `PATH` rather than
+    /// spelled `/bin/bash` so local sandboxes keep working on NixOS.
+    #[strum(serialize = "bash")]
+    SandboxBash,
 }
 
 fn resolve_hook(hook: &HookEntry, index: usize, errors: &mut Vec<ResolveError>) -> HookDefinition {
@@ -568,7 +601,6 @@ fn resolve_hook_type(hook: &HookEntry) -> Option<HookType> {
         return Some(HookType::Http {
             url: url.clone(),
             headers,
-            allowed_env_vars: hook.allowed_env_vars.clone(),
             tls,
         });
     }
@@ -620,7 +652,21 @@ fn resolve_pull_request(pull_request: Option<&RunPullRequestLayer>) -> Option<Pu
     })
 }
 
-fn resolve_artifacts(artifacts: Option<&RunArtifactsLayer>) -> ArtifactsSettings {
+fn resolve_artifacts(
+    artifacts: Option<&RunArtifactsLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> ArtifactsSettings {
+    if let Some(artifacts) = artifacts {
+        for (index, pattern) in artifacts.include.iter().enumerate() {
+            if let Err(error) = WorkspaceGlob::try_new(pattern) {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("run.artifacts.include[{index}]"),
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+
     ArtifactsSettings {
         include: artifacts
             .map(|artifacts| artifacts.include.clone())
@@ -665,8 +711,8 @@ mod resolve_prepare_tests {
         assert_eq!(steps[0].run, PreparedStepRun::Script {
             script: "setup".to_string(),
         });
-        // The per-step env survives resolution in source form (its {{ env.* }}
-        // token resolves later, at the run boundary).
+        // The per-step env survives config resolution in source form. The
+        // unsupported token fails later at the run boundary.
         assert_eq!(
             steps[0].env.get("TOKEN").map(String::as_str),
             Some("{{ env.DEPLOY_TOKEN }}")
@@ -691,9 +737,9 @@ mod resolve_prepare_tests {
         let steps = resolve(&layer);
 
         // Argv elements are carried as separate source strings, NOT joined and
-        // NOT shell-quoted here. Quoting happens at the run boundary, after
-        // `{{ env.* }}` resolution, so the resolved value (not the source
-        // token) is what gets quoted.
+        // NOT shell-quoted here. Quoting happens after late interpolation at
+        // the run boundary, so a resolved value (not the source token) is what
+        // gets quoted.
         assert_eq!(steps[0].run, PreparedStepRun::Command {
             command: vec![
                 "echo".to_string(),

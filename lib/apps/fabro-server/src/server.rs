@@ -137,6 +137,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tower::{ServiceExt, service_fn};
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{Instrument, debug, error, info, warn};
 use ulid::Ulid;
@@ -152,7 +153,6 @@ use crate::git_checkout::GitRepoCache;
 use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
-use crate::interp::process_env_var;
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -719,6 +719,7 @@ impl SlackService {
                     allow_freeform:  props.allow_freeform,
                     timeout_seconds: props.timeout_seconds,
                     context_display: props.context_display.clone(),
+                    review_target:   props.review_target.clone(),
                 });
                 let blocks = slack_blocks::question_to_blocks(
                     &event.run_id.to_string(),
@@ -873,13 +874,8 @@ impl SlackService {
 
         let blocks = &blocks;
         let posts = routes.into_iter().filter_map(|(route_name, route)| {
-            let channel = resolve_slack_lifecycle_route_channel(
-                state,
-                event.run_id,
-                route_name,
-                route,
-                event_name,
-            )?;
+            let channel =
+                resolve_slack_lifecycle_route_channel(event.run_id, route_name, route, event_name)?;
             Some(async move {
                 if let Err(err) = self.client.post_message(&channel, blocks, None).await {
                     warn!(
@@ -1059,7 +1055,6 @@ fn slack_lifecycle_pull_request_from_link(link: &PullRequestLink) -> SlackLifecy
 }
 
 fn resolve_slack_lifecycle_route_channel(
-    state: &AppState,
     run_id: RunId,
     route_name: &str,
     route: &NotificationRouteSettings,
@@ -1079,7 +1074,10 @@ fn resolve_slack_lifecycle_route_channel(
         return None;
     };
 
-    let resolved = match channel.resolve(|name| (state.env_lookup)(name)) {
+    // `{{ vars.* }}` is substituted at run creation, so the channel is literal
+    // here; anything still unresolved skips the route rather than sending to a
+    // half-rendered channel name.
+    let resolved = match channel.resolve_with(&mut fabro_types::settings::ResolveCtx::new()) {
         Ok(resolved) => resolved,
         Err(err) => {
             warn!(
@@ -1925,12 +1923,14 @@ pub fn build_router_with_options(
 /// Response-compression layer shared by the main and install-mode routers.
 ///
 /// The default predicate skips streaming SSE (`text/event-stream`), gRPC,
-/// images, and tiny bodies. The quality is pinned because tower-http's
-/// default defers to each codec's own default, and brotli's is quality 11 —
-/// seconds of CPU on a multi-megabyte asset. Level 4 keeps both codecs fast
-/// at a near-optimal ratio.
-pub(crate) fn compression_layer() -> CompressionLayer {
-    CompressionLayer::new().quality(CompressionLevel::Precise(4))
+/// images, ZIP archives, and tiny bodies. The quality is pinned because
+/// tower-http's default defers to each codec's own default, and brotli's is
+/// quality 11 — seconds of CPU on a multi-megabyte asset. Level 4 keeps both
+/// codecs fast at a near-optimal ratio.
+pub(crate) fn compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new()
+        .quality(CompressionLevel::Precise(4))
+        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("application/zip")))
 }
 
 async fn http_log_middleware(mut req: axum_extract::Request, next: Next) -> Response {
@@ -3708,6 +3708,7 @@ fn runtime_question_from_interview_record(question: &InterviewQuestionRecord) ->
         stage:           question.stage.clone(),
         metadata:        HashMap::new(),
         context_display: question.context_display.clone(),
+        review_target:   question.review_target.clone(),
     }
 }
 
@@ -3721,6 +3722,7 @@ fn api_question_from_interview_record(question: &InterviewQuestionRecord) -> Api
         allow_freeform:  question.allow_freeform,
         timeout_seconds: question.timeout_seconds,
         context_display: question.context_display.clone(),
+        review_target:   question.review_target.clone(),
     }
 }
 
@@ -4082,13 +4084,31 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
-    let github_permissions = persisted
+    let github_permissions = match persisted
         .run_spec()
         .settings
         .run
         .integrations
         .github
-        .resolve_permissions(process_env_var);
+        .resolve_permissions()
+    {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run_id,
+                error = %err,
+                "GitHub permission interpolation failed"
+            );
+            fail_run_before_execution(
+                &state,
+                run_id,
+                FailureReason::WorkflowError,
+                format!("Failed to resolve GitHub permissions: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
     let vault = match state.stores.vault.snapshot().await {
         Ok(vault) => vault,
         Err(err) => {
@@ -4115,7 +4135,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         run_control: None,
         github_app,
         github_permissions,
-        vault: Some(Arc::new(AsyncRwLock::new(vault.into_vault()))),
+        vault: Arc::new(AsyncRwLock::new(vault.into_vault())),
         catalog: state.catalog(),
         on_node: None,
         registry_override,
@@ -4169,9 +4189,15 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     let mut runs = state.runs.lock().expect("runs lock poisoned");
     if let Some(managed_run) = runs.get_mut(&run_id) {
         match &result {
-            ExecutionResult::Completed(result) => match result.as_ref() {
-                Ok(started) => match &started.finalized.outcome {
-                    Ok(_) => {
+            ExecutionResult::Completed(result) => {
+                // A run can fail either before it produces a `Started` or in
+                // its own outcome; both carry the same `WorkflowError`.
+                let outcome = match result.as_ref() {
+                    Ok(started) => started.finalized.outcome.as_ref().map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(()) => {
                         info!(run_id = %run_id, "Run completed");
                         managed_run.status = RunStatus::Succeeded {
                             reason: SuccessReason::Completed,
@@ -4184,27 +4210,15 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                         };
                     }
                     Err(e) => {
-                        error!(run_id = %run_id, error = %e, "Run failed");
+                        let detail = e.display_with_causes();
+                        error!(run_id = %run_id, error = %detail, "Run failed");
                         managed_run.status = RunStatus::Failed {
-                            reason: FailureReason::WorkflowError,
+                            reason: e.failure_reason(),
                         };
-                        managed_run.error = Some(e.to_string());
+                        managed_run.error = Some(detail);
                     }
-                },
-                Err(WorkflowError::Cancelled) => {
-                    info!(run_id = %run_id, "Run cancelled");
-                    managed_run.status = RunStatus::Failed {
-                        reason: FailureReason::Cancelled,
-                    };
                 }
-                Err(e) => {
-                    error!(run_id = %run_id, error = %e, "Run failed");
-                    managed_run.status = RunStatus::Failed {
-                        reason: FailureReason::WorkflowError,
-                    };
-                    managed_run.error = Some(e.to_string());
-                }
-            },
+            }
             ExecutionResult::CancelledBySignal => {
                 info!(run_id = %run_id, "Run cancelled");
                 managed_run.status = RunStatus::Failed {

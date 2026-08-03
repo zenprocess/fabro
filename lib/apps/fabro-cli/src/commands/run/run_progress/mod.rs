@@ -256,7 +256,11 @@ impl ProgressUI {
             ProgressEvent::AssistantMessage {
                 stage_node_id,
                 model,
+                root_session,
             } => {
+                if root_session {
+                    self.stage.on_llm_request_finished(&stage_node_id);
+                }
                 self.stage
                     .on_assistant_message(renderer, &stage_node_id, &model);
             }
@@ -316,6 +320,30 @@ impl ProgressUI {
                     tracked_file_count,
                 );
             }
+            ProgressEvent::CompactionFailed {
+                stage_node_id,
+                error,
+                root_session,
+            } => {
+                if root_session {
+                    self.stage.on_llm_request_finished(&stage_node_id);
+                }
+                self.stage
+                    .on_compaction_failed(renderer, &stage_node_id, &error);
+            }
+            ProgressEvent::LlmRequestStarted {
+                stage_node_id,
+                model,
+            } => {
+                self.stage
+                    .on_llm_request_started(renderer, &stage_node_id, &model);
+            }
+            ProgressEvent::LlmFirstOutput {
+                stage_node_id,
+                kind,
+            } => {
+                self.stage.on_llm_first_output(&stage_node_id, kind);
+            }
             ProgressEvent::LlmRetry {
                 stage_node_id,
                 model,
@@ -332,13 +360,22 @@ impl ProgressUI {
                     &error,
                 );
             }
-            ProgressEvent::SubagentSpawned {
+            ProgressEvent::LlmRequestFinished { stage_node_id } => {
+                self.stage.on_llm_request_finished(&stage_node_id);
+            }
+            ProgressEvent::SubagentStarted {
                 stage_node_id,
                 agent_id,
                 task,
+                generation,
             } => {
-                self.stage
-                    .on_subagent_spawned(renderer, &stage_node_id, &agent_id, &task);
+                self.stage.on_subagent_started(
+                    renderer,
+                    &stage_node_id,
+                    &agent_id,
+                    &task,
+                    generation,
+                );
             }
             ProgressEvent::SubagentCompleted {
                 stage_node_id,
@@ -508,6 +545,17 @@ mod tests {
         }
     }
 
+    fn child_agent_event(stage: &str, event: AgentEvent) -> Event {
+        Event::Agent {
+            stage: stage.into(),
+            visit: 1,
+            event,
+            session_id: Some("ses_child".into()),
+            parent_session_id: Some("ses_root".into()),
+            tool_call_id: None,
+        }
+    }
+
     fn stage_started(node_id: &str, name: &str) -> Event {
         Event::StageStarted {
             graph_visit:           None,
@@ -521,9 +569,9 @@ mod tests {
         }
     }
 
-    fn assistant_message(stage: &str, model: &str) -> Event {
-        agent_event(stage, AgentEvent::AssistantMessage {
-            text:            "done".into(),
+    fn assistant_event(model: &str, text: &str) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            text:            text.into(),
             model:           ModelRef {
                 provider: ProviderId::openai(),
                 model_id: model.into(),
@@ -534,6 +582,25 @@ mod tests {
             cost_source:     None,
             tool_call_count: 0,
             context_window:  None,
+            reasoning:       None,
+        }
+    }
+
+    fn assistant_message(stage: &str, model: &str) -> Event {
+        agent_event(stage, assistant_event(model, "done"))
+    }
+
+    fn child_assistant_message(stage: &str, model: &str) -> Event {
+        child_agent_event(stage, assistant_event(model, "child done"))
+    }
+
+    fn llm_request_started(stage: &str, model: &str) -> Event {
+        agent_event(stage, AgentEvent::LlmRequestStarted {
+            requested_model: ModelRef {
+                provider: ProviderId::anthropic(),
+                model_id: model.into(),
+                speed:    None,
+            },
         })
     }
 
@@ -599,10 +666,11 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            Some("auth".into()),
         });
         let stage = &ui.stage.active_stages["fork1"];
         assert_eq!(stage.tool_calls.len(), 1);
-        assert_eq!(stage.tool_calls[0].tool_call_id, "security");
+        assert_eq!(stage.tool_calls[0].tool_call_id, "auth (security #0)");
         assert!(matches!(
             stage.tool_calls[0].status,
             ToolCallStatus::Running
@@ -613,6 +681,7 @@ mod tests {
             parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:             "security".into(),
             index:              0,
+            item_label:         Some("auth".into()),
             duration_ms:        2000,
             status:             fabro_workflow::outcome::StageOutcome::Succeeded,
         });
@@ -640,6 +709,7 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            None,
         });
 
         let stage = &ui.stage.active_stages["fork1"];
@@ -665,6 +735,8 @@ mod tests {
             }),
         );
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_some());
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_some());
 
         emit(
             &mut ui,
@@ -676,6 +748,161 @@ mod tests {
             }),
         );
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_none());
+    }
+
+    #[test]
+    fn compaction_failure_clears_bar() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::CompactionStarted {
+                estimated_tokens:    5000,
+                context_window_size: 8000,
+            }),
+        );
+        assert!(ui.stage.active_stages["s1"].compaction_bar.is_some());
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::Error {
+                error: fabro_agent::Error::Compaction(fabro_agent::CompactionError::EmptySummary {
+                    summarized_turn_count: 14,
+                }),
+            }),
+        );
+
+        assert!(ui.stage.active_stages["s1"].compaction_bar.is_none());
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
+    fn plain_compaction_failure_snapshot() {
+        let (mut ui, buffer) = capture_ui(false);
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::Error {
+                error: fabro_agent::Error::Compaction(fabro_agent::CompactionError::EmptySummary {
+                    summarized_turn_count: 14,
+                }),
+            }),
+        );
+
+        insta::assert_snapshot!(rendered(&buffer), @"      ✗ compaction failed: generated summary was empty after trimming; refused to replace 14 turns and left history intact");
+    }
+
+    #[test]
+    fn inference_bracket_sets_updates_and_clears_bar() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("bracket should open a live line")
+            .message();
+        assert!(
+            message.contains("waiting on claude-fable-5"),
+            "expected the requested model, got: {message:?}"
+        );
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::ToolCall,
+            }),
+        );
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("the line stays open until the round ends")
+            .message();
+        assert!(
+            message.contains("calling tools"),
+            "expected the observed output kind, got: {message:?}"
+        );
+
+        emit(&mut ui, assistant_message("s1", "claude-fable-5"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
+    fn inference_retry_resets_the_live_line_before_verbose_output() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::Text,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmRetry {
+                provider:   "anthropic".into(),
+                model:      "claude-fable-5".into(),
+                attempt:    1,
+                delay_secs: 0.1,
+                phase:      fabro_types::LlmRetryPhase::Consume,
+                error:      fabro_llm::Error::Configuration {
+                    message: "retry".into(),
+                    source:  None,
+                },
+            }),
+        );
+
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("retry keeps the bracket open")
+            .message();
+        assert!(message.contains("waiting on claude-fable-5"));
+    }
+
+    #[test]
+    fn inference_interrupt_clears_the_live_line() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::RoundInterrupted { generation: 1 }),
+        );
+
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
+    fn child_session_events_do_not_mutate_the_root_inference_line() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            child_agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::ToolCall,
+            }),
+        );
+        emit(&mut ui, child_assistant_message("s1", "child-model"));
+
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("child output must not close the root bracket")
+            .message();
+        assert!(message.contains("waiting on claude-fable-5"));
+
+        emit(&mut ui, assistant_message("s1", "claude-fable-5"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
     }
 
     #[test]
@@ -742,19 +969,22 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
+                phase:      fabro_types::LlmRetryPhase::Open,
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,
                 },
             }),
             agent_event("code", AgentEvent::SubAgentSpawned {
-                agent_id: "a1".into(),
-                depth:    1,
-                task:     "review recent changes".into(),
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "review recent changes".into(),
+                generation: 1,
             }),
             agent_event("code", AgentEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
+                generation: 1,
                 success:    true,
                 turns_used: 3,
             }),
@@ -1100,6 +1330,7 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
+                phase:      fabro_types::LlmRetryPhase::Open,
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,
@@ -1109,9 +1340,10 @@ mod tests {
         emit(
             &mut ui,
             agent_event("code", AgentEvent::SubAgentSpawned {
-                agent_id: "a1".into(),
-                depth:    1,
-                task:     "review recent changes".into(),
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "review recent changes".into(),
+                generation: 1,
             }),
         );
         emit(
@@ -1119,8 +1351,28 @@ mod tests {
             agent_event("code", AgentEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
+                generation: 1,
                 success:    true,
                 turns_used: 3,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("code", AgentEvent::SubAgentTurnStarted {
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "fix the review findings".into(),
+                generation: 2,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("code", AgentEvent::SubAgentCompleted {
+                agent_id:   "a1".into(),
+                depth:      1,
+                generation: 2,
+                success:    true,
+                turns_used: 2,
             }),
         );
         emit(&mut ui, Event::SetupStarted { command_count: 1 });
@@ -1140,6 +1392,8 @@ mod tests {
           ⚠ retry: gpt-5-mini attempt 2 (busy, delay 1s)
             ▸ subagent[a1] "review recent changes"
             ✓ subagent[a1] (3 turns)
+            ↻ subagent[a1] turn 2 "fix the review findings"
+            ✓ subagent[a1] (2 turns)
           ✓ [1/1] bun install  2s
         Setup: 1 command (2s)
         ✓ Code  5s  (1 turns, 0 tools, 1.5k toks)
@@ -1163,6 +1417,7 @@ mod tests {
             repo:        "fabro".into(),
             base_branch: "main".into(),
             head_branch: "fabro/run/42".into(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Ship the change".into(),
             draft:       true,
         });
@@ -1257,12 +1512,14 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            None,
         });
         emit(&mut ui, Event::ParallelBranchCompleted {
             parallel_group_id:  StageId::new("fork1", 1),
             parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:             "security".into(),
             index:              0,
+            item_label:         None,
             duration_ms:        500,
             status:             fabro_workflow::outcome::StageOutcome::Succeeded,
         });

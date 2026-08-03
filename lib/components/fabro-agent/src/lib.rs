@@ -15,9 +15,9 @@ pub mod local_sandbox;
 pub mod loop_detection;
 pub mod mcp_integration;
 pub mod memory;
+pub mod native_tool;
 pub mod profiles;
 pub mod question_tools;
-pub mod read_before_write_sandbox;
 pub mod sandbox;
 pub mod session;
 pub mod skills;
@@ -34,12 +34,12 @@ pub mod types;
 
 pub use agent_profile::AgentProfile;
 pub use config::{
-    SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode,
-    ToolHookCallback, ToolHookDecision, ToolSecrets,
+    NativeToolOptions, SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter,
+    ToolExposureMode, ToolHookCallback, ToolHookDecision, ToolSecrets,
 };
 #[cfg(feature = "docker")]
 pub use docker_sandbox::{DockerSandbox, DockerSandboxOptions};
-pub use error::{Error, InterruptReason, Result};
+pub use error::{CompactionError, Error, InterruptReason, Result};
 pub use event::Emitter;
 pub use fabro_mcp::config::McpServerSettings;
 pub use fabro_types::SteeringMessage;
@@ -47,17 +47,20 @@ pub use history::History;
 pub use local_sandbox::LocalSandbox;
 pub use loop_detection::detect_loop;
 pub use memory::{MemoryDocument, discover_memory};
-pub use profiles::{AnthropicProfile, EnvContext, GeminiProfile, OpenAiProfile};
+pub use native_tool::{NativeTool, ToolVocabulary};
+pub use profiles::{
+    AgentProfileBuilder, AnthropicProfile, Claude5Profile, EnvContext, GeminiProfile, KimiProfile,
+    OpenAiProfile,
+};
 pub use question_tools::{
     ANTHROPIC_ASK_USER_QUESTION_TOOL, AgentQuestion, AgentQuestionAnswer,
     AgentQuestionAnswerStatus, AgentQuestionRuntime, AgentToolRuntime,
     OPENAI_REQUEST_USER_INPUT_TOOL, register_question_tools,
 };
-pub use read_before_write_sandbox::ReadBeforeWriteSandbox;
 pub use sandbox::{
-    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, RefreshOutcome,
-    Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    format_lines_numbered, shell_quote,
+    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingRequest, ExecStreamingResult,
+    GrepOptions, RefreshOutcome, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
+    StdioProcess, StdioProcessHandle, format_lines_numbered, shell_quote,
 };
 pub use session::{
     CompletionCoordinator, Session, SessionControlHandle, SessionInputTiming,
@@ -68,12 +71,13 @@ pub use subagent::{SubAgentEventCallback, SubAgentResult, SubAgentStatus, SubAge
 pub use todo_runtime::TodoRuntime;
 pub use todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
-    make_update_plan_tool,
+    make_todo_list_tool, make_update_plan_tool,
 };
+pub use tool_permissions::canonical_tool_name;
 pub use tool_registry::{AgentEventEmitter, ToolRegistry};
 pub use tools::{
     WebFetchSummarizer, make_edit_file_tool, make_glob_tool, make_grep_tool, make_read_file_tool,
-    make_shell_tool, make_shell_tool_with_config, make_write_file_tool, register_core_tools,
+    make_shell_tool, make_shell_tool_with_options, make_write_file_tool, register_core_tools,
 };
 pub use truncation::{TruncationMode, truncate_lines, truncate_output, truncate_tool_output};
 pub use types::{

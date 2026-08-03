@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,13 +9,14 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use daytona_api_client::apis::api_keys_api;
 use daytona_api_client::apis::configuration::Configuration;
+use daytona_api_client::models::SandboxState;
 use daytona_api_client::models::api_key_list::Permissions;
 use daytona_sdk::api_types::SignedPortPreviewUrl;
 use daytona_sdk::toolbox_types::Command as SessionCommandResult;
 use daytona_sdk::{DaytonaError, SessionCommandLogsResult};
 use fabro_github::GitHubCredentials;
 use fabro_static::EnvVars;
-use fabro_types::{CommandOutputStream, CommandTermination, RunId};
+use fabro_types::{CommandOutputStream, CommandTermination, RunId, SandboxProviderKind};
 use fabro_util::time::elapsed_ms;
 use rand::Rng;
 use tokio::runtime::Handle;
@@ -24,13 +25,35 @@ use tokio::task::JoinHandle;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
+use crate::clone_retry::{self, CloneRetryReason};
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
-use crate::sandbox::{RefreshOutcome, optional_timeout, resolve_path};
-use crate::{
-    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
-    SandboxEvent, SandboxEventCallback, StdioProcess, glob_match, managed_labels, shell_quote,
+use crate::sandbox::{
+    self, BASH_ENV_VAR, BASH_PROBE_MARKER, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
+    REMOTE_WALK_TIMEOUT_MS, RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
 };
+use crate::{
+    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingRequest, ExecStreamingResult,
+    GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StdioProcess,
+    WalkOptions, managed_labels, shell_quote,
+};
+
+/// Remediation shown when a Daytona sandbox has no usable Bash.
+const DAYTONA_BASH_REMEDIATION: &str = "Daytona sandboxes require /bin/bash for every command, with no `sh` fallback. Use the \
+     built-in Daytona snapshot, or a custom snapshot whose Dockerfile installs bash.";
+
+/// Remediation shown when the session transport reaches Bash but never
+/// completes.
+///
+/// The direct transport is probed first, so a sandbox that reaches this failure
+/// already has a usable Bash. What is left is the session contract: Daytona
+/// sources the submitted command inside a wrapper that resumes afterward to
+/// drain the log labelers and persist the exit code, so the command has to
+/// return control to it.
+const DAYTONA_BASH_SESSION_REMEDIATION: &str = "Daytona ran the direct command transport but not its streaming session transport. \
+     A session command must leave Daytona's wrapper shell in place so the provider can \
+     record the exit code; replacing that shell reports no completion and stalls every \
+     streaming command until its timeout.";
 
 pub(crate) const WORKING_DIRECTORY: &str = "/home/daytona/workspace";
 pub(crate) const REPOS_ROOT: &str = "/home/daytona/repos";
@@ -40,9 +63,11 @@ pub(crate) const DAYTONA_DASHBOARD_SANDBOXES_URL: &str =
     "https://app.daytona.io/dashboard/sandboxes";
 const FABRO_SANDBOX_USER_AGENT: &str = concat!("fabro-sandbox/", env!("CARGO_PKG_VERSION"));
 const DAYTONA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// Upper bound on `DaytonaSession::close` so a stalled Daytona REST call cannot
-/// block cancellation/timeout paths from returning.
-const DAYTONA_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+const DAYTONA_START_TIMEOUT: Duration = Duration::from_mins(1);
+/// Upper bound on explicit and Drop-triggered Daytona cleanup calls (session
+/// deletion, temporary stdin files) so a stalled REST call cannot block
+/// cancellation/timeout paths indefinitely.
+const DAYTONA_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Permissions a Daytona API key needs for Fabro's snapshot and sandbox flow.
 pub const REQUIRED_DAYTONA_PERMISSIONS: &[Permissions] = &[
@@ -486,54 +511,180 @@ impl DaytonaSandbox {
         resolve_path(path, self.working_directory())
     }
 
+    /// Verify a Daytona sandbox evaluates commands as non-login Bash.
+    ///
+    /// Runs on a freshly created sandbox before any Fabro-owned setup, and
+    /// again after a reconnected sandbox starts, so a snapshot without Bash
+    /// fails at the lifecycle boundary rather than on some later command.
+    ///
+    /// Both transports are probed. They build different requests — a direct
+    /// process exec and a toolbox session — so neither is evidence for the
+    /// other, and a session transport that never yields an exit code otherwise
+    /// surfaces as every streaming command timing out rather than as an init
+    /// failure. The direct probe runs first because it isolates "no usable
+    /// Bash" from "Bash runs but the session contract is broken".
+    async fn probe_bash(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        Self::probe_bash_exec(sandbox).await?;
+        Self::probe_bash_session(sandbox).await
+    }
+
+    /// Probe Bash over the direct process-exec transport.
+    async fn probe_bash_exec(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        let start = Instant::now();
+        let execution = time::timeout(Duration::from_millis(BASH_PROBE_TIMEOUT_MS), async {
+            let process_svc = sandbox
+                .process()
+                .await
+                .map_err(|e| crate::Error::context("Failed to get Daytona process service", e))?;
+            let result = process_svc
+                .execute_command(
+                    &wrap_bash_command(BASH_PROBE_SCRIPT),
+                    daytona_sdk::ExecuteCommandOptions {
+                        cwd: Some("/".to_string()),
+                        timeout: Some(Duration::from_millis(BASH_PROBE_TIMEOUT_MS)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| crate::Error::context("Failed to run Daytona Bash check", e))?;
+            Ok(ExecResult {
+                stdout:      result.result,
+                stderr:      String::new(),
+                exit_code:   Some(result.exit_code),
+                termination: CommandTermination::Exited,
+                duration_ms: elapsed_ms(start),
+            })
+        })
+        .await;
+        let execution = match execution {
+            Ok(result) => result,
+            Err(_) => Err(crate::Error::message(format!(
+                "Daytona Bash check timed out after {BASH_PROBE_TIMEOUT_MS}ms"
+            ))),
+        };
+
+        daytona_bash_probe_outcome(execution)
+    }
+
+    /// Probe Bash over the streaming toolbox-session transport.
+    ///
+    /// Builds, submits, and awaits the command exactly the way
+    /// [`Sandbox::exec_command_streaming`] does, so the provider's exit-code
+    /// bookkeeping is part of what passes or fails here. The probe script's
+    /// `BASH_ENV` assertion is vacuous on this path — the generated session
+    /// script blanks `BASH_ENV` itself — but the interpreter, non-login,
+    /// non-POSIX, and completion assertions all hold.
+    ///
+    /// Costs one session round trip plus a single status poll per sandbox
+    /// lifecycle transition. `DAYTONA_PROBE_TIMEOUT` is the outer backstop for
+    /// a stalled REST call; the inner [`BASH_PROBE_TIMEOUT_MS`] is the deadline
+    /// for the command itself. Session cleanup runs outside that deadline under
+    /// its own bounded timeout.
+    async fn probe_bash_session(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        let deadline = time::Instant::now() + DAYTONA_PROBE_TIMEOUT;
+        let timeout_error = || {
+            crate::Error::message(format!(
+                "Daytona Bash session check timed out after {}s",
+                DAYTONA_PROBE_TIMEOUT.as_secs()
+            ))
+        };
+        let mut session = match time::timeout_at(deadline, DaytonaSession::create(sandbox)).await {
+            Ok(Ok(session)) => session,
+            Ok(Err(err)) => return daytona_bash_session_probe_outcome(Err(err)),
+            Err(_) => return daytona_bash_session_probe_outcome(Err(timeout_error())),
+        };
+
+        let execution =
+            match time::timeout_at(deadline, Self::run_bash_session_probe(&session)).await {
+                Ok(result) => result,
+                Err(_) => Err(timeout_error()),
+            };
+        let close_reason = if execution.is_ok() {
+            "bash session probe finished"
+        } else {
+            "bash session probe failure"
+        };
+        session.close(close_reason).await;
+        daytona_bash_session_probe_outcome(execution)
+    }
+
+    /// Run one probe command through a Daytona session and collect its result.
+    async fn run_bash_session_probe(session: &DaytonaSession) -> crate::Result<ExecResult> {
+        let start = Instant::now();
+        let session_exec = session
+            .execute(
+                &build_bash_session_command(BASH_PROBE_SCRIPT, "/", None),
+                true,
+                true,
+            )
+            .await
+            .map_err(|err| {
+                crate::Error::context("Failed to execute Daytona session command", err)
+            })?;
+
+        if let Some(exit_code) = session_exec.exit_code {
+            return Ok(ExecResult {
+                stdout:      session_exec
+                    .stdout
+                    .or(session_exec.output)
+                    .unwrap_or_default(),
+                stderr:      session_exec.stderr.unwrap_or_default(),
+                exit_code:   Some(exit_code),
+                termination: CommandTermination::Exited,
+                duration_ms: elapsed_ms(start),
+            });
+        }
+        let command_id = session_exec.cmd_id;
+
+        let outcome = wait_for_completion(
+            session,
+            &command_id,
+            None,
+            Some(BASH_PROBE_TIMEOUT_MS),
+            CancellationToken::new(),
+        )
+        .await?;
+
+        let logs = match outcome.final_logs {
+            Some(logs) => Some(logs),
+            None => session.fetch_logs(&command_id).await,
+        };
+        let (stdout, stderr) = logs
+            .map(|logs| (logs.stdout, logs.stderr))
+            .unwrap_or_default();
+
+        Ok(ExecResult {
+            stdout,
+            stderr,
+            exit_code: outcome.exit_code,
+            termination: outcome.termination,
+            duration_ms: elapsed_ms(start),
+        })
+    }
+
+    /// Discard a sandbox that failed its Bash probe.
+    ///
+    /// A failed cleanup is logged rather than returned: the Bash failure is
+    /// what the operator needs to act on.
+    async fn delete_unusable_sandbox(
+        sandbox: &daytona_sdk::Sandbox,
+        bash_error: crate::Error,
+    ) -> crate::Error {
+        if let Err(cleanup_error) = sandbox.delete().await {
+            tracing::warn!(
+                error = %cleanup_error,
+                sandbox = %sandbox.name,
+                "Failed to delete Daytona sandbox after its Bash check failed"
+            );
+        }
+        bash_error
+    }
+
     /// Get the sandbox, returning an error if not yet initialized.
     fn sandbox(&self) -> crate::Result<&daytona_sdk::Sandbox> {
         self.sandbox.get().ok_or_else(|| {
             crate::Error::message("Daytona sandbox not initialized — call initialize() first")
         })
-    }
-
-    async fn list_files_recursive(&self, root: &str) -> crate::Result<Vec<String>> {
-        let sandbox = self.sandbox()?;
-        let fs_svc = sandbox
-            .fs()
-            .await
-            .map_err(|e| crate::Error::context("Failed to get Daytona fs service", e))?;
-        let mut candidates = Vec::new();
-        let mut stack = vec![root.to_string()];
-        let mut visited_dirs = HashSet::new();
-
-        while let Some(dir) = stack.pop() {
-            if !visited_dirs.insert(dir.clone()) {
-                continue;
-            }
-
-            let entries = match fs_svc.list_files(&dir).await {
-                Ok(entries) => entries,
-                Err(daytona_sdk::DaytonaError::NotFound { .. }) => continue,
-                Err(err) => {
-                    return Err(crate::Error::context(
-                        format!("Failed to list Daytona directory {dir}"),
-                        err,
-                    ));
-                }
-            };
-
-            for entry in entries {
-                if entry.name.is_empty() || entry.name == "." || entry.name == ".." {
-                    continue;
-                }
-
-                let child_path = glob_match::join_path(&dir, &entry.name);
-                if entry.is_dir {
-                    stack.push(child_path);
-                } else {
-                    candidates.push(child_path);
-                }
-            }
-        }
-
-        Ok(candidates)
     }
 
     /// Read-only access to the SDK sandbox once initialized. Returns `None`
@@ -575,6 +726,7 @@ impl DaytonaSandbox {
         };
         daytona_sdk::SandboxBaseParams {
             name: Some(name),
+            env_vars: Some(clean_bash_env(None)),
             auto_stop_interval: self.config.auto_stop_interval,
             labels: Some(managed_labels::merge_for_run(
                 self.config.labels.as_ref(),
@@ -863,6 +1015,11 @@ impl Sandbox for DaytonaSandbox {
                 )
             })?;
 
+        if let Err(bash_error) = Self::probe_bash(&sandbox).await {
+            let err = Self::delete_unusable_sandbox(&sandbox, bash_error).await;
+            return Err(self.fail_init(init_start, err));
+        }
+
         let clone_decision = clone_source::decide_clone(
             self.config.skip_clone,
             self.clone_origin_url.as_deref(),
@@ -895,6 +1052,10 @@ impl Sandbox for DaytonaSandbox {
                 let layout =
                     clone_source::github_repo_layout(&origin_url, WORKING_DIRECTORY, REPOS_ROOT)
                         .map_err(|err| self.fail_init(init_start, err))?;
+                let token_was_freshly_minted = self
+                    .github_app
+                    .as_ref()
+                    .is_some_and(GitHubCredentials::mints_installation_token);
                 self.emit(SandboxEvent::GitCloneStarted {
                     url:    origin_url.clone(),
                     branch: branch.clone(),
@@ -902,40 +1063,26 @@ impl Sandbox for DaytonaSandbox {
                 let clone_start = Instant::now();
 
                 let (username, password) = match &self.github_app {
-                    Some(creds) => {
-                        let (owner, repo) = fabro_github::parse_github_owner_repo(&origin_url)
-                            .map_err(|e| {
-                                let err = crate::Error::message(format!(
-                                    "Failed to parse GitHub URL for clone: {e}"
-                                ));
-                                self.emit(SandboxEvent::GitCloneFailed {
-                                    url:    origin_url.clone(),
-                                    error:  err.to_string(),
-                                    causes: err.causes(),
-                                });
-                                err
-                            })?;
-                        fabro_github::resolve_clone_credentials(
-                            &fabro_github::GitHubContext::new(
-                                creds,
-                                &fabro_github::github_api_base_url(),
-                            ),
-                            &owner,
-                            &repo,
-                        )
-                        .await
-                        .map_err(|e| {
-                            let err = crate::Error::message(format!(
-                                "Failed to get GitHub App credentials for clone: {e}"
-                            ));
-                            self.emit(SandboxEvent::GitCloneFailed {
-                                url:    origin_url.clone(),
-                                error:  err.to_string(),
-                                causes: err.causes(),
-                            });
-                            self.fail_init(init_start, err)
-                        })?
-                    }
+                    Some(creds) => fabro_github::resolve_clone_credentials(
+                        &fabro_github::GitHubContext::new(
+                            creds,
+                            &fabro_github::github_api_base_url(),
+                        ),
+                        &layout.owner,
+                        &layout.repo,
+                    )
+                    .await
+                    .map_err(|e| {
+                        let err = crate::Error::message(format!(
+                            "Failed to get GitHub App credentials for clone: {e}"
+                        ));
+                        self.emit(SandboxEvent::GitCloneFailed {
+                            url:    origin_url.clone(),
+                            error:  err.to_string(),
+                            causes: err.causes(),
+                        });
+                        self.fail_init(init_start, err)
+                    })?,
                     None => (None, None),
                 };
 
@@ -1000,19 +1147,24 @@ impl Sandbox for DaytonaSandbox {
                     self.fail_init(init_start, err)
                 })?;
 
-                let clone_token = password.clone();
-                let clone_result = git_svc
-                    .clone(
-                        &origin_url,
-                        &layout.primary_repo_path,
-                        daytona_sdk::GitCloneOptions {
-                            branch,
-                            username,
-                            password,
+                let clone_result = clone_retry::retry_clone(
+                    SandboxProviderKind::Daytona,
+                    None,
+                    |_attempt| {
+                        let git_svc = &git_svc;
+                        let origin = origin_url.as_str();
+                        let target = layout.primary_repo_path.as_str();
+                        let options = daytona_sdk::GitCloneOptions {
+                            branch: branch.clone(),
+                            username: username.clone(),
+                            password: password.clone(),
                             ..Default::default()
-                        },
-                    )
-                    .await;
+                        };
+                        async move { git_svc.clone(origin, target, options).await }
+                    },
+                    |err: &DaytonaError| classify_clone_failure(err, token_was_freshly_minted),
+                )
+                .await;
 
                 match clone_result {
                     Ok(()) => {
@@ -1026,7 +1178,7 @@ impl Sandbox for DaytonaSandbox {
                             });
                             self.fail_init(init_start, err)
                         })?;
-                        let symlink_cmd = daytona_symlink_command(&layout);
+                        let symlink_cmd = clone_source::repo_symlink_command(&layout);
                         let symlink_result = process_svc
                             .execute_command(
                                 &wrap_bash_command(&symlink_cmd),
@@ -1078,8 +1230,8 @@ impl Sandbox for DaytonaSandbox {
                         let _ = self.origin_url.set(origin_url.clone());
                         self.set_working_directory(layout.execution_directory.clone())
                             .map_err(|err| self.fail_init(init_start, err))?;
-                        if let Some(token) = clone_token {
-                            match fabro_github::embed_token_in_url(&origin_url, &token) {
+                        if let Some(token) = password.as_deref() {
+                            match fabro_github::embed_token_in_url(&origin_url, token) {
                                 Ok(auth_url) => {
                                     let cmd = format!(
                                         "git -c maintenance.auto=0 remote set-url origin {}",
@@ -1198,12 +1350,39 @@ impl Sandbox for DaytonaSandbox {
             });
             return Err(err);
         }
+        if let Err(err) = Self::probe_bash(sandbox).await {
+            self.emit(SandboxEvent::StartFailed {
+                provider: "daytona".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            });
+            return Err(err);
+        }
         let duration_ms = elapsed_ms(start);
         self.emit(SandboxEvent::StartCompleted {
             provider: "daytona".into(),
             duration_ms,
         });
         Ok(())
+    }
+
+    async fn activate(&self) -> crate::Result<()> {
+        let sandbox = self.sandbox()?;
+        let current = self.client.get(&sandbox.name).await.map_err(|e| {
+            crate::Error::context("Failed to inspect Daytona sandbox before activation", e)
+        })?;
+        if current.state == Some(SandboxState::Started) {
+            return Ok(());
+        }
+        if current.state == Some(SandboxState::Starting) {
+            return current
+                .wait_for_start(Some(DAYTONA_START_TIMEOUT))
+                .await
+                .map_err(|e| {
+                    crate::Error::context("Failed to wait for Daytona sandbox activation", e)
+                });
+        }
+        self.start().await
     }
 
     async fn stop(&self) -> crate::Result<()> {
@@ -1354,7 +1533,7 @@ impl Sandbox for DaytonaSandbox {
         // Only a GitHub App installation token can be re-minted; a static PAT or
         // a pre-minted Installation token is fixed, so re-embedding it changes
         // nothing. Short-circuit to Skipped before the resolve + set-url exec.
-        if !matches!(creds, GitHubCredentials::App(_)) {
+        if !creds.mints_installation_token() {
             return Ok(RefreshOutcome::Skipped);
         }
 
@@ -1547,9 +1726,10 @@ impl Sandbox for DaytonaSandbox {
             "exec_command: process service acquired, starting select"
         );
 
+        let clean_env = clean_bash_env(env_vars);
         let options = daytona_sdk::ExecuteCommandOptions {
             cwd:     Some(cwd),
-            env:     env_vars.cloned(),
+            env:     Some(clean_env.clone()),
             timeout: Some(std::time::Duration::from_millis(timeout_ms)),
         };
 
@@ -1557,19 +1737,7 @@ impl Sandbox for DaytonaSandbox {
         // process the `envs` field (not in its OpenAPI spec), so we also
         // prepend `export` statements as a fallback until server support
         // lands. The SDK sends `envs` too for forward compatibility.
-        let command_with_env = if let Some(vars) = env_vars {
-            if vars.is_empty() {
-                command.to_string()
-            } else {
-                let exports: Vec<String> = vars
-                    .iter()
-                    .map(|(k, v)| format!("export {}={}", shell_quote(k), shell_quote(v)))
-                    .collect();
-                format!("{}\n{}", exports.join("\n"), command)
-            }
-        } else {
-            command.to_string()
-        };
+        let command_with_env = format!("{}\n{command}", bash_export_lines(&clean_env).join("\n"));
 
         // Wrap with `bash -c` so pipes, env vars, and shell features work.
         // The Daytona API uses direct exec, not a shell.
@@ -1632,23 +1800,37 @@ impl Sandbox for DaytonaSandbox {
 
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
         let sandbox = self.sandbox()?;
         let start = Instant::now();
         let cwd = working_dir.map_or_else(
             || self.working_directory().to_string(),
             |d| self.resolve_path(d),
         );
+        let stdin_upload = async {
+            match stdin {
+                Some(stdin) => DaytonaStdinFile::create(sandbox, &stdin).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        let (mut stdin_file, mut session) =
+            tokio::try_join!(stdin_upload, DaytonaSession::create(sandbox))?;
+        let command_with_stdin = stdin_file
+            .as_ref()
+            .map(|stdin_file| stdin_file.redirect(command));
+        let command = command_with_stdin.as_deref().unwrap_or(command);
 
-        let mut session = DaytonaSession::create(sandbox).await?;
-
-        let session_command = build_session_command(command, &cwd, env_vars);
+        let session_command = build_bash_session_command(command, &cwd, env_vars);
         let session_exec = match session.execute(&session_command, true, true).await {
             Ok(result) => result,
             Err(err) => {
@@ -1694,9 +1876,11 @@ impl Sandbox for DaytonaSandbox {
                             if !bytes.is_empty() {
                                 saw_live_chunk.store(true, Ordering::Relaxed);
                                 stdout_seen.lock().await.extend_from_slice(&bytes);
-                                callback(CommandOutputStream::Stdout, bytes)
-                                    .await
-                                    .map_err(|err| daytona_callback_error(&err))?;
+                                if let Some(callback) = callback {
+                                    callback(CommandOutputStream::Stdout, bytes)
+                                        .await
+                                        .map_err(|err| daytona_callback_error(&err))?;
+                                }
                             }
                             Ok(())
                         }
@@ -1710,9 +1894,11 @@ impl Sandbox for DaytonaSandbox {
                             if !bytes.is_empty() {
                                 saw_live_chunk.store(true, Ordering::Relaxed);
                                 stderr_seen.lock().await.extend_from_slice(&bytes);
-                                callback(CommandOutputStream::Stderr, bytes)
-                                    .await
-                                    .map_err(|err| daytona_callback_error(&err))?;
+                                if let Some(callback) = callback {
+                                    callback(CommandOutputStream::Stderr, bytes)
+                                        .await
+                                        .map_err(|err| daytona_callback_error(&err))?;
+                                }
                             }
                             Ok(())
                         }
@@ -1727,12 +1913,12 @@ impl Sandbox for DaytonaSandbox {
             session_exec.exit_code,
             timeout_ms,
             cancel_token.unwrap_or_default(),
-            &mut stream_task,
         )
         .await
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                stream_task.abort();
                 session.close("status poll failure").await;
                 return Err(err);
             }
@@ -1769,14 +1955,14 @@ impl Sandbox for DaytonaSandbox {
                 CommandOutputStream::Stdout,
                 logs.stdout.as_bytes(),
                 &stdout_seen,
-                &output_callback,
+                output_callback.as_ref(),
             )
             .await?;
             append_missing_log_suffix(
                 CommandOutputStream::Stderr,
                 logs.stderr.as_bytes(),
                 &stderr_seen,
-                &output_callback,
+                output_callback.as_ref(),
             )
             .await?;
         }
@@ -1784,7 +1970,7 @@ impl Sandbox for DaytonaSandbox {
         let stdout = String::from_utf8_lossy(&stdout_seen.lock().await).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_seen.lock().await).into_owned();
 
-        Ok(ExecStreamingResult {
+        let result = ExecStreamingResult {
             result: ExecResult {
                 stdout,
                 stderr,
@@ -1796,7 +1982,11 @@ impl Sandbox for DaytonaSandbox {
             },
             streams_separated,
             live_streaming: saw_live_chunk.load(Ordering::Relaxed),
-        })
+        };
+        if let Some(stdin_file) = stdin_file.as_mut() {
+            stdin_file.close().await;
+        }
+        Ok(result)
     }
 
     async fn spawn_stdio_process(
@@ -1885,22 +2075,26 @@ impl Sandbox for DaytonaSandbox {
         Ok(result.stdout.lines().map(String::from).collect())
     }
 
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base = path.map_or_else(
-            || self.working_directory().to_string(),
-            |p| self.resolve_path(p),
-        );
+    async fn walk_files(
+        &self,
+        base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        if options.excludes_relative_path(relative_start) {
+            return Ok(Vec::new());
+        }
 
-        let traversal_root = glob_match::traversal_root(&base, pattern);
-        let matcher = glob_match::GlobMatcher::new(&base, pattern)?;
-        let mut matches = self
-            .list_files_recursive(&traversal_root)
-            .await?
-            .into_iter()
-            .filter(|path| matcher.matches(path))
-            .collect::<Vec<_>>();
-        matches.sort();
-        Ok(matches)
+        let base = self.resolve_path(base);
+        let command = sandbox::build_remote_walk_command(&base, relative_start, options);
+        let result = self
+            .exec_command(&command, REMOTE_WALK_TIMEOUT_MS, None, None, None)
+            .await?;
+        if !result.is_success() {
+            return Err(crate::Error::exec("recursive file traversal", result));
+        }
+
+        sandbox::parse_remote_walk_output(&base, relative_start, &result.stdout)
     }
 }
 
@@ -1957,18 +2151,116 @@ async fn finish_daytona_log_stream(
     }
 }
 
+/// A temporary Daytona file used to provide exact stdin bytes and EOF.
+///
+/// Daytona sessions accept input strings but do not expose a reliable EOF
+/// operation. A file redirection preserves arbitrary bytes and gives the
+/// command EOF without embedding workflow data in shell source.
+struct DaytonaStdinFile {
+    fs:   Option<daytona_sdk::FileSystemService>,
+    path: String,
+}
+
+impl DaytonaStdinFile {
+    async fn create(sandbox: &daytona_sdk::Sandbox, stdin: &[u8]) -> crate::Result<Self> {
+        let fs = sandbox
+            .fs()
+            .await
+            .map_err(|err| crate::Error::context("Failed to get Daytona file service", err))?;
+        let path = format!(
+            "/tmp/fabro-command-stdin-{:016x}",
+            rand::rng().random::<u64>()
+        );
+        fs.upload_file_bytes(&path, stdin)
+            .await
+            .map_err(|err| crate::Error::context("Failed to upload Daytona command stdin", err))?;
+        Ok(Self { fs: Some(fs), path })
+    }
+
+    /// Wrap `command` so it reads this file as its standard input.
+    fn redirect(&self, command: &str) -> String {
+        redirect_command_stdin(command, &self.path)
+    }
+
+    /// Idempotent, best-effort deletion bounded by
+    /// [`DAYTONA_CLEANUP_TIMEOUT`]. Failures are logged rather than surfaced
+    /// so cleanup can never fail a command that already completed.
+    async fn close(&mut self) {
+        let Some(fs) = self.fs.as_ref() else {
+            return;
+        };
+        let deletion =
+            time::timeout(DAYTONA_CLEANUP_TIMEOUT, fs.delete_file(&self.path, false)).await;
+
+        // Keep the service owned until the delete future completes. If this
+        // method is cancelled at the await above, Drop still has everything it
+        // needs to retry cleanup.
+        self.fs.take();
+        match deletion {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "Failed to delete Daytona command stdin");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms =
+                        u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    "Timed out deleting Daytona command stdin"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for DaytonaStdinFile {
+    fn drop(&mut self) {
+        let Some(fs) = self.fs.take() else {
+            return;
+        };
+        let path = std::mem::take(&mut self.path);
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match time::timeout(DAYTONA_CLEANUP_TIMEOUT, fs.delete_file(&path, false)).await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                error = %err,
+                                "Failed to delete Daytona command stdin from Drop"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
+                                    .unwrap_or(u64::MAX),
+                                "Timed out deleting Daytona command stdin from Drop"
+                            );
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Could not schedule Daytona command stdin cleanup"
+                );
+            }
+        }
+    }
+}
+
 /// RAII wrapper around a Daytona toolbox session.
 ///
-/// Holds the per-session [`ProcessService`] handle and the session id, and
-/// guarantees the session is deleted exactly once. Callers should invoke
-/// [`close`] on every path. If a `DaytonaSession` is dropped while still
-/// active, [`Drop`] spawns a cleanup task on the current Tokio runtime as a
-/// safety net (matching the [`DetachedRunBootstrapGuard`] pattern in
-/// `fabro-workflow`).
+/// Holds the per-session [`ProcessService`] handle and the session id. Callers
+/// should invoke [`close`] on every path. If that future is cancelled, or a
+/// `DaytonaSession` is otherwise dropped while it still owns its process
+/// service, [`Drop`] spawns a bounded cleanup task on the current Tokio runtime
+/// as a safety net (matching the
+/// [`DetachedRunBootstrapGuard`] pattern in `fabro-workflow`).
 struct DaytonaSession {
     process_svc: Option<daytona_sdk::ProcessService>,
     session_id:  String,
-    active:      bool,
 }
 
 impl DaytonaSession {
@@ -1985,7 +2277,6 @@ impl DaytonaSession {
         Ok(Self {
             process_svc: Some(process_svc),
             session_id,
-            active: true,
         })
     }
 
@@ -2024,40 +2315,43 @@ impl DaytonaSession {
         fetch_daytona_session_logs(svc, &self.session_id, command_id).await
     }
 
-    /// Idempotent: a second call after `active=false` is a no-op.
+    /// Idempotent: a second call after the process service is consumed is a
+    /// no-op.
     ///
-    /// `delete_session` is bounded by [`DAYTONA_SESSION_CLOSE_TIMEOUT`] so a
+    /// `delete_session` is bounded by [`DAYTONA_CLEANUP_TIMEOUT`] so a
     /// stalled Daytona REST call cannot block cancellation paths indefinitely.
     async fn close(&mut self, reason: &'static str) {
-        if !self.active {
+        let Some(svc) = self.process_svc.as_ref() else {
             return;
-        }
-        self.active = false;
-        if let Some(svc) = self.process_svc.take() {
-            match time::timeout(
-                DAYTONA_SESSION_CLOSE_TIMEOUT,
-                svc.delete_session(&self.session_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        error = %err,
-                        session_id = %self.session_id,
-                        reason,
-                        "failed to delete Daytona session"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        reason,
-                        timeout_ms = u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
-                            .unwrap_or(u64::MAX),
-                        "timed out deleting Daytona session"
-                    );
-                }
+        };
+        let deletion = time::timeout(
+            DAYTONA_CLEANUP_TIMEOUT,
+            svc.delete_session(&self.session_id),
+        )
+        .await;
+
+        // Keep the service owned until the delete future completes. If this
+        // method is cancelled at the await above, Drop still has everything it
+        // needs to retry cleanup.
+        self.process_svc.take();
+        match deletion {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    session_id = %self.session_id,
+                    reason,
+                    "failed to delete Daytona session"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    reason,
+                    timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
+                        .unwrap_or(u64::MAX),
+                    "timed out deleting Daytona session"
+                );
             }
         }
     }
@@ -2065,24 +2359,36 @@ impl DaytonaSession {
 
 impl Drop for DaytonaSession {
     fn drop(&mut self) {
-        if !self.active {
+        let Some(svc) = self.process_svc.take() else {
             return;
-        }
-        let svc = self.process_svc.take();
+        };
         let session_id = std::mem::take(&mut self.session_id);
-        match (svc, Handle::try_current()) {
-            (Some(svc), Ok(handle)) => {
+        match Handle::try_current() {
+            Ok(handle) => {
                 handle.spawn(async move {
-                    if let Err(err) = svc.delete_session(&session_id).await {
-                        tracing::warn!(
-                            error = %err,
-                            session_id,
-                            "Daytona session leaked; deleted from Drop"
-                        );
+                    match time::timeout(DAYTONA_CLEANUP_TIMEOUT, svc.delete_session(&session_id))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                error = %err,
+                                session_id,
+                                "Daytona session leaked; failed to delete from Drop"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                session_id,
+                                timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
+                                    .unwrap_or(u64::MAX),
+                                "Daytona session leaked; timed out deleting from Drop"
+                            );
+                        }
                     }
                 });
             }
-            _ => {
+            Err(_) => {
                 tracing::error!(session_id, "Daytona session leaked; no runtime to clean up");
             }
         }
@@ -2096,15 +2402,14 @@ struct WaitOutcome {
 }
 
 /// Wait for the session command to terminate by polling status, the timeout
-/// timer, and the cancel token. On status-poll failure, aborts `stream_task`
-/// and returns an error; the caller is responsible for closing the session.
+/// timer, and the cancel token. The caller owns any associated log-stream task
+/// and is responsible for aborting it and closing the session on poll failure.
 async fn wait_for_completion(
     session: &DaytonaSession,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout_ms: Option<u64>,
     cancel_token: CancellationToken,
-    stream_task: &mut JoinHandle<Result<(), DaytonaError>>,
 ) -> crate::Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
         return Ok(WaitOutcome {
@@ -2122,7 +2427,6 @@ async fn wait_for_completion(
                 let status = match session.get_command_status(command_id).await {
                     Ok(status) => status,
                     Err(err) => {
-                        stream_task.abort();
                         return Err(crate::Error::context(
                             "Failed to get Daytona session command status",
                             err,
@@ -2181,7 +2485,7 @@ async fn append_missing_log_suffix(
     stream: CommandOutputStream,
     final_bytes: &[u8],
     seen: &Arc<Mutex<Vec<u8>>>,
-    output_callback: &CommandOutputCallback,
+    output_callback: Option<&CommandOutputCallback>,
 ) -> crate::Result<()> {
     if final_bytes.is_empty() {
         return Ok(());
@@ -2196,7 +2500,10 @@ async fn append_missing_log_suffix(
     let missing = final_bytes[offset..].to_vec();
     seen.extend_from_slice(&missing);
     drop(seen);
-    output_callback(stream, missing).await
+    match output_callback {
+        Some(output_callback) => output_callback(stream, missing).await,
+        None => Ok(()),
+    }
 }
 
 fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
@@ -2216,24 +2523,33 @@ fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
     0
 }
 
-fn build_session_command(
+/// Override caller or snapshot startup-file injection for a Bash process.
+fn clean_bash_env(env_vars: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    let mut clean = env_vars.cloned().unwrap_or_default();
+    clean.insert(BASH_ENV_VAR.to_string(), String::new());
+    clean
+}
+
+fn bash_export_lines(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<_> = env_vars.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("export {}={}", shell_quote(key), shell_quote(value)))
+        .collect()
+}
+
+/// Build the inner Bash script a session command evaluates.
+///
+/// The result is Bash source, not something Daytona can exec directly — it is
+/// passed through [`wrap_bash_session_script`] before reaching the toolbox.
+fn build_bash_session_script(
     command: &str,
     cwd: &str,
     env_vars: Option<&HashMap<String, String>>,
 ) -> String {
     let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
-
-    if let Some(vars) = env_vars {
-        let mut entries: Vec<_> = vars.iter().collect();
-        entries.sort_by_key(|(key, _)| *key);
-        for (key, value) in entries {
-            lines.push(format!(
-                "export {}={}",
-                shell_quote(key),
-                shell_quote(value)
-            ));
-        }
-    }
+    lines.extend(bash_export_lines(&clean_bash_env(env_vars)));
 
     lines.push("(".to_string());
     lines.push(command.to_string());
@@ -2241,36 +2557,139 @@ fn build_session_command(
     lines.join("\n")
 }
 
-fn daytona_symlink_command(layout: &clone_source::GitHubRepoLayout) -> String {
-    format!(
-        "ln -s {} {}",
-        shell_quote(&layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_link),
-    )
+/// Interpret the outcome of the direct-exec Daytona Bash probe.
+///
+/// A failure to run the probe at all, a nonzero exit, and a zero exit without
+/// the marker are all probe failures, and all carry the snapshot remediation.
+fn daytona_bash_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Result<()> {
+    match execution {
+        Err(err) => Err(crate::Error::context(DAYTONA_BASH_REMEDIATION, err)),
+        Ok(result) => validate_bash_probe(result, DAYTONA_BASH_REMEDIATION),
+    }
 }
 
-/// Wrap a command string with `bash -c '...'`, escaping single quotes.
+/// Interpret the outcome of the session Daytona Bash probe.
+///
+/// The marker has to be its own line rather than the whole of stdout: session
+/// output arrives through Daytona's log labelers rather than as a single
+/// captured buffer, and a probe that rejected any surrounding transport bytes
+/// would fail every sandbox creation instead of the transport defect it exists
+/// to catch. Substring matching would be too weak in the other direction —
+/// [`BASH_PROBE_SCRIPT`] contains the marker literal, so a transport that
+/// echoed the submitted script back would pass.
+fn daytona_bash_session_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Result<()> {
+    let result = match execution {
+        Ok(result) => result,
+        Err(err) => {
+            return Err(crate::Error::context(DAYTONA_BASH_SESSION_REMEDIATION, err));
+        }
+    };
+
+    if result.is_success()
+        && result
+            .stdout
+            .lines()
+            .any(|line| line.trim() == BASH_PROBE_MARKER)
+    {
+        return Ok(());
+    }
+
+    Err(crate::Error::context(
+        DAYTONA_BASH_SESSION_REMEDIATION,
+        result.into_exec_error("Sandbox Bash session probe"),
+    ))
+}
+
+/// Classify a failed Daytona clone for retry.
+///
+/// The GitHub 404 does not arrive as an HTTP 404 on the Daytona call. git runs
+/// inside the sandbox, so its stderr comes back through the toolbox as the
+/// error message — the credential race has to be matched on text. Daytona's own
+/// transport failures are visible structurally.
+fn classify_clone_failure(
+    err: &DaytonaError,
+    token_was_freshly_minted: bool,
+) -> Option<CloneRetryReason> {
+    // A Daytona request timeout does not prove that the remote clone stopped.
+    // Retrying could overlap the still-running first request.
+    if matches!(err, DaytonaError::Timeout { .. }) {
+        return None;
+    }
+
+    match clone_retry::classify_message(err.message(), token_was_freshly_minted) {
+        clone_retry::CloneMessageClass::Retry(reason) => Some(reason),
+        clone_retry::CloneMessageClass::Permanent => None,
+        clone_retry::CloneMessageClass::Unknown => match err {
+            DaytonaError::RateLimit { .. } => Some(CloneRetryReason::TransientInfra),
+            DaytonaError::Api { status_code, .. } if (500..600).contains(status_code) => {
+                Some(CloneRetryReason::TransientInfra)
+            }
+            DaytonaError::Timeout { .. }
+            | DaytonaError::Api { .. }
+            | DaytonaError::NotFound { .. }
+            | DaytonaError::General(_) => None,
+        },
+    }
+}
+
+/// Wrap Bash source in the canonical non-login Bash transport.
 ///
 /// The Daytona API uses direct exec (not a shell), so pipes, env vars,
-/// semicolons, etc. won't work without this wrapper.
+/// semicolons, etc. won't work without this wrapper. Every path that sends a
+/// caller-supplied or Fabro-built command to Daytona goes through here, so
+/// there is exactly one interpreter on both sides of the transport.
 ///
 /// Uses base64 encoding (matching the TypeScript/Python/Ruby Daytona SDKs)
-/// to avoid shell escaping issues with quotes and special characters.
+/// to avoid shell escaping issues with quotes and special characters. The
+/// pipeline's exit status is the inner Bash's, so command exit codes survive
+/// the transport.
 fn wrap_bash_command(command: &str) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     let encoded = STANDARD.encode(command);
-    format!("sh -c \"echo '{encoded}' | base64 -d | sh\"")
+    format!("{REMOTE_BASH} -c \"echo '{encoded}' | base64 -d | {REMOTE_BASH}\"")
+}
+
+/// Invoke the canonical Bash interpreter from a Daytona streaming session.
+///
+/// Session commands already pass through the provider's shell parser, so an
+/// audited shell-quoted argument avoids the direct-exec path's base64 process
+/// and second Bash while keeping caller source inert until `/bin/bash -c`
+/// evaluates it. Bash must remain a child process: Daytona sources this command
+/// inside a wrapper that resumes afterward to drain logs and persist the exit
+/// code.
+fn wrap_bash_session_script(script: &str) -> String {
+    format!("{REMOTE_BASH} -c {}", shell_quote(script))
+}
+
+fn redirect_command_stdin(command: &str, stdin_path: &str) -> String {
+    format!("(\n{command}\n) < {}", shell_quote(stdin_path))
+}
+
+/// Build a command for Daytona's streaming session transport.
+///
+/// Both [`Sandbox::exec_command_streaming`] and the lifecycle probe call this
+/// helper, so they cannot drift onto different script construction or Bash
+/// wrappers.
+fn build_bash_session_command(
+    command: &str,
+    cwd: &str,
+    env_vars: Option<&HashMap<String, String>>,
+) -> String {
+    wrap_bash_session_script(&build_bash_session_script(command, cwd, env_vars))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use daytona_api_client::models::api_key_list::Permissions;
     use fabro_util::error::collect_chain;
-    use httpmock::Method::GET;
-    use httpmock::MockServer;
+    use httpmock::Method::{DELETE, GET, POST};
+    use httpmock::{HttpMockResponse, MockServer};
 
     use super::*;
+    use crate::sandbox::BASH_PROBE_MARKER;
 
     fn api_key_body(permissions: &[&str]) -> serde_json::Value {
         serde_json::json!({
@@ -2367,6 +2786,25 @@ mod tests {
             "lastUsedAt": null,
             "createdAt": "2026-05-01T00:00:00Z",
             "updatedAt": "2026-05-01T00:00:00Z"
+        })
+    }
+
+    fn sandbox_body(name: &str, state: SandboxState) -> serde_json::Value {
+        serde_json::json!({
+            "id": name,
+            "organizationId": "org-1",
+            "name": name,
+            "user": "daytona",
+            "env": {},
+            "labels": {},
+            "public": false,
+            "networkBlockAll": false,
+            "target": "us",
+            "cpu": 2.0,
+            "gpu": 0.0,
+            "memory": 4.0,
+            "disk": 20.0,
+            "state": state.to_string()
         })
     }
 
@@ -2513,12 +2951,117 @@ mod tests {
         assert_eq!(params.ephemeral, Some(false));
         assert_eq!(params.auto_delete_interval, Some(-1));
         assert_eq!(
+            params.env_vars,
+            Some(HashMap::from([(BASH_ENV_VAR.to_string(), String::new())]))
+        );
+        assert_eq!(
             params.labels,
             Some(HashMap::from([(
                 managed_labels::MANAGED_LABEL.to_string(),
                 "true".to_string(),
             )]))
         );
+    }
+
+    #[tokio::test]
+    async fn activate_skips_start_when_daytona_reports_started() {
+        let server = MockServer::start_async().await;
+        let get_sandbox = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/sandbox/test-sandbox")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let start_sandbox = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox/test-sandbox/start")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let sandbox = mock_daytona_sandbox(&server, "dtn_test", DaytonaConfig::default()).await;
+        let sdk_sandbox = sandbox
+            .client
+            .get("test-sandbox")
+            .await
+            .expect("test sandbox should load");
+        sandbox
+            .sandbox
+            .set(sdk_sandbox)
+            .expect("test sandbox should initialize once");
+
+        let get_calls_before = get_sandbox.calls_async().await;
+        sandbox
+            .activate()
+            .await
+            .expect("an active sandbox should require no restart");
+
+        assert_eq!(get_sandbox.calls_async().await, get_calls_before + 1);
+        start_sandbox.assert_calls_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn activate_waits_for_a_daytona_start_already_in_progress() {
+        let server = MockServer::start_async().await;
+        let response_count = Arc::new(AtomicU32::new(0));
+        let get_sandbox = server
+            .mock_async({
+                let response_count = Arc::clone(&response_count);
+                move |when, then| {
+                    when.method(GET)
+                        .path("/sandbox/test-sandbox")
+                        .header("authorization", "Bearer dtn_test");
+                    then.respond_with(move |_| {
+                        let state = if response_count.fetch_add(1, Ordering::Relaxed) == 1 {
+                            SandboxState::Starting
+                        } else {
+                            SandboxState::Started
+                        };
+                        HttpMockResponse::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(sandbox_body("test-sandbox", state).to_string())
+                            .build()
+                    });
+                }
+            })
+            .await;
+        let start_sandbox = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox/test-sandbox/start")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let sandbox = mock_daytona_sandbox(&server, "dtn_test", DaytonaConfig::default()).await;
+        let sdk_sandbox = sandbox
+            .client
+            .get("test-sandbox")
+            .await
+            .expect("test sandbox should load");
+        sandbox
+            .sandbox
+            .set(sdk_sandbox)
+            .expect("test sandbox should initialize once");
+
+        let get_calls_before = get_sandbox.calls_async().await;
+        sandbox
+            .activate()
+            .await
+            .expect("an in-progress start should be awaited");
+
+        assert_eq!(get_sandbox.calls_async().await, get_calls_before + 2);
+        start_sandbox.assert_calls_async(0).await;
     }
 
     #[tokio::test]
@@ -2583,18 +3126,78 @@ mod tests {
     }
 
     #[test]
-    fn daytona_symlink_command_links_workspace_repo_to_repos_checkout() {
-        let layout = clone_source::github_repo_layout(
-            "https://github.com/fabro-sh/fabro",
-            WORKING_DIRECTORY,
-            REPOS_ROOT,
-        )
-        .unwrap();
+    fn clone_not_found_after_a_successful_mint_is_retried() {
+        // The exact error from run 01KYM99DF27JRRW4XSYZBP27K7: git's stderr,
+        // relayed through the toolbox, five seconds after a token was minted.
+        let err = DaytonaError::general("repository not found: Repository not found.");
 
         assert_eq!(
-            daytona_symlink_command(&layout),
-            "ln -s /home/daytona/repos/fabro-sh/fabro /home/daytona/workspace/fabro"
+            classify_clone_failure(&err, true),
+            Some(CloneRetryReason::TokenReplication)
         );
+        assert_eq!(
+            classify_clone_failure(&err, false),
+            None,
+            "without credentials there is no token to replicate"
+        );
+    }
+
+    #[test]
+    fn clone_transient_transport_failures_are_retried() {
+        for err in [
+            DaytonaError::rate_limit("too many requests"),
+            DaytonaError::api(503, ""),
+        ] {
+            assert_eq!(
+                classify_clone_failure(&err, false),
+                Some(CloneRetryReason::TransientInfra),
+                "expected {err:?} to be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_timeout_is_not_retried_without_remote_termination() {
+        let err = DaytonaError::timeout("request timed out");
+
+        assert_eq!(classify_clone_failure(&err, true), None);
+    }
+
+    #[test]
+    fn clone_api_failure_message_takes_precedence_over_status() {
+        let not_found = DaytonaError::api(500, "repository not found: Repository not found.");
+        assert_eq!(
+            classify_clone_failure(&not_found, true),
+            Some(CloneRetryReason::TokenReplication)
+        );
+        assert_eq!(classify_clone_failure(&not_found, false), None);
+
+        for message in [
+            "fatal: destination path 'fabro' already exists",
+            "remote: Permission to fabro-sh/fabro.git denied",
+        ] {
+            assert_eq!(
+                classify_clone_failure(&DaytonaError::api(500, message), true),
+                None,
+                "expected {message:?} to take precedence over HTTP 500"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_client_errors_are_not_retried() {
+        for err in [
+            DaytonaError::api(400, "bad request"),
+            DaytonaError::api(403, "forbidden"),
+            DaytonaError::not_found("Sandbox not found"),
+            DaytonaError::general("fatal: could not read Username for 'https://github.com'"),
+        ] {
+            assert_eq!(
+                classify_clone_failure(&err, true),
+                None,
+                "expected {err:?} to fail fast"
+            );
+        }
     }
 
     #[test]
@@ -2702,7 +3305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_daytona_api_key_with_accepts_full_scopes() {
+    async fn check_daytona_api_key_with_accepts_full_scopes_and_new_scopes() {
         let server = MockServer::start_async().await;
         let auth = mock_auth_probe(&server, 200).await;
         let current_key = mock_current_key(&server, vec![
@@ -2710,6 +3313,9 @@ mod tests {
             "delete:snapshots",
             "write:sandboxes",
             "delete:sandboxes",
+            "manage:secrets",
+            "read:limits",
+            "manage:sso",
         ])
         .await;
 
@@ -2752,17 +3358,111 @@ mod tests {
         auth.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn daytona_stdin_file_uploads_exact_bytes_and_is_deleted() {
+        let server = MockServer::start_async().await;
+        let server_url = server.base_url();
+        let sandbox_response = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/sandbox/sandbox-stdin");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "sandbox-stdin",
+                        "organizationId": "org-1",
+                        "name": "stdin-test",
+                        "user": "daytona",
+                        "env": {},
+                        "labels": {},
+                        "public": false,
+                        "networkBlockAll": false,
+                        "target": "us",
+                        "cpu": 2.0,
+                        "gpu": 0.0,
+                        "memory": 4.0,
+                        "disk": 20.0,
+                        "state": "started"
+                    }));
+            })
+            .await;
+        let toolbox_response = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/sandbox/sandbox-stdin/toolbox-proxy-url");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({"url": server_url}));
+            })
+            .await;
+        let upload = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox-stdin/files/upload")
+                    .body_includes("opaque\n$(not shell)\nlast");
+                then.status(200);
+            })
+            .await;
+        let delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/sandbox-stdin/files")
+                    .query_param("recursive", "false");
+                then.status(200);
+            })
+            .await;
+        let client = build_daytona_client_with(
+            Some("dtn_test".to_string()),
+            Some(server.base_url()),
+            None,
+            Some(fabro_test::test_http_client()),
+        )
+        .await
+        .expect("create Daytona client");
+        let sandbox = client.get("sandbox-stdin").await.expect("get mock sandbox");
+
+        let mut file = DaytonaStdinFile::create(&sandbox, b"opaque\n$(not shell)\nlast")
+            .await
+            .expect("upload stdin file");
+        assert!(file.path.starts_with("/tmp/fabro-command-stdin-"));
+        file.close().await;
+
+        sandbox_response.assert_async().await;
+        toolbox_response.assert_async().await;
+        upload.assert_async().await;
+        delete.assert_async().await;
+    }
+
+    /// Recover the inner command a wrapper carries, proving it survives the
+    /// base64 transport byte-for-byte.
+    fn decode_wrapped_command(wrapped: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let prefix = "/bin/bash -c \"echo '";
+        let suffix = "' | base64 -d | /bin/bash\"";
+        let encoded = wrapped
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .unwrap_or_else(|| panic!("wrapper should have the canonical bash shape: {wrapped}"));
+        String::from_utf8(
+            STANDARD
+                .decode(encoded)
+                .expect("wrapper payload should be base64"),
+        )
+        .expect("wrapper payload should be UTF-8")
+    }
+
     #[test]
-    fn wrap_bash_uses_base64_encoding() {
+    fn wrap_bash_uses_bash_on_both_sides_of_the_transport() {
         let wrapped = wrap_bash_command("echo hello");
-        // Should use base64 pipe to sh
+
         assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should start with sh -c wrapper"
+            wrapped.starts_with("/bin/bash -c \"echo '"),
+            "should start with a non-login /bin/bash wrapper: {wrapped}"
         );
         assert!(
-            wrapped.ends_with("' | base64 -d | sh\""),
-            "should end with base64 -d | sh"
+            wrapped.ends_with("' | base64 -d | /bin/bash\""),
+            "should pipe the decoded payload into /bin/bash: {wrapped}"
         );
         // The base64 of "echo hello" is "ZWNobyBoZWxsbw=="
         assert!(
@@ -2772,12 +3472,47 @@ mod tests {
     }
 
     #[test]
+    fn wrap_bash_never_names_sh_as_an_interpreter() {
+        for command in ["echo hello", "ls | grep foo", "sh -c 'echo explicit'"] {
+            let wrapped = wrap_bash_command(command);
+            let transport = wrapped
+                .strip_suffix('"')
+                .and_then(|rest| rest.split_once("| base64 -d | "))
+                .map(|(_, interpreter)| interpreter)
+                .expect("wrapper should end with its inner interpreter");
+
+            assert_eq!(transport, "/bin/bash", "inner interpreter for {command:?}");
+            assert!(
+                !wrapped.starts_with("sh ") && !wrapped.starts_with("/bin/sh"),
+                "outer interpreter for {command:?} should not be sh: {wrapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_bash_passes_arbitrary_text_through_unchanged() {
+        for command in [
+            "echo 'hello world'",
+            "printf '%s\\n' \"quoted\"",
+            "ls | grep foo",
+            "echo line1\necho line2",
+            "echo \"it's mixed 'quotes'\"",
+        ] {
+            assert_eq!(
+                decode_wrapped_command(&wrap_bash_command(command)),
+                command,
+                "inner command should reach bash unchanged"
+            );
+        }
+    }
+
+    #[test]
     fn wrap_bash_handles_single_quotes_safely() {
         // Single quotes in the original command are safely encoded in base64
         let wrapped = wrap_bash_command("echo 'hello world'");
         assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should use sh -c wrapper"
+            wrapped.starts_with("/bin/bash -c \"echo '"),
+            "should use the /bin/bash wrapper"
         );
         // No raw single quotes from the original command should appear in the base64
         assert!(
@@ -2787,36 +3522,217 @@ mod tests {
     }
 
     #[test]
-    fn wrap_bash_handles_pipes() {
-        let wrapped = wrap_bash_command("ls | grep foo");
-        assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should use sh -c wrapper"
-        );
-        assert!(
-            wrapped.ends_with("' | base64 -d | sh\""),
-            "should end with base64 -d | sh"
-        );
-    }
-
-    #[test]
-    fn build_session_command_adds_cwd_and_sorted_exports() {
+    fn build_bash_session_script_adds_cwd_and_sorted_exports() {
         let env = HashMap::from([
             ("BETA".to_string(), "two words".to_string()),
             ("ALPHA".to_string(), "one".to_string()),
+            (
+                BASH_ENV_VAR.to_string(),
+                "/tmp/untrusted-startup".to_string(),
+            ),
         ]);
 
-        let command = build_session_command("echo $ALPHA $BETA", "/tmp/with space", Some(&env));
+        let command = build_bash_session_script("echo $ALPHA $BETA", "/tmp/with space", Some(&env));
 
         assert_eq!(
             command,
             "cd '/tmp/with space' || exit $?\n\
              export ALPHA=one\n\
+             export BASH_ENV=''\n\
              export BETA='two words'\n\
              (\n\
              echo $ALPHA $BETA\n\
              )"
         );
+    }
+
+    #[test]
+    fn streaming_session_script_reaches_bash_through_the_canonical_wrapper() {
+        let script = build_bash_session_script("[[ -d / ]] && echo ok", "/tmp", None);
+        let wrapped = wrap_bash_session_script(&script);
+
+        assert_eq!(
+            wrapped,
+            format!("/bin/bash -c {}", shell_quote(&script)),
+            "the streaming path must enter the canonical Bash exactly once"
+        );
+        assert!(!wrapped.contains("base64"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test executes the generated stdin redirection to verify exact bytes and EOF"
+    )]
+    fn stdin_file_redirection_applies_to_the_whole_command() {
+        let dir = tempfile::tempdir().expect("create stdin transport temp dir");
+        let stdin_path = dir.path().join("stdin data");
+        let injection_path = dir.path().join("must-not-run");
+        let stdin = format!(
+            "first line\n$(touch {})\nlast line",
+            injection_path.display()
+        );
+        std::fs::write(&stdin_path, &stdin).expect("write stdin fixture");
+        let command = redirect_command_stdin(
+            "IFS= read -r first\nprintf '%s\\n' \"$first\"\ncat",
+            stdin_path.to_str().expect("temp path should be UTF-8"),
+        );
+
+        let output = std::process::Command::new(REMOTE_BASH)
+            .args(["-c", &command])
+            .env_remove(BASH_ENV_VAR)
+            .output()
+            .expect("execute redirected command");
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), stdin);
+        assert!(!injection_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test executes the generated shell transport to verify provider bookkeeping resumes"
+    )]
+    fn streaming_session_script_returns_to_provider_bookkeeping() {
+        let dir = tempfile::tempdir().expect("create session transport temp dir");
+        let command_file = dir.path().join("cmd.sh");
+        let exit_code_file = dir.path().join("exit_code");
+        let script = build_bash_session_script("printf 'command-finished\\n'; exit 7", "/", None);
+        std::fs::write(&command_file, wrap_bash_session_script(&script))
+            .expect("write generated session command");
+
+        // Daytona sources the command file, then records the exit code. The
+        // generated command must return control so that bookkeeping can run.
+        let provider_wrapper = format!(
+            "{{ . {}; }}\n\
+             command_exit_code=$?\n\
+             printf '%s\\n' \"$command_exit_code\" > {}",
+            shell_quote(&command_file.to_string_lossy()),
+            shell_quote(&exit_code_file.to_string_lossy()),
+        );
+        let output = std::process::Command::new(REMOTE_BASH)
+            .args(["-c", &provider_wrapper])
+            .env_remove(BASH_ENV_VAR)
+            .output()
+            .expect("execute generated session command");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "command-finished\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_file)
+                .expect("provider bookkeeping should record the exit code"),
+            "7\n"
+        );
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    fn bash_probe_result(exit_code: i32, stdout: impl Into<String>) -> ExecResult {
+        ExecResult {
+            stdout:      stdout.into(),
+            stderr:      String::new(),
+            exit_code:   Some(exit_code),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn bash_probe_outcome_accepts_a_marked_zero_exit() {
+        assert!(
+            daytona_bash_probe_outcome(Ok(bash_probe_result(0, format!("{BASH_PROBE_MARKER}\n"))))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bash_probe_outcome_rejects_failures_with_snapshot_remediation() {
+        let failures = [
+            Err(crate::Error::message("connection reset")),
+            Ok(bash_probe_result(1, "bash: not found")),
+            Ok(bash_probe_result(0, "ready")),
+        ];
+
+        for failure in failures {
+            let err = daytona_bash_probe_outcome(failure)
+                .expect_err("probe should fail")
+                .display_with_causes();
+
+            assert!(
+                err.contains("/bin/bash") && err.contains("snapshot"),
+                "probe failure should carry the Daytona snapshot remediation: {err}"
+            );
+            assert!(
+                !err.contains("bash: not found"),
+                "raw process output must not enter lifecycle errors: {err}"
+            );
+        }
+    }
+
+    /// The session probe exists to catch a transport that runs the command but
+    /// never returns control to Daytona's bookkeeping. That failure arrives as
+    /// a timeout with no exit code — with the marker already on stdout — not as
+    /// a nonzero exit.
+    #[test]
+    fn bash_session_probe_outcome_rejects_a_command_that_never_reports_completion() {
+        let never_completed = ExecResult {
+            stdout:      format!("{BASH_PROBE_MARKER}\n"),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: CommandTermination::TimedOut,
+            duration_ms: BASH_PROBE_TIMEOUT_MS,
+        };
+
+        let err = daytona_bash_session_probe_outcome(Ok(never_completed))
+            .expect_err("a command with no recorded exit code must fail the probe")
+            .display_with_causes();
+
+        assert!(
+            err.contains("wrapper shell") && err.contains("exit code"),
+            "session probe failure should explain the completion contract: {err}"
+        );
+    }
+
+    #[test]
+    fn bash_session_probe_outcome_accepts_a_marker_line_amid_transport_output() {
+        assert!(
+            daytona_bash_session_probe_outcome(Ok(bash_probe_result(
+                0,
+                format!("\n{BASH_PROBE_MARKER}\r\n"),
+            )))
+            .is_ok()
+        );
+    }
+
+    /// The probe script contains the marker literal, so a session transport
+    /// that echoed the submitted script instead of running it must not pass.
+    #[test]
+    fn bash_session_probe_outcome_rejects_echoed_script_source() {
+        let echoed = daytona_bash_session_probe_outcome(Ok(bash_probe_result(
+            0,
+            build_bash_session_command(BASH_PROBE_SCRIPT, "/", None),
+        )));
+
+        assert!(echoed.is_err());
+    }
+
+    #[test]
+    fn bash_session_command_enters_bash_once_without_exec() {
+        let command = build_bash_session_command(BASH_PROBE_SCRIPT, "/", None);
+
+        assert!(
+            command.starts_with(&format!("{REMOTE_BASH} -c ")),
+            "{command}"
+        );
+        assert!(
+            !command.contains("exec "),
+            "the session probe must leave Daytona's wrapper shell in place: {command}"
+        );
+        assert_eq!(command.matches(REMOTE_BASH).count(), 1, "{command}");
     }
 
     #[test]

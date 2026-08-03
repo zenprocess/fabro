@@ -1,7 +1,10 @@
+use fabro_model::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
-use crate::{CommandTermination, ParallelBranchResult, PullRequestLink, StageId, StageOutcome};
+use crate::{
+    CommandTermination, ParallelBranchResult, PullRequestLink, ReviewTarget, StageId, StageOutcome,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InterviewOption {
@@ -22,6 +25,8 @@ pub struct ParallelStartedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParallelBranchStartedProps {
     pub index:                 usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_label:            Option<String>,
     /// Graph visit of the branch target for this dispatch. The envelope
     /// `stage_id` ordinal counts executions, so a resumed fan-out's branches
     /// keep visit metadata even though their ordinals advanced.
@@ -35,6 +40,8 @@ pub struct ParallelBranchStartedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParallelBranchCompletedProps {
     pub index:       usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_label:  Option<String>,
     pub duration_ms: u64,
     pub status:      StageOutcome,
 }
@@ -65,6 +72,8 @@ pub struct InterviewStartedProps {
     pub timeout_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_target:   Option<ReviewTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,11 +188,24 @@ pub struct SshAccessReadyProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailoverProps {
+    /// `original_*` and `attempt` are `Option` only because failover events
+    /// recorded before model-keyed fallbacks lack them. New events always set
+    /// them; stored events are immutable, so absence stays a supported input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub from_provider: String,
-    pub from_model:    String,
-    pub to_provider:   String,
-    pub to_model:      String,
-    pub error:         String,
+    pub from_model: String,
+    pub to_provider: String,
+    pub to_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<ReasoningEffort>,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +269,8 @@ pub struct PullRequestCreatedProps {
     pub repo:        String,
     pub base_branch: String,
     pub head_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha:    Option<String>,
     pub title:       String,
     pub draft:       bool,
 }

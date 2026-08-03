@@ -461,6 +461,42 @@ async fn decode_reasoning_and_function_call_items() {
     fabro_test::fabro_json_snapshot!(response);
 }
 
+/// A reasoning item carrying both readable channels normalizes into both
+/// fields while its encrypted payload stays opaque.
+#[tokio::test]
+async fn decode_reasoning_item_normalizes_summary_and_trace() {
+    let response = decode_response(serde_json::json!({
+        "id": "resp_test",
+        "object": "response",
+        "model": MODEL,
+        "status": "completed",
+        "output": [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "gAAAAAopaque",
+                "summary": [{"type": "summary_text", "text": "Adding two numbers."}],
+                "content": [{"type": "reasoning_text", "text": "2 plus 2 is 4."}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_out",
+                "content": [{"type": "output_text", "text": "4."}]
+            }
+        ],
+        "usage": {"input_tokens": 30, "output_tokens": 12}
+    }))
+    .await;
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("Adding two numbers."));
+    assert_eq!(reasoning.trace(), Some("2 plus 2 is 4."));
+
+    let normalized = serde_json::to_string(&reasoning).unwrap();
+    assert!(!normalized.contains("gAAAAAopaque"));
+}
+
 #[tokio::test]
 async fn decode_incomplete_status_maps_to_length() {
     let response = decode_response(serde_json::json!({
@@ -506,7 +542,25 @@ async fn stream_text_happy_path_request() {
 #[tokio::test]
 async fn stream_text_happy_path_events() {
     let (_, events) = stream_text_happy_path_capture().await;
+    support::assert_stream_starts(&events);
     fabro_test::fabro_json_snapshot!(events);
+}
+
+#[tokio::test]
+async fn stream_first_frame_error_still_opens_with_stream_start() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"type":"response.failed","response":{"id":"resp_stream","error":{"code":"server_error","message":"boom"}}}"#,
+    ]);
+    let (_capture, events) = stream_capture(adapter(), &base_request(MODEL), &sse).await;
+
+    support::assert_stream_starts(&events);
+    assert!(
+        events
+            .get(1)
+            .and_then(|event| event.get("stream_item_error"))
+            .is_some(),
+        "the decoder error should follow stream_start: {events:?}"
+    );
 }
 
 #[tokio::test]

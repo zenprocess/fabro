@@ -11,20 +11,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fabro_agent::config::{ToolAccess, ToolAccessPolicy, ToolExposureMode};
-use fabro_agent::profiles::assemble_system_prompt;
+use fabro_agent::profiles::{self, EmbeddedPrompt};
 use fabro_agent::tool_registry::ToolRegistry;
 use fabro_agent::{
-    AgentEvent, AgentProfile, AnthropicProfile, Error as AgentError, GeminiProfile, OpenAiProfile,
-    Session, SessionEvent, SessionOptions, ToolSecrets, WebFetchSummarizer,
+    AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
+    SessionOptions,
 };
 use fabro_api::types::{
     CreateRunSessionRequest, PaginatedEventList, PaginationMeta, SubmitTurnRequest,
 };
-use fabro_llm::client::Client as LlmClient;
 use fabro_llm::types::ToolDefinition;
-use fabro_model::{
-    AgentProfileKind, Catalog, ModelHandle, ModelSelectionError, ProviderId, catalog,
-};
+use fabro_model::{AgentProfileKind, Catalog, ModelSelectionError, ProviderId, catalog};
 use fabro_sandbox::reconnect::reconnect_for_run;
 use fabro_static::EnvVars;
 use fabro_store::{
@@ -59,6 +56,8 @@ use crate::server_secrets::LlmClientResult;
 use crate::worker_token::issue_worker_token;
 
 const SESSION_SSE_BUFFER_CAPACITY: usize = 1024;
+
+const ASK_FABRO_SYSTEM_PROMPT: &str = include_str!("prompts/ask_fabro.md.j2");
 
 const ASK_FABRO_RUN_TOOL_NAMES: &[&str] = &[
     fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME,
@@ -731,14 +730,16 @@ async fn build_agent_session(
     let sandbox = reconnect_for_run(sandbox_instance, daytona_api_key, Some(run_id))
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
+    sandbox
+        .activate()
+        .await
+        .map_err(|err| AskFabroBuildError::SandboxUnavailable(anyhow::Error::new(err)))?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
-    let mut profile = build_profile(
-        provider_id,
-        profile_kind,
-        &model,
-        &llm_result.client,
-        Arc::clone(&catalog),
-    );
+    // No optional web-tool dependencies: `AskFabroToolAccessPolicy` denies
+    // `web_search` and `web_fetch`, and both `tools()` and the prompt are
+    // filtered through that policy.
+    let mut profile =
+        AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog)).build();
 
     // Give the Ask Fabro agent access to read-only run-inspection tools scoped
     // to its owning run. The session reaches the local HTTP API via a same-run
@@ -771,16 +772,9 @@ async fn build_agent_session(
     let profile: Arc<dyn AgentProfile> =
         Arc::new(AskFabroProfile::new(profile, Arc::clone(&ask_fabro_policy)));
 
-    let brave_search_api_key = state
-        .vault_secret(EnvVars::BRAVE_SEARCH_API_KEY)
-        .await
-        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
     let config = SessionOptions {
         tool_access_policy: Some(ask_fabro_policy),
         tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-        tool_secrets: ToolSecrets {
-            brave_search_api_key,
-        },
         ..SessionOptions::default()
     };
 
@@ -867,9 +861,10 @@ fn canonical_session_model(
     }
     let model_ref = requested
         .parse::<SettingsModelRef>()
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let (qualified_provider, model) = match model_ref {
-        SettingsModelRef::Qualified { provider, model } => {
+        .map_err(|err| ApiError::bad_request(err.to_string()))?
+        .qualify(catalog);
+    let (qualified_provider, selector) = match model_ref {
+        SettingsModelRef::Qualified { provider, selector } => {
             let requested_provider = ProviderId::new(provider);
             let provider = catalog
                 .provider(&requested_provider)
@@ -887,28 +882,30 @@ fn canonical_session_model(
                     )));
                 }
             }
-            (Some(provider), model)
+            (Some(provider), selector)
         }
-        SettingsModelRef::Bare(model) => {
-            if explicit_provider.is_none() && catalog.provider(&ProviderId::new(&model)).is_some() {
-                let detail = if catalog.is_model_selector(&model) {
+        SettingsModelRef::Bare(selector) => {
+            if explicit_provider.is_none()
+                && catalog.provider(&ProviderId::new(&selector)).is_some()
+            {
+                let detail = if catalog.is_model_selector(&selector) {
                     format!(
-                        "Session model reference '{model}' is ambiguous between a provider and a \
-                         model selector; supply `provider` or use `provider/model`."
+                        "Session model reference '{selector}' is ambiguous between a provider and \
+                         a model selector; supply `provider` or use `provider:model`."
                     )
                 } else {
                     format!(
-                        "Session model reference '{model}' names a provider; include a model ID."
+                        "Session model reference '{selector}' names a provider; include a model ID."
                     )
                 };
                 return Err(ApiError::bad_request(detail));
             }
-            (None, model)
+            (None, selector)
         }
     };
     let provider = qualified_provider.as_ref().or(explicit_provider.as_ref());
     let selected = catalog
-        .resolve_selection(Some(&model), provider, eligible)
+        .resolve_selection(Some(&selector), provider, eligible)
         .map_err(|error| session_selection_error(&error))?;
     Ok((selected.provider, selected.model))
 }
@@ -917,63 +914,14 @@ fn session_selection_error(error: &ModelSelectionError) -> ApiError {
     ApiError::bad_request(error.to_string())
 }
 
-fn build_profile(
-    provider_id: ProviderId,
-    profile_kind: AgentProfileKind,
-    model: &str,
-    llm_client: &LlmClient,
-    catalog: Arc<Catalog>,
-) -> Box<dyn AgentProfile> {
-    let summarizer = Some(WebFetchSummarizer {
-        client:   llm_client.clone(),
-        model_id: summarizer_model_id(&provider_id, profile_kind, &catalog, model),
-    });
-    match profile_kind {
-        AgentProfileKind::OpenAi => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Gemini => Box::new(
-            GeminiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Anthropic => Box::new(
-            AnthropicProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-    }
-}
-
-fn summarizer_model_id(
-    provider_id: &ProviderId,
-    profile_kind: AgentProfileKind,
-    catalog: &Catalog,
-    selected_model: &str,
-) -> ModelHandle {
-    ModelHandle::ByName {
-        provider: provider_id.clone(),
-        model:    catalog
-            .default_for_provider(provider_id)
-            .map_or_else(
-                || match profile_kind {
-                    AgentProfileKind::Anthropic => "claude-haiku-4-5",
-                    AgentProfileKind::OpenAi => selected_model,
-                    AgentProfileKind::Gemini => "gemini-2.0-flash",
-                },
-                |model| model.id.as_str(),
-            )
-            .to_string(),
-    }
-}
-
 struct AskFabroToolAccessPolicy;
 
 impl ToolAccessPolicy for AskFabroToolAccessPolicy {
     fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-        match tool_name {
+        // Resolve through the canonical name so a profile that exposes its own
+        // vocabulary (the Kimi profile uses `Read`/`Grep`/`Glob`) is not denied
+        // its whole tool set.
+        match fabro_agent::canonical_tool_name(tool_name) {
             "read_file" | "grep" | "glob" => ToolAccess::Allowed,
             name if ASK_FABRO_RUN_TOOL_NAMES.contains(&name) => ToolAccess::Allowed,
             _ => ToolAccess::Denied,
@@ -1015,31 +963,15 @@ fn build_ask_fabro_system_prompt(
     registry: &ToolRegistry,
     policy: &dyn ToolAccessPolicy,
 ) -> String {
+    // `tool_guidance` is passed as a template variable rather than interpolated
+    // into the template text: it carries tool names and descriptions that can
+    // come from MCP servers, and MiniJinja does not re-render substituted
+    // values, so arbitrary `{{ ... }}` in a tool description stays inert.
     let tool_guidance = render_ask_fabro_tool_guidance(registry, policy);
-    let core_prompt = format!(
-        "\
-You are Ask Fabro, an interactive read-only, run-scoped analyst.
+    let template = EmbeddedPrompt::new("ask_fabro.md.j2", ASK_FABRO_SYSTEM_PROMPT)
+        .with_string("tool_guidance", tool_guidance);
 
-Answer questions about the current Fabro run, its event history, and its workspace. Stay scoped to this run. Do not modify the run or workspace, and do not take control actions.
-
-Use the provided run snapshot for orientation. Treat it as possibly stale. Use `fabro_run_events` for current status, exact timestamps, failures, tool calls, stage outputs, and event-backed claims. Use workspace file tools only when the question asks about files, code, artifacts, or implementation details.
-
-When answering:
-- Be concise by default.
-- Cite the source of important facts in plain language, such as \"from run events\" or \"from workspace file <path>\".
-- If evidence is incomplete, say what you could not inspect.
-
-{{env_block}}
-
-# Tool Access
-
-You can only call these tools:
-{tool_guidance}
-
-Do not claim access to tools that are not listed. Treat tool failures as real failures, not as permission discovery. If the available tools are insufficient, say what cannot be inspected."
-    );
-
-    assemble_system_prompt(&core_prompt, env, env_context, &[], user_instructions, &[])
+    profiles::assemble_system_prompt(template, env, env_context, &[], user_instructions, &[])
 }
 
 fn build_ask_fabro_run_snapshot(projection: &fabro_types::RunProjection, run_id: RunId) -> String {
@@ -1674,7 +1606,12 @@ reasoning = false
             (openrouter.clone(), "gpt-5.6-sol".to_string())
         );
         assert_eq!(
-            canonical_session_model(&catalog, &both, Some("openrouter/gpt-56-sol"), None,).unwrap(),
+            canonical_session_model(&catalog, &both, Some("openrouter:gpt-56-sol"), None,).unwrap(),
+            (openrouter.clone(), "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("openrouter:openai/gpt-5.6-sol"), None,)
+                .unwrap(),
             (openrouter, "gpt-5.6-sol".to_string())
         );
     }
@@ -1694,6 +1631,31 @@ reasoning = false
         assert_eq!(
             canonical_session_model(&catalog, &both, Some("future-model"), None).unwrap(),
             (openai, "future-model".to_string())
+        );
+    }
+
+    /// A colon in a model ID does not make it provider-qualified. Ollama
+    /// `name:tag` values and Bedrock ARNs must still reach the provider.
+    #[test]
+    fn canonical_session_model_passes_through_colon_bearing_model_ids() {
+        let catalog = portable_session_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
+
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &both,
+                Some("future-model:latest"),
+                Some(&openrouter),
+            )
+            .unwrap(),
+            (openrouter, "future-model:latest".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("future-model:latest"), None).unwrap(),
+            (openai, "future-model:latest".to_string())
         );
     }
 
@@ -1745,7 +1707,7 @@ reasoning = false
     }
 
     #[test]
-    fn canonical_session_model_still_treats_non_legacy_qualified_model_as_a_pin() {
+    fn canonical_session_model_treats_colon_qualified_model_as_a_pin() {
         let catalog = portable_session_catalog();
         let openrouter = ProviderId::new("openrouter");
 
@@ -1753,7 +1715,7 @@ reasoning = false
             canonical_session_model(
                 &catalog,
                 &catalog.all_provider_ids(),
-                Some("openrouter/gpt-56-sol"),
+                Some("openrouter:gpt-56-sol"),
                 None,
             )
             .unwrap(),
@@ -1767,7 +1729,7 @@ reasoning = false
         let error = canonical_session_model(
             &catalog,
             &catalog.all_provider_ids(),
-            Some("openrouter/gpt-56-sol"),
+            Some("openrouter:gpt-56-sol"),
             Some(&ProviderId::openai()),
         )
         .unwrap_err();
@@ -1902,6 +1864,28 @@ reasoning = false
         assert!(prompt.contains("Use the provided run snapshot for orientation"));
         assert!(prompt.contains("Use `fabro_run_events` for current status"));
         assert!(prompt.contains("Use workspace file tools only when the question asks"));
+    }
+
+    #[test]
+    fn ask_fabro_prompt_keeps_tool_descriptions_inert() {
+        let mut registry = ToolRegistry::new();
+        let mut tool = stub_tool("read_file");
+        tool.definition.description = "{{ inputs.env_block }}".to_string();
+        registry.register(tool);
+        let policy = build_ask_fabro_tool_access_policy();
+
+        let prompt = build_ask_fabro_system_prompt(
+            &fabro_agent::LocalSandbox::new(std::env::current_dir().unwrap()),
+            &fabro_agent::EnvContext::default(),
+            &[],
+            None,
+            &[],
+            &registry,
+            policy.as_ref(),
+        );
+
+        assert!(prompt.contains("- `read_file`: {{ inputs.env_block }}"));
+        assert_eq!(prompt.matches("<environment>").count(), 1);
     }
 
     #[test]
