@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import sys, json, re
+args = sys.argv[1:]
+method = args[0] if args else ''
+path = args[1] if len(args) > 1 else ''
+jq_expr = ''
+i = 0
+while i < len(args):
+    if args[i] == '--jq' and i + 1 < len(args):
+        jq_expr = args[i + 1]
+        i += 2
+    else:
+        i += 1
+ROUTES = [
+    (r'^repos/[^/]+/[^/]+$', 'main'),
+    (r'^repos/[^/]+/[^/]+/git/ref/heads/main$', dict(object=dict(sha='1d7f4f2000000000000000000000000000000'))),
+    (r'^repos/[^/]+/[^/]+/commits/__M__/status$', dict(statuses=[])),
+    (r'^repos/[^/]+/[^/]+/commits/__P__/status$', dict(statuses=[dict(context='fabro/qa-pipeline', state='success', description='hermetic microVM gate: npm test')])),
+    (r'^repos/[^/]+/[^/]+/commits/__O__/status$', dict(statuses=[])),
+    (r'^repos/[^/]+/[^/]+/commits/__M__/pulls$', [dict(number=41, head=dict(sha='2222222222222222222222222222222222222222'))]),
+    (r'^repos/[^/]+/[^/]+/git/commits/__M__$', dict(tree=dict(sha='deadbeefcafebabe000000000000000000000000'))),
+    (r'^repos/[^/]+/[^/]+/git/commits/__P__$', dict(tree=dict(sha='deadbeefcafebabe000000000000000000000000'))),
+    (r'^repos/[^/]+/[^/]+/git/commits/__O__$', dict(tree=dict(sha='/private/tmp/claude-501/-Users-vvladescu--ao-data-worktrees-fabro-fabro-108/51b7dd01-b68d-58d7-87e4-ab342119fda6/scratchpad/work/test_stub.py'))),
+    (r'^repos/[^/]+/[^/]+/pulls', [dict(number=41, head=dict(sha='2222222222222222222222222222222222222222')), dict(number=42, head=dict(sha='abc123def456abc123def456abc123def45678'))]),
+]
+resp = 'main'
+for pat, val in ROUTES:
+    if re.match(pat, path):
+        resp = val
+        break
+if not jq_expr:
+    if isinstance(resp, str):
+        print(resp)
+    else:
+        print(json.dumps(resp))
+    sys.exit(0)
+if jq_expr == '.[].head.sha':
+    if isinstance(resp, list):
+        for it in resp:
+            if isinstance(it, dict) and isinstance(it.get('head'), dict):
+                print(it['head'].get('sha', ''))
+elif jq_expr.startswith('[.statuses[]') and '|length' in jq_expr:
+    m = re.search(r'select\.context==["]([^\"]+)[\"]', jq_expr)
+    if m and isinstance(resp, dict):
+        ctx = m.group(1)
+        count = sum(1 for s in resp.get('statuses', []) if isinstance(s, dict) and s.get('context') == ctx)
+        print(count)
+    else:
+        print(0)
+elif jq_expr == '.[0].number':
+    if isinstance(resp, list) and resp and isinstance(resp[0], dict):
+        print(resp[0].get('number', ''))
+    else:
+        print('')
+elif jq_expr.startswith('.'):
+    parts = jq_expr[1:].split('.')
+    cur = resp
+    for p in parts:
+        if p == '': continue
+        if isinstance(cur, dict):
+            cur = cur.get(p)
+        elif isinstance(cur, list) and cur and isinstance(cur[0], dict):
+            cur = [it.get(p) for it in cur]
+        else:
+            cur = None
+            break
+    if isinstance(cur, (dict, list)):
+        print(json.dumps(cur))
+    else:
+        print(cur if cur is not None else '')
+else:
+    if isinstance(resp, str):
+        print(resp)
+    else:
+        print(json.dumps(resp))
