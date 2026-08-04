@@ -16774,3 +16774,109 @@ fn validate_github_slug_rejects_overlong() {
     let long = "a".repeat(40);
     assert!(super::validate_github_slug("owner", &long, 39).is_err());
 }
+
+// SPA fallback: client-side routes (`/runs`, `/runs/<id>/stages`, etc.) must
+// resolve to the embedded `index.html` so deep links and bookmarks survive a
+// page reload. This is the durable surface the operator's bookmark depends on;
+// if the fallback is removed these tests fail.
+mod spa_fallback_for_client_routes {
+    use axum::body::to_bytes;
+    use axum::http::header;
+
+    use tower::ServiceExt;
+
+    use super::{Body, Request, StatusCode, test_app_with};
+
+    async fn body_string(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).expect("response body must be utf-8 text/html")
+    }
+
+    fn browser_get(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn runs_route_serves_spa_index_for_bookmarked_link() {
+        let app = test_app_with();
+        let response = app.oneshot(browser_get("/runs")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /runs must return the SPA shell, not a 404 — \
+             deep links and bookmarks depend on this fallback"
+        );
+        let body = body_string(response).await;
+        assert!(
+            body.contains("<title>Fabro Test SPA</title>"),
+            "expected the embedded SPA shell; body was: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_detail_route_serves_spa_index_for_bookmarked_link() {
+        // Deep route `/runs/<id>/stages` must also fall back to index.html so
+        // the React router can resolve it client-side.
+        let app = test_app_with();
+        let response = app
+            .oneshot(browser_get("/runs/01HABCDEFGHJKMNPQRSTVWXYZ/stages"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(
+            body.contains("<title>Fabro Test SPA</title>"),
+            "deep run routes must fall back to the SPA shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_route_404s_for_non_html_clients_to_avoid_silent_shells() {
+        // The fallback is gated on `Accept: text/html` so a `fetch()` /
+        // typo'd API request cannot silently receive a 25KB HTML shell.
+        // Locking this in: reverting the fallback flips both halves at once
+        // and these tests fail together.
+        let app = test_app_with();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/runs")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "non-HTML clients must not receive the SPA shell on miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_route_404s_for_post_requests() {
+        // POST/PUT/DELETE never reach the SPA fallback — only GET/HEAD do.
+        // Locking this in so a future change that widens the method match
+        // doesn't accidentally expose non-idempotent methods.
+        let app = test_app_with();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runs")
+                    .header(header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
